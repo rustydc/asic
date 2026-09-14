@@ -1,0 +1,23 @@
+{
+  "index64_fp4_compress4": {
+    "index_dim": 64,
+    "index_bits": 4,
+    "retrieval_block_size": 4,
+    "recurrent_intermediate_size": 16384,
+    "global_intermediate_size": 8192
+  },
+  "index128_int2_compress4": {
+    "index_dim": 128,
+    "index_bits": 2,
+    "retrieval_block_size": 4,
+    "recurrent_intermediate_size": 16384,
+    "global_intermediate_size": 8192
+  },
+  "index128_fp4_compress8": {
+    "index_dim": 128,
+    "index_bits": 4,
+    "retrieval_block_size": 8,
+    "recurrent_intermediate_size": 16384,
+    "global_intermediate_size": 8192
+  }
+}
