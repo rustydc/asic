@@ -55,6 +55,7 @@ class Platform:
     fill_cells: tuple[str, ...]
     vdd_volts: float
     pin_min_distance_tracks: int = 0   # spread I/O pins so the detailed router can reach each one
+    dont_use: tuple[str, ...] = ()     # the flow scripts' DONT_USE_CELLS, applied to the resizer
 
 
 PLATFORMS = {
@@ -78,6 +79,7 @@ PLATFORMS = {
         fill_cells=("sky130_fd_sc_hd__fill_1", "sky130_fd_sc_hd__fill_2",
                     "sky130_fd_sc_hd__fill_4", "sky130_fd_sc_hd__fill_8"),
         vdd_volts=1.8,
+        dont_use=("sky130_fd_sc_hd__probe_p_8", "sky130_fd_sc_hd__probec_p_8", "sky130_fd_sc_hd__lpflow_*"),
     ),
     "asap7": Platform(
         name="asap7",
@@ -101,6 +103,7 @@ PLATFORMS = {
                     "DECAPx10_ASAP7_75t_R"),
         vdd_volts=0.70,
         pin_min_distance_tracks=2,
+        dont_use=("*x1p*_ASAP7*", "*xp*_ASAP7*", "SDF*", "ICG*"),
     ),
 }
 
@@ -203,6 +206,7 @@ def write_flow(work: Path, platform: Platform, platforms_dir: Path, netlist: Pat
         f"read_verilog {netlist.resolve()}",
         f"link_design {top}",
         "read_sdc design.sdc",
+        (f"set_dont_use {{{' '.join(platform.dont_use)}}}" if platform.dont_use else ""),
         f"source {p / platform.rc_script}",
         # Floorplan.
         f"initialize_floorplan -utilization {utilization} -aspect_ratio 1.0 "
