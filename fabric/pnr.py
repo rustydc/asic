@@ -148,7 +148,7 @@ def write_flow(work: Path, platform: Platform, platforms_dir: Path, netlist: Pat
         f"repair_tie_fanout {platform.tie_lo}",
         "detailed_placement",
         "estimate_parasitics -placement",
-        "repair_timing -setup -setup_margin 0",
+        "repair_timing -setup",
         "detailed_placement",
         # Clock tree.
         f"clock_tree_synthesis -buf_list {{{platform.cts_buffer}}} -root_buf {platform.cts_buffer} -sink_clustering_enable",
@@ -156,7 +156,7 @@ def write_flow(work: Path, platform: Platform, platforms_dir: Path, netlist: Pat
         "repair_clock_nets",
         "detailed_placement",
         "estimate_parasitics -placement",
-        "repair_timing -setup -hold -hold_margin 0",
+        "repair_timing -setup -hold",
         "detailed_placement",
         "check_placement",
         # Global routing and post-route timing.
