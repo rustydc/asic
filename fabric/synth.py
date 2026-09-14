@@ -187,6 +187,10 @@ def map_ties(netlist: Path, liberties: Sequence[Path], output: Path, *, tie_hi: 
         script = "\n".join([
             *lib_reads,
             "read_verilog in.v",
+            # Drop the unused named wires yosys keeps for hierarchy (some carry
+            # x bits), ground any remaining x, then map the constants to ties.
+            "opt_clean -purge",
+            "setundef -zero",
             f"hilomap -singleton -hicell {hi_cell} {hi_port} -locell {lo_cell} {lo_port}",
             "opt_clean",
             "write_verilog -noattr out.v",
