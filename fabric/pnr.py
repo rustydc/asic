@@ -56,6 +56,8 @@ class Platform:
     vdd_volts: float
     pin_min_distance_tracks: int = 0   # spread I/O pins so the detailed router can reach each one
     dont_use: tuple[str, ...] = ()     # the flow scripts' DONT_USE_CELLS, applied to the resizer
+    pin_length_um: float = 0.0         # I/O pin stub length (0 = platform default)
+    pin_exclude: tuple[str, ...] = ()  # place_pins -exclude regions, e.g. "left:*"
 
 
 PLATFORMS = {
@@ -104,6 +106,10 @@ PLATFORMS = {
         vdd_volts=0.70,
         pin_min_distance_tracks=2,
         dont_use=("*x1p*_ASAP7*", "*xp*_ASAP7*", "SDF*", "ICG*"),
+        # TritonRoute in this build cannot reach some M4/M5 pins on the left and
+        # bottom die edges of a pin-dense slice; 1 um stubs on the other two
+        # edges route cleanly (experiment C in fabric/README.md).
+        pin_length_um=1.0, pin_exclude=("left:*", "bottom:*"),
     ),
 }
 
@@ -212,9 +218,12 @@ def write_flow(work: Path, platform: Platform, platforms_dir: Path, netlist: Pat
         f"initialize_floorplan -utilization {utilization} -aspect_ratio 1.0 "
         f"-core_space {platform.core_space_um} -site {platform.site}",
         f"source {p / platform.tracks_script}",
+        (f"set_pin_length -hor_length {platform.pin_length_um} -ver_length {platform.pin_length_um}"
+         if platform.pin_length_um else ""),
         f"place_pins -hor_layers {platform.pin_layer_h} -ver_layers {platform.pin_layer_v}"
         + (f" -min_distance {platform.pin_min_distance_tracks} -min_distance_in_tracks"
-           if platform.pin_min_distance_tracks else ""),
+           if platform.pin_min_distance_tracks else "")
+        + "".join(f" -exclude {region}" for region in platform.pin_exclude),
         # Well taps and the power grid from the platform's strategy, before
         # placement so the stripes are routing blockages from the start.
         f"tapcell -distance {platform.tap_distance_um} -tapcell_master {platform.tap_cell}",
