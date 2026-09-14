@@ -1,0 +1,25 @@
+{
+  "platform": "asap7",
+  "period_ps": 700.0,
+  "worst_slack_ps": -2.69,
+  "tns_ps": -39.46,
+  "critical_path_ps": 904.505,
+  "max_frequency_mhz": 1423.1026483940286,
+  "design_area_um2": 2623.0,
+  "utilization_pct": 45.0,
+  "instances": 23621,
+  "clock_skew_ps": 73.48,
+  "wirelength_um": 131319.0,
+  "overflow": 0,
+  "stage": "global_route",
+  "report": "4   77.827  355.852 v _40548_/QN (DFFHQNx2_ASAP7_75t_R)\n   9.708   17.798   34.889  390.741 v repeater666/Y (BUFx6f_ASAP7_75t_R)\n   9.119   12.436   21.148  411.889 v split2393/Y (BUFx12f_ASAP7_75t_R)\n   1.487   22.053   15.569  427.458 ^ _27599_/Y (NOR2x1p5_ASAP7_75t_R)\n   1.418   19.464   30.219  457.677 ^ _27601_/Y (AND3x1_ASAP7_75t_R)\n   0.741   10.226   10.152  467.830 v _27602_/Y (INVx1_ASAP7_75t_R)\n   1.149   21.087   13.884  481.714 ^ _27603_/Y (NAND2xp5_ASAP7_75t_R)\n   2.012   46.177   26.899  508.613 ^ _27604_/Y (XNOR2xp5_ASAP7_75t_R)\n   1.354   28.261   23.916  532.529 v _27605_/Y (NAND2xp5_ASAP7_75t_R)\n   1.175   24.248   21.116  553.646 ^ _27608_/Y (NAND2xp5_ASAP7_75t_R)\n   1.772   40.564   35.513  589.159 ^ _27617_/Y (XOR2xp5_ASAP7_75t_R)\n   1.480   25.153   23.646  612.805 v _27619_/Y (NOR2xp67_ASAP7_75t_R)\n   0.755   13.838   12.882  625.688 ^ _27620_/Y (INVx1_ASAP7_75t_R)\n   1.013   18.544   13.423  639.110 v _27621_/Y (NAND2xp5_ASAP7_75t_R)\n   2.571   16.080   32.954  672.064 v _27623_/Y (XOR2x2_ASAP7_75t_R)\n   0.880   10.975   24.236  696.300 v _27719_/Y (AO21x1_ASAP7_75t_R)\n   1.448   15.937   12.062  708.362 ^ _27720_/Y (INVx1_ASAP7_75t_R)\n   1.549   19.993   29.636  737.998 ^ _27722_/Y (AND3x1_ASAP7_75t_R)\n   0.744   10.361   10.364  748.362 v _27723_/Y (INVx1_ASAP7_75t_R)\n   1.203   21.542   14.266  762.628 ^ _27724_/Y (NAND2xp5_ASAP7_75t_R)\n   1.919   43.064   36.091  798.719 ^ _27738_/Y (XOR2xp5_ASAP7_75t_R)\n   1.285   34.171   35.848  834.567 ^ _27741_/Y (XOR2xp5_ASAP7_75t_R)\n   1.829   41.918   38.391  872.958 ^ _27746_/Y (XOR2xp5_ASAP7_75t_R)\n   0.771   25.369   31.500  904.458 ^ _28874_/Y (XOR2xp5_ASAP7_75t_R)\n           25.369    0.047  904.505 ^ _40441_/D (DFFHQNx1_ASAP7_75t_R)\n                            904.505   data arrival time\n\n                   700.000  700.000   clock clk (rise edge)\n                     0.000  700.000   clock source latency\n   9.162    0.000    0.000  700.000 ^ clk (in)\n  14.546   41.175   40.927  740.927 ^ clkbuf_0_clk/Y (BUFx4_ASAP7_75t_R)\n   1.172   10.758   37.850  778.777 ^ clkbuf_2_2_0_clk/Y (BUFx4_ASAP7_75t_R)\n   3.165   14.475   26.015  804.792 ^ clkbuf_2_2_1_clk/Y (BUFx4_ASAP7_75t_R)\n   5.002   19.173   30.039  834.831 ^ clkbuf_3_4_0_clk/Y (BUFx4_ASAP7_75t_R)\n  11.057   32.140   39.433  874.264 ^ clkbuf_4_9__f_clk/Y (BUFx4_ASAP7_75t_R)\n   6.289   21.231   38.153  912.417 ^ clkbuf_leaf_69_clk/Y (BUFx4_ASAP7_75t_R)\n           21.237    0.211  912.628 ^ _40441_/CLK (DFFHQNx1_ASAP7_75t_R)\n                     0.000  912.628   clock reconvergence pessimism\n                   -10.813  901.815   library setup time\n                            901.815   data required time\n---------------------------------------------------------------------------\n                            901.815   data required time\n                           -904.505   data arrival time\n---------------------------------------------------------------------------\n                             -2.689   slack (VIOLATED)\n\n\nC",
+  "inputs": {
+    "netlist": "net_a7_v14.v",
+    "rows": 256,
+    "cols": 16,
+    "rows_per_cycle": 2,
+    "target_utilization_pct": 45,
+    "openroad": "litex-hub conda build, Feb 2024",
+    "platform_files": "OpenROAD-flow-scripts flow/platforms/asap7"
+  }
+}

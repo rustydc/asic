@@ -71,7 +71,7 @@ class ParseTest(unittest.TestCase):
     def test_parse_pnr_reports_scale_library_units(self) -> None:
         log = "\n".join([
             "Startpoint: early", "   1.000   data arrival time", "   0.500   slack (MET)",
-            "wns max 0.5", "Instance count: 21000",
+            "wns max 0.5", "[INFO GPL-0006] NumInstances: 21000",
             "Startpoint: a", "   2.950   data arrival time", "  -0.250   slack (VIOLATED)",
             "Total            580308        176889           30.48%             0 /  0 /  3",
             "[INFO GRT-0018] Total wirelength: 131319 um",
@@ -92,6 +92,29 @@ class ParseTest(unittest.TestCase):
         self.assertAlmostEqual(result.wirelength_um, 131319.0)
         self.assertEqual(result.overflow, 3)
         self.assertEqual(result.stage, "global_route")
+
+    def test_parse_pnr_reports_older_report_formats(self) -> None:
+        # Older OpenROAD builds print "wns X", a skew table, and no instance count;
+        # the count then comes from the written DEF.
+        log = "\n".join([
+            "[INFO GPL-0006] NumInstances: 21449",
+            "Startpoint: a", "  904.505   data arrival time", "  -2.689   slack (VIOLATED)",
+            "Clock clk", "Latency      CRPR       Skew", "_40822_/CLK ^", " 288.74", "_40061_/CLK ^",
+            " 215.26      0.00      73.48", "Design area 2623 u^2 45% utilization.",
+            "wns -2.69", "tns -39.46", ""])
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            (work / "openroad.log").write_text(log, encoding="utf-8")
+            (work / "design.def").write_text("DESIGN x ;\nCOMPONENTS 23621 ;\n", encoding="utf-8")
+            result = parse_results(work, PLATFORMS["asap7"], 700.0, detailed_route=False)
+        self.assertEqual(result.instances, 23621)
+        self.assertAlmostEqual(result.worst_slack_ps, -2.69)             # ASAP7 reports in ps
+        self.assertAlmostEqual(result.tns_ps, -39.46)
+        self.assertAlmostEqual(result.critical_path_ps, 904.505)
+        self.assertAlmostEqual(result.clock_skew_ps, 73.48)
+        self.assertAlmostEqual(result.max_frequency_mhz, 1e6 / 702.69)
+        self.assertTrue(result.wirelength_um != result.wirelength_um)   # NaN when absent
+        self.assertEqual(result.overflow, -1)
 
     def test_parse_sta_report_reads_clock_group_slack(self) -> None:
         report = """

@@ -205,9 +205,10 @@ What open PDKs can and cannot do for this project:
   about a square millimetre of columns plus a hand-drawn via-ROM array, and
   both processes run open shuttles. That measures the column datapath, the
   ROM cell, and the personalization flow end to end, at 130 nm.
-* **Timing: yes, pre-layout.** OpenSTA builds from source in a few minutes
-  and times the yosys netlist against the same liberty files. See the next
-  section for the numbers and what they do and do not include.
+* **Timing: yes, pre-layout and placed-and-routed.** OpenSTA builds from
+  source in a few minutes and times the yosys netlist against the same
+  liberty files; OpenROAD then places, buffers, clocks and routes it on
+  the sky130 and ASAP7 platform files. See the next two sections.
 * **The production die: no.** At 130 nm the ROM cell is 30 to 50 times larger
   than at 28 nm, so the 9B layer die would be several thousand square
   millimetres. The production node needs a foundry PDK under NDA.
@@ -288,6 +289,98 @@ the requantizer is select, two resolve stages, multiply, three add stages,
 and shift/saturate, nine cycles of latency after the 64-cycle walk. All of
 it stays bit-exact against the Python model, which never changed.
 
+## Place and route
+
+`fabric/pnr.py` drives OpenROAD through floorplan, timing-driven global
+placement, resize and buffering, clock-tree synthesis, hold repair, global
+routing, and post-route timing on wire parasitics extracted from the global
+route. It uses the platform files from OpenROAD-flow-scripts (LEF, RC
+tables, track scripts) and the same netlists OpenSTA timed above:
+
+```bash
+micromamba create -p eda -c litex-hub -c conda-forge openroad   # or build from source
+git clone --depth 1 https://github.com/The-OpenROAD-Project/OpenROAD-flow-scripts orfs
+python -m fabric.pnr --openroad eda/bin/openroad --platform sky130hd \
+    --platforms-dir orfs/flow/platforms --netlist net_sky130.v \
+    --period-ps 3000 --utilization 35 --work pnr_sky130
+python -m fabric.pnr --openroad eda/bin/openroad --platform asap7 \
+    --platforms-dir orfs/flow/platforms --netlist net_asap7.v \
+    --liberty asap7_tt.lib --period-ps 700 --utilization 45 --work pnr_asap7
+```
+
+Results for the same 256-row, 16-column, two-rows-per-cycle slice, after
+global routing, typical corner (`fabric/results/pnr_*.json` holds the parsed
+numbers and the final critical path):
+
+| | sky130 HD, 130 nm | ASAP7, 7 nm predictive |
+| --- | ---: | ---: |
+| Target period | 3.00 ns | 700 ps |
+| Worst slack | −1.15 ns | −2.7 ps |
+| Achievable clock | **241 MHz** | **1.42 GHz** |
+| Pre-layout estimate | 235 MHz (310 buffered) | 1.37 GHz (1.7 buffered) |
+| Clock insertion / skew | 1.9 ns, 8 levels / 470 ps | 280 ps, 4 levels / 73 ps |
+| Hold buffers | 3051 | 1584 |
+| Design area | 215,071 µm² (47 %) | 2,623 µm² (45 %) |
+| Placed area before repair | 159,971 µm² | 2,646 µm² |
+| Instances | 28,034 | 23,621 |
+| Wirelength | 1.48 m | 131 mm |
+| Routing overflow (global) | 297 edges, ≤ 6 per edge | 0 |
+
+The pre-layout numbers hold up. On ASAP7 the routed design is a little
+faster than the unbuffered estimate: the resizer fixes the fanout the STA
+run flagged, and wires, the clock tree and 73 ps of skew cost less than
+that fix gains. On sky130 the routed flop-to-flop path is 4.2 ns, the same
+as the unbuffered pre-layout path, so none of the expected buffering gain
+arrived (see below); the 2345-sink clock tree built from `clkbuf_4` alone
+is eight levels and 1.9 ns deep, but its 470 ps of skew happens to favour
+the worst path. The 28 nm-class bracket stays where the previous section
+put it, roughly 0.6 to 1.2 GHz, with the 800 MHz placeholder inside it.
+
+What limits each node now:
+
+* **ASAP7:** the critical path is twenty-seven XOR and NAND levels in the
+  requantizer, the ripple form ABC leaves a 14-bit chunk add in, plus the
+  skew between two clock branches. Both are design choices: narrower
+  chunks or a conditional-sum adder should be worth 100 to 150 ps, and a
+  two-level clock mesh removes most of the skew. Neither is worth doing
+  before the target library is known.
+* **sky130:** the critical path runs through the walking select and the
+  requantizer input mux, and one `o41ai_4` cell on it drives a 64 fF net
+  at a 0.9 ns slew that the resizer gave up on (`RSZ-0062`, three times).
+  That one cell is 0.85 ns of a 4.2 ns path. It is a buffering failure
+  rather than a logic-depth limit; a hand-placed buffer tree on the select
+  would recover most of the missing 300 MHz. It only matters for the MPW
+  tile.
+
+Area moves in the expected direction. Sky130 grows 34 percent in place and
+route, almost all of it the 3051 hold buffers that propagated-clock skew
+forces on a design whose datapath registers have no logic between them in
+the walk, plus the clock tree. ASAP7 does not grow at all because the
+resizer downsizes 10,390 cells that yosys had mapped larger than needed,
+which pays for its 1584 hold buffers. Per column slice the routed area is
+3585 NAND2 equivalents on sky130 and 2827 on ASAP7, against 2050 for a
+column of the 64-wide tile pre-layout; the 16-column slice amortizes the
+shared requantizer over four times fewer columns, which accounts for most
+of the difference. The density model still carries the pre-layout
+64-column figure. The sky130 run says place and route can add a third on
+top of it, mostly hold buffers a better clock tree would reduce, and the
+ASAP7 run says it can add nothing; the die-size table should be read with
+that spread in mind until the target library settles it.
+
+What this run is not: detailed routing (`--detailed-route` runs it, at
+several times the wall time), a signoff extraction, multiple corners, or a
+power grid. The global router reports no overflow on ASAP7 and a few
+hundred lightly overfull edges on sky130 at 35 percent target utilization,
+so both would detail-route; the sky130 slice is pin-limited, with 1390
+ports on a 0.68 mm square, which is an artifact of routing a slice rather
+than the whole tile.
+
+Two things the flow had to work around in the litex-hub OpenROAD build of
+February 2024: `report_wire_length` crashes on a typo in its error path,
+so wirelength comes from the router's own log line, and `> file`
+redirection on several report commands writes empty files, so every report
+goes to the log and `parse_results` reads that.
+
 ## RTL
 
 `rtl/fabric_tile.sv` is the synthesizable tile with the ROM as a constant
@@ -305,9 +398,9 @@ at four rows per cycle, and 4096×16 at full depth.
 
 ## What is next
 
-1. Place-and-route of the column datapath with OpenROAD on sky130 or ASAP7 to
-   add wires, buffering and sizing to the pre-layout timing above, then the
-   same on the target library.
+1. Detailed routing and a multi-corner pass of the OpenROAD flow above, a
+   buffer tree on the walking select for sky130, and then the same flow on
+   the target library.
 2. A via-ROM compiler cell from the foundry, or a hand-drawn cell for the MPW,
    to replace the ROM area and read energy placeholders.
 3. The GDS writer: `via_coordinates` into the ROM macro's bit-cell grid.

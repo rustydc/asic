@@ -1,0 +1,25 @@
+{
+  "platform": "sky130hd",
+  "period_ps": 3000.0,
+  "worst_slack_ps": -1150.0,
+  "tns_ps": -594140.0,
+  "critical_path_ps": 6135.0,
+  "max_frequency_mhz": 240.96385542168676,
+  "design_area_um2": 215071.0,
+  "utilization_pct": 47.0,
+  "instances": 28034,
+  "clock_skew_ps": 470.0,
+  "wirelength_um": 1475240.0,
+  "overflow": 297,
+  "stage": "global_route",
+  "report": "    3.044 ^ _40047_/Y (sky130_fd_sc_hd__o21ai_2)\n   0.012    0.054    0.074    3.118 v _40048_/Y (sky130_fd_sc_hd__nor2_2)\n   0.013    0.170    0.176    3.294 ^ _40049_/Y (sky130_fd_sc_hd__a31oi_4)\n   0.006    0.044    0.143    3.437 ^ rebuffer1200/X (sky130_fd_sc_hd__clkbuf_2)\n   0.006    0.045    0.104    3.541 ^ rebuffer1193/X (sky130_fd_sc_hd__clkbuf_2)\n   0.006    0.021    0.034    3.575 v _40050_/Y (sky130_fd_sc_hd__inv_2)\n   0.011    0.159    0.150    3.724 ^ _40051_/Y (sky130_fd_sc_hd__o21ai_2)\n   0.009    0.104    0.130    3.855 v _40134_/Y (sky130_fd_sc_hd__mux2i_1)\n   0.005    0.230    0.254    4.108 ^ _40153_/Y (sky130_fd_sc_hd__nor4_2)\n   0.010    0.155    0.182    4.290 v _40210_/Y (sky130_fd_sc_hd__nand4_1)\n   0.064    0.920    0.847    5.137 ^ _40287_/Y (sky130_fd_sc_hd__o41ai_4)\n   0.095    0.194    0.325    5.462 ^ repeater1024/X (sky130_fd_sc_hd__buf_6)\n   0.050    0.201    0.222    5.684 v _40383_/Y (sky130_fd_sc_hd__a31oi_4)\n   0.039    0.049    0.216    5.900 v _40384_/X (sky130_fd_sc_hd__buf_6)\n   0.033    0.043    0.137    6.037 v split4409/X (sky130_fd_sc_hd__buf_6)\n   0.003    0.083    0.098    6.135 ^ _40476_/Y (sky130_fd_sc_hd__o21ai_2)\n            0.083    0.000    6.135 ^ _43879_/D (sky130_fd_sc_hd__dfxtp_1)\n                              6.135   data arrival time\n\n                     3.000    3.000   clock clk (rise edge)\n                     0.000    3.000   clock source latency\n   0.090    0.000    0.000    3.000 ^ clk (in)\n   0.025    0.087    0.154    3.154 ^ clkbuf_0_clk/X (sky130_fd_sc_hd__clkbuf_4)\n   0.011    0.050    0.152    3.305 ^ clkbuf_1_1_0_clk/X (sky130_fd_sc_hd__clkbuf_4)\n   0.043    0.137    0.205    3.510 ^ clkbuf_1_1_1_clk/X (sky130_fd_sc_hd__clkbuf_4)\n   0.014    0.058    0.177    3.687 ^ clkbuf_2_2_0_clk/X (sky130_fd_sc_hd__clkbuf_4)\n   0.035    0.115    0.191    3.878 ^ clkbuf_2_2_1_clk/X (sky130_fd_sc_hd__clkbuf_4)\n   0.041    0.131    0.225    4.103 ^ clkbuf_3_5_0_clk/X (sky130_fd_sc_hd__clkbuf_4)\n   0.034    0.111    0.217    4.320 ^ clkbuf_4_10_0_clk/X (sky130_fd_sc_hd__clkbuf_4)\n   0.022    0.078    0.184    4.504 ^ clkbuf_5_21_0_clk/X (sky130_fd_sc_hd__clkbuf_4)\n   0.011    0.049    0.147    4.651 ^ clkbuf_6_42_0_clk/X (sky130_fd_sc_hd__clkbuf_4)\n   0.011    0.049    0.135    4.786 ^ clkbuf_7_85_0_clk/X (sky130_fd_sc_hd__clkbuf_4)\n   0.061    0.187    0.240    5.026 ^ clkbuf_8_170_0_clk/X (sky130_fd_sc_hd__clkbuf_4)\n            0.187    0.003    5.029 ^ _43879_/CLK (sky130_fd_sc_hd__dfxtp_1)\n                     0.000    5.029   clock reconvergence pessimism\n                    -0.042    4.986   library setup time\n                              4.986   data required time\n---------------------------------------------------------------------------\n                              4.986   data required time\n                             -6.135   data arrival time\n---------------------------------------------------------------------------\n                             -1.149   slack (VIOLATED)\n\n\nC",
+  "inputs": {
+    "netlist": "net_sky_v13.v",
+    "rows": 256,
+    "cols": 16,
+    "rows_per_cycle": 2,
+    "target_utilization_pct": 35,
+    "openroad": "litex-hub conda build, Feb 2024",
+    "platform_files": "OpenROAD-flow-scripts flow/platforms/sky130hd"
+  }
+}

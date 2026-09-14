@@ -191,8 +191,9 @@ def parse_results(work: Path, platform: Platform, period_ps: float, detailed_rou
     unit = platform.time_unit_ps
     log = (work / "openroad.log").read_text(encoding="utf-8") if (work / "openroad.log").exists() else ""
     stage = "detailed_route" if detailed_route and "detailed_route" in log and "route_drc" in log else "global_route"
-    wns_all = re.findall(r"wns\s+max\s+([-0-9.]+)", log)
-    tns_all = re.findall(r"tns\s+max\s+([-0-9.]+)", log)
+    # `report_wns` prints "wns max X" in current builds and "wns X" in older ones.
+    wns_all = re.findall(r"^wns(?:\s+max)?\s+([-0-9.]+)", log, re.MULTILINE)
+    tns_all = re.findall(r"^tns(?:\s+max)?\s+([-0-9.]+)", log, re.MULTILINE)
     if not wns_all:
         raise ValueError(f"no wns in OpenROAD log {work / 'openroad.log'}")
     wns_val = float(wns_all[-1]) * unit
@@ -205,9 +206,16 @@ def parse_results(work: Path, platform: Platform, period_ps: float, detailed_rou
     area_all = re.findall(r"Design area\s+([0-9.]+)\s+u\^2\s+([0-9.]+)%\s+utilization", log)
     design_area = float(area_all[-1][0]) if area_all else float("nan")
     util = float(area_all[-1][1]) if area_all else float("nan")
+    # `report_clock_skew` prints either "X skew" or a "Latency CRPR Skew" table
+    # whose data line is three numbers.
     skew_all = re.findall(r"([-0-9.]+)\s+skew", log)
+    if not skew_all:
+        skew_all = re.findall(r"^\s*[-0-9.]+\s+[-0-9.]+\s+([-0-9.]+)\s*$", log[log.rfind("Clock clk"):], re.MULTILINE)
     skew_val = float(skew_all[-1]) * unit if skew_all else None
-    inst = re.findall(r"Instance count:\s+(\d+)", log)
+    # Post-route instance count from the written DEF; fall back to the placer's count.
+    def_path = work / "design.def"
+    inst = re.findall(r"^COMPONENTS\s+(\d+)", def_path.read_text(encoding="utf-8") if def_path.exists() else "", re.MULTILINE)
+    inst = inst or re.findall(r"NumInstances:\s+(\d+)", log)
     instances = int(inst[-1]) if inst else 0
     wl = re.findall(r"Total wirelength:\s+(\d+)\s+um", log)
     wirelength = float(wl[-1]) if wl else float("nan")
@@ -232,7 +240,7 @@ def run_pnr(openroad: Path, platform: Platform, platforms_dir: Path, netlist: Pa
         result = subprocess.run([str(openroad), "-exit", "-no_init", "-threads", str(threads), str(script)],
                                 cwd=work, stdout=log, stderr=subprocess.STDOUT, text=True)
     log_text = (work / "openroad.log").read_text(encoding="utf-8")
-    if result.returncode != 0 or "wns max" not in log_text:
+    if result.returncode != 0 or not re.search(r"^wns", log_text, re.MULTILINE):
         raise RuntimeError(f"OpenROAD failed (see {work / 'openroad.log'}):\n{log_text[-4000:]}")
     return parse_results(work, platform, period_ps, detailed_route)
 
