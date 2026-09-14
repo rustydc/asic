@@ -341,16 +341,19 @@ class DensityModel:
     """Area, clock, and energy estimates (28 nm class).
 
     The MAC-column numbers are calibrated from open-tooling synthesis of
-    ``fabric_columns`` on SkyWater sky130 HD (``fabric/synth.py``): 3916, 5221
-    and 7876 um2 per column at 1, 2 and 4 rows per cycle, scaled by the NAND2
-    area ratio sky130 HD (3.75 um2) to 28 nm (~0.30 um2), i.e. about 12x.  The
-    ROM cell, clock, and energy numbers remain placeholders for the MPW tile.
+    ``fabric_columns`` (``fabric/synth.py``) on four libraries: sky130 HD,
+    IHP SG13G2, NanGate 45 and ASAP7.  Divided by each library's NAND2 area
+    the column costs agree within a few percent: about 700 NAND2 equivalents
+    per column plus 330 per rows-per-cycle bank.  At a 28 nm NAND2 of about
+    0.30 um2 that is 210 + 100 per bank.  The ROM cell, clock, and energy
+    numbers remain placeholders for the MPW tile.
     """
 
     node: str = "28nm-class estimate"
+    nand2_um2: float = 0.30                 # 28 nm-class NAND2 area used for the column scaling
     rom_um2_per_bit: float = 0.03           # via-programmed ROM bit cell incl. array overhead (placeholder)
-    mac_um2_per_column_per_bank: float = 110.0   # 8:1 multiple select + add/sub per bank (sky130 synthesis / 12)
-    acc_um2_per_column: float = 216.0       # accumulator, shared requantizer share, output register (same source)
+    mac_um2_per_column_per_bank: float = 100.0   # 330 NAND2-eq: 8:1 multiple select + add/sub per bank
+    acc_um2_per_column: float = 210.0       # 700 NAND2-eq: accumulator, shared requantizer share, output register
     tile_overhead_um2: float = 2500.0       # multiples generator, ROM periphery, control per tile (placeholder)
     clock_mhz: float = 800.0
     rom_fj_per_bit: float = 3.0

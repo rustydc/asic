@@ -10,13 +10,52 @@ import shutil
 import unittest
 from pathlib import Path
 
-from fabric.synth import parse_stat, synthesize
+import tempfile
+
+from fabric.synth import merge_liberty, nand2_area, parse_stat, synthesize
 
 LIBERTY = os.environ.get("FABRIC_LIBERTY")
 HAVE_YOSYS = shutil.which("yosys") or shutil.which("yowasp-yosys")
 
+LIB_A = """library (a) {
+  delay_model : table_lookup;
+  cell (NAND2_X1) {
+    area : 0.798;
+    pin (A) { direction : input; }
+  }
+  cell (INV_X1) {
+    area : 0.532;
+  }
+}
+"""
+LIB_B = """library (b) {
+  cell (DFF_X1) {
+    area : 4.522;
+  }
+}
+"""
+
 
 class ParseTest(unittest.TestCase):
+    def test_merge_liberty_keeps_one_header_and_all_cells(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            (work / "a.lib").write_text(LIB_A, encoding="utf-8")
+            (work / "b.lib").write_text(LIB_B, encoding="utf-8")
+            count = merge_liberty([work / "a.lib", work / "b.lib"], work / "m.lib")
+            merged = (work / "m.lib").read_text(encoding="utf-8")
+        self.assertEqual(count, 3)
+        self.assertEqual(merged.count("library ("), 1)
+        for cell in ("NAND2_X1", "INV_X1", "DFF_X1"):
+            self.assertIn(f"cell ({cell})", merged)
+        self.assertTrue(merged.rstrip().endswith("}"))
+
+    def test_nand2_area_reads_the_smallest_nand(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "a.lib"
+            path.write_text(LIB_A, encoding="utf-8")
+            self.assertEqual(nand2_area(path), 0.798)
+
     def test_parse_stat_reads_cells_area_and_flops(self) -> None:
         log = """
 Printing statistics.

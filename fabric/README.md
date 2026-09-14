@@ -95,7 +95,7 @@ below.
 | Tiles | 3306 | 1940 | 2858 | 1940 |
 | Coefficients | 866M | 509M | 447M | 318M |
 | Utilization | 99.9% | 100% | 97.7% | 100% |
-| Area at 2 rows/cycle | 205 mm² | 120 mm² | 143 mm² | 97 mm² |
+| Area at 2 rows/cycle | 199 mm² | 117 mm² | 138 mm² | 94 mm² |
 | Latency per layer, 800 MHz | 10.2 µs | 2.6 µs (die) | 6.4 µs | 1.6 µs (die) |
 | Fabric energy per token | 62 µJ | 37 µJ | 32 µJ | 19 µJ |
 
@@ -108,10 +108,10 @@ the coefficient count; the MAC columns scale with rows per cycle.
 
 | Rows/cycle | Clock | 9B layer die area | ROM / MAC | Latency per layer | Pass |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 800 MHz | 181 mm² | 104 / 69 mm² | 20.5 µs | 5.1 µs |
-| 2 | 800 MHz | 205 mm² | 104 / 92 mm² | 10.2 µs | 2.6 µs |
-| 4 | 800 MHz | 251 mm² | 104 / 139 mm² | 5.1 µs | 1.3 µs |
-| 2 | 500 MHz | 205 mm² | 104 / 92 mm² | 16.4 µs | 4.1 µs |
+| 1 | 800 MHz | 178 mm² | 104 / 66 mm² | 20.5 µs | 5.1 µs |
+| 2 | 800 MHz | 199 mm² | 104 / 87 mm² | 10.2 µs | 2.6 µs |
+| 4 | 800 MHz | 241 mm² | 104 / 129 mm² | 5.1 µs | 1.3 µs |
+| 2 | 500 MHz | 199 mm² | 104 / 87 mm² | 16.4 µs | 4.1 µs |
 
 Two rows per cycle is the baseline. The simulator's stage times are derived
 from it: 102 ticks (10.2 µs) per 9B layer, 26 ticks per head die.
@@ -132,14 +132,14 @@ placeholders the MPW tile is meant to replace.
 | Entry | Value | Source |
 | --- | ---: | --- |
 | ROM area | 0.03 µm² per bit | placeholder: via-ROM compiler cell at the target node |
-| MAC column | 110 µm² per bank | sky130 synthesis scaled to 28 nm |
-| Accumulator, requantizer share, output | 216 µm² per column | sky130 synthesis scaled to 28 nm |
+| MAC column | 100 µm² per bank | 330 NAND2 equivalents from four-library synthesis, at a 0.30 µm² 28 nm NAND2 |
+| Accumulator, requantizer share, output | 210 µm² per column | 700 NAND2 equivalents, same source |
 | Tile overhead | 2500 µm² | placeholder: multiples generator, ROM periphery, control |
 | Clock | 800 MHz | placeholder: ROM read plus column add in one cycle |
 | ROM read | 3 fJ per bit | placeholder |
 | MAC | 60 fJ per coefficient | placeholder |
 
-At these numbers a 28 nm-class 9B layer die is 205 mm², about half ROM and
+At these numbers a 28 nm-class 9B layer die is 199 mm², about half ROM and
 slightly less than half MAC columns. At a 16 nm-class node expect roughly
 half. If the ROM cell comes in denser than 0.03 µm² per bit, the MAC columns
 dominate and one row per cycle becomes the better trade.
@@ -157,30 +157,49 @@ python -m fabric.synth --liberty sky130_fd_sc_hd__tt_025C_1v80.lib --rows 256 --
 FABRIC_LIBERTY=$PWD/sky130_fd_sc_hd__tt_025C_1v80.lib python -m unittest fabric.tests.test_synth
 ```
 
-Measured on a 16-column tile (256 rows; column cost does not depend on depth):
+Measured on a 16-column tile (256 rows; column cost does not depend on depth)
+at two rows per cycle, on two manufacturable 130 nm libraries and two
+predictive advanced-node kits:
 
-| Library | Rows/cycle | Cells | Flops | Area | Per column |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| SkyWater sky130 HD (130 nm) | 1 | 8692 | 528 | 62,649 µm² | 3916 µm² |
-| SkyWater sky130 HD | 2 | 12,087 | 527 | 83,530 µm² | 5221 µm² |
-| SkyWater sky130 HD | 4 | 18,199 | 526 | 126,008 µm² | 7876 µm² |
-| IHP SG13G2 (130 nm) | 2 | 12,027 | 527 | 149,585 µm² | 9349 µm² |
+| Library | Kind | NAND2 | Cells | Per column | NAND2-eq per column |
+| --- | --- | ---: | ---: | ---: | ---: |
+| SkyWater sky130 HD (130 nm) | manufacturable | 3.75 µm² | 12,087 | 5221 µm² | 1392 |
+| IHP SG13G2 (130 nm) | manufacturable | 7.26 µm² | 12,027 | 9349 µm² | 1288 |
+| NanGate 45 (FreePDK45) | predictive | 0.80 µm² | 12,999 | 1043 µm² | 1307 |
+| ASAP7 (7 nm FinFET) | predictive | 0.058 µm² | 11,974 | 74 µm² | 1271 |
 
-About 750 cells per column at two rows per cycle, with 300 cells per extra
-bank. Scaling by the NAND2 area ratio from sky130 HD (3.75 µm²) to a 28 nm
-library (about 0.30 µm²) gives 326, 435, and 656 µm² per column at 1, 2, and
-4 rows per cycle, which is where the density model's 216 + 110 per bank comes
-from. The first synthesis run also caught a design error: a per-column
-requantizer multiplier that tripled the column area, now a single unit
-shared across the 64 columns.
+Four libraries spanning 130 nm to 7 nm agree within ten percent once
+normalized to their own NAND2: about 1300 NAND2 equivalents per column at two
+rows per cycle, 1000 at one and 1900 at four (sky130: 3916 and 7876 µm²;
+ASAP7: 57 and 111 µm²). That is the number to carry, and it makes the
+28 nm estimate a NAND2 area, about 0.30 µm², times 700 + 330 per bank. The
+first synthesis run also caught a design error: a per-column requantizer
+multiplier that tripled the column area, now a single unit shared across the
+64 columns.
+
+ASAP7 ships its cells in several liberty files; merge them first:
+
+```bash
+python -m fabric.synth --merge asap7_tt.lib --liberty SIMPLE.lib --liberty INVBUF.lib \
+    --liberty AO.lib --liberty OA.lib --liberty SEQ.lib
+python -m fabric.synth --liberty asap7_tt.lib --rows 256 --cols 16 --rows-per-cycle 2
+```
+
+On the predictive kits: FreePDK15 (NC State, 15 nm FinFET) is the same kind
+of thing as ASAP7 and NanGate 45, an academic model of a node with no fab
+behind it. Its standard cells are the NanGate 15 nm library distributed by
+Silvaco behind a registration, so it is not fetchable in a script the way the
+OpenROAD platforms are, and ASAP7 already gives the below-28 nm bracket. Any
+of them is fine for relative area, useless for a tapeout.
 
 What open PDKs can and cannot do for this project:
 
-* **Relative column cost and the MPW tile: yes.** A 1024 × 64 test tile on
-  sky130 or IHP SG13G2 is about a square millimetre of columns plus a
-  hand-drawn via-ROM array, and both processes run open shuttles. That
-  measures the column datapath, the ROM cell, and the personalization flow
-  end to end, at 130 nm.
+* **Relative column cost: yes, done above.** Predictive kits (NanGate 45,
+  ASAP7, FreePDK15) bracket the target node from both sides.
+* **The MPW tile: yes.** A 1024 × 64 test tile on sky130 or IHP SG13G2 is
+  about a square millimetre of columns plus a hand-drawn via-ROM array, and
+  both processes run open shuttles. That measures the column datapath, the
+  ROM cell, and the personalization flow end to end, at 130 nm.
 * **Timing: partly.** yosys gives area; the clock needs OpenSTA or a full
   OpenROAD flow, which is the next step. Expect 100 to 200 MHz at 130 nm and
   scale from there.
