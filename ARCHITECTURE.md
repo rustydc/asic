@@ -90,20 +90,33 @@ The board-level capture of this topology is in `hw/`.
 
 ## Fixed-weight layer fabric
 
-The fixed fabric evaluates `y = Wx` without an addressed weight store or a large
-weight bus in the inference path. A low-precision implementation can generate a
-small set of coefficient multiples for an input element and use mask-programmed
-connectivity to route the selected multiple into output accumulators.
+The fixed fabric evaluates `y = Wx` with no weight bus, cache, or DRAM traffic
+in the inference path. Its unit is the **tile** defined in `fabric/`: a
+via-programmed ROM of 4096 × 64 int4 coefficients read two rows per cycle,
+feeding 64 multiply-accumulate columns. Each activation's coefficient
+multiples are formed once per bank; every column selects its multiple through
+the ROM word and adds or subtracts it. The coefficient never leaves the tile;
+the read is a few tens of micrometres of bitline.
 
-The implementation may consume one or more input dimensions per cycle. The
-gating physical-design experiment is place-and-route of a representative layer
-macro on the candidate PDK. It must measure:
+Coefficients are ROM bits, not wiring. A coefficient that is literally a wire
+cannot be time-multiplexed, so pure wiring would need one adder per
+coefficient. A mask-programmed bit read by a wordline is what lets the
+arithmetic be shared, and a via ROM is denser than wiring or SRAM in any case.
+Each of the ten chips is therefore the same base mask set plus one via mask.
 
-* parameters per square millimetre and routing congestion;
-* input dimensions processed per cycle and achievable clock frequency;
-* accumulator, clock-tree, and nonlinear/vector-unit area;
-* power, IR drop, and thermal density;
-* which masks must change between the eight coefficient variants.
+A 9B layer die maps to 3306 tiles at 99.9 percent utilization, 229 mm² at the
+28 nm-class placeholder densities, with the ROM and the MAC columns roughly
+equal in area. A layer is four sequential passes of 2048 cycles, 10.2 µs at
+800 MHz. The head die is 1940 tiles.
+
+The gating physical-design experiment is a tile on the candidate PDK, and it
+must measure:
+
+* via-ROM bit-cell area and read energy, which set the ROM half of the die;
+* column datapath area at one, two, and four rows per cycle;
+* the ROM-read-plus-add cycle time;
+* power, IR drop, and thermal density at full pass rate;
+* that the via layer is the only mask that changes between variants.
 
 If four approximately 215M-parameter layers do not fit economically, the
 fallbacks are the 4B geometry (four approximately 110M-parameter layers per
@@ -243,8 +256,9 @@ first parameters the software model must qualify.
    freeze retrieval, KV precision, compression, and fabric quantization formats.
 2. **Architecture simulator:** validate the 32-stage multi-context schedule,
    local state management, memory traces, backpressure, and packet protocol.
-3. **Fixed-weight GDS macro:** demonstrate credible density, routing, timing,
-   power, and mask personalization on the target process.
+3. **Fixed-weight tile macro:** demonstrate credible ROM density, column
+   datapath timing, power, and via-mask personalization on the target process,
+   driven by the coefficient compiler in `fabric/`.
 4. **Small silicon:** validate the coefficient/connectivity fabric against the
    physical estimates on an MPW test chip. The head-mode personalization is
    the natural vehicle: one matrix, no state, no memory interface.

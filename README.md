@@ -9,6 +9,11 @@ LLM inference appliance built around the Qwen3.5 dense hybrid geometry.
   reference model. Its parameter names match the Hugging Face `Qwen3_5` text
   model so released checkpoints load with a prefix rename. It is not an
   optimized long-context training kernel.
+* [`fabric/`](fabric/) defines the fixed-weight fabric tile: a via-programmed
+  coefficient ROM feeding 64 MAC columns. It holds the bit-exact reference
+  model, the coefficient compiler and via-pattern export, the model-to-tile
+  mapping with area and latency estimates, and synthesizable RTL verified
+  against the model with Icarus Verilog.
 * [`clash/`](clash/) contains a synthesizable four-stage ASIC-shard seed with a
   deliberately small fixed-coefficient datapath for early RTL and P&R work.
 * [`sim/`](sim/) contains the cycle-stepped 32-stage appliance simulator for
@@ -42,6 +47,8 @@ PyTorch installed:
 python fixed_llm_poc.py
 python -m unittest discover -s training/tests -t .
 python -m unittest discover -s sim/tests -t .
+python -m unittest discover -s fabric/tests -t .   # RTL tests need iverilog
+python -m unittest discover -s hw/tests -t .
 ```
 
 Import a released checkpoint (needs the `safetensors` package):

@@ -52,9 +52,13 @@ pipeline.
 
 Both configurations use the Qwen3.5 head geometry: `kv_heads=4` KV heads of
 `head_dim=256`, so a stored position costs 2 KB at int8. Both add two
-head-mode ASICs after the last layer chip; `head_cycles` assumes the four stage
-fabrics of a head die run in parallel on the same input at the layer die's
-coefficient rate (41 cycles for the 9B, 25 for the 4B). The 4B configuration
+head-mode ASICs after the last layer chip. Fabric stage times come from the
+tile model in `fabric/` at two rows per cycle and 800 MHz: four passes of
+2048 cycles per 9B layer (`recurrent_cycles` 102 ticks) and one pass per head
+die (26 ticks); the 4B tile is 2560 deep, so 64 and 16 ticks. A layer is
+modeled as one stage whose initiation interval equals its latency; pass-level
+pipelining would cut the interval to one pass but the global stage is the
+bottleneck regardless. The 4B configuration
 keeps every memory parameter identical and scales fabric cycles by the
 446M/865M per-shard parameter ratio. `activation_bytes` assumes int8 activations
 of the hidden width (4096 or 2560).
@@ -71,7 +75,7 @@ pipeline sweeps fast.
 With int8 KV at 4:1 compression, 32 retrieved blocks, and 64 GB/s sustained
 bandwidth, both geometries saturate the global stage at about 14.5K tokens/s
 with a 128K context, below the 25K to 50K target. The recurrent stages sit at
-10 percent (9B) or 6 percent (4B) utilization, the head stages under 6
+15 percent (9B) or 10 percent (4B) utilization, the head stages under 5
 percent, and the ring links under 4 percent. The global memory interval is
 half index scan and half selected-KV transfer. The sweep shows int4 KV plus
 8:1 compression recovers 30K tokens/s at 75 GB/s and 40K at 100 GB/s; 16:1
