@@ -12,6 +12,7 @@ from pathlib import Path
 
 import tempfile
 
+from fabric.pnr import PLATFORMS, parse_results
 from fabric.sta import parse_report
 from fabric.synth import filter_liberty, merge_liberty, nand2_area, parse_stat, synthesize
 
@@ -66,6 +67,24 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(removed, 1)
         self.assertIn("cell (NAND2_X1)", text)
         self.assertNotIn("lpflow", text)
+
+    def test_parse_pnr_reports_scale_library_units(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            (work / "timing.rpt").write_text("Startpoint: a\n   2.950   data arrival time\n", encoding="utf-8")
+            (work / "wns.rpt").write_text("wns max -0.25\n", encoding="utf-8")
+            (work / "tns.rpt").write_text("tns max -12.5\n", encoding="utf-8")
+            (work / "area.rpt").write_text("Design area 123456 u^2 47% utilization.\n", encoding="utf-8")
+            (work / "skew.rpt").write_text("   0.120 skew\n", encoding="utf-8")
+            result = parse_results(work, PLATFORMS["sky130hd"], 3000.0, detailed_route=False)
+        self.assertAlmostEqual(result.worst_slack_ps, -250.0)          # sky130 reports in ns
+        self.assertAlmostEqual(result.tns_ps, -12500.0)
+        self.assertAlmostEqual(result.critical_path_ps, 2950.0)
+        self.assertAlmostEqual(result.design_area_um2, 123456.0)
+        self.assertAlmostEqual(result.utilization_pct, 47.0)
+        self.assertAlmostEqual(result.clock_skew_ps, 120.0)
+        self.assertAlmostEqual(result.max_frequency_mhz, 1e6 / 3250.0)
+        self.assertEqual(result.stage, "global_route")
 
     def test_parse_sta_report_reads_clock_group_slack(self) -> None:
         report = """

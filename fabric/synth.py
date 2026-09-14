@@ -116,7 +116,10 @@ def yosys_command() -> list[str]:
     raise FileNotFoundError("no yosys found; install yosys or `pip install yowasp-yosys`")
 
 
-DONT_USE_PATTERNS = ("*lpflow*", "*probe*")   # sky130 low-power/level-shift and probe cells
+# Cells the OpenROAD flow scripts mark dont_use for each open platform: sky130's
+# low-power/level-shift and probe cells; ASAP7's weakest drive strengths, scan
+# flops and clock gates.  Filtering them out of the liberty works with any yosys.
+DONT_USE_PATTERNS = ("*lpflow*", "*probe*", "*x1p*_ASAP7*", "*xp*_ASAP7*", "SDF*", "ICG*")
 
 
 def filter_liberty(source: Path, output: Path, patterns: Sequence[str] = DONT_USE_PATTERNS) -> int:
