@@ -54,6 +54,7 @@ class Platform:
     rcx_rules: str         # OpenRCX extraction rules for post-detailed-route parasitics
     fill_cells: tuple[str, ...]
     vdd_volts: float
+    pin_min_distance_tracks: int = 0   # spread I/O pins so the detailed router can reach each one
 
 
 PLATFORMS = {
@@ -99,6 +100,7 @@ PLATFORMS = {
                     "DECAPx2_ASAP7_75t_R", "DECAPx4_ASAP7_75t_R", "DECAPx6_ASAP7_75t_R",
                     "DECAPx10_ASAP7_75t_R"),
         vdd_volts=0.70,
+        pin_min_distance_tracks=2,
     ),
 }
 
@@ -178,6 +180,7 @@ def write_flow(work: Path, platform: Platform, platforms_dir: Path, netlist: Pat
     # The IR-drop and antenna steps are wrapped in catch so a build that lacks
     # them still produces the timing numbers.
     detailed = "\n".join([
+        "write_def design_grt.def",
         "detailed_route -output_drc route_drc.rpt -output_maze maze.log -droute_end_iter 64 -verbose 1",
         "catch {check_antennas -report_file antennas.rpt} msg; puts $msg",
         f"filler_placement {{{' '.join(platform.fill_cells)}}}",
@@ -204,7 +207,9 @@ def write_flow(work: Path, platform: Platform, platforms_dir: Path, netlist: Pat
         f"initialize_floorplan -utilization {utilization} -aspect_ratio 1.0 "
         f"-core_space {platform.core_space_um} -site {platform.site}",
         f"source {p / platform.tracks_script}",
-        f"place_pins -hor_layers {platform.pin_layer_h} -ver_layers {platform.pin_layer_v}",
+        f"place_pins -hor_layers {platform.pin_layer_h} -ver_layers {platform.pin_layer_v}"
+        + (f" -min_distance {platform.pin_min_distance_tracks} -min_distance_in_tracks"
+           if platform.pin_min_distance_tracks else ""),
         # Well taps and the power grid from the platform's strategy, before
         # placement so the stripes are routing blockages from the start.
         f"tapcell -distance {platform.tap_distance_um} -tapcell_master {platform.tap_cell}",
@@ -238,6 +243,12 @@ def write_flow(work: Path, platform: Platform, platforms_dir: Path, netlist: Pat
         "global_route -congestion_iterations 50 -allow_congestion -verbose",
         "estimate_parasitics -global_routing",
         "repair_timing -setup",
+        # The post-route repair inserts buffers that are not legalized; legalize
+        # and re-route, or the detailed router finds cells with no pin access.
+        "detailed_placement",
+        "check_placement",
+        "global_route -congestion_iterations 50 -allow_congestion -verbose",
+        "estimate_parasitics -global_routing",
         # All reports go to the log; older builds ignore `> file` on some of them.
         "puts {--- timing on global-route parasitics ---}",
         *reports,
