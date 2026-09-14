@@ -381,6 +381,80 @@ so wirelength comes from the router's own log line, and `> file`
 redirection on several report commands writes empty files, so every report
 goes to the log and `parse_results` reads that.
 
+## Detailed routing, power grid and IR drop
+
+`--detailed-route` extends the flow: well taps and the platform's power
+grid go in at floorplan (`pdngen` with the OpenROAD-flow-scripts strategy,
+M1/M2 rails with M5/M6 stripes on ASAP7, met1 rails with met4/met5 stripes
+on sky130), and after global routing it runs TritonRoute, fill cells,
+OpenRCX extraction, timing on the extracted parasitics, `report_power`,
+and static IR-drop analysis of both supply nets.
+
+```bash
+python -m fabric.pnr --openroad eda/bin/openroad --platform asap7 \
+    --platforms-dir orfs/flow/platforms --netlist net_asap7.v \
+    --liberty asap7_tt.lib --period-ps 700 --utilization 25 \
+    --detailed-route --work pnr_asap7_drt --json
+```
+
+ASAP7, same 256-row 16-column slice, after detailed routing and
+extraction (`fabric/results/pnr_asap7_signoff.json`):
+
+| | ASAP7, 7 nm predictive |
+| --- | ---: |
+| Detailed-route DRC violations | 0 (8 iterations); 0 antenna violations |
+| Timing on extracted parasitics | 700 ps met exactly, **1.43 GHz** |
+| Same path on global-route estimates | −8 ps |
+| Clock skew | 75 ps |
+| Cells (before 38,086 fillers) | 26,433 |
+| Design area | 3,311 µm² at 31 % of a 107 µm die |
+| Wirelength | 157 mm |
+| Power (default 10 % activity, 1.43 GHz) | 17.9 mW: 61 % internal, 39 % switching |
+| Static IR drop, VDD | 364 mV worst at the core edge, 12 mV average |
+
+The timing story does not change from global routing to signoff: the
+extracted parasitics come in slightly under the global-route estimate, and
+the slice closes at exactly the 700 ps it was asked for. The pre-layout
+bracket for 28 nm stands.
+
+The power grid is the new information. The slice draws 1.7 W/mm² at the
+default activity, which is high, and the platform's default grid was not
+made for that: 18 nm M1/M2 rails fed from M5/M6 stripes every 5.4 µm lose
+100 mV or more on half of the cells, and 364 mV at the right core edge,
+where the last stripe sits 3 µm from the boundary. That result is with a
+supply point on every top-layer node (this build turns `-dx 20 -dy 20`
+into 4.2 million sources), so it is the distribution loss alone; a real
+bump grid adds to it. For the tile this says two things: stripe pitch and
+rail width are first-order design parameters at this power density, and
+the density model's 800 MHz at 28 nm will need a grid sized from the
+measured current, not the platform default. It does not change the area
+model.
+
+Getting a pin-dense slice through this build's TritonRoute took some
+care, and each item is a flag or an experiment in `fabric/pnr.py`:
+
+* constants must be tie cells (`hilomap` on the mapped netlist, with
+  `opt_clean -purge` and `setundef -zero` first) or the router refuses
+  the supply-typed nets they become;
+* buffers inserted by post-route timing repair must be legalized and the
+  design re-routed before detailed routing;
+* on ASAP7 the router could not reach a handful of M4/M5 I/O pins on the
+  left and bottom edges whatever the stub length or spacing (experiments
+  A and B); with 1 µm stubs on the top and right edges only (experiment
+  C) it routes cleanly;
+* `pin_access` before global routing puts guides on M9 on ASAP7 and is
+  therefore off there;
+* the routing derating follows the flow scripts (0.25 on ASAP7, 0.2 on
+  sky130): at 0.5 the slice overflowed by a few edges and the guides of
+  those nets were unusable;
+* on sky130 the router rejected every net on a pin whose li1 and met1
+  shapes are separate LEF `PORT`s (xor2 B, dfrtp RESET_B, mux, fa) when
+  the ports straddle a gcell boundary; the driver merges those ports in
+  a copy of the cell LEF, and the resizer is told not to use the probe
+  cells it had been picking as hold buffers.
+
+sky130 signoff: pending (see the results file when it lands).
+
 ## RTL
 
 `rtl/fabric_tile.sv` is the synthesizable tile with the ROM as a constant

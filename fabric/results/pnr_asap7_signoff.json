@@ -1,0 +1,33 @@
+{
+  "platform": "asap7",
+  "period_ps": 700.0,
+  "worst_slack_ps": 0.0,
+  "tns_ps": 0.0,
+  "critical_path_ps": 808.461,
+  "max_frequency_mhz": 1428.5714285714287,
+  "design_area_um2": 3311.0,
+  "utilization_pct": 31.0,
+  "instances": 64519,
+  "clock_skew_ps": 74.68,
+  "wirelength_um": 157007.0,
+  "overflow": 0,
+  "drc_violations": 0,
+  "power_w": 0.0179,
+  "ir_drop_vdd_mv": 364.0,
+  "ir_drop_vss_mv": 347.0,
+  "stage": "detailed_route",
+  "report": "7_75t_R)\n   9.323   54.338   81.138  318.306 v _40718_/QN (DFFHQNx2_ASAP7_75t_R)\n   3.283   15.021   40.385  358.691 v _28214_/Y (AND2x2_ASAP7_75t_R)\n   1.510   14.541   12.588  371.278 ^ _28222_/Y (INVx1_ASAP7_75t_R)\n   1.320   14.330   25.365  396.643 ^ _28224_/Y (AND3x1_ASAP7_75t_R)\n   1.679   15.436   12.042  408.685 v _28225_/Y (NOR2x1_ASAP7_75t_R)\n   5.780   24.764   51.887  460.572 v _28226_/Y (OR3x4_ASAP7_75t_R)\n   1.349    8.775   27.215  487.786 v _30009_/Y (AND2x2_ASAP7_75t_R)\n   4.465   18.706   12.283  500.069 ^ _30010_/Y (INVx2_ASAP7_75t_R)\n   1.604   14.332   21.562  521.632 ^ _30045_/Y (AO21x1_ASAP7_75t_R)\n   0.432    7.928    7.861  529.492 v _30046_/Y (NAND2x1_ASAP7_75t_R)\n   1.588   15.351   36.141  565.634 v _30047_/Y (OA211x2_ASAP7_75t_R)\n   1.832   19.615   26.698  592.332 v _30048_/Y (XOR2x1_ASAP7_75t_R)\n   1.834   18.988   15.667  607.999 ^ _30049_/Y (NOR2x1_ASAP7_75t_R)\n   1.592   16.916   16.226  624.225 v _30051_/Y (NOR2x1_ASAP7_75t_R)\n   2.414   18.380   28.062  652.287 v _30057_/Y (XOR2x1_ASAP7_75t_R)\n   1.419   16.605   13.970  666.257 ^ _30059_/Y (NOR2x1_ASAP7_75t_R)\n   1.093    8.909    9.098  675.355 v _30060_/Y (INVx1_ASAP7_75t_R)\n   1.546   19.700   12.710  688.066 ^ _30061_/Y (NAND2x1_ASAP7_75t_R)\n   0.677   15.959   22.252  710.318 ^ _30062_/Y (XNOR2x1_ASAP7_75t_R)\n   1.788   11.708   10.735  721.053 v _30063_/Y (INVx1_ASAP7_75t_R)\n   1.691    9.803   23.852  744.905 v _30065_/Y (OR2x2_ASAP7_75t_R)\n   1.534   19.181   12.924  757.829 ^ _30066_/Y (NAND2x1_ASAP7_75t_R)\n   2.698   26.079   27.565  785.394 ^ _30068_/Y (XOR2x1_ASAP7_75t_R)\n   0.639   14.877   23.021  808.415 ^ _30289_/Y (XOR2x1_ASAP7_75t_R)\n           14.877    0.046  808.461 ^ _39770_/D (DFFHQNx1_ASAP7_75t_R)\n                            808.461   data arrival time\n\n                   700.000  700.000   clock clk (rise edge)\n                     0.000  700.000   clock source latency\n   7.093    0.000    0.000  700.000 ^ clk (in)\n   9.784   30.358   34.546  734.546 ^ clkbuf_0_clk/Y (BUFx4_ASAP7_75t_R)\n   1.030   10.077   32.454  766.999 ^ clkbuf_2_2_0_clk/Y (BUFx4_ASAP7_75t_R)\n   3.250   14.934   25.796  792.795 ^ clkbuf_2_2_1_clk/Y (BUFx4_ASAP7_75t_R)\n   2.556   13.060   27.652  820.447 ^ clkbuf_3_4_0_clk/Y (BUFx4_ASAP7_75t_R)\n  13.886   39.650   38.710  859.157 ^ clkbuf_4_9_0_clk/Y (BUFx4_ASAP7_75t_R)\n   5.248   19.364   40.600  899.756 ^ clkbuf_leaf_146_clk/Y (BUFx4_ASAP7_75t_R)\n           19.400    0.463  900.219 ^ _39770_/CLK (DFFHQNx1_ASAP7_75t_R)\n                     0.212  900.432   clock reconvergence pessimism\n                    -9.258  891.174   library setup time\n                            891.174   data required time\n---------------------------------------------------------------------------\n                            891.174   data required time\n                           -808.461   data arrival time\n---------------------------------------------------------------------------\n                             82.713   slack (MET)\n\n\nClock ",
+  "inputs": {
+    "netlist": "net_a7_v14.v",
+    "rows": 256,
+    "cols": 16,
+    "rows_per_cycle": 2,
+    "target_utilization_pct": 25,
+    "place_density": 0.5,
+    "pins": "top and right edges, 1 um stubs, 2 tracks apart",
+    "pdn": "ORFS asap7 grid_strategy-M1-M2-M5-M6 (M5/M6 stripes at 5.4 um pitch)",
+    "ir_drop_sources": "analyze_power_grid -dx 20 -dy 20 (this build places a source on every top-layer node)",
+    "openroad": "litex-hub conda build, Feb 2024",
+    "platform_files": "OpenROAD-flow-scripts flow/platforms/asap7"
+  }
+}
