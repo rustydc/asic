@@ -85,6 +85,22 @@ class SimulationTest(unittest.TestCase):
         )
         self.assertGreater(latency, interval)
 
+    def test_head_asics_extend_the_ring_without_memory(self) -> None:
+        config = replace(SMALL, num_head_asics=2, head_cycles=3, head_result_bytes=4)
+        simulation = Simulation(config)
+        self.assertEqual(len(simulation.stages), 10)
+        self.assertEqual(len(simulation.links), 3)
+        self.assertTrue(simulation.stages[8].is_head and simulation.stages[9].is_head)
+        result = simulation.run()
+        self.assertEqual(result.completed_tokens, 12)
+        self.assertEqual([stage.counters.accepted for stage in simulation.stages], [12] * 10)
+        self.assertEqual(len(result.memory_bytes_per_asic), config.num_asics)
+        self.assertEqual(simulation.stages[8].counters.memory_bytes, 0)
+        # The head hop carries the hidden vector plus the top-k partial result.
+        self.assertGreater(result.link_utilization[2], result.link_utilization[0])
+        self.assertGreater(result.mean_token_latency_cycles,
+                           Simulation(SMALL).run().mean_token_latency_cycles)
+
     def test_rejects_invalid_configuration(self) -> None:
         with self.assertRaises(ValueError):
             Simulation(replace(SMALL, fifo_depth=0))

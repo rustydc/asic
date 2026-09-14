@@ -16,6 +16,9 @@ LLM inference appliance built around the Qwen3.5 dense hybrid geometry.
   and retrieval-geometry sweep experiments.
 * [`training/`](training/) contains the Qwen3.5 checkpoint importer, the
   retrieval candidates, and a layer-wise activation-distillation harness.
+* [`hw/`](hw/) contains the block-level board description (eight layer ASICs,
+  two head-mode ASICs, sixteen LPDDR5X devices, one PCIe FPGA), its consistency
+  checks, and the rendered block diagram.
 
 ## Reference geometries
 

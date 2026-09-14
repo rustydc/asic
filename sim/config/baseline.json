@@ -29,5 +29,8 @@
   "kv_element_bytes": 1.0,
   "head_dim": 256,
   "kv_heads": 4,
+  "num_head_asics": 2,
+  "head_cycles": 41,
+  "head_result_bytes": 768,
   "max_cycles": 50000000
 }

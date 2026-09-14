@@ -1,0 +1,107 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1180 560" font-family="sans-serif" font-size="12">
+<rect width="1180" height="560" fill="#fafafa"/>
+<text x="20" y="28" font-size="16" font-weight="bold">asic-llm-appliance-a0: block diagram</text>
+<text x="20" y="46" fill="#555">PCIe CEM full-length (312 mm), full-height, dual-slot, passive heatsink + blower</text>
+<defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#1f5fbf"/></marker></defs>
+<line x1="156.0" y1="236.0" x2="300.0" y2="164.0" stroke="#1f5fbf" stroke-width="2.5" marker-end="url(#arrow)" fill="none"/>
+<line x1="396.0" y1="140.0" x2="470.0" y2="140.0" stroke="#1f5fbf" stroke-width="2.5" marker-end="url(#arrow)" fill="none"/>
+<line x1="566.0" y1="140.0" x2="640.0" y2="140.0" stroke="#1f5fbf" stroke-width="2.5" marker-end="url(#arrow)" fill="none"/>
+<line x1="736.0" y1="140.0" x2="810.0" y2="140.0" stroke="#1f5fbf" stroke-width="2.5" marker-end="url(#arrow)" fill="none"/>
+<line x1="858.0" y1="170.0" x2="858.0" y2="330.0" stroke="#1f5fbf" stroke-width="2.5" marker-end="url(#arrow)" fill="none"/>
+<line x1="810.0" y1="360.0" x2="736.0" y2="360.0" stroke="#1f5fbf" stroke-width="2.5" marker-end="url(#arrow)" fill="none"/>
+<line x1="640.0" y1="360.0" x2="566.0" y2="360.0" stroke="#1f5fbf" stroke-width="2.5" marker-end="url(#arrow)" fill="none"/>
+<line x1="470.0" y1="360.0" x2="396.0" y2="360.0" stroke="#1f5fbf" stroke-width="2.5" marker-end="url(#arrow)" fill="none"/>
+<line x1="300.0" y1="374.0" x2="156.0" y2="416.0" stroke="#1f5fbf" stroke-width="2.5" marker-end="url(#arrow)" fill="none"/>
+<line x1="108.0" y1="460.0" x2="108.0" y2="480.0" stroke="#1f5fbf" stroke-width="2.5" marker-end="url(#arrow)" fill="none"/>
+<polyline points="60,510.0 30,510.0 30,312 70,312 70,300" stroke="#1f5fbf" stroke-width="2.5" marker-end="url(#arrow)" fill="none"/>
+<rect x="328" y="80" width="40" height="22" fill="#e8f3e8" stroke="#333"/>
+<text x="348.0" y="95" text-anchor="middle" font-size="10">M0a</text>
+<line x1="348.0" y1="102" x2="348.0" y2="110" stroke="#2a7a2a" stroke-width="2"/>
+<rect x="328" y="178" width="40" height="22" fill="#e8f3e8" stroke="#333"/>
+<text x="348.0" y="193" text-anchor="middle" font-size="10">M0b</text>
+<line x1="348.0" y1="178" x2="348.0" y2="170" stroke="#2a7a2a" stroke-width="2"/>
+<rect x="498" y="80" width="40" height="22" fill="#e8f3e8" stroke="#333"/>
+<text x="518.0" y="95" text-anchor="middle" font-size="10">M1a</text>
+<line x1="518.0" y1="102" x2="518.0" y2="110" stroke="#2a7a2a" stroke-width="2"/>
+<rect x="498" y="178" width="40" height="22" fill="#e8f3e8" stroke="#333"/>
+<text x="518.0" y="193" text-anchor="middle" font-size="10">M1b</text>
+<line x1="518.0" y1="178" x2="518.0" y2="170" stroke="#2a7a2a" stroke-width="2"/>
+<rect x="668" y="80" width="40" height="22" fill="#e8f3e8" stroke="#333"/>
+<text x="688.0" y="95" text-anchor="middle" font-size="10">M2a</text>
+<line x1="688.0" y1="102" x2="688.0" y2="110" stroke="#2a7a2a" stroke-width="2"/>
+<rect x="668" y="178" width="40" height="22" fill="#e8f3e8" stroke="#333"/>
+<text x="688.0" y="193" text-anchor="middle" font-size="10">M2b</text>
+<line x1="688.0" y1="178" x2="688.0" y2="170" stroke="#2a7a2a" stroke-width="2"/>
+<rect x="838" y="80" width="40" height="22" fill="#e8f3e8" stroke="#333"/>
+<text x="858.0" y="95" text-anchor="middle" font-size="10">M3a</text>
+<line x1="858.0" y1="102" x2="858.0" y2="110" stroke="#2a7a2a" stroke-width="2"/>
+<rect x="838" y="178" width="40" height="22" fill="#e8f3e8" stroke="#333"/>
+<text x="858.0" y="193" text-anchor="middle" font-size="10">M3b</text>
+<line x1="858.0" y1="178" x2="858.0" y2="170" stroke="#2a7a2a" stroke-width="2"/>
+<rect x="838" y="300" width="40" height="22" fill="#e8f3e8" stroke="#333"/>
+<text x="858.0" y="315" text-anchor="middle" font-size="10">M4a</text>
+<line x1="858.0" y1="322" x2="858.0" y2="330" stroke="#2a7a2a" stroke-width="2"/>
+<rect x="838" y="398" width="40" height="22" fill="#e8f3e8" stroke="#333"/>
+<text x="858.0" y="413" text-anchor="middle" font-size="10">M4b</text>
+<line x1="858.0" y1="398" x2="858.0" y2="390" stroke="#2a7a2a" stroke-width="2"/>
+<rect x="668" y="300" width="40" height="22" fill="#e8f3e8" stroke="#333"/>
+<text x="688.0" y="315" text-anchor="middle" font-size="10">M5a</text>
+<line x1="688.0" y1="322" x2="688.0" y2="330" stroke="#2a7a2a" stroke-width="2"/>
+<rect x="668" y="398" width="40" height="22" fill="#e8f3e8" stroke="#333"/>
+<text x="688.0" y="413" text-anchor="middle" font-size="10">M5b</text>
+<line x1="688.0" y1="398" x2="688.0" y2="390" stroke="#2a7a2a" stroke-width="2"/>
+<rect x="498" y="300" width="40" height="22" fill="#e8f3e8" stroke="#333"/>
+<text x="518.0" y="315" text-anchor="middle" font-size="10">M6a</text>
+<line x1="518.0" y1="322" x2="518.0" y2="330" stroke="#2a7a2a" stroke-width="2"/>
+<rect x="498" y="398" width="40" height="22" fill="#e8f3e8" stroke="#333"/>
+<text x="518.0" y="413" text-anchor="middle" font-size="10">M6b</text>
+<line x1="518.0" y1="398" x2="518.0" y2="390" stroke="#2a7a2a" stroke-width="2"/>
+<rect x="328" y="300" width="40" height="22" fill="#e8f3e8" stroke="#333"/>
+<text x="348.0" y="315" text-anchor="middle" font-size="10">M7a</text>
+<line x1="348.0" y1="322" x2="348.0" y2="330" stroke="#2a7a2a" stroke-width="2"/>
+<rect x="328" y="398" width="40" height="22" fill="#e8f3e8" stroke="#333"/>
+<text x="348.0" y="413" text-anchor="middle" font-size="10">M7b</text>
+<line x1="348.0" y1="398" x2="348.0" y2="390" stroke="#2a7a2a" stroke-width="2"/>
+<rect x="60" y="220" width="96" height="80" rx="6" fill="#fff2cc" stroke="#333"/>
+<text x="108.0" y="240" text-anchor="middle" font-weight="bold">U_FPGA</text>
+<text x="108.0" y="258" text-anchor="middle" fill="#333">PCIe Gen4 x8</text>
+<rect x="20" y="230" width="30" height="60" fill="#ddd" stroke="#333"/>
+<text x="35" y="264" text-anchor="middle" font-size="9" transform="rotate(-90 35 264)">PCIe edge</text>
+<rect x="168" y="272" width="56" height="18" fill="#eee" stroke="#333"/>
+<text x="196" y="285" text-anchor="middle" font-size="9">DDR4 x64</text>
+<line x1="156" y1="281" x2="168" y2="281" stroke="#333"/>
+<rect x="20" y="180" width="60" height="18" fill="#eee" stroke="#333" stroke-dasharray="3,2"/>
+<text x="50" y="193" text-anchor="middle" font-size="9">SFP+ (opt)</text>
+<rect x="300" y="110" width="96" height="60" rx="6" fill="#dbe8f7" stroke="#333"/>
+<text x="348.0" y="130" text-anchor="middle" font-weight="bold">U_A0</text>
+<text x="348.0" y="148" text-anchor="middle" fill="#333">L0-3</text>
+<rect x="470" y="110" width="96" height="60" rx="6" fill="#dbe8f7" stroke="#333"/>
+<text x="518.0" y="130" text-anchor="middle" font-weight="bold">U_A1</text>
+<text x="518.0" y="148" text-anchor="middle" fill="#333">L4-7</text>
+<rect x="640" y="110" width="96" height="60" rx="6" fill="#dbe8f7" stroke="#333"/>
+<text x="688.0" y="130" text-anchor="middle" font-weight="bold">U_A2</text>
+<text x="688.0" y="148" text-anchor="middle" fill="#333">L8-11</text>
+<rect x="810" y="110" width="96" height="60" rx="6" fill="#dbe8f7" stroke="#333"/>
+<text x="858.0" y="130" text-anchor="middle" font-weight="bold">U_A3</text>
+<text x="858.0" y="148" text-anchor="middle" fill="#333">L12-15</text>
+<rect x="810" y="330" width="96" height="60" rx="6" fill="#dbe8f7" stroke="#333"/>
+<text x="858.0" y="350" text-anchor="middle" font-weight="bold">U_A4</text>
+<text x="858.0" y="368" text-anchor="middle" fill="#333">L16-19</text>
+<rect x="640" y="330" width="96" height="60" rx="6" fill="#dbe8f7" stroke="#333"/>
+<text x="688.0" y="350" text-anchor="middle" font-weight="bold">U_A5</text>
+<text x="688.0" y="368" text-anchor="middle" fill="#333">L20-23</text>
+<rect x="470" y="330" width="96" height="60" rx="6" fill="#dbe8f7" stroke="#333"/>
+<text x="518.0" y="350" text-anchor="middle" font-weight="bold">U_A6</text>
+<text x="518.0" y="368" text-anchor="middle" fill="#333">L24-27</text>
+<rect x="300" y="330" width="96" height="60" rx="6" fill="#dbe8f7" stroke="#333"/>
+<text x="348.0" y="350" text-anchor="middle" font-weight="bold">U_A7</text>
+<text x="348.0" y="368" text-anchor="middle" fill="#333">L28-31</text>
+<rect x="60" y="400" width="96" height="60" rx="6" fill="#f7dbdb" stroke="#333"/>
+<text x="108.0" y="420" text-anchor="middle" font-weight="bold">U_H0</text>
+<text x="108.0" y="438" text-anchor="middle" fill="#333">head mode</text>
+<rect x="60" y="480" width="96" height="60" rx="6" fill="#f7dbdb" stroke="#333"/>
+<text x="108.0" y="500" text-anchor="middle" font-weight="bold">U_H1</text>
+<text x="108.0" y="518" text-anchor="middle" fill="#333">head mode</text>
+<text x="300" y="520" fill="#333">Blue: activation ring, 36-signal source-synchronous link per hop. Green: LPDDR5X x32 channels. Power budget 158 W load / 186 W input (placeholders).</text>
+<text x="300" y="540" fill="#333">Management SPI, JTAG chain, and reference clock fan out from U_FPGA / U_CLK to all ten ASICs (not drawn).</text>
+</svg>

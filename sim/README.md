@@ -4,7 +4,9 @@ This is a deterministic, cycle-stepped transaction-level simulator for the
 eight-ASIC appliance. It moves tagged work items rather than real tensors and
 models the resources that determine system throughput:
 
-* 32 finite-queue layer stages in `R/R/R/G` order;
+* 32 finite-queue layer stages in `R/R/R/G` order, followed by one stage per
+  head-mode ASIC (`num_head_asics`, `head_cycles`) that forwards the hidden
+  vector plus `head_result_bytes` of top-k partial result;
 * one unresolved token per autoregressive context;
 * round-robin FPGA injection and configurable sampling delay;
 * serialized links at ASIC boundaries;
@@ -49,7 +51,10 @@ pipeline.
 ## Configurations
 
 Both configurations use the Qwen3.5 head geometry: `kv_heads=4` KV heads of
-`head_dim=256`, so a stored position costs 2 KB at int8. The 4B configuration
+`head_dim=256`, so a stored position costs 2 KB at int8. Both add two
+head-mode ASICs after the last layer chip; `head_cycles` assumes the four stage
+fabrics of a head die run in parallel on the same input at the layer die's
+coefficient rate (41 cycles for the 9B, 25 for the 4B). The 4B configuration
 keeps every memory parameter identical and scales fabric cycles by the
 446M/865M per-shard parameter ratio. `activation_bytes` assumes int8 activations
 of the hidden width (4096 or 2560).
@@ -66,7 +71,8 @@ pipeline sweeps fast.
 With int8 KV at 4:1 compression, 32 retrieved blocks, and 64 GB/s sustained
 bandwidth, both geometries saturate the global stage at about 14.5K tokens/s
 with a 128K context, below the 25K to 50K target. The recurrent stages sit at
-10 percent (9B) or 6 percent (4B) utilization. The global memory interval is
+10 percent (9B) or 6 percent (4B) utilization, the head stages under 6
+percent, and the ring links under 4 percent. The global memory interval is
 half index scan and half selected-KV transfer. The sweep shows int4 KV plus
 8:1 compression recovers 30K tokens/s at 75 GB/s and 40K at 100 GB/s; 16:1
 compression with int4 KV reaches the 50K ceiling at 100 GB/s.

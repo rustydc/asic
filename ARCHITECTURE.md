@@ -52,23 +52,41 @@ global FFN widths, but any such change discards the copied feed-forward weights
 and must be justified by training results.
 
 The 248K-entry vocabulary makes the LM head 1.0B multiply-accumulates per token
-(0.64B for the 4B). At the throughput targets that is beyond an FPGA. The head
-must be a fixed-weight fabric block, on the last ASIC or a ninth device, and
-the embedding table lives in host or FPGA memory.
+(0.64B for the 4B). At the throughput targets that is beyond an FPGA, and the
+head does not fit one layer die's 866M-coefficient fabric. The head is
+therefore two additional layer dies in **head mode**: the same base design with
+a head personalization, each holding half of the vocabulary rows. The
+embedding table lives in FPGA memory.
 
-Eight ASICs each implement four consecutive layers. Every layer is an
-independent physical pipeline stage.
+Head mode needs three features in the base design:
+
+* an input broadcast so all four stage fabrics see the same hidden vector,
+  with residual and norm bypassed;
+* a top-k plus log-sum-exp reduce on the output, so a head chip emits a few
+  hundred bytes instead of 124K logits;
+* a two-pin mode strap.
+
+A head chip forwards the incoming work item unchanged and appends its partial
+result, so the ring needs no broadcast path. The FPGA merges the two lists and
+samples. Head chips have no external memory.
+
+Eight ASICs each implement four consecutive layers, and two more ASICs of the
+same design run in head mode. Every layer is an independent physical pipeline
+stage.
 
 ```text
-FPGA -> ASIC 0 -> ASIC 1 -> ... -> ASIC 7 -> FPGA
-        L0-L3     L4-L7           L28-L31
+FPGA -> ASIC 0 -> ASIC 1 -> ... -> ASIC 7 -> HEAD 0 -> HEAD 1 -> FPGA
+        L0-L3     L4-L7           L28-L31   vocab     vocab
+                                            rows 0-   rows
+                                            124159    124160-
 
-inside each ASIC:
+inside each layer ASIC:
 input -> recurrent -> recurrent -> recurrent -> sparse global -> output
 ```
 
-The eight parts should share arithmetic, control, interfaces, and base physical
-design. Only the mask-programmed coefficient connectivity differs.
+All ten parts share arithmetic, control, interfaces, and base physical design.
+Only the mask-programmed coefficient connectivity and the mode strap differ.
+The board-level capture of this topology is in `hw/`.
 
 ## Fixed-weight layer fabric
 
@@ -178,10 +196,18 @@ revision-A link is 32 data bits at 250 MHz DDR (2 GB/s raw). At 50K work items/s
 a BF16 4096-element hidden vector consumes about 400 MB/s before framing, leaving
 substantial raw-link margin.
 
-Each ASIC provisionally receives 2-4 GB of commodity dynamic memory for its one
-global layer. The bandwidth target is at least 50 GB/s per ASIC, preferably
-75-100 GB/s. Actual compressed-state formats and measured access traces must
-close both capacity and bandwidth before architecture freeze.
+Each layer ASIC provisionally receives two LPDDR5X x32 devices (4 GB, about
+77 GB/s raw at 9600 MT/s) for its one global layer. The bandwidth target is at
+least 50 GB/s per ASIC, preferably 75-100 GB/s; GDDR6 is the fallback if the
+sweep demands the top of that range. Head ASICs have no external memory.
+Actual compressed-state formats and measured access traces must close both
+capacity and bandwidth before architecture freeze.
+
+The FPGA owns PCIe Gen4 (x8 wired, x4 sufficient) and 4 GB of DDR4 for the
+embedding table and context metadata. Power-over-Ethernet cannot supply the
+board's roughly 190 W, and PCIe gives lower host latency than a network hop, so
+the first board is a PCIe card with an optional SFP+ cage for a later
+standalone mode (see `hw/README.md`).
 
 The FPGA owns the host protocol, scheduling, sampling, context allocation,
 bring-up, telemetry, error recovery, and performance counters. Speculative
@@ -220,8 +246,10 @@ first parameters the software model must qualify.
 3. **Fixed-weight GDS macro:** demonstrate credible density, routing, timing,
    power, and mask personalization on the target process.
 4. **Small silicon:** validate the coefficient/connectivity fabric against the
-   physical estimates on an MPW test chip.
-5. **Full appliance:** tape out the variants only after the preceding gates pass.
+   physical estimates on an MPW test chip. The head-mode personalization is
+   the natural vehicle: one matrix, no state, no memory interface.
+5. **Full appliance:** tape out the eight layer variants and the two head
+   variants only after the preceding gates pass.
 
 The largest open risks are fixed-connectivity routing density, global-stage
 memory bandwidth at the Qwen3.5 KV width, model-quality loss from replacing

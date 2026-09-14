@@ -49,12 +49,29 @@ class ApplianceConfig:
     kv_element_bytes: float = 1.0
     head_dim: int = 128
     kv_heads: int = 1
+    num_head_asics: int = 0
+    head_cycles: int = 40
+    head_result_bytes: int = 768
     max_cycles: int = 2_000_000_000
     trace: bool = False
 
     @property
     def num_layers(self) -> int:
         return self.num_asics * self.layers_per_asic
+
+    @property
+    def num_stages(self) -> int:
+        """Layer stages plus one stage per head-mode ASIC."""
+        return self.num_layers + self.num_head_asics
+
+    @property
+    def num_chips(self) -> int:
+        return self.num_asics + self.num_head_asics
+
+    def chip_of_stage(self, stage_id: int) -> int:
+        if stage_id < self.num_layers:
+            return stage_id // self.layers_per_asic
+        return self.num_asics + (stage_id - self.num_layers)
 
     def validate(self) -> None:
         positive = {
@@ -85,14 +102,16 @@ class ApplianceConfig:
             "kv_element_bytes": self.kv_element_bytes,
             "head_dim": self.head_dim,
             "kv_heads": self.kv_heads,
+            "head_cycles": self.head_cycles,
             "max_cycles": self.max_cycles,
         }
         invalid = [name for name, value in positive.items() if value <= 0]
         if invalid:
             raise ValueError(f"configuration fields must be positive: {', '.join(invalid)}")
         if (self.sampling_cycles < 0 or self.packet_overhead_bytes < 0
-                or self.warmup_tokens_per_context < 0):
-            raise ValueError("sampling, overhead, and warm-up values cannot be negative")
+                or self.warmup_tokens_per_context < 0 or self.num_head_asics < 0
+                or self.head_result_bytes < 0):
+            raise ValueError("sampling, overhead, warm-up, and head values cannot be negative")
         if self.memory_efficiency > 1:
             raise ValueError("memory_efficiency cannot exceed one")
 
@@ -136,6 +155,7 @@ class Stage:
     stage_id: int
     is_global: bool
     queue: deque[WorkItem]
+    is_head: bool = False
     active: list["InFlight"] = field(default_factory=list)
     finished: deque[WorkItem] = field(default_factory=deque)
     last_start_cycle: int = -1
@@ -207,11 +227,14 @@ class Simulation:
         self.stages = [
             Stage(i, (i + 1) % config.layers_per_asic == 0, deque())
             for i in range(config.num_layers)
+        ] + [
+            Stage(config.num_layers + i, False, deque(), is_head=True)
+            for i in range(config.num_head_asics)
         ]
         self.contexts = [Context(i, config.initial_context_tokens) for i in range(config.resident_contexts)]
-        self.links: list[Transit | None] = [None] * (config.num_asics - 1)
-        self.link_busy_cycles = [0] * (config.num_asics - 1)
-        self.fifo_high_watermarks = [0] * config.num_layers
+        self.links: list[Transit | None] = [None] * (config.num_chips - 1)
+        self.link_busy_cycles = [0] * (config.num_chips - 1)
+        self.fifo_high_watermarks = [0] * config.num_stages
         self.memory_bytes_per_asic = [0] * config.num_asics
         self.pending_sampling: list[tuple[int, WorkItem]] = []
         self.completed_latencies: list[int] = []
@@ -236,6 +259,8 @@ class Simulation:
         return index_bytes, kv_bytes, append_bytes
 
     def _timing(self, stage: Stage, item: WorkItem) -> tuple[int, int, int]:
+        if stage.is_head:
+            return self.config.head_cycles, self.config.head_cycles, 0
         if not stage.is_global:
             cycles = math.ceil(self.config.recurrent_cycles * self.config.recurrent_weight_scale)
             return cycles, cycles, 0
@@ -261,11 +286,13 @@ class Simulation:
         return latency, initiation_interval, index_bytes + kv_bytes + append_bytes
 
     def _link_index_after(self, stage_id: int) -> int | None:
-        if (stage_id + 1) % self.config.layers_per_asic != 0:
+        """Chip-boundary link index following ``stage_id``, if any (the last chip's link to the FPGA is not modeled)."""
+        if stage_id == self.config.num_stages - 1:
             return None
-        if stage_id == self.config.num_layers - 1:
+        chip = self.config.chip_of_stage(stage_id)
+        if self.config.chip_of_stage(stage_id + 1) == chip:
             return None
-        return stage_id // self.config.layers_per_asic
+        return chip
 
     def _advance_sampling(self) -> None:
         still_pending: list[tuple[int, WorkItem]] = []
@@ -301,7 +328,7 @@ class Simulation:
             if not stage.finished:
                 continue
             item = stage.finished[0]
-            if stage.stage_id == self.config.num_layers - 1:
+            if stage.stage_id == self.config.num_stages - 1:
                 self.pending_sampling.append((self.cycle + self.config.sampling_cycles, item))
             else:
                 link_index = self._link_index_after(stage.stage_id)
@@ -310,6 +337,9 @@ class Simulation:
                         stage.counters.output_stalled_cycles += 1
                         continue
                     packet_bytes = self.config.activation_bytes + self.config.packet_overhead_bytes
+                    if stage.is_head:
+                        # Head chips forward the hidden vector plus their top-k partial result.
+                        packet_bytes += self.config.head_result_bytes
                     link_cycles = math.ceil(packet_bytes / self.config.link_bytes_per_cycle)
                     self.links[link_index] = Transit(item, stage.stage_id + 1, link_cycles)
                 else:
@@ -354,7 +384,7 @@ class Simulation:
                 self.memory_bytes_per_asic[asic] += memory_bytes
             if self.config.trace:
                 self.trace_events.append(TraceEvent(
-                    "FULL global" if stage.is_global else "recurrent",
+                    "head" if stage.is_head else "FULL global" if stage.is_global else "recurrent",
                     "stage",
                     self.cycle,
                     service_cycles,
