@@ -146,7 +146,8 @@ def filter_pdn_script(text: str) -> str:
 
 
 def write_flow(work: Path, platform: Platform, platforms_dir: Path, netlist: Path, liberties: Sequence[Path],
-               *, top: str, period_ps: float, utilization: float, detailed_route: bool, threads: int) -> Path:
+               *, top: str, period_ps: float, utilization: float, detailed_route: bool, threads: int,
+               place_density: float = 0.5) -> Path:
     p = platforms_dir.resolve()
     lef_reads = [f"read_lef {p / platform.tech_lef}"] + [f"read_lef {p / lef}" for lef in platform.cell_lefs]
     lib_reads = [f"read_liberty {Path(l).resolve()}" for l in liberties]
@@ -217,7 +218,10 @@ def write_flow(work: Path, platform: Platform, platforms_dir: Path, netlist: Pat
         "pdngen",
         fastroute,
         # Placement with timing-driven global placement, then resize and repair.
-        "global_placement -timing_driven -density 0.65",
+        # Routability-driven placement: the column logic forms dense clusters
+        # (CSA trees, resolve stages) that overflow li1/met1 on sky130 at the
+        # placer's default density whatever the die size.
+        f"global_placement -timing_driven -routability_driven -density {place_density}",
         "estimate_parasitics -placement",
         "repair_design",
         f"repair_tie_fanout {platform.tie_hi}",
@@ -317,7 +321,7 @@ def parse_results(work: Path, platform: Platform, period_ps: float, detailed_rou
 
 def run_pnr(openroad: Path, platform: Platform, platforms_dir: Path, netlist: Path, liberties: Sequence[Path], work: Path,
             *, top: str = "fabric_columns", period_ps: float = 3000.0, utilization: float = 45.0,
-            detailed_route: bool = False, threads: int = 4) -> PnrResult:
+            detailed_route: bool = False, threads: int = 4, place_density: float = 0.5) -> PnrResult:
     work.mkdir(parents=True, exist_ok=True)
     # Constants become tie cells (the detailed router refuses constant-driven
     # nets), and OpenROAD's Verilog reader rejects `wire signed`, which yosys
@@ -328,7 +332,8 @@ def run_pnr(openroad: Path, platform: Platform, platforms_dir: Path, netlist: Pa
     cleaned = work / "netlist.v"
     cleaned.write_text(tied.read_text(encoding="utf-8").replace("wire signed ", "wire "), encoding="utf-8")
     script = write_flow(work, platform, platforms_dir, cleaned, liberties, top=top, period_ps=period_ps,
-                        utilization=utilization, detailed_route=detailed_route, threads=threads)
+                        utilization=utilization, detailed_route=detailed_route, threads=threads,
+                        place_density=place_density)
     with (work / "openroad.log").open("w", encoding="utf-8") as log:
         result = subprocess.run([str(openroad), "-exit", "-no_init", "-threads", str(threads), str(script)],
                                 cwd=work, stdout=log, stderr=subprocess.STDOUT, text=True)
@@ -349,6 +354,7 @@ def main() -> None:
     parser.add_argument("--top", default="fabric_columns")
     parser.add_argument("--period-ps", type=float, default=3000.0)
     parser.add_argument("--utilization", type=float, default=45.0)
+    parser.add_argument("--place-density", type=float, default=0.5, help="global placement target density")
     parser.add_argument("--detailed-route", action="store_true")
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--work", type=Path, required=True, help="working directory for reports and DEF")
@@ -363,7 +369,7 @@ def main() -> None:
         raise SystemExit("this platform needs --liberty (merged ASAP7 liberty)")
     result = run_pnr(args.openroad, platform, args.platforms_dir, args.netlist, liberties, args.work, top=args.top,
                      period_ps=args.period_ps, utilization=args.utilization, detailed_route=args.detailed_route,
-                     threads=args.threads)
+                     threads=args.threads, place_density=args.place_density)
     if args.json:
         print(json.dumps(result.as_dict(), indent=2))
     else:
