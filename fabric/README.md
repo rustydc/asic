@@ -95,7 +95,7 @@ below.
 | Tiles | 3306 | 1940 | 2858 | 1940 |
 | Coefficients | 866M | 509M | 447M | 318M |
 | Utilization | 99.9% | 100% | 97.7% | 100% |
-| Area at 2 rows/cycle | 229 mm² | 134 mm² | 164 mm² | 134 mm² |
+| Area at 2 rows/cycle | 205 mm² | 120 mm² | 143 mm² | 97 mm² |
 | Latency per layer, 800 MHz | 10.2 µs | 2.6 µs (die) | 6.4 µs | 1.6 µs (die) |
 | Fabric energy per token | 62 µJ | 37 µJ | 32 µJ | 19 µJ |
 
@@ -108,10 +108,10 @@ the coefficient count; the MAC columns scale with rows per cycle.
 
 | Rows/cycle | Clock | 9B layer die area | ROM / MAC | Latency per layer | Pass |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 800 MHz | 186 mm² | 104 / 74 mm² | 20.5 µs | 5.1 µs |
-| 2 | 800 MHz | 229 mm² | 104 / 116 mm² | 10.2 µs | 2.6 µs |
-| 4 | 800 MHz | 313 mm² | 104 / 201 mm² | 5.1 µs | 1.3 µs |
-| 2 | 500 MHz | 229 mm² | 104 / 116 mm² | 16.4 µs | 4.1 µs |
+| 1 | 800 MHz | 181 mm² | 104 / 69 mm² | 20.5 µs | 5.1 µs |
+| 2 | 800 MHz | 205 mm² | 104 / 92 mm² | 10.2 µs | 2.6 µs |
+| 4 | 800 MHz | 251 mm² | 104 / 139 mm² | 5.1 µs | 1.3 µs |
+| 2 | 500 MHz | 205 mm² | 104 / 92 mm² | 16.4 µs | 4.1 µs |
 
 Two rows per cycle is the baseline. The simulator's stage times are derived
 from it: 102 ticks (10.2 µs) per 9B layer, 26 ticks per head die.
@@ -125,22 +125,74 @@ about 66 µs.
 
 ## Density model
 
-`DensityModel` holds the placeholders that the MPW tile is meant to replace:
+`DensityModel` holds the numbers behind the tables. The MAC-column entries
+are calibrated from open-tooling synthesis (next section); the rest are
+placeholders the MPW tile is meant to replace.
 
-| Placeholder | Value | What measures it |
+| Entry | Value | Source |
 | --- | ---: | --- |
-| ROM area | 0.03 µm² per bit | via-ROM compiler cell at the target node |
-| MAC column | 200 µm² per rows-per-cycle unit | synthesis of the column datapath |
-| Accumulator and requantizer | 150 µm² per column | synthesis |
-| Tile overhead | 2500 µm² | multiples generator, ROM periphery, control |
-| Clock | 800 MHz | ROM read plus column add in one cycle |
-| ROM read | 3 fJ per bit | silicon |
-| MAC | 60 fJ per coefficient | silicon |
+| ROM area | 0.03 µm² per bit | placeholder: via-ROM compiler cell at the target node |
+| MAC column | 110 µm² per bank | sky130 synthesis scaled to 28 nm |
+| Accumulator, requantizer share, output | 216 µm² per column | sky130 synthesis scaled to 28 nm |
+| Tile overhead | 2500 µm² | placeholder: multiples generator, ROM periphery, control |
+| Clock | 800 MHz | placeholder: ROM read plus column add in one cycle |
+| ROM read | 3 fJ per bit | placeholder |
+| MAC | 60 fJ per coefficient | placeholder |
 
-At these numbers a 28 nm-class 9B layer die is 229 mm² with the ROM and the
-MAC columns roughly equal. At a 16 nm-class node expect roughly half. If the
-ROM cell comes in denser than 0.03 µm² per bit, the MAC columns dominate and
-one row per cycle becomes the better trade.
+At these numbers a 28 nm-class 9B layer die is 205 mm², about half ROM and
+slightly less than half MAC columns. At a 16 nm-class node expect roughly
+half. If the ROM cell comes in denser than 0.03 µm² per bit, the MAC columns
+dominate and one row per cycle becomes the better trade.
+
+## Open tooling and open PDKs
+
+Yes, the column datapath synthesizes with open tooling today, and the numbers
+above already come from it. `fabric/synth.py` runs yosys (native or the
+`yowasp-yosys` PyPI build) on `fabric_columns` against any liberty file:
+
+```bash
+pip install yowasp-yosys
+curl -LO https://raw.githubusercontent.com/The-OpenROAD-Project/OpenROAD-flow-scripts/master/flow/platforms/sky130hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib
+python -m fabric.synth --liberty sky130_fd_sc_hd__tt_025C_1v80.lib --rows 256 --cols 16 --rows-per-cycle 2
+FABRIC_LIBERTY=$PWD/sky130_fd_sc_hd__tt_025C_1v80.lib python -m unittest fabric.tests.test_synth
+```
+
+Measured on a 16-column tile (256 rows; column cost does not depend on depth):
+
+| Library | Rows/cycle | Cells | Flops | Area | Per column |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| SkyWater sky130 HD (130 nm) | 1 | 8692 | 528 | 62,649 µm² | 3916 µm² |
+| SkyWater sky130 HD | 2 | 12,087 | 527 | 83,530 µm² | 5221 µm² |
+| SkyWater sky130 HD | 4 | 18,199 | 526 | 126,008 µm² | 7876 µm² |
+| IHP SG13G2 (130 nm) | 2 | 12,027 | 527 | 149,585 µm² | 9349 µm² |
+
+About 750 cells per column at two rows per cycle, with 300 cells per extra
+bank. Scaling by the NAND2 area ratio from sky130 HD (3.75 µm²) to a 28 nm
+library (about 0.30 µm²) gives 326, 435, and 656 µm² per column at 1, 2, and
+4 rows per cycle, which is where the density model's 216 + 110 per bank comes
+from. The first synthesis run also caught a design error: a per-column
+requantizer multiplier that tripled the column area, now a single unit
+shared across the 64 columns.
+
+What open PDKs can and cannot do for this project:
+
+* **Relative column cost and the MPW tile: yes.** A 1024 × 64 test tile on
+  sky130 or IHP SG13G2 is about a square millimetre of columns plus a
+  hand-drawn via-ROM array, and both processes run open shuttles. That
+  measures the column datapath, the ROM cell, and the personalization flow
+  end to end, at 130 nm.
+* **Timing: partly.** yosys gives area; the clock needs OpenSTA or a full
+  OpenROAD flow, which is the next step. Expect 100 to 200 MHz at 130 nm and
+  scale from there.
+* **The production die: no.** At 130 nm the ROM cell is 30 to 50 times larger
+  than at 28 nm, so the 9B layer die would be several thousand square
+  millimetres. The production node needs a foundry PDK under NDA.
+* **OpenRPDK28 (RIOS Lab): not yet.** It is an academic 28 nm template
+  under construction with device models and rule decks but, as far as its
+  repository shows, no standard-cell library or liberty timing, and it is
+  not tied to a foundry, so nothing built on it can be fabricated. It may
+  become useful for checking a via-ROM cell against 28 nm-class design rules
+  once it matures.
 
 A further density lever, not in the baseline, is current-mode readout: drive
 wordlines with the activation as a pulse width, sum bitline currents, and
@@ -165,8 +217,8 @@ at four rows per cycle, and 4096×16 at full depth.
 
 ## What is next
 
-1. Column datapath synthesis on the target library to replace the MAC area
-   placeholders.
+1. Timing of the column datapath with OpenSTA or OpenROAD on sky130, then on
+   the target library, to replace the 800 MHz placeholder.
 2. A via-ROM compiler cell from the foundry, or a hand-drawn cell for the MPW,
    to replace the ROM area and read energy placeholders.
 3. The GDS writer: `via_coordinates` into the ROM macro's bit-cell grid.

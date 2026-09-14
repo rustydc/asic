@@ -338,13 +338,20 @@ def tiles_for(shape: MatrixShape, spec: TileSpec) -> int:
 
 @dataclass(frozen=True)
 class DensityModel:
-    """Area, clock, and energy placeholders (28 nm class). Replace with MPW measurements."""
+    """Area, clock, and energy estimates (28 nm class).
 
-    node: str = "28nm-class placeholder"
-    rom_um2_per_bit: float = 0.03           # via-programmed ROM bit cell incl. array overhead
-    mac_um2_per_column_per_bank: float = 200.0   # 8:1 multiple select + add/sub, per rows_per_cycle unit
-    acc_um2_per_column: float = 150.0       # accumulator, requantizer share, output register
-    tile_overhead_um2: float = 2500.0       # multiples generator, ROM periphery, control per tile
+    The MAC-column numbers are calibrated from open-tooling synthesis of
+    ``fabric_columns`` on SkyWater sky130 HD (``fabric/synth.py``): 3916, 5221
+    and 7876 um2 per column at 1, 2 and 4 rows per cycle, scaled by the NAND2
+    area ratio sky130 HD (3.75 um2) to 28 nm (~0.30 um2), i.e. about 12x.  The
+    ROM cell, clock, and energy numbers remain placeholders for the MPW tile.
+    """
+
+    node: str = "28nm-class estimate"
+    rom_um2_per_bit: float = 0.03           # via-programmed ROM bit cell incl. array overhead (placeholder)
+    mac_um2_per_column_per_bank: float = 110.0   # 8:1 multiple select + add/sub per bank (sky130 synthesis / 12)
+    acc_um2_per_column: float = 216.0       # accumulator, shared requantizer share, output register (same source)
+    tile_overhead_um2: float = 2500.0       # multiples generator, ROM periphery, control per tile (placeholder)
     clock_mhz: float = 800.0
     rom_fj_per_bit: float = 3.0
     mac_fj_per_coefficient: float = 60.0

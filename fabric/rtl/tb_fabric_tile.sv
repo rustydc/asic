@@ -28,13 +28,15 @@ module tb_fabric_tile #(
     reg  [COLS*SHB-1:0] shift = '0;
     wire                x_ready;
     wire                done;
+    wire                q_valid;
     wire [COLS*ACC-1:0] psum_out;
     wire [COLS*AB-1:0]  q_out;
 
     fabric_tile #(.ROWS(ROWS), .COLS(COLS), .WB(WB), .AB(AB), .P(P), .ACC(ACC), .SB(SB), .SHB(SHB),
                   .ROM_FILE("rom.hex")) dut (
         .clk(clk), .rst_n(rst_n), .start(start), .psum_in(psum_in), .x_valid(x_valid), .x_data(x_data),
-        .mult(mult), .shift(shift), .x_ready(x_ready), .done(done), .psum_out(psum_out), .q_out(q_out));
+        .mult(mult), .shift(shift), .x_ready(x_ready), .done(done), .psum_out(psum_out), .q_out(q_out),
+        .q_valid(q_valid));
 
     always #5 clk = ~clk;
 
@@ -46,6 +48,13 @@ module tb_fabric_tile #(
     reg [AB-1:0]  eq     [0:COLS-1];
 
     integer i, b, errors, cyc, guard;
+
+    // Sticky flags so one-cycle pulses cannot race the checks below.
+    reg seen_done = 0, seen_q_valid = 0;
+    always @(posedge clk) begin
+        if (done)    seen_done <= 1;
+        if (q_valid) seen_q_valid <= 1;
+    end
 
     initial begin
         $readmemh("x.hex", xmem);
@@ -85,12 +94,12 @@ module tb_fabric_tile #(
         x_valid = 0;
 
         guard = 0;
-        while (!done && guard < 10) begin
+        while (!seen_done && guard < 10) begin
             @(posedge clk);
+            #1;
             guard = guard + 1;
         end
-        #1;
-        if (!done) begin
+        if (!seen_done) begin
             $display("FAIL: done never asserted");
             $finish;
         end
@@ -102,6 +111,20 @@ module tb_fabric_tile #(
                 if (errors <= 5)
                     $display("psum mismatch col %0d: got %h expected %h", i, psum_out[i*ACC +: ACC], epsum[i]);
             end
+        end
+
+        // The shared requantizer walks the columns after done.
+        guard = 0;
+        while (!seen_q_valid && guard < COLS + 4) begin
+            @(posedge clk);
+            #1;
+            guard = guard + 1;
+        end
+        if (!seen_q_valid) begin
+            $display("FAIL: q_valid never asserted");
+            $finish;
+        end
+        for (i = 0; i < COLS; i = i + 1) begin
             if (q_out[i*AB +: AB] !== eq[i]) begin
                 errors = errors + 1;
                 if (errors <= 5)
