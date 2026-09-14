@@ -244,6 +244,10 @@ def write_flow(work: Path, platform: Platform, platforms_dir: Path, netlist: Pat
         # timing estimate still completes and report the congestion separately.
         # (`report_wire_length` is not used: it crashes the litex-hub build; the
         # router's own "Total wirelength" line carries the same number.)
+        # pin_access first so the guides cover the access points the detailed
+        # router will use (without it, sky130 xor2 B pins end up outside their
+        # guides and TritonRoute rejects the nets).
+        f"pin_access -bottom_routing_layer {platform.min_route_layer} -top_routing_layer {platform.max_route_layer}",
         "global_route -congestion_iterations 50 -allow_congestion -verbose",
         "estimate_parasitics -global_routing",
         "repair_timing -setup",
@@ -251,6 +255,7 @@ def write_flow(work: Path, platform: Platform, platforms_dir: Path, netlist: Pat
         # and re-route, or the detailed router finds cells with no pin access.
         "detailed_placement",
         "check_placement",
+        f"pin_access -bottom_routing_layer {platform.min_route_layer} -top_routing_layer {platform.max_route_layer}",
         "global_route -congestion_iterations 50 -allow_congestion -verbose",
         "estimate_parasitics -global_routing",
         # All reports go to the log; older builds ignore `> file` on some of them.
