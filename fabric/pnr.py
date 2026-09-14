@@ -59,6 +59,7 @@ class Platform:
     pin_length_um: float = 0.0         # I/O pin stub length (0 = platform default)
     pin_exclude: tuple[str, ...] = ()  # place_pins -exclude regions, e.g. "left:*"
     merge_lef_ports: bool = False      # rewrite multi-PORT pins in the cell LEF (see merge_pin_ports)
+    pin_access_before_route: bool = False  # run pin_access ahead of global_route (ASAP7: it yields M9 guides)
 
 
 PLATFORMS = {
@@ -84,6 +85,7 @@ PLATFORMS = {
         vdd_volts=1.8,
         dont_use=("sky130_fd_sc_hd__probe_p_8", "sky130_fd_sc_hd__probec_p_8", "sky130_fd_sc_hd__lpflow_*"),
         merge_lef_ports=True,
+        pin_access_before_route=True,
     ),
     "asap7": Platform(
         name="asap7",
@@ -226,6 +228,8 @@ def write_flow(work: Path, platform: Platform, platforms_dir: Path, netlist: Pat
     # extracted parasitics, power, and static IR drop on the generated grid.
     # The IR-drop and antenna steps are wrapped in catch so a build that lacks
     # them still produces the timing numbers.
+    pin_access = (f"pin_access -bottom_routing_layer {platform.min_route_layer} "
+                  f"-top_routing_layer {platform.max_route_layer}") if platform.pin_access_before_route else ""
     detailed = "\n".join([
         "write_def design_grt.def",
         "detailed_route -output_drc route_drc.rpt -output_maze maze.log -droute_end_iter 64 -verbose 1",
@@ -294,10 +298,10 @@ def write_flow(work: Path, platform: Platform, platforms_dir: Path, netlist: Pat
         # timing estimate still completes and report the congestion separately.
         # (`report_wire_length` is not used: it crashes the litex-hub build; the
         # router's own "Total wirelength" line carries the same number.)
-        # pin_access first so the guides cover the access points the detailed
-        # router will use (without it, sky130 xor2 B pins end up outside their
-        # guides and TritonRoute rejects the nets).
-        f"pin_access -bottom_routing_layer {platform.min_route_layer} -top_routing_layer {platform.max_route_layer}",
+        # Optionally pin_access first so the guides cover the access points the
+        # detailed router will use (kept for sky130; on ASAP7 it produced
+        # guides on M9 that the router rejects).
+        pin_access,
         "global_route -congestion_iterations 100 -allow_congestion -verbose",
         "estimate_parasitics -global_routing",
         "repair_timing -setup",
@@ -305,7 +309,7 @@ def write_flow(work: Path, platform: Platform, platforms_dir: Path, netlist: Pat
         # and re-route, or the detailed router finds cells with no pin access.
         "detailed_placement",
         "check_placement",
-        f"pin_access -bottom_routing_layer {platform.min_route_layer} -top_routing_layer {platform.max_route_layer}",
+        pin_access,
         "global_route -congestion_iterations 100 -allow_congestion -verbose",
         "estimate_parasitics -global_routing",
         # All reports go to the log; older builds ignore `> file` on some of them.
