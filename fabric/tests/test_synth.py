@@ -14,7 +14,7 @@ import tempfile
 
 from fabric.pnr import PLATFORMS, filter_pdn_script, parse_results
 from fabric.sta import parse_report
-from fabric.synth import filter_liberty, merge_liberty, nand2_area, parse_stat, synthesize
+from fabric.synth import filter_liberty, map_ties, merge_liberty, nand2_area, parse_stat, synthesize
 
 LIBERTY = os.environ.get("FABRIC_LIBERTY")
 HAVE_YOSYS = shutil.which("yosys") or shutil.which("yowasp-yosys")
@@ -189,6 +189,39 @@ Printing statistics.
    Chip area for module '\\fabric_columns': 5678.900000
 """
         self.assertEqual(parse_stat(log), (1234, 5678.9, 48))
+
+
+TIE_LIB = """library (ties) {
+  cell (TIEHI) { area : 1; pin (H) { direction : output; function : "1"; } }
+  cell (TIELO) { area : 1; pin (L) { direction : output; function : "0"; } }
+  cell (DFF) { area : 4; ff (IQ, IQN) { clocked_on : CK; next_state : D; }
+    pin (CK) { direction : input; clock : true; }
+    pin (D) { direction : input; }
+    pin (RESETN) { direction : input; }
+    pin (Q) { direction : output; function : "IQ"; } }
+}
+"""
+TIE_NETLIST = """module top(input clk, input d, output q, output z);
+  DFF u0 (.CK(clk), .D(d), .RESETN(1'h1), .Q(q));
+  DFF u1 (.CK(clk), .D(1'h0), .RESETN(1'h1), .Q(z));
+endmodule
+"""
+
+
+@unittest.skipUnless(HAVE_YOSYS, "yosys not available")
+class TieMappingTest(unittest.TestCase):
+    def test_constants_become_tie_cells(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            (work / "ties.lib").write_text(TIE_LIB, encoding="utf-8")
+            (work / "in.v").write_text(TIE_NETLIST, encoding="utf-8")
+            map_ties(work / "in.v", [work / "ties.lib"], work / "out.v", tie_hi="TIEHI/H", tie_lo="TIELO/L")
+            out = (work / "out.v").read_text(encoding="utf-8")
+        self.assertIn("TIEHI", out)
+        self.assertIn("TIELO", out)
+        self.assertNotIn("1'h1", out)
+        self.assertNotIn("1'h0", out)
+        self.assertEqual(out.count("TIEHI "), 1)     # -singleton: one driver per module
 
 
 @unittest.skipUnless(HAVE_YOSYS and LIBERTY and Path(LIBERTY).exists(), "yosys or FABRIC_LIBERTY not available")

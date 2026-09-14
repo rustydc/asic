@@ -308,9 +308,14 @@ def run_pnr(openroad: Path, platform: Platform, platforms_dir: Path, netlist: Pa
             *, top: str = "fabric_columns", period_ps: float = 3000.0, utilization: float = 45.0,
             detailed_route: bool = False, threads: int = 4) -> PnrResult:
     work.mkdir(parents=True, exist_ok=True)
-    # OpenROAD's Verilog reader rejects `wire signed`; yosys emits it for signed nets.
+    # Constants become tie cells (the detailed router refuses constant-driven
+    # nets), and OpenROAD's Verilog reader rejects `wire signed`, which yosys
+    # emits for signed nets.
+    from fabric.synth import map_ties
+    tied = work / "netlist_ties.v"
+    map_ties(Path(netlist), [Path(l) for l in liberties], tied, tie_hi=platform.tie_hi, tie_lo=platform.tie_lo)
     cleaned = work / "netlist.v"
-    cleaned.write_text(Path(netlist).read_text(encoding="utf-8").replace("wire signed ", "wire "), encoding="utf-8")
+    cleaned.write_text(tied.read_text(encoding="utf-8").replace("wire signed ", "wire "), encoding="utf-8")
     script = write_flow(work, platform, platforms_dir, cleaned, liberties, top=top, period_ps=period_ps,
                         utilization=utilization, detailed_route=detailed_route, threads=threads)
     with (work / "openroad.log").open("w", encoding="utf-8") as log:

@@ -167,6 +167,40 @@ def yosys_supports_dont_use(command: list[str]) -> bool:
     return _DONT_USE_SUPPORT[key]
 
 
+def map_ties(netlist: Path, liberties: Sequence[Path], output: Path, *, tie_hi: str, tie_lo: str) -> str:
+    """Replace constant drivers in a mapped netlist with the library's tie cells.
+
+    ``tie_hi``/``tie_lo`` are "CELL/PORT".  The detailed router refuses nets
+    driven by a literal 1'b1/1'b0 (OpenROAD types them as supply nets), and
+    ``repair_tie_fanout`` only acts on nets a tie cell already drives, so this
+    runs yosys ``hilomap`` on the gate-level netlist.  Returns the yosys log.
+    """
+    hi_cell, hi_port = tie_hi.split("/")
+    lo_cell, lo_port = tie_lo.split("/")
+    with tempfile.TemporaryDirectory() as directory:
+        work = Path(directory)
+        shutil.copy(netlist, work / "in.v")
+        lib_reads = []
+        for index, path in enumerate(liberties):
+            shutil.copy(path, work / f"cells{index}.lib")
+            lib_reads.append(f"read_liberty -lib cells{index}.lib")
+        script = "\n".join([
+            *lib_reads,
+            "read_verilog in.v",
+            f"hilomap -singleton -hicell {hi_cell} {hi_port} -locell {lo_cell} {lo_port}",
+            "opt_clean",
+            "write_verilog -noattr out.v",
+        ]) + "\n"
+        (work / "ties.ys").write_text(script, encoding="utf-8")
+        result = subprocess.run([*yosys_command(), "-q", "-l", "ties.log", "ties.ys"], cwd=work,
+                                capture_output=True, text=True)
+        log = (work / "ties.log").read_text(encoding="utf-8") if (work / "ties.log").exists() else result.stdout
+        if result.returncode != 0:
+            raise RuntimeError(f"yosys hilomap failed:\n{result.stderr[-4000:]}\n{log[-4000:]}")
+        shutil.copy(work / "out.v", output)
+    return log
+
+
 def synthesize(liberty: Path | Sequence[Path], *, rows: int, cols: int, rows_per_cycle: int, weight_bits: int = 4,
                act_bits: int = 8, acc_bits: int = 24, top: str = "fabric_columns",
                target_ps: int | None = None, keep_netlist: Path | None = None) -> SynthResult:
