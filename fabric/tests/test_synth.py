@@ -69,14 +69,19 @@ class ParseTest(unittest.TestCase):
         self.assertNotIn("lpflow", text)
 
     def test_parse_pnr_reports_scale_library_units(self) -> None:
+        log = "\n".join([
+            "Startpoint: early", "   1.000   data arrival time", "   0.500   slack (MET)",
+            "wns max 0.5", "Instance count: 21000",
+            "Startpoint: a", "   2.950   data arrival time", "  -0.250   slack (VIOLATED)",
+            "Total            580308        176889           30.48%             0 /  0 /  3",
+            "[INFO GRT-0018] Total wirelength: 131319 um",
+            "   0.120 skew", "Design area 123456 u^2 47% utilization.",
+            "wns max -0.25", "tns max -12.5", ""])
         with tempfile.TemporaryDirectory() as directory:
             work = Path(directory)
-            (work / "timing.rpt").write_text("Startpoint: a\n   2.950   data arrival time\n", encoding="utf-8")
-            (work / "wns.rpt").write_text("wns max -0.25\n", encoding="utf-8")
-            (work / "tns.rpt").write_text("tns max -12.5\n", encoding="utf-8")
-            (work / "area.rpt").write_text("Design area 123456 u^2 47% utilization.\n", encoding="utf-8")
-            (work / "skew.rpt").write_text("   0.120 skew\n", encoding="utf-8")
+            (work / "openroad.log").write_text(log, encoding="utf-8")
             result = parse_results(work, PLATFORMS["sky130hd"], 3000.0, detailed_route=False)
+        self.assertEqual(result.instances, 21000)
         self.assertAlmostEqual(result.worst_slack_ps, -250.0)          # sky130 reports in ns
         self.assertAlmostEqual(result.tns_ps, -12500.0)
         self.assertAlmostEqual(result.critical_path_ps, 2950.0)
@@ -84,6 +89,8 @@ class ParseTest(unittest.TestCase):
         self.assertAlmostEqual(result.utilization_pct, 47.0)
         self.assertAlmostEqual(result.clock_skew_ps, 120.0)
         self.assertAlmostEqual(result.max_frequency_mhz, 1e6 / 3250.0)
+        self.assertAlmostEqual(result.wirelength_um, 131319.0)
+        self.assertEqual(result.overflow, 3)
         self.assertEqual(result.stage, "global_route")
 
     def test_parse_sta_report_reads_clock_group_slack(self) -> None:

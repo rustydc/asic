@@ -95,6 +95,8 @@ class PnrResult:
     utilization_pct: float
     instances: int
     clock_skew_ps: float | None
+    wirelength_um: float        # global-route total wirelength
+    overflow: int               # global-route total overflow (0 = routable)
     stage: str                  # which timing report the numbers come from
     report: str
 
@@ -126,8 +128,8 @@ def write_flow(work: Path, platform: Platform, platforms_dir: Path, netlist: Pat
     detailed = "\n".join([
         "detailed_route -output_drc route_drc.rpt -verbose 0",
         "estimate_parasitics -global_routing",
-        "report_checks -path_delay max -path_group clk -format full_clock_expanded -fields {slew cap fanout} -digits 3 > timing_droute.rpt",
-        "report_wns > wns_droute.rpt", "report_tns > tns_droute.rpt",
+        "report_checks -path_delay max -path_group clk -format full_clock_expanded -fields {slew cap fanout} -digits 3",
+        "report_wns", "report_tns",
     ]) if detailed_route else ""
     tcl = "\n".join(lef_reads + lib_reads + [
         f"read_verilog {netlist.resolve()}",
@@ -160,14 +162,16 @@ def write_flow(work: Path, platform: Platform, platforms_dir: Path, netlist: Pat
         "detailed_placement",
         "check_placement",
         # Global routing and post-route timing.
-        "global_route -congestion_iterations 30 -verbose",
+        # A 16-column slice is pin-heavy for its area; allow overflow so the
+        # timing estimate still completes and report the congestion separately.
+        # (`report_wire_length` is not used: it crashes the litex-hub build; the
+        # router's own "Total wirelength" line carries the same number.)
+        "global_route -congestion_iterations 50 -allow_congestion -verbose",
         "estimate_parasitics -global_routing",
         "repair_timing -setup",
-        "report_checks -path_delay max -path_group clk -format full_clock_expanded -fields {slew cap fanout} -digits 3 > timing.rpt",
-        "report_wns > wns.rpt",
-        "report_tns > tns.rpt",
-        "report_clock_skew > skew.rpt",
-        "report_design_area > area.rpt",
+        # All reports go to the log; older builds ignore `> file` on some of them.
+        "report_checks -path_delay max -path_group clk -format full_clock_expanded -fields {slew cap fanout} -digits 3",
+        "report_clock_skew",
         "report_design_area",
         "report_wns",
         "report_tns",
@@ -181,27 +185,38 @@ def write_flow(work: Path, platform: Platform, platforms_dir: Path, netlist: Pat
 
 
 def parse_results(work: Path, platform: Platform, period_ps: float, detailed_route: bool) -> PnrResult:
+    """Read the final reports.  Older OpenROAD builds ignore `> file` redirects on
+    some report commands, so everything is taken from the log, last occurrence
+    wins (the post-route reports come last)."""
     unit = platform.time_unit_ps
-    stage = "detailed_route" if detailed_route and (work / "timing_droute.rpt").exists() else "global_route"
-    suffix = "_droute" if stage == "detailed_route" else ""
-    timing = (work / f"timing{suffix}.rpt").read_text(encoding="utf-8")
-    wns = (work / f"wns{suffix}.rpt").read_text(encoding="utf-8")
-    tns = (work / f"tns{suffix}.rpt").read_text(encoding="utf-8")
-    area = (work / "area.rpt").read_text(encoding="utf-8")
-    skew = (work / "skew.rpt").read_text(encoding="utf-8") if (work / "skew.rpt").exists() else ""
-    wns_val = float(re.search(r"wns\s+max\s+([-0-9.]+)", wns).group(1)) * unit
-    tns_val = float(re.search(r"tns\s+max\s+([-0-9.]+)", tns).group(1)) * unit
+    log = (work / "openroad.log").read_text(encoding="utf-8") if (work / "openroad.log").exists() else ""
+    stage = "detailed_route" if detailed_route and "detailed_route" in log and "route_drc" in log else "global_route"
+    wns_all = re.findall(r"wns\s+max\s+([-0-9.]+)", log)
+    tns_all = re.findall(r"tns\s+max\s+([-0-9.]+)", log)
+    if not wns_all:
+        raise ValueError(f"no wns in OpenROAD log {work / 'openroad.log'}")
+    wns_val = float(wns_all[-1]) * unit
+    tns_val = float(tns_all[-1]) * unit if tns_all else float("nan")
+    paths = [m.start() for m in re.finditer(r"Startpoint:", log)]
+    timing = log[paths[-1]:] if paths else ""
+    timing = timing[: timing.find("slack (") + 20] if "slack (" in timing else timing
     arrival = re.search(r"([-0-9.]+)\s+data arrival time", timing)
     critical = float(arrival.group(1)) * unit if arrival else float("nan")
-    area_match = re.search(r"Design area\s+([0-9.]+)\s+u\^2\s+([0-9.]+)%\s+utilization", area)
-    design_area = float(area_match.group(1)) if area_match else float("nan")
-    util = float(area_match.group(2)) if area_match else float("nan")
-    skew_match = re.search(r"([-0-9.]+)\s+skew", skew)
-    skew_val = float(skew_match.group(1)) * unit if skew_match else None
-    instances = len(re.findall(r"^\s*-\s+", ""))  # placeholder, filled from the log below
+    area_all = re.findall(r"Design area\s+([0-9.]+)\s+u\^2\s+([0-9.]+)%\s+utilization", log)
+    design_area = float(area_all[-1][0]) if area_all else float("nan")
+    util = float(area_all[-1][1]) if area_all else float("nan")
+    skew_all = re.findall(r"([-0-9.]+)\s+skew", log)
+    skew_val = float(skew_all[-1]) * unit if skew_all else None
+    inst = re.findall(r"Instance count:\s+(\d+)", log)
+    instances = int(inst[-1]) if inst else 0
+    wl = re.findall(r"Total wirelength:\s+(\d+)\s+um", log)
+    wirelength = float(wl[-1]) if wl else float("nan")
+    # Last line of the final congestion table: "Total  resource demand usage% H / V / Total".
+    ovf = re.findall(r"^Total\s+\d+\s+\d+\s+[0-9.]+%\s+\d+\s+/\s+\d+\s+/\s+(\d+)", log, re.MULTILINE)
+    overflow = int(ovf[-1]) if ovf else -1
     achievable = period_ps - wns_val
     return PnrResult(platform.name, period_ps, wns_val, tns_val, critical, 1e6 / achievable if achievable > 0 else float("inf"),
-                     design_area, util, instances, skew_val, stage, timing[-5000:])
+                     design_area, util, instances, skew_val, wirelength, overflow, stage, timing[-5000:])
 
 
 def run_pnr(openroad: Path, platform: Platform, platforms_dir: Path, netlist: Path, liberties: Sequence[Path], work: Path,
@@ -216,15 +231,10 @@ def run_pnr(openroad: Path, platform: Platform, platforms_dir: Path, netlist: Pa
     with (work / "openroad.log").open("w", encoding="utf-8") as log:
         result = subprocess.run([str(openroad), "-exit", "-no_init", "-threads", str(threads), str(script)],
                                 cwd=work, stdout=log, stderr=subprocess.STDOUT, text=True)
-    if result.returncode != 0 or not (work / "timing.rpt").exists():
-        tail = (work / "openroad.log").read_text(encoding="utf-8")[-4000:]
-        raise RuntimeError(f"OpenROAD failed (see {work / 'openroad.log'}):\n{tail}")
-    parsed = parse_results(work, platform, period_ps, detailed_route)
     log_text = (work / "openroad.log").read_text(encoding="utf-8")
-    inst = re.findall(r"Instance count:\s+(\d+)", log_text)
-    if inst:
-        parsed.instances = int(inst[-1])
-    return parsed
+    if result.returncode != 0 or "wns max" not in log_text:
+        raise RuntimeError(f"OpenROAD failed (see {work / 'openroad.log'}):\n{log_text[-4000:]}")
+    return parse_results(work, platform, period_ps, detailed_route)
 
 
 def main() -> None:
@@ -260,7 +270,8 @@ def main() -> None:
         print(f"{result.platform} after {result.stage}: period {result.period_ps:.0f} ps, worst slack "
               f"{result.worst_slack_ps:+.0f} ps, critical path {result.critical_path_ps:.0f} ps, "
               f"achievable {result.max_frequency_mhz:.0f} MHz, design area {result.design_area_um2:.0f} um2 "
-              f"({result.utilization_pct:.0f}% utilization), {result.instances} instances{skew}")
+              f"({result.utilization_pct:.0f}% utilization), {result.instances} instances{skew}, "
+              f"wirelength {result.wirelength_um:.0f} um, overflow {result.overflow}")
     if args.report:
         print(result.report)
 
