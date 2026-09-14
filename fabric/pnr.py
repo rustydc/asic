@@ -60,6 +60,7 @@ class Platform:
     pin_exclude: tuple[str, ...] = ()  # place_pins -exclude regions, e.g. "left:*"
     merge_lef_ports: bool = False      # rewrite multi-PORT pins in the cell LEF (see merge_pin_ports)
     pin_access_before_route: bool = False  # run pin_access ahead of global_route (ASAP7: it yields M9 guides)
+    bump_pitch_um: float = 100.0       # supply-point pitch for the static IR-drop analysis
 
 
 PLATFORMS = {
@@ -86,6 +87,7 @@ PLATFORMS = {
         dont_use=("sky130_fd_sc_hd__probe_p_8", "sky130_fd_sc_hd__probec_p_8", "sky130_fd_sc_hd__lpflow_*"),
         merge_lef_ports=True,
         pin_access_before_route=True,
+        bump_pitch_um=100.0,
     ),
     "asap7": Platform(
         name="asap7",
@@ -114,6 +116,7 @@ PLATFORMS = {
         # bottom die edges of a pin-dense slice; 1 um stubs on the other two
         # edges route cleanly (experiment C in fabric/README.md).
         pin_length_um=1.0, pin_exclude=("left:*", "bottom:*"),
+        bump_pitch_um=20.0,
     ),
 }
 
@@ -233,21 +236,29 @@ def write_flow(work: Path, platform: Platform, platforms_dir: Path, netlist: Pat
     detailed = "\n".join([
         "write_def design_grt.def",
         "detailed_route -output_drc route_drc.rpt -output_maze maze.log -droute_end_iter 64 -verbose 1",
+        # Save the routed design at once: the steps below are the ones most
+        # likely to trip on a build difference, and detailed routing is the
+        # expensive part.
+        "write_def design_drt.def",
         "catch {check_antennas -report_file antennas.rpt} msg; puts $msg",
         f"filler_placement {{{' '.join(platform.fill_cells)}}}",
         "check_placement",
         "define_process_corner -ext_model_index 0 X",
-        f"set_extraction_rules_file {p / platform.rcx_rules}",
-        "extract_parasitics",
+        f"extract_parasitics -ext_model_file {p / platform.rcx_rules}",
         "write_spef design.spef",
-        "read_spef design.spef",
+        "if {[file exists design.spef]} {read_spef design.spef} else {puts {no SPEF written}}",
         "puts {--- timing on extracted parasitics ---}",
         *reports,
         "report_power",
+        # Static IR drop with a checkerboard of supply points at the given
+        # pitch, as a block inside a larger die would see (without -dx/-dy the
+        # analyser feeds the whole slice from one point at die centre).
         f"set_pdnsim_net_voltage -net VDD -voltage {platform.vdd_volts}",
-        "catch {analyze_power_grid -net VDD -outfile ir_vdd.rpt} msg; puts $msg",
+        f"catch {{analyze_power_grid -net VDD -outfile ir_vdd.rpt -dx {platform.bump_pitch_um} "
+        f"-dy {platform.bump_pitch_um}}} msg; puts $msg",
         "set_pdnsim_net_voltage -net VSS -voltage 0.0",
-        "catch {analyze_power_grid -net VSS -outfile ir_vss.rpt} msg; puts $msg",
+        f"catch {{analyze_power_grid -net VSS -outfile ir_vss.rpt -dx {platform.bump_pitch_um} "
+        f"-dy {platform.bump_pitch_um}}} msg; puts $msg",
     ]) if detailed_route else ""
     tcl = "\n".join(lef_reads + lib_reads + [
         f"read_verilog {netlist.resolve()}",
