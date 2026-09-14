@@ -12,7 +12,7 @@ from pathlib import Path
 
 import tempfile
 
-from fabric.pnr import PLATFORMS, parse_results
+from fabric.pnr import PLATFORMS, filter_pdn_script, parse_results
 from fabric.sta import parse_report
 from fabric.synth import filter_liberty, merge_liberty, nand2_area, parse_stat, synthesize
 
@@ -68,6 +68,20 @@ class ParseTest(unittest.TestCase):
         self.assertIn("cell (NAND2_X1)", text)
         self.assertNotIn("lpflow", text)
 
+    def test_filter_pdn_script_keeps_stdcell_grid_only(self) -> None:
+        script = "\n".join([
+            "add_global_connection -net {VDD} -inst_pattern {.*} -pin_pattern {VPWR}",
+            "global_connect", "set_voltage_domain -name {CORE} -power {VDD} -ground {VSS}",
+            "define_pdn_grid -name {grid} -voltage_domains {CORE} -pins {met5}",
+            "add_pdn_stripe -grid {grid} -layer {met1} -width {0.48} -pitch {5.44} -offset {0} -followpins",
+            "####", "# macro grids", "####",
+            "define_pdn_grid -name {CORE_macro_grid_1} -voltage_domains {CORE} -macro -grid_over_boundary", ""])
+        filtered = filter_pdn_script(script)
+        self.assertNotIn("global_connect", filtered.splitlines())
+        self.assertNotIn("macro", filtered)
+        self.assertIn("add_pdn_stripe", filtered)
+        self.assertIn("add_global_connection", filtered)
+
     def test_parse_pnr_reports_scale_library_units(self) -> None:
         log = "\n".join([
             "Startpoint: early", "   1.000   data arrival time", "   0.500   slack (MET)",
@@ -115,6 +129,32 @@ class ParseTest(unittest.TestCase):
         self.assertAlmostEqual(result.max_frequency_mhz, 1e6 / 702.69)
         self.assertTrue(result.wirelength_um != result.wirelength_um)   # NaN when absent
         self.assertEqual(result.overflow, -1)
+
+    def test_parse_pnr_reports_detailed_route_stage(self) -> None:
+        log = "\n".join([
+            "Total            580308        176889           30.48%             0 /  0 /  0",
+            "[INFO GRT-0018] Total wirelength: 131319 um",
+            "Startpoint: grt", "  900.000   data arrival time", "  -1.000   slack (VIOLATED)",
+            "wns -1.00", "tns -5.00",
+            "[INFO DRT-0199]   Number of violations = 2.",
+            "Startpoint: drt", "  910.000   data arrival time", "  -11.000   slack (VIOLATED)",
+            "Design area 2700 u^2 46% utilization.",
+            "wns -11.00", "tns -55.00",
+            "Total                  1.20e-03   4.00e-04   1.00e-08   1.60e-03 100.0%",
+            "[INFO PSM-0027] Worstcase IR drop: 2.5e-03 V",
+            "[INFO PSM-0027] Worstcase IR drop: 1.5e-03 V", ""])
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            (work / "openroad.log").write_text(log, encoding="utf-8")
+            result = parse_results(work, PLATFORMS["asap7"], 700.0, detailed_route=True)
+        self.assertEqual(result.stage, "detailed_route")
+        self.assertEqual(result.drc_violations, 2)
+        self.assertAlmostEqual(result.worst_slack_ps, -11.0)
+        self.assertAlmostEqual(result.critical_path_ps, 910.0)
+        self.assertAlmostEqual(result.power_w, 1.6e-3)
+        self.assertAlmostEqual(result.ir_drop_vdd_mv, 2.5)
+        self.assertAlmostEqual(result.ir_drop_vss_mv, 1.5)
+        self.assertEqual(result.overflow, 0)
 
     def test_parse_sta_report_reads_clock_group_slack(self) -> None:
         report = """

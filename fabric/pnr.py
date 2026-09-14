@@ -1,11 +1,12 @@
 """Place and route the fabric column datapath with OpenROAD on an open platform.
 
 Drives OpenROAD directly with the platform files from OpenROAD-flow-scripts
-(sky130hd or asap7): floorplan, pin placement, timing-driven global
-placement, resizing and buffering, clock-tree synthesis, global routing,
-parasitic estimation, timing repair, and a final timing report.  Detailed
-routing is optional (``--detailed-route``); global-routing parasitics are
-what the timing numbers use either way.
+(sky130hd or asap7): floorplan, pin placement, well taps and the platform
+power grid, timing-driven global placement, resizing and buffering,
+clock-tree synthesis, global routing, parasitic estimation, timing repair,
+and a timing report.  With ``--detailed-route`` it continues through
+detailed routing, fill, OpenRCX extraction, timing on the extracted
+parasitics, a power report, and static IR-drop analysis of the grid.
 
     python -m fabric.pnr --openroad /path/openroad --platform sky130hd \
         --platforms-dir /path/OpenROAD-flow-scripts/flow/platforms \
@@ -47,6 +48,12 @@ class Platform:
     tie_lo: str
     core_space_um: float
     time_unit_ps: float    # liberty time unit in ps (sky130: ns -> 1000, asap7: ps -> 1)
+    pdn_script: str        # platform power-grid strategy (sourced before pdngen)
+    tap_cell: str
+    tap_distance_um: float
+    rcx_rules: str         # OpenRCX extraction rules for post-detailed-route parasitics
+    fill_cells: tuple[str, ...]
+    vdd_volts: float
 
 
 PLATFORMS = {
@@ -64,6 +71,12 @@ PLATFORMS = {
         tie_hi="sky130_fd_sc_hd__conb_1/HI", tie_lo="sky130_fd_sc_hd__conb_1/LO",
         core_space_um=10.0,
         time_unit_ps=1000.0,
+        pdn_script="sky130hd/pdn.tcl",
+        tap_cell="sky130_fd_sc_hd__tapvpwrvgnd_1", tap_distance_um=14.0,
+        rcx_rules="sky130hd/rcx_patterns.rules",
+        fill_cells=("sky130_fd_sc_hd__fill_1", "sky130_fd_sc_hd__fill_2",
+                    "sky130_fd_sc_hd__fill_4", "sky130_fd_sc_hd__fill_8"),
+        vdd_volts=1.8,
     ),
     "asap7": Platform(
         name="asap7",
@@ -79,6 +92,13 @@ PLATFORMS = {
         tie_hi="TIEHIx1_ASAP7_75t_R/H", tie_lo="TIELOx1_ASAP7_75t_R/L",
         core_space_um=2.0,
         time_unit_ps=1.0,
+        pdn_script="asap7/openRoad/pdn/grid_strategy-M1-M2-M5-M6.tcl",
+        tap_cell="TAPCELL_ASAP7_75t_R", tap_distance_um=25.0,
+        rcx_rules="asap7/rcx_patterns.rules",
+        fill_cells=("FILLERxp5_ASAP7_75t_R", "FILLER_ASAP7_75t_R", "DECAPx1_ASAP7_75t_R",
+                    "DECAPx2_ASAP7_75t_R", "DECAPx4_ASAP7_75t_R", "DECAPx6_ASAP7_75t_R",
+                    "DECAPx10_ASAP7_75t_R"),
+        vdd_volts=0.70,
     ),
 }
 
@@ -97,11 +117,30 @@ class PnrResult:
     clock_skew_ps: float | None
     wirelength_um: float        # global-route total wirelength
     overflow: int               # global-route total overflow (0 = routable)
+    drc_violations: int | None  # after detailed route, else None
+    power_w: float | None       # report_power total (default activity), after detailed route
+    ir_drop_vdd_mv: float | None  # worst static IR drop on VDD from the generated grid
+    ir_drop_vss_mv: float | None
     stage: str                  # which timing report the numbers come from
     report: str
 
     def as_dict(self) -> dict:
         return asdict(self)
+
+
+def filter_pdn_script(text: str) -> str:
+    """Keep the global connections, voltage domain and standard-cell grid of a
+    platform PDN strategy; drop the macro grids (there are none here) and the
+    `global_connect` call that older builds lack (their pdngen connects the
+    supplies itself from the add_global_connection patterns)."""
+    kept = []
+    for line in text.splitlines():
+        if "macro grids" in line:
+            break
+        if line.strip() == "global_connect":
+            continue
+        kept.append(line)
+    return "\n".join(kept) + "\n"
 
 
 def write_flow(work: Path, platform: Platform, platforms_dir: Path, netlist: Path, liberties: Sequence[Path],
@@ -118,6 +157,8 @@ def write_flow(work: Path, platform: Platform, platforms_dir: Path, netlist: Pat
         "set_max_fanout 20 [current_design]",
     ]) + "\n"
     (work / "design.sdc").write_text(sdc, encoding="utf-8")
+    (work / "pdn.tcl").write_text(filter_pdn_script((p / platform.pdn_script).read_text(encoding="utf-8")),
+                                  encoding="utf-8")
     # Equivalent of the flow scripts' fastroute.tcl, without its environment variables.
     fastroute = "\n".join([
         f"set_global_routing_layer_adjustment {platform.min_route_layer}-{platform.max_route_layer} "
@@ -125,11 +166,34 @@ def write_flow(work: Path, platform: Platform, platforms_dir: Path, netlist: Pat
         f"set_routing_layers -clock {platform.min_clock_layer}-{platform.max_route_layer}",
         f"set_routing_layers -signal {platform.min_route_layer}-{platform.max_route_layer}",
     ])
-    detailed = "\n".join([
-        "detailed_route -output_drc route_drc.rpt -verbose 0",
-        "estimate_parasitics -global_routing",
+    reports = [
         "report_checks -path_delay max -path_group clk -format full_clock_expanded -fields {slew cap fanout} -digits 3",
-        "report_wns", "report_tns",
+        "report_clock_skew",
+        "report_design_area",
+        "report_wns",
+        "report_tns",
+    ]
+    # Detailed route, fill, signoff-style extraction with OpenRCX, timing on the
+    # extracted parasitics, power, and static IR drop on the generated grid.
+    # The IR-drop and antenna steps are wrapped in catch so a build that lacks
+    # them still produces the timing numbers.
+    detailed = "\n".join([
+        "detailed_route -output_drc route_drc.rpt -output_maze maze.log -droute_end_iter 64 -verbose 1",
+        "catch {check_antennas -report_file antennas.rpt} msg; puts $msg",
+        f"filler_placement {{{' '.join(platform.fill_cells)}}}",
+        "check_placement",
+        "define_process_corner -ext_model_index 0 X",
+        f"set_extraction_rules_file {p / platform.rcx_rules}",
+        "extract_parasitics",
+        "write_spef design.spef",
+        "read_spef design.spef",
+        "puts {--- timing on extracted parasitics ---}",
+        *reports,
+        "report_power",
+        f"set_pdnsim_net_voltage -net VDD -voltage {platform.vdd_volts}",
+        "catch {analyze_power_grid -net VDD -outfile ir_vdd.rpt} msg; puts $msg",
+        "set_pdnsim_net_voltage -net VSS -voltage 0.0",
+        "catch {analyze_power_grid -net VSS -outfile ir_vss.rpt} msg; puts $msg",
     ]) if detailed_route else ""
     tcl = "\n".join(lef_reads + lib_reads + [
         f"read_verilog {netlist.resolve()}",
@@ -141,6 +205,11 @@ def write_flow(work: Path, platform: Platform, platforms_dir: Path, netlist: Pat
         f"-core_space {platform.core_space_um} -site {platform.site}",
         f"source {p / platform.tracks_script}",
         f"place_pins -hor_layers {platform.pin_layer_h} -ver_layers {platform.pin_layer_v}",
+        # Well taps and the power grid from the platform's strategy, before
+        # placement so the stripes are routing blockages from the start.
+        f"tapcell -distance {platform.tap_distance_um} -tapcell_master {platform.tap_cell}",
+        "source pdn.tcl",
+        "pdngen",
         fastroute,
         # Placement with timing-driven global placement, then resize and repair.
         "global_placement -timing_driven -density 0.65",
@@ -170,11 +239,8 @@ def write_flow(work: Path, platform: Platform, platforms_dir: Path, netlist: Pat
         "estimate_parasitics -global_routing",
         "repair_timing -setup",
         # All reports go to the log; older builds ignore `> file` on some of them.
-        "report_checks -path_delay max -path_group clk -format full_clock_expanded -fields {slew cap fanout} -digits 3",
-        "report_clock_skew",
-        "report_design_area",
-        "report_wns",
-        "report_tns",
+        "puts {--- timing on global-route parasitics ---}",
+        *reports,
         detailed,
         "write_def design.def",
         "exit",
@@ -190,7 +256,17 @@ def parse_results(work: Path, platform: Platform, period_ps: float, detailed_rou
     wins (the post-route reports come last)."""
     unit = platform.time_unit_ps
     log = (work / "openroad.log").read_text(encoding="utf-8") if (work / "openroad.log").exists() else ""
-    stage = "detailed_route" if detailed_route and "detailed_route" in log and "route_drc" in log else "global_route"
+    drc = re.findall(r"Number of violations\s*=\s*(\d+)", log)
+    stage = "detailed_route" if detailed_route and drc else "global_route"
+    drc_count = int(drc[-1]) if drc else None
+    # report_power's Total row: internal, switching, leakage, total, percent.
+    power = re.findall(r"^Total\s+([0-9.e+-]+)\s+([0-9.e+-]+)\s+([0-9.e+-]+)\s+([0-9.e+-]+)\s+100", log, re.MULTILINE)
+    power_w = float(power[-1][3]) if power else None
+
+    # pdnsim prints "Worstcase IR drop: X V" once per analyzed net, VDD first then VSS.
+    drops = re.findall(r"Worst[- ]?case IR drop\s*:?\s*([0-9.e+-]+)\s*V", log, re.IGNORECASE)
+    ir_vdd = float(drops[0]) * 1000.0 if drops else None
+    ir_vss = float(drops[1]) * 1000.0 if len(drops) > 1 else None
     # `report_wns` prints "wns max X" in current builds and "wns X" in older ones.
     wns_all = re.findall(r"^wns(?:\s+max)?\s+([-0-9.]+)", log, re.MULTILINE)
     tns_all = re.findall(r"^tns(?:\s+max)?\s+([-0-9.]+)", log, re.MULTILINE)
@@ -224,7 +300,8 @@ def parse_results(work: Path, platform: Platform, period_ps: float, detailed_rou
     overflow = int(ovf[-1]) if ovf else -1
     achievable = period_ps - wns_val
     return PnrResult(platform.name, period_ps, wns_val, tns_val, critical, 1e6 / achievable if achievable > 0 else float("inf"),
-                     design_area, util, instances, skew_val, wirelength, overflow, stage, timing[-5000:])
+                     design_area, util, instances, skew_val, wirelength, overflow, drc_count, power_w, ir_vdd, ir_vss,
+                     stage, timing[-5000:])
 
 
 def run_pnr(openroad: Path, platform: Platform, platforms_dir: Path, netlist: Path, liberties: Sequence[Path], work: Path,
@@ -280,6 +357,10 @@ def main() -> None:
               f"achievable {result.max_frequency_mhz:.0f} MHz, design area {result.design_area_um2:.0f} um2 "
               f"({result.utilization_pct:.0f}% utilization), {result.instances} instances{skew}, "
               f"wirelength {result.wirelength_um:.0f} um, overflow {result.overflow}")
+        if result.stage == "detailed_route":
+            fmt = lambda v, u: "n/a" if v is None else f"{v:.3g} {u}"
+            print(f"detailed route: {result.drc_violations} DRC violations, power {fmt(result.power_w, 'W')}, "
+                  f"IR drop VDD {fmt(result.ir_drop_vdd_mv, 'mV')}, VSS {fmt(result.ir_drop_vss_mv, 'mV')}")
     if args.report:
         print(result.report)
 
