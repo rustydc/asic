@@ -25,13 +25,14 @@ DRAM simulator.
 From the repository root:
 
 ```bash
-python -m unittest discover -s sim/tests -v
-python -m sim.run --config sim/config/baseline.json
+python -m unittest discover -s sim/tests -t .
+python -m sim.run --config sim/config/baseline.json      # Qwen3.5-9B geometry
+python -m sim.run --config sim/config/qwen35_4b.json     # Qwen3.5-4B geometry
 python -m sim.run --config sim/config/baseline.json --trace trace.json
-python -m sim.sweep --output retrieval-sweep.csv
+python -m sim.sweep --kv-element-bytes 1,0.5 --top-blocks 32,16 --output retrieval-sweep.csv
 ```
 
-The last command writes a Chrome/Perfetto-compatible trace. Open it in Perfetto
+The trace command writes a Chrome/Perfetto-compatible trace. Open it in Perfetto
 to inspect stage occupancy by context and token.
 
 Warm-up tokens are simulated but excluded from reported throughput and latency,
@@ -41,16 +42,31 @@ KV transfers still share the configured memory interval.
 
 The sweep reports bytes/token, operation latency, initiation interval, and the
 global-stage throughput ceiling across index dimension, index precision,
-compression, and bandwidth combinations. It is analytical and therefore much
-faster than running every point through the full pipeline.
+compression, KV element size, top-K, and bandwidth combinations. It is
+analytical and therefore much faster than running every point through the full
+pipeline.
 
-The baseline is a hypothesis, not a performance claim. It provisionally moves
-fixed-weight work toward recurrent stages with `recurrent_weight_scale=1.25`
-and `global_weight_scale=0.75`; the PyTorch model exposes corresponding distinct
-FFN widths for training experiments. Stage-cycle scales, global phase timing,
-sustained memory efficiency, and link throughput must ultimately be replaced
-with RTL and memory-system measurements.
+## Configurations
 
-The baseline uses a 10 MHz architecture tick (100 ns), while preserving the
-intended microsecond service times and bytes/second. This is a simulation time
-quantum rather than the proposed RTL clock and makes long pipeline sweeps fast.
+Both configurations use the Qwen3.5 head geometry: `kv_heads=4` KV heads of
+`head_dim=256`, so a stored position costs 2 KB at int8. The 4B configuration
+keeps every memory parameter identical and scales fabric cycles by the
+446M/865M per-shard parameter ratio. `activation_bytes` assumes int8 activations
+of the hidden width (4096 or 2560).
+
+Fabric cycle scales, global phase timing, sustained memory efficiency, and link
+throughput are hypotheses to be replaced with RTL and memory-system
+measurements. The baseline uses a 10 MHz architecture tick (100 ns), while
+preserving the intended microsecond service times and bytes/second. This is a
+simulation time quantum rather than the proposed RTL clock and makes long
+pipeline sweeps fast.
+
+## Current finding
+
+With int8 KV at 4:1 compression, 32 retrieved blocks, and 64 GB/s sustained
+bandwidth, both geometries saturate the global stage at about 14.5K tokens/s
+with a 128K context, below the 25K to 50K target. The recurrent stages sit at
+10 percent (9B) or 6 percent (4B) utilization. The global memory interval is
+half index scan and half selected-KV transfer. The sweep shows int4 KV plus
+8:1 compression recovers 30K tokens/s at 75 GB/s and 40K at 100 GB/s; 16:1
+compression with int4 KV reaches the 50K ceiling at 100 GB/s.

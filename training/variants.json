@@ -1,23 +1,26 @@
 {
   "index64_fp4_compress4": {
+    "geometry": "qwen3_5_9b",
     "index_dim": 64,
     "index_bits": 4,
-    "retrieval_block_size": 4,
-    "recurrent_intermediate_size": 16384,
-    "global_intermediate_size": 8192
+    "retrieval_block_size": 4
   },
   "index128_int2_compress4": {
+    "geometry": "qwen3_5_9b",
     "index_dim": 128,
     "index_bits": 2,
-    "retrieval_block_size": 4,
-    "recurrent_intermediate_size": 16384,
-    "global_intermediate_size": 8192
+    "retrieval_block_size": 4
   },
   "index128_fp4_compress8": {
+    "geometry": "qwen3_5_9b",
     "index_dim": 128,
     "index_bits": 4,
-    "retrieval_block_size": 8,
-    "recurrent_intermediate_size": 16384,
-    "global_intermediate_size": 8192
+    "retrieval_block_size": 8
+  },
+  "index128_fp4_compress4_4b": {
+    "geometry": "qwen3_5_4b",
+    "index_dim": 128,
+    "index_bits": 4,
+    "retrieval_block_size": 4
   }
 }

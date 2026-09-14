@@ -1,7 +1,8 @@
-# Fixed-Weight 8B LLM Inference Appliance
+# Fixed-Weight LLM Inference Appliance
 
 **Status:** Concept / pre-architecture  
-**Target:** Dense approximately 8B-parameter inference appliance with 128K context  
+**Target:** Dense Qwen3.5-9B-geometry inference appliance with 128K context,
+with the Qwen3.5-4B geometry as a narrow first build  
 **Primary objective:** Test whether immutable model weights implemented directly
 in silicon can sustain high decode throughput in a simple, multi-chip pipeline.
 
@@ -28,20 +29,32 @@ fixed at manufacture: model weights
 
 ## Reference model and package partition
 
-The starting geometry is a 32-layer, 4096-hidden dense decoder with roughly 8B
-parameters. Layers repeat an `R/R/R/G` pattern:
+The reference model is the Qwen3.5 dense hybrid geometry, which already has the
+`R/R/R/G` layer pattern the appliance needs:
 
-* 24 bounded-state recurrent layers (`R`);
-* 8 sparse global-attention layers (`G`);
+* 24 Gated DeltaNet bounded-state recurrent layers (`R`): 32 value heads and
+  16 key heads of 128 dimensions, a 4-tap causal convolution, and an output gate;
+* 8 gated-attention global layers (`G`): 16 query heads sharing 4 KV heads of
+  256 dimensions with rotary embedding on the first 64 dimensions;
 * a dense SwiGLU feed-forward block in every layer.
 
-The software model permits different FFN widths in recurrent and global layers.
-An important training experiment is to move a fixed total parameter budget from
-the memory-bound global stages into the recurrent stages. For example, recurrent
-FFNs can be widened while global FFNs are narrowed, keeping the approximate 8B
-total unchanged. This may recover capacity in the layers doing most sequence
-mixing work while moving fixed-fabric cycles toward otherwise underutilized
-recurrent stages. It is a quality/latency hypothesis, not yet a frozen geometry.
+| Preset | Hidden | FFN width | R layer | G layer | Per-ASIC shard | Body | Embedding + head |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `qwen3_5_9b` | 4096 | 12288 | 218M | 211M | 866M | 6.93B | 2.03B (untied) |
+| `qwen3_5_4b` | 2560 | 9216 | 113M | 108M | 447M | 3.58B | 0.64B (tied) |
+
+The head geometry is identical in both presets, so every per-context state
+format, the recurrent update logic, and the retrieval engine are shared. Only
+the fabric width changes. Recurrent and global layers are within four percent
+of each other in parameters, so the stages are balanced without moving FFN
+capacity between them. The software model still permits distinct recurrent and
+global FFN widths, but any such change discards the copied feed-forward weights
+and must be justified by training results.
+
+The 248K-entry vocabulary makes the LM head 1.0B multiply-accumulates per token
+(0.64B for the 4B). At the throughput targets that is beyond an FPGA. The head
+must be a fixed-weight fabric block, on the last ASIC or a ninth device, and
+the embedding table lives in host or FPGA memory.
 
 Eight ASICs each implement four consecutive layers. Every layer is an
 independent physical pipeline stage.
@@ -74,8 +87,9 @@ macro on the candidate PDK. It must measure:
 * power, IR drop, and thermal density;
 * which masks must change between the eight coefficient variants.
 
-If four approximately 250M-parameter layers do not fit economically, the
-fallback is sixteen two-layer devices.
+If four approximately 215M-parameter layers do not fit economically, the
+fallbacks are the 4B geometry (four approximately 110M-parameter layers per
+device) or sixteen two-layer devices.
 
 ## Long-context state
 
@@ -111,11 +125,14 @@ Hierarchical or chunked index scanning remains an allowed implementation detail
 inside every global stage. It must preserve the same observable FULL-retrieval
 semantics and a common stage budget.
 
-The preliminary state budget is 12-24 MB per global layer per 128K-token
-context. Since each ASIC owns one global layer, 32 resident contexts consume
-approximately 384-768 MB before allocator and metadata overhead. A 2-4 GB local
-memory device therefore leaves capacity margin, but bandwidth still requires
-trace-based validation.
+A stored position carries four 256-dimensional KV heads, 2 KB at int8 or 1 KB
+at int4. At 4:1 compression a 128K-token context therefore needs about 64 MB
+per global layer at int8 plus the 128-dimensional index, and about 32 MB at
+int4. Since each ASIC owns one global layer, 32 resident contexts consume
+roughly 1-2 GB before allocator and metadata overhead. A 2-4 GB local memory
+device still fits, but the margin is smaller than the earlier single-KV-head
+estimate, and the simulator shows bandwidth, not capacity, is the binding
+constraint (see "Performance targets").
 
 ## Context ownership and work item
 
@@ -127,7 +144,7 @@ struct WorkItem {
     uint8_t context_id;   // five significant bits in revision A
     uint8_t flags;
     uint32_t position;
-    activation_t hidden[4096];
+    activation_t hidden[4096];   // 2560 in the 4B build
 };
 ```
 
@@ -184,10 +201,20 @@ latency and a 20-40 microsecond worst-stage service time. A cycle-accurate model
 must derive both figures from fixed-fabric, memory, link, and queue timing rather
 than assume them.
 
+The transaction-level simulator with the Qwen3.5 head geometry, int8 KV, 4:1
+compression, 32 retrieved blocks, and 64 GB/s sustained bandwidth saturates the
+global stage at about 14.5K tokens/s for both presets at 128K context, with the
+recurrent stages under 10 percent busy. Half of the global memory interval is
+the index scan and half is the selected-KV transfer. Reaching the 25K-50K
+target needs some combination of int4 KV storage, 8:1 or 16:1 compression,
+fewer retrieved blocks, and 75-100 GB/s sustained bandwidth. Those are now the
+first parameters the software model must qualify.
+
 ## Development gates
 
-1. **Software model:** recover acceptable quality at 128K and freeze retrieval,
-   state, and quantization formats.
+1. **Software model:** import the Qwen3.5 weights, recover acceptable quality
+   at 128K with the retrieval replacement in the eight global layers, and
+   freeze retrieval, KV precision, compression, and fabric quantization formats.
 2. **Architecture simulator:** validate the 32-stage multi-context schedule,
    local state management, memory traces, backpressure, and packet protocol.
 3. **Fixed-weight GDS macro:** demonstrate credible density, routing, timing,
@@ -196,7 +223,9 @@ than assume them.
    physical estimates on an MPW test chip.
 5. **Full appliance:** tape out the variants only after the preceding gates pass.
 
-The largest open risks are fixed-connectivity routing density, model-quality
-recovery after replacing 24 attention layers, architecture-specific
-quantization, external-memory PHY effort, global-stage service time, and yield
+The largest open risks are fixed-connectivity routing density, global-stage
+memory bandwidth at the Qwen3.5 KV width, model-quality loss from replacing
+full attention with windowed retrieval in the eight global layers,
+architecture-specific weight quantization (especially below 4 bits on the 4B),
+placement of the 1B-parameter LM head, external-memory PHY effort, and yield
 across eight large coefficient variants.

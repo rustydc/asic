@@ -48,6 +48,7 @@ class ApplianceConfig:
     index_bits: int = 4
     kv_element_bytes: float = 1.0
     head_dim: int = 128
+    kv_heads: int = 1
     max_cycles: int = 2_000_000_000
     trace: bool = False
 
@@ -83,6 +84,7 @@ class ApplianceConfig:
             "index_bits": self.index_bits,
             "kv_element_bytes": self.kv_element_bytes,
             "head_dim": self.head_dim,
+            "kv_heads": self.kv_heads,
             "max_cycles": self.max_cycles,
         }
         invalid = [name for name, value in positive.items() if value <= 0]
@@ -98,6 +100,7 @@ class ApplianceConfig:
     def from_json(cls, path: str | Path) -> "ApplianceConfig":
         with Path(path).open(encoding="utf-8") as source:
             values = json.load(source)
+        values = {key: value for key, value in values.items() if not key.startswith("_")}
         return cls(**values)
 
 
@@ -216,14 +219,20 @@ class Simulation:
         self.trace_events: list[TraceEvent] = []
         self.next_context = 0
 
+    @property
+    def kv_bytes_per_position(self) -> float:
+        """Stored key plus value bytes for one position across all KV heads."""
+        cfg = self.config
+        return 2 * cfg.kv_heads * cfg.head_dim * cfg.kv_element_bytes
+
     def _global_memory_components(self, item: WorkItem) -> tuple[int, int, int]:
         cfg = self.config
         compressed_positions = math.ceil(item.position / cfg.compression_ratio)
         index_bytes = math.ceil(compressed_positions * cfg.index_dim * cfg.index_bits / 8)
         selected_positions = cfg.top_blocks * cfg.retrieval_block_size
         kv_positions = cfg.local_window + selected_positions
-        kv_bytes = math.ceil(kv_positions * 2 * cfg.head_dim * cfg.kv_element_bytes)
-        append_bytes = math.ceil(cfg.index_dim * cfg.index_bits / 8 + 2 * cfg.head_dim * cfg.kv_element_bytes)
+        kv_bytes = math.ceil(kv_positions * self.kv_bytes_per_position)
+        append_bytes = math.ceil(cfg.index_dim * cfg.index_bits / 8 + self.kv_bytes_per_position)
         return index_bytes, kv_bytes, append_bytes
 
     def _timing(self, stage: Stage, item: WorkItem) -> tuple[int, int, int]:

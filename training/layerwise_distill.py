@@ -20,10 +20,13 @@ from fixed_llm_poc import ASICDecoderLayer, ASICLMConfig
 
 
 def load_variant(path: Path, name: str) -> ASICLMConfig:
+    """Resolve a variant: a geometry preset plus retrieval overrides."""
     variants = json.loads(path.read_text(encoding="utf-8"))
     if name not in variants:
         raise ValueError(f"unknown variant {name!r}; choose from {sorted(variants)}")
-    return ASICLMConfig(**variants[name])
+    values = dict(variants[name])
+    geometry = values.pop("geometry", "qwen3_5_9b")
+    return ASICLMConfig.from_preset(geometry, **values)
 
 
 def activation_loss(student: torch.Tensor, teacher: torch.Tensor) -> torch.Tensor:

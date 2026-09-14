@@ -1,4 +1,4 @@
-"""Sweep retrieval geometry and memory bandwidth without long simulations."""
+"""Sweep retrieval geometry, KV precision, and memory bandwidth without long simulations."""
 
 from __future__ import annotations
 
@@ -22,6 +22,9 @@ def main() -> None:
     parser.add_argument("--index-dims", default="32,64,96,128")
     parser.add_argument("--index-bits", default="2,4,8")
     parser.add_argument("--compression-ratios", default="4,8,16")
+    parser.add_argument("--kv-element-bytes", default="1",
+                        help="stored KV bytes per element, e.g. 1 for int8, 0.5 for int4")
+    parser.add_argument("--top-blocks", default=None, help="defaults to the config value")
     parser.add_argument("--bandwidth-gbps", default="50,75,100")
     parser.add_argument("--output", help="CSV path; defaults to stdout")
     args = parser.parse_args()
@@ -29,8 +32,8 @@ def main() -> None:
     base = ApplianceConfig.from_json(args.config)
     output = open(args.output, "w", newline="", encoding="utf-8") if args.output else sys.stdout
     fields = [
-        "index_dim", "index_bits", "compression_ratio", "bandwidth_gbps",
-        "bytes_per_token_per_asic", "global_latency_us", "global_interval_us",
+        "index_dim", "index_bits", "compression_ratio", "kv_element_bytes", "top_blocks",
+        "bandwidth_gbps", "bytes_per_token_per_asic", "global_latency_us", "global_interval_us",
         "global_ceiling_tokens_per_second",
     ]
     writer = csv.DictWriter(output, fieldnames=fields)
@@ -40,15 +43,19 @@ def main() -> None:
             comma_numbers(args.index_dims),
             comma_numbers(args.index_bits),
             comma_numbers(args.compression_ratios),
+            comma_numbers(args.kv_element_bytes, float),
+            comma_numbers(args.top_blocks) if args.top_blocks else [base.top_blocks],
             comma_numbers(args.bandwidth_gbps, float),
         )
-        for index_dim, index_bits, compression_ratio, bandwidth_gbps in combinations:
+        for index_dim, index_bits, compression_ratio, kv_bytes, top_blocks, bandwidth_gbps in combinations:
             raw_bytes_per_cycle = bandwidth_gbps * 1_000 / base.clock_mhz
             config = replace(
                 base,
                 index_dim=index_dim,
                 index_bits=index_bits,
                 compression_ratio=compression_ratio,
+                kv_element_bytes=kv_bytes,
+                top_blocks=top_blocks,
                 memory_bytes_per_cycle=raw_bytes_per_cycle,
             )
             simulation = Simulation(config)
@@ -59,6 +66,8 @@ def main() -> None:
                 "index_dim": index_dim,
                 "index_bits": index_bits,
                 "compression_ratio": compression_ratio,
+                "kv_element_bytes": kv_bytes,
+                "top_blocks": top_blocks,
                 "bandwidth_gbps": bandwidth_gbps,
                 "bytes_per_token_per_asic": memory_bytes,
                 "global_latency_us": round(latency / config.clock_mhz, 3),
