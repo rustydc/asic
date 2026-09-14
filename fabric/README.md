@@ -60,7 +60,8 @@ wiring. They are a via pattern in a ROM array, which is denser anyway.
 
 A pass starts by loading the accumulators with chained partial sums (zero for a
 fresh pass), consumes two activations per cycle in row order, and after 2048
-cycles exposes the raw accumulators and the requantized int8 outputs. Matrices
+cycles the shared requantizer walks the columns and publishes the resolved
+accumulators and the requantized int8 outputs together. Matrices
 wider than 64 outputs use more tiles side by side. Matrices deeper than the
 tile, such as the 12288-wide FFN down-projection, use three tiles over
 disjoint row ranges in parallel and a partial-sum reduction after them, so
@@ -95,7 +96,7 @@ below.
 | Tiles | 3306 | 1940 | 2858 | 1940 |
 | Coefficients | 866M | 509M | 447M | 318M |
 | Utilization | 99.9% | 100% | 97.7% | 100% |
-| Area at 2 rows/cycle | 199 mm² | 117 mm² | 138 mm² | 94 mm² |
+| Area at 2 rows/cycle | 242 mm² | 142 mm² | 176 mm² | 119 mm² |
 | Latency per layer, 800 MHz | 10.2 µs | 2.6 µs (die) | 6.4 µs | 1.6 µs (die) |
 | Fabric energy per token | 62 µJ | 37 µJ | 32 µJ | 19 µJ |
 
@@ -108,10 +109,10 @@ the coefficient count; the MAC columns scale with rows per cycle.
 
 | Rows/cycle | Clock | 9B layer die area | ROM / MAC | Latency per layer | Pass |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 800 MHz | 178 mm² | 104 / 66 mm² | 20.5 µs | 5.1 µs |
-| 2 | 800 MHz | 199 mm² | 104 / 87 mm² | 10.2 µs | 2.6 µs |
-| 4 | 800 MHz | 241 mm² | 104 / 129 mm² | 5.1 µs | 1.3 µs |
-| 2 | 500 MHz | 199 mm² | 104 / 87 mm² | 16.4 µs | 4.1 µs |
+| 1 | 800 MHz | 218 mm² | 104 / 106 mm² | 20.5 µs | 5.1 µs |
+| 2 | 800 MHz | 242 mm² | 104 / 130 mm² | 10.2 µs | 2.6 µs |
+| 4 | 800 MHz | 291 mm² | 104 / 179 mm² | 5.1 µs | 1.3 µs |
+| 2 | 500 MHz | 242 mm² | 104 / 130 mm² | 16.4 µs | 4.1 µs |
 
 Two rows per cycle is the baseline. The simulator's stage times are derived
 from it: 102 ticks (10.2 µs) per 9B layer, 26 ticks per head die.
@@ -132,15 +133,17 @@ placeholders the MPW tile is meant to replace.
 | Entry | Value | Source |
 | --- | ---: | --- |
 | ROM area | 0.03 µm² per bit | placeholder: via-ROM compiler cell at the target node |
-| MAC column | 100 µm² per bank | 330 NAND2 equivalents from four-library synthesis, at a 0.30 µm² 28 nm NAND2 |
-| Accumulator, requantizer share, output | 210 µm² per column | 700 NAND2 equivalents, same source |
+| MAC column | 115 µm² per bank | 380 NAND2 equivalents from 64-column sky130 synthesis, at a 0.30 µm² 28 nm NAND2 |
+| Accumulator, requantizer share, registers | 385 µm² per column | 1280 NAND2 equivalents, same source |
 | Tile overhead | 2500 µm² | placeholder: multiples generator, ROM periphery, control |
 | Clock | 800 MHz | placeholder: ROM read plus column add in one cycle |
 | ROM read | 3 fJ per bit | placeholder |
 | MAC | 60 fJ per coefficient | placeholder |
 
-At these numbers a 28 nm-class 9B layer die is 199 mm², about half ROM and
-slightly less than half MAC columns. At a 16 nm-class node expect roughly
+At these numbers a 28 nm-class 9B layer die is 242 mm², about 43 percent
+ROM and 54 percent MAC columns. The timing-clean column (next sections)
+costs about 45 percent more than the first ripple-carry version; that is the
+price of a pipeline with no carry chain per cycle. At a 16 nm-class node expect roughly
 half. If the ROM cell comes in denser than 0.03 µm² per bit, the MAC columns
 dominate and one row per cycle becomes the better trade.
 
@@ -157,9 +160,9 @@ python -m fabric.synth --liberty sky130_fd_sc_hd__tt_025C_1v80.lib --rows 256 --
 FABRIC_LIBERTY=$PWD/sky130_fd_sc_hd__tt_025C_1v80.lib python -m unittest fabric.tests.test_synth
 ```
 
-Measured on a 16-column tile (256 rows; column cost does not depend on depth)
-at two rows per cycle, on two manufacturable 130 nm libraries and two
-predictive advanced-node kits:
+Measured first on the original ripple-carry column (16 columns, 256 rows,
+two rows per cycle) on two manufacturable 130 nm libraries and two predictive
+advanced-node kits:
 
 | Library | Kind | NAND2 | Cells | Per column | NAND2-eq per column |
 | --- | --- | ---: | ---: | ---: | ---: |
@@ -169,13 +172,15 @@ predictive advanced-node kits:
 | ASAP7 (7 nm FinFET) | predictive | 0.058 µm² | 11,974 | 74 µm² | 1271 |
 
 Four libraries spanning 130 nm to 7 nm agree within ten percent once
-normalized to their own NAND2: about 1300 NAND2 equivalents per column at two
-rows per cycle, 1000 at one and 1900 at four (sky130: 3916 and 7876 µm²;
-ASAP7: 57 and 111 µm²). That is the number to carry, and it makes the
-28 nm estimate a NAND2 area, about 0.30 µm², times 700 + 330 per bank. The
-first synthesis run also caught a design error: a per-column requantizer
+normalized to their own NAND2, so NAND2 equivalents are the number to carry.
+The first synthesis run also caught a design error: a per-column requantizer
 multiplier that tripled the column area, now a single unit shared across the
 64 columns.
+
+The timing work below reshaped the column (carry-save accumulate,
+signed-digit taps, a deeper shared requantizer). A full 64-column tile on
+sky130 now costs 1663, 2050 and 2808 NAND2 equivalents per column at 1, 2 and
+4 rows per cycle, which is the 1280 + 380 per bank the density model uses.
 
 ASAP7 ships its cells in several liberty files; merge them first:
 
@@ -200,9 +205,9 @@ What open PDKs can and cannot do for this project:
   about a square millimetre of columns plus a hand-drawn via-ROM array, and
   both processes run open shuttles. That measures the column datapath, the
   ROM cell, and the personalization flow end to end, at 130 nm.
-* **Timing: partly.** yosys gives area; the clock needs OpenSTA or a full
-  OpenROAD flow, which is the next step. Expect 100 to 200 MHz at 130 nm and
-  scale from there.
+* **Timing: yes, pre-layout.** OpenSTA builds from source in a few minutes
+  and times the yosys netlist against the same liberty files. See the next
+  section for the numbers and what they do and do not include.
 * **The production die: no.** At 130 nm the ROM cell is 30 to 50 times larger
   than at 28 nm, so the 9B layer die would be several thousand square
   millimetres. The production node needs a foundry PDK under NDA.
@@ -218,6 +223,70 @@ wordlines with the activation as a pulse width, sum bitline currents, and
 digitize once per column. That removes the column datapath entirely and is
 the only path well below 0.15 µm² per coefficient, at the cost of analog
 precision risk. It is a second-generation experiment.
+
+## Timing on 130 nm and 7 nm
+
+`fabric/sta.py` runs OpenSTA on a netlist written by `fabric/synth.py`
+(`--target-ps` for timing-driven mapping, `--netlist` to keep it), with a
+clock constraint and ten percent input and output delays:
+
+```bash
+python -m fabric.synth --liberty sky130.lib --rows 256 --cols 16 --rows-per-cycle 2 \
+    --target-ps 2500 --netlist net_sky130.v
+python -m fabric.sta --sta /path/to/OpenSTA/build/sta --liberty sky130.lib \
+    --netlist net_sky130.v --period-ps 2500 --report
+```
+
+Results for the column datapath at two rows per cycle, typical corner:
+
+| Library | Critical path | Of which unbuffered fanout | Logic-depth limit |
+| --- | ---: | ---: | ---: |
+| sky130 HD, 130 nm | 4.25 ns | 1.4 ns (80-load flop) | 235 MHz, ~310 MHz buffered |
+| ASAP7, 7 nm predictive | 0.73 ns | 0.14 ns (52-load flop) | 1.37 GHz, ~1.7 GHz buffered |
+
+What these numbers are: post-synthesis, pre-layout, no wire load, no clock
+tree, ideal clock, one corner, and no cell sizing or buffering beyond what
+ABC does inside one combinational block. Flop-driven nets are not buffered,
+so the first line of every critical path is a fat unbuffered fanout that
+place-and-route would fix; the "buffered" column subtracts it and charges a
+buffer tree instead. ASAP7 maps to its smallest cells throughout, so it is
+pessimistic in the other direction. Budget 20 to 40 percent on top for wires.
+
+Read across the nodes: 130 nm at roughly 300 MHz and predictive 7 nm at
+roughly 1.7 GHz bracket a 28 nm-class part somewhere around 0.6 to 1.2 GHz
+for this logic depth. The 800 MHz placeholder is inside that range, not
+proven by it. The MPW tile and a foundry library settle it.
+
+Getting here changed the design, and every change was driven by a reported
+critical path:
+
+1. **Requantizer multiplier per column** (3000 cells per column): made one
+   shared unit that walks the columns after the pass.
+2. **41-bit ripple-carry adds** in the requantizer at 6 to 9 ns on sky130:
+   yosys emits ripple adders and ABC cannot restructure carry chains, so the
+   multiply became a carry-save tree with the rounding constant folded in and
+   the final add runs in three 14-bit chunks over three stages.
+3. **Column select fanout** (`q_col` on 600 accumulator mux bits): replaced by
+   a one-hot walking select, 69 loads per bit regardless of column count.
+4. **Control strobes** merged back into one 600-load net by synthesis even
+   with `keep`: the per-column copies are now their own module with
+   `keep_hierarchy`.
+5. **Pre-adders for 3x, 5x, 7x** on the activation path: every coefficient
+   magnitude is now a signed pair of power-of-two taps, so stage A has no
+   arithmetic at all.
+6. **24-bit accumulate and the term sum**, ripple again: both are carry-save.
+   The accumulator is a (sum, carry) pair with a constant-depth 3:2 reduction
+   per cycle; the carries resolve once per pass in the requantizer walk, in
+   two 12-bit chunks. The term sum reduces the four taps and the negation
+   count to a carry-save pair at accumulator width, so no width change and
+   no wrap can occur.
+7. **Datapath resets** removed; `start` loads the accumulators, everything
+   else free-runs, and only control keeps an asynchronous reset.
+
+The column pipeline is now A (inputs), B (term reduction), C (accumulate);
+the requantizer is select, two resolve stages, multiply, three add stages,
+and shift/saturate, nine cycles of latency after the 64-cycle walk. All of
+it stays bit-exact against the Python model, which never changed.
 
 ## RTL
 
@@ -236,8 +305,9 @@ at four rows per cycle, and 4096×16 at full depth.
 
 ## What is next
 
-1. Timing of the column datapath with OpenSTA or OpenROAD on sky130, then on
-   the target library, to replace the 800 MHz placeholder.
+1. Place-and-route of the column datapath with OpenROAD on sky130 or ASAP7 to
+   add wires, buffering and sizing to the pre-layout timing above, then the
+   same on the target library.
 2. A via-ROM compiler cell from the foundry, or a hand-drawn cell for the MPW,
    to replace the ROM area and read energy placeholders.
 3. The GDS writer: `via_coordinates` into the ROM macro's bit-cell grid.

@@ -13,8 +13,9 @@ LLM inference appliance built around the Qwen3.5 dense hybrid geometry.
   coefficient ROM feeding 64 MAC columns. It holds the bit-exact reference
   model, the coefficient compiler and via-pattern export, the model-to-tile
   mapping with area and latency estimates, synthesizable RTL verified
-  against the model with Icarus Verilog, and a yosys flow that measures the
-  column datapath on open liberty files (sky130, IHP SG13G2).
+  against the model with Icarus Verilog, a yosys flow that measures the
+  column datapath on open liberty files (sky130, IHP SG13G2, NanGate 45,
+  ASAP7), and an OpenSTA driver for pre-layout timing.
 * [`clash/`](clash/) contains a synthesizable four-stage ASIC-shard seed with a
   deliberately small fixed-coefficient datapath for early RTL and P&R work.
 * [`sim/`](sim/) contains the cycle-stepped 32-stage appliance simulator for

@@ -104,18 +104,10 @@ module tb_fabric_tile #(
             $finish;
         end
 
-        errors = 0;
-        for (i = 0; i < COLS; i = i + 1) begin
-            if (psum_out[i*ACC +: ACC] !== epsum[i]) begin
-                errors = errors + 1;
-                if (errors <= 5)
-                    $display("psum mismatch col %0d: got %h expected %h", i, psum_out[i*ACC +: ACC], epsum[i]);
-            end
-        end
-
-        // The shared requantizer walks the columns after done.
+        // The shared requantizer walks the columns after done; resolved
+        // partial sums and requantized outputs are both valid at q_valid.
         guard = 0;
-        while (!seen_q_valid && guard < COLS + 4) begin
+        while (!seen_q_valid && guard < COLS + 16) begin
             @(posedge clk);
             #1;
             guard = guard + 1;
@@ -123,6 +115,14 @@ module tb_fabric_tile #(
         if (!seen_q_valid) begin
             $display("FAIL: q_valid never asserted");
             $finish;
+        end
+        errors = 0;
+        for (i = 0; i < COLS; i = i + 1) begin
+            if (psum_out[i*ACC +: ACC] !== epsum[i]) begin
+                errors = errors + 1;
+                if (errors <= 5)
+                    $display("psum mismatch col %0d: got %h expected %h", i, psum_out[i*ACC +: ACC], epsum[i]);
+            end
         end
         for (i = 0; i < COLS; i = i + 1) begin
             if (q_out[i*AB +: AB] !== eq[i]) begin

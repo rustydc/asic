@@ -104,10 +104,12 @@ coefficient. A mask-programmed bit read by a wordline is what lets the
 arithmetic be shared, and a via ROM is denser than wiring or SRAM in any case.
 Each of the ten chips is therefore the same base mask set plus one via mask.
 
-A 9B layer die maps to 3306 tiles at 99.9 percent utilization, about 200 mm²
+A 9B layer die maps to 3306 tiles at 99.9 percent utilization, about 240 mm²
 at a 28 nm-class node with the ROM cell still a placeholder and the MAC
 columns calibrated by open-tooling synthesis on four libraries from 130 nm
-to a predictive 7 nm. A layer is four sequential passes of 2048 cycles, 10.2 µs at
+to a predictive 7 nm. Pre-layout static timing of the column on sky130 and
+ASAP7 brackets the 28 nm clock at roughly 0.6 to 1.2 GHz; the 800 MHz
+assumption sits inside that range. A layer is four sequential passes of 2048 cycles, 10.2 µs at
 800 MHz. The head die is 1940 tiles.
 
 The gating physical-design experiment is a tile on the candidate PDK, and it

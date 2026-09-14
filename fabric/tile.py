@@ -341,19 +341,22 @@ class DensityModel:
     """Area, clock, and energy estimates (28 nm class).
 
     The MAC-column numbers are calibrated from open-tooling synthesis of
-    ``fabric_columns`` (``fabric/synth.py``) on four libraries: sky130 HD,
-    IHP SG13G2, NanGate 45 and ASAP7.  Divided by each library's NAND2 area
-    the column costs agree within a few percent: about 700 NAND2 equivalents
-    per column plus 330 per rows-per-cycle bank.  At a 28 nm NAND2 of about
-    0.30 um2 that is 210 + 100 per bank.  The ROM cell, clock, and energy
-    numbers remain placeholders for the MPW tile.
+    ``fabric_columns`` (``fabric/synth.py``).  Across sky130 HD, IHP SG13G2,
+    NanGate 45 and ASAP7 the column cost, divided by each library's NAND2
+    area, agrees within a few percent.  For the timing-clean column (carry-
+    save accumulate, signed-digit taps, pipelined shared requantizer) a full
+    64-column tile on sky130 costs 1663, 2050 and 2808 NAND2 equivalents per
+    column at 1, 2 and 4 rows per cycle: about 1280 per column plus 380 per
+    bank.  At a 28 nm NAND2 of about 0.30 um2 that is 385 + 115 per bank.
+    The ROM cell, clock, and energy numbers remain placeholders for the MPW
+    tile.
     """
 
     node: str = "28nm-class estimate"
     nand2_um2: float = 0.30                 # 28 nm-class NAND2 area used for the column scaling
     rom_um2_per_bit: float = 0.03           # via-programmed ROM bit cell incl. array overhead (placeholder)
-    mac_um2_per_column_per_bank: float = 100.0   # 330 NAND2-eq: 8:1 multiple select + add/sub per bank
-    acc_um2_per_column: float = 210.0       # 700 NAND2-eq: accumulator, shared requantizer share, output register
+    mac_um2_per_column_per_bank: float = 115.0   # 380 NAND2-eq: tap select, one's complement, CSA per bank
+    acc_um2_per_column: float = 385.0       # 1280 NAND2-eq: carry-save accumulator, requantizer share, registers
     tile_overhead_um2: float = 2500.0       # multiples generator, ROM periphery, control per tile (placeholder)
     clock_mhz: float = 800.0
     rom_fj_per_bit: float = 3.0

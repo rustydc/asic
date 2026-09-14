@@ -12,7 +12,8 @@ from pathlib import Path
 
 import tempfile
 
-from fabric.synth import merge_liberty, nand2_area, parse_stat, synthesize
+from fabric.sta import parse_report
+from fabric.synth import filter_liberty, merge_liberty, nand2_area, parse_stat, synthesize
 
 LIBERTY = os.environ.get("FABRIC_LIBERTY")
 HAVE_YOSYS = shutil.which("yosys") or shutil.which("yowasp-yosys")
@@ -55,6 +56,36 @@ class ParseTest(unittest.TestCase):
             path = Path(directory) / "a.lib"
             path.write_text(LIB_A, encoding="utf-8")
             self.assertEqual(nand2_area(path), 0.798)
+
+    def test_filter_liberty_removes_matching_cells(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            src = Path(directory) / "a.lib"
+            src.write_text(LIB_A.replace("INV_X1", "sky130_fd_sc_hd__lpflow_lsbuf_1"), encoding="utf-8")
+            removed = filter_liberty(src, Path(directory) / "f.lib")
+            text = (Path(directory) / "f.lib").read_text(encoding="utf-8")
+        self.assertEqual(removed, 1)
+        self.assertIn("cell (NAND2_X1)", text)
+        self.assertNotIn("lpflow", text)
+
+    def test_parse_sta_report_reads_clock_group_slack(self) -> None:
+        report = """
+Startpoint: rst_n (input port clocked by clk)
+Endpoint: _1_ (recovery check against rising-edge clock clk)
+Path Group: asynchronous
+                                     2.478   slack (MET)
+Startpoint: _36191_ (rising edge-triggered flip-flop clocked by clk)
+Endpoint: _35376_ (rising edge-triggered flip-flop clocked by clk)
+Path Group: clk
+                                  4383.052   data arrival time
+                                  2441.106   data required time
+                                  -1941.946   slack (VIOLATED)
+"""
+        result = parse_report(report, 2500.0)
+        self.assertEqual(result.startpoint, "_36191_")
+        self.assertEqual(result.endpoint, "_35376_")
+        self.assertAlmostEqual(result.worst_slack_ps, -1941.946)
+        self.assertAlmostEqual(result.critical_path_ps, 4383.052)
+        self.assertAlmostEqual(result.max_frequency_mhz, 1e6 / (2500.0 + 1941.946))
 
     def test_parse_stat_reads_cells_area_and_flops(self) -> None:
         log = """
