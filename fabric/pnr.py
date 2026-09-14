@@ -58,6 +58,7 @@ class Platform:
     dont_use: tuple[str, ...] = ()     # the flow scripts' DONT_USE_CELLS, applied to the resizer
     pin_length_um: float = 0.0         # I/O pin stub length (0 = platform default)
     pin_exclude: tuple[str, ...] = ()  # place_pins -exclude regions, e.g. "left:*"
+    merge_lef_ports: bool = False      # rewrite multi-PORT pins in the cell LEF (see merge_pin_ports)
 
 
 PLATFORMS = {
@@ -82,6 +83,7 @@ PLATFORMS = {
                     "sky130_fd_sc_hd__fill_4", "sky130_fd_sc_hd__fill_8"),
         vdd_volts=1.8,
         dont_use=("sky130_fd_sc_hd__probe_p_8", "sky130_fd_sc_hd__probec_p_8", "sky130_fd_sc_hd__lpflow_*"),
+        merge_lef_ports=True,
     ),
     "asap7": Platform(
         name="asap7",
@@ -90,7 +92,7 @@ PLATFORMS = {
         lib="",   # ASAP7 splits its liberty; pass the merged file with --liberty
         site="asap7sc7p5t",
         pin_layer_h="M4", pin_layer_v="M5",
-        min_route_layer="M2", max_route_layer="M7", min_clock_layer="M4", route_adjustment=0.5,
+        min_route_layer="M2", max_route_layer="M7", min_clock_layer="M4", route_adjustment=0.25,
         cts_buffer="BUFx4_ASAP7_75t_R",
         tracks_script="asap7/openRoad/make_tracks.tcl",
         rc_script="asap7/setRC.tcl",
@@ -139,6 +141,32 @@ class PnrResult:
         return asdict(self)
 
 
+def merge_pin_ports(text: str) -> tuple[str, int]:
+    """Merge a LEF pin's several PORT groups into one.
+
+    A few sky130 pins (xor2 B, dfrtp RESET_B, mux, fa) declare their li1 and
+    met1 shapes as separate PORTs.  TritonRoute in the litex-hub build then
+    counts more nodes than pins for nets whose ports straddle a gcell boundary
+    and stops with "initial #node != #rpin".  The ports of one pin are
+    internally connected, so one PORT with all the shapes routes the same.
+    Returns the rewritten text and the number of pins changed.
+    """
+    count = 0
+
+    def merge(match: re.Match) -> str:
+        nonlocal count
+        name, body = match.group(1), match.group(2)
+        ports = re.findall(r"^    PORT\n(.*?)^    END\n", body, re.S | re.M)
+        if len(ports) <= 1:
+            return match.group(0)
+        count += 1
+        head = re.sub(r"^    PORT\n.*?^    END\n", "", body, flags=re.S | re.M)
+        return f"  PIN {name}\n{head}    PORT\n{''.join(ports)}    END\n  END {name}\n"
+
+    merged = re.sub(r"^  PIN (\S+)\n(.*?)^  END \1\n", merge, text, flags=re.S | re.M)
+    return merged, count
+
+
 def filter_pdn_script(text: str) -> str:
     """Keep the global connections, voltage domain and standard-cell grid of a
     platform PDN strategy; drop the macro grids (there are none here) and the
@@ -158,7 +186,16 @@ def write_flow(work: Path, platform: Platform, platforms_dir: Path, netlist: Pat
                *, top: str, period_ps: float, utilization: float, detailed_route: bool, threads: int,
                place_density: float = 0.5) -> Path:
     p = platforms_dir.resolve()
-    lef_reads = [f"read_lef {p / platform.tech_lef}"] + [f"read_lef {p / lef}" for lef in platform.cell_lefs]
+    cell_lefs = []
+    for lef in platform.cell_lefs:
+        source = p / lef
+        if platform.merge_lef_ports:
+            merged, count = merge_pin_ports(source.read_text(encoding="utf-8", errors="ignore"))
+            target = work / f"merged_ports_{source.name}"
+            target.write_text(merged, encoding="utf-8")
+            source = target.resolve()
+        cell_lefs.append(source)
+    lef_reads = [f"read_lef {p / platform.tech_lef}"] + [f"read_lef {lef}" for lef in cell_lefs]
     lib_reads = [f"read_liberty {Path(l).resolve()}" for l in liberties]
     period_lib = period_ps / platform.time_unit_ps     # SDC in library time units
     io_delay = period_lib * 0.1
@@ -261,7 +298,7 @@ def write_flow(work: Path, platform: Platform, platforms_dir: Path, netlist: Pat
         # router will use (without it, sky130 xor2 B pins end up outside their
         # guides and TritonRoute rejects the nets).
         f"pin_access -bottom_routing_layer {platform.min_route_layer} -top_routing_layer {platform.max_route_layer}",
-        "global_route -congestion_iterations 50 -allow_congestion -verbose",
+        "global_route -congestion_iterations 100 -allow_congestion -verbose",
         "estimate_parasitics -global_routing",
         "repair_timing -setup",
         # The post-route repair inserts buffers that are not legalized; legalize
@@ -269,7 +306,7 @@ def write_flow(work: Path, platform: Platform, platforms_dir: Path, netlist: Pat
         "detailed_placement",
         "check_placement",
         f"pin_access -bottom_routing_layer {platform.min_route_layer} -top_routing_layer {platform.max_route_layer}",
-        "global_route -congestion_iterations 50 -allow_congestion -verbose",
+        "global_route -congestion_iterations 100 -allow_congestion -verbose",
         "estimate_parasitics -global_routing",
         # All reports go to the log; older builds ignore `> file` on some of them.
         "puts {--- timing on global-route parasitics ---}",

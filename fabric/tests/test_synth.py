@@ -12,7 +12,7 @@ from pathlib import Path
 
 import tempfile
 
-from fabric.pnr import PLATFORMS, filter_pdn_script, parse_results
+from fabric.pnr import PLATFORMS, filter_pdn_script, merge_pin_ports, parse_results
 from fabric.sta import parse_report
 from fabric.synth import filter_liberty, map_ties, merge_liberty, nand2_area, parse_stat, synthesize
 
@@ -67,6 +67,27 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(removed, 1)
         self.assertIn("cell (NAND2_X1)", text)
         self.assertNotIn("lpflow", text)
+
+    def test_merge_pin_ports_joins_multi_port_pins(self) -> None:
+        lef = "\n".join([
+            "MACRO xor2", "  CLASS CORE ;",
+            "  PIN B", "    DIRECTION INPUT ;", "    USE SIGNAL ;",
+            "    PORT", "      LAYER li1 ;", "        RECT 1 1 2 2 ;", "    END",
+            "    PORT", "      LAYER met1 ;", "        RECT 1 1 4 2 ;", "    END",
+            "  END B",
+            "  PIN Y", "    DIRECTION OUTPUT ;",
+            "    PORT", "      LAYER li1 ;", "        RECT 5 1 6 2 ;", "    END",
+            "  END Y",
+            "END xor2", ""])
+        merged, count = merge_pin_ports(lef)
+        self.assertEqual(count, 1)
+        pin_b = merged[merged.index("  PIN B"):merged.index("  END B")]
+        self.assertEqual(pin_b.count("    PORT\n"), 1)
+        self.assertEqual(pin_b.count("    END\n"), 1)
+        self.assertIn("LAYER li1", pin_b)
+        self.assertIn("LAYER met1", pin_b)
+        self.assertIn("DIRECTION INPUT", pin_b)
+        self.assertIn("  PIN Y\n    DIRECTION OUTPUT ;\n    PORT\n", merged)   # untouched
 
     def test_filter_pdn_script_keeps_stdcell_grid_only(self) -> None:
         script = "\n".join([
