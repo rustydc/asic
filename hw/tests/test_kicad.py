@@ -1,3 +1,4 @@
+import copy
 import re
 import tempfile
 import unittest
@@ -29,30 +30,69 @@ class KicadGeneratorTest(unittest.TestCase):
         cls.board = Board.load()
         cls.design = kg.build_design(cls.board)
 
-    def test_every_component_is_placed_on_the_card(self) -> None:
+    def physical_boxes(self, design):
+        boxes = []
+        for part in design.parts:
+            if part.body_w == 0:
+                continue
+            x, y = design.physical_xy(part)
+            w, h = design.physical_extent(part)
+            boxes.append((part.ref, x - w / 2, y - h / 2, x + w / 2, y + h / 2))
+        return boxes
+
+    def test_every_component_is_placed_on_the_board(self) -> None:
         refs = {part.ref for part in self.design.parts}
         for ref in self.board.components:
             self.assertIn(ref, refs)
+        ff = self.design.form_factor
+        self.assertEqual(ff.key, "1u")
+        for ref, x0, y0, x1, y1 in self.physical_boxes(self.design):
+            self.assertGreaterEqual(x0, 0.0, ref)
+            self.assertLessEqual(x1, ff.width, ref)
+            self.assertGreaterEqual(y0, 0.0, ref)
+            self.assertLessEqual(y1, ff.depth, ref)
+
+    def test_chassis_keepouts_hold_only_their_connectors(self) -> None:
+        ff = self.design.form_factor
+        allowed = {"psu_input", "fan_header", "host_cable", "rj45", "sfp_cage"}
         for part in self.design.parts:
-            if part.body_w == 0:
+            if part.body_w == 0 or part.part_class in allowed:
                 continue
-            bw, bh = (part.body_h, part.body_w) if part.rotation in (90, 270) else (part.body_w, part.body_h)
-            self.assertGreaterEqual(part.x - bw / 2, 0.0, part.ref)
-            self.assertLessEqual(part.x + bw / 2, kg.CARD_LENGTH, part.ref)
-            self.assertGreaterEqual(part.y - bh / 2, 0.0, part.ref)
-            self.assertLessEqual(part.y + bh / 2, kg.CARD_HEIGHT, part.ref)
+            x, y = self.design.physical_xy(part)
+            w, h = self.design.physical_extent(part)
+            for name, (kx0, ky0, kx1, ky1) in ff.keepouts:
+                inside = x - w / 2 < kx1 and kx0 < x + w / 2 and y - h / 2 < ky1 and ky0 < y + h / 2
+                self.assertFalse(inside, f"{part.ref} in {name}")
+        # The connectors sit on the edges they serve.
+        self.assertLess(self.design.part("J_HOST").y, 12.0)
+        self.assertTrue(all(self.design.part(f"J_FAN{k}").y > 340.0 for k in range(6)))
+        self.assertTrue(all(self.design.part(f"J_PSU{k}").x > 273.0 for k in range(2)))
+        with self.assertRaises(ValueError):
+            moved = kg.build_design(self.board)
+            moved.part("U_BMC").x = 350.0
+            kg.check_fit(moved)
 
     def test_no_two_bodies_overlap(self) -> None:
-        boxes = []
-        for part in self.design.parts:
-            if part.body_w == 0:
-                continue
-            bw, bh = (part.body_h, part.body_w) if part.rotation in (90, 270) else (part.body_w, part.body_h)
-            boxes.append((part.ref, part.x - bw / 2, part.y - bh / 2, part.x + bw / 2, part.y + bh / 2))
+        boxes = self.physical_boxes(self.design)
         for i, (ra, ax0, ay0, ax1, ay1) in enumerate(boxes):
             for rb, bx0, by0, bx1, by1 in boxes[i + 1:]:
                 overlap = ax0 < bx1 and bx0 < ax1 and ay0 < by1 and by0 < ay1
                 self.assertFalse(overlap, f"{ra} overlaps {rb}")
+
+    def test_pcie_card_form_factor_still_builds_at_the_card_rating(self) -> None:
+        data = copy.deepcopy(self.board.data)
+        data["board"]["form_factor_key"] = "pcie_card"
+        data["package_selection"]["rated_tokens_per_second"] = 14_500
+        design = kg.build_design(Board(data))
+        self.assertEqual(design.form_factor.key, "pcie_card")
+        self.assertEqual(design.pinout.package.name, "FCBGA784_28x28_P0.8")
+        self.assertTrue(all(hi <= kg.MAX_LINK_MM for _, hi in design.hop_lengths.values()), design.hop_lengths)
+        self.assertIn("J_PCIE", {p.ref for p in design.parts})
+        boxes = self.physical_boxes(design)
+        for ref, x0, y0, x1, y1 in boxes:
+            self.assertGreaterEqual(x0, 0.0, ref)
+            self.assertLessEqual(x1, design.form_factor.width, ref)
+            self.assertLessEqual(y1, design.form_factor.depth, ref)
 
     def test_ring_is_fully_routed_within_the_link_limit(self) -> None:
         hops = kg.ring_hops(self.board)

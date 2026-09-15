@@ -24,12 +24,15 @@ class PinoutTest(unittest.TestCase):
         self.assertEqual(need.total, need.signal_balls + need.signal_grounds + 2 * need.core_balls + sum(need.rail_balls.values()))
 
     def test_smallest_sufficient_package_is_selected(self) -> None:
-        # 400 balls cannot carry 54 A of core plus 216 signals; the 784-ball 23 mm package can.
-        self.assertEqual(self.pinout.package.name, "FCBGA784_28x28_P0.8")
-        self.assertTrue(any(name == "FCBGA400_20x20_P1.0" for name, _ in self.pinout.rejected))
-        larger = pinout.derive(self.board, rated_tokens_per_second=50_000)
-        self.assertGreater(larger.package.balls, self.pinout.package.balls)
-        self.assertGreater(larger.requirements.core_balls, 3 * self.pinout.requirements.core_balls)
+        # At the 50K tokens/s rating the core needs 354 balls each of power and ground;
+        # only the 1225-ball 29 mm package carries that.  The 784-ball 23 mm package is
+        # enough at the 14.5K design point, and 400 balls never are.
+        self.assertEqual(self.pinout.package.name, "FCBGA1225_35x35_P0.8")
+        self.assertTrue(any(name == "FCBGA784_28x28_P0.8" for name, _ in self.pinout.rejected))
+        smaller = pinout.derive(self.board, rated_tokens_per_second=14_500)
+        self.assertEqual(smaller.package.name, "FCBGA784_28x28_P0.8")
+        self.assertTrue(any(name == "FCBGA400_20x20_P1.0" for name, _ in smaller.rejected))
+        self.assertGreater(self.pinout.requirements.core_balls, 3 * smaller.requirements.core_balls)
 
     def test_ball_map_places_every_signal_once_in_the_outer_rows(self) -> None:
         p = self.pinout.package
@@ -44,7 +47,7 @@ class PinoutTest(unittest.TestCase):
         self.assertEqual({b.col for b in link_in}, {0, 1})
         rows = sorted({b.row for b in link_in})
         self.assertEqual(rows, list(range(rows[0], rows[0] + 18)))
-        self.assertAlmostEqual(rows[0] + 8.5, (p.rows - 1) / 2)          # centred on the edge
+        self.assertLessEqual(abs(rows[0] + 8.5 - (p.rows - 1) / 2), 0.5)   # centred on the edge
         self.assertTrue(all(b.escape == ("W", b.col) for b in link_in))
         self.assertTrue(all(b.escape == ("E", p.cols - 1 - b.col) for b in balls if b.interface == "link_out"))
         memory = [b for b in balls if b.interface.startswith("lpddr")]

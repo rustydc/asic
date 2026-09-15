@@ -340,9 +340,9 @@ class Board:
                              f'y2="{y + (0 if index == 0 else box_h)}" stroke="#2a7a2a" stroke-width="2"/>')
         # Boxes.
         fx, fy = pos["U_FPGA"]
-        box("U_FPGA", fx, fy, box_w, box_h + 20, "#fff2cc", "U_FPGA", "PCIe Gen4 x8")
+        box("U_FPGA", fx, fy, box_w, box_h + 20, "#fff2cc", "U_FPGA", "PCIe Gen4 x8 (cable)")
         parts.append(f'<rect x="{fx - 40}" y="{fy + 10}" width="30" height="60" fill="#ddd" stroke="#333"/>')
-        parts.append(f'<text x="{fx - 25}" y="{fy + 44}" text-anchor="middle" font-size="9" transform="rotate(-90 {fx - 25} {fy + 44})">PCIe edge</text>')
+        parts.append(f'<text x="{fx - 25}" y="{fy + 44}" text-anchor="middle" font-size="9" transform="rotate(-90 {fx - 25} {fy + 44})">host cable</text>')
         parts.append(f'<rect x="{fx + box_w + 12}" y="{fy + 52}" width="56" height="18" fill="#eee" stroke="#333"/>')
         parts.append(f'<text x="{fx + box_w + 40}" y="{fy + 65}" text-anchor="middle" font-size="9">DDR4 x64</text>')
         parts.append(f'<line x1="{fx + box_w}" y1="{fy + 61}" x2="{fx + box_w + 12}" y2="{fy + 61}" stroke="#333"/>')

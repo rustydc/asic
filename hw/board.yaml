@@ -7,16 +7,18 @@
 
 board:
   name: asic-llm-appliance-a0
-  form_factor: PCIe CEM full-length (312 mm), full-height, dual-slot, passive heatsink + blower
-  host_interface: PCIe Gen4 x8 (x4 electrically sufficient; see hw/README.md)
+  form_factor: 1U rack chassis, one 420 x 360 mm board, host-attached over a PCIe cable, front-to-back fans, redundant CRPS
+  form_factor_key: 1u          # selects the enclosure model in hw/kicad_gen.py (1u or pcie_card)
+  host_interface: PCIe Gen4 x8 over a SlimSAS 8i cable to a host adapter card (x4 electrically sufficient; see hw/README.md)
   power_input:
-    - {name: PCIe slot 12 V, watts: 66}
-    - {name: 12V-2x6 (12VHPWR) aux 12 V, watts: 600}
-  # The auxiliary connector follows from the energy model below: at the
-  # simulator's 14.5K tokens/s ceiling and 3 pJ per MAC the ASICs alone draw
-  # about 390 W, so the two 8-pin connectors of the first draft (300 W) are
-  # not enough.  A 7 nm-class die at ~1 pJ/MAC would bring the board back
-  # under one 8-pin connector.
+    # Two CRPS modules in a 1+1 redundant pair; one carries the whole load, so
+    # the available input is one module's rating.  2000 W covers the 50K
+    # tokens/s row of the power table with margin for the fans and the BMC.
+    - {name: CRPS 12 V, 1+1 redundant pair (two 2000 W modules), watts: 2000}
+  # The chassis follows from the energy model below: at 3 pJ per MAC the
+  # board draws 0.5 to 1.6 kW of input across the throughput range, which is
+  # a rack power supply, not a slot.  A 7 nm-class die at ~1 pJ/MAC would
+  # bring the whole range under 600 W and make a PCIe card viable again.
 
 # Energy model for the ASICs.  Dynamic power is throughput times energy per
 # token; the per-MAC energy is the one number measured so far (0.39 pJ on
@@ -37,7 +39,7 @@ power_model:
 # outer `signal_rows` rows, and the smallest candidate that satisfies all of
 # that wins.  The KiCad generator uses the same derived map.
 package_selection:
-  rated_tokens_per_second: 14500
+  rated_tokens_per_second: 50000   # the 1U carries the 50K target; the package is rated for it
   amps_per_ball: 0.5
   signals_per_ground: 4
   signal_rows: 3
@@ -54,7 +56,7 @@ package_selection:
 part_classes:
   layer_asic:
     description: fixed-weight 4-layer shard die (personalized coefficient masks)
-    package: FCBGA, derived by hw/pinout.py from package_selection (28x28 at 0.8 mm, 23 mm at the design point)
+    package: FCBGA, derived by hw/pinout.py from package_selection (35x35 at 0.8 mm, 29 mm at the 50K rating)
     rails: [VDD_CORE, VDD_IO_1V8, VDD_PLL_0V9, VDD2H_1V05, VDDQ_0V3]
     static_w: 3
     macs_per_token: 866000000
@@ -116,13 +118,33 @@ part_classes:
     rails: [VDD_IO_1V8]
     tdp_w: 0.5
   sfp_cage:
-    description: SFP+ cage on the bracket for standalone 10GbE operation (optional fit)
+    description: SFP+ cage on the rear panel for standalone 10GbE operation (optional fit)
     rails: [VDD_3V3]
     tdp_w: 1.5
+  host_cable:
+    description: SlimSAS 8i (SFF-8654) receptacle, PCIe Gen4 x8 plus sideband, to a host adapter card
+    rails: []
+    tdp_w: 0
+  bmc:
+    description: baseboard management controller (AST2600 class) with its own Ethernet, fans, PSU PMBus, FPGA UART
+    rails: [VDD_3V3]
+    tdp_w: 5
+  rj45:
+    description: BMC management Ethernet, rear panel
+    rails: [VDD_3V3]
+    tdp_w: 0.5
+  psu_input:
+    description: CRPS 12 V output blade receptacle (one per module) with PMBus and enable
+    rails: []
+    tdp_w: 0
+  fan_header:
+    description: 4-pin PWM fan header, one per 40 mm front fan
+    rails: []
+    tdp_w: 12
 
 # Instances.
 components:
-  U_FPGA: {class: fpga, place: bracket end}
+  U_FPGA: {class: fpga, place: rear, beside the host connector}
   U_A0: {class: layer_asic, layers: "0-3",   place: "row A, col 0"}
   U_A1: {class: layer_asic, layers: "4-7",   place: "row A, col 1"}
   U_A2: {class: layer_asic, layers: "8-11",  place: "row A, col 2"}
@@ -131,8 +153,8 @@ components:
   U_A5: {class: layer_asic, layers: "20-23", place: "row B, col 2"}
   U_A6: {class: layer_asic, layers: "24-27", place: "row B, col 1"}
   U_A7: {class: layer_asic, layers: "28-31", place: "row B, col 0"}
-  U_H0: {class: head_asic, vocab_rows: "0-124159",      place: bracket end}
-  U_H1: {class: head_asic, vocab_rows: "124160-248319", place: bracket end}
+  U_H0: {class: head_asic, vocab_rows: "0-124159",      place: under the FPGA, row B}
+  U_H1: {class: head_asic, vocab_rows: "124160-248319", place: under the FPGA, row B}
   U_M0a: {class: lpddr5x}
   U_M0b: {class: lpddr5x}
   U_M1a: {class: lpddr5x}
@@ -154,7 +176,18 @@ components:
   U_D2: {class: ddr4}
   U_D3: {class: ddr4}
   U_CLK: {class: clock_gen}
+  U_BMC: {class: bmc}
+  J_HOST: {class: host_cable}
   J_SFP: {class: sfp_cage}
+  J_BMC_NET: {class: rj45}
+  J_PSU0: {class: psu_input}
+  J_PSU1: {class: psu_input}
+  J_FAN0: {class: fan_header}
+  J_FAN1: {class: fan_header}
+  J_FAN2: {class: fan_header}
+  J_FAN3: {class: fan_header}
+  J_FAN4: {class: fan_header}
+  J_FAN5: {class: fan_header}
 
 # Point-to-point buses. `link` is the activation ring; each hop is one
 # source-synchronous parallel link (see interface_kinds).
@@ -244,10 +277,10 @@ interface_kinds:
   uart:
     signals: {pins: 2}
 
-# Power tree: 12 V intermediate bus from the slot and aux connector, then
-# point-of-load regulators.  Currents are placeholders derived from tdp_w.
+# Power tree: 12 V intermediate bus from the two CRPS modules (ORed inside
+# the modules), then point-of-load regulators.
 power_tree:
-  input_bus: 12 V (slot + 8-pin aux, ORed with ideal-diode controllers)
+  input_bus: 12 V from two CRPS modules, 1+1 redundant, PMBus to the BMC
   regulator_efficiency: 0.85
   rails:
     VDD_CORE:    {volts: 0.80, per: [layer_asic, head_asic], note: one multiphase PoL buck per ASIC, PMBus; ~50 A each at the design point, ~170 A at 50K tokens/s (from power_model)}
@@ -265,7 +298,7 @@ power_tree:
     MGTAVTT:     {volts: 1.20, per: [fpga]}
     VDD_1V2:     {volts: 1.20, shared: true, note: DDR4}
     VPP_2V5:     {volts: 2.50, shared: true, note: DDR4}
-    VDD_3V3:     {volts: 3.30, shared: true, note: SFP, EEPROM, LEDs, misc}
+    VDD_3V3:     {volts: 3.30, shared: true, note: SFP, BMC, EEPROM, LEDs, misc}
 
 # Board-level housekeeping not tied to a part class.
 misc:
@@ -273,5 +306,6 @@ misc:
   - two I2C temperature sensors near ASIC rows plus per-ASIC thermal diode via mgmt SPI
   - PMBus on VDD_CORE regulators for per-ASIC current telemetry
   - FPGA config QSPI flash, JTAG header, UART debug header
-  - fan/blower PWM and tach header
-  - status LEDs on bracket
+  - six 40 mm fan headers, PWM and tach to the BMC
+  - BMC: PSU PMBus, fan control, thermal, FPGA UART console, its own RJ45
+  - status LEDs on the rear panel

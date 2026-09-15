@@ -224,9 +224,11 @@ capacity and bandwidth before architecture freeze.
 The FPGA owns PCIe Gen4 (x8 wired, x4 sufficient) and 4 GB of DDR4 for the
 embedding table and context metadata. Power-over-Ethernet cannot supply a
 board that draws hundreds of watts, and PCIe gives lower host latency than a
-network hop, so the first board is a PCIe card with a 12V-2x6 auxiliary
-connector and an optional SFP+ cage for a later standalone mode (see
-`hw/README.md`).
+network hop, so the first board is a host-attached 1U: one board in a rack
+chassis with redundant CRPS supplies and a BMC, reached over a SlimSAS PCIe
+cable from the host, with an optional SFP+ cage for a later standalone mode
+(see `hw/README.md`). The energy model moved it out of a PCIe slot: at 3 pJ
+per MAC the board draws 0.5 to 1.6 kW across the throughput range.
 
 The FPGA owns the host protocol, scheduling, sampling, context allocation,
 bring-up, telemetry, error recovery, and performance counters. Speculative
