@@ -128,13 +128,27 @@ class SimulationTest(unittest.TestCase):
         for config in loaded.values():
             config.validate()
         hbm = [name for name in loaded if "hbm" in name]
-        self.assertEqual(len(hbm), 2)
+        self.assertEqual(len(hbm), 5)
         for name in hbm:
             # HBM configurations: faster fabric, int4 KV at 16:1, far more bandwidth and contexts.
             self.assertLess(loaded[name].recurrent_cycles, loaded["baseline"].recurrent_cycles)
             self.assertGreater(loaded[name].memory_bytes_per_cycle, 10 * loaded["baseline"].memory_bytes_per_cycle)
             self.assertGreater(loaded[name].resident_contexts, loaded["baseline"].resident_contexts)
             self.assertLess(loaded[name].mac_energy_pj, loaded["baseline"].mac_energy_pj)
+        # The 27B-class configurations hold two R,R,R,G groups per die, so a global layer every four
+        # layers rather than one per ASIC; the 9B ones keep the default.
+        for name in hbm:
+            config = loaded[name]
+            expected_globals = config.num_layers // (4 if "27b" in name else config.layers_per_asic)
+            self.assertEqual(sum(1 for i in range(config.num_layers) if (i + 1) % config.global_period == 0), expected_globals, name)
+        self.assertEqual(loaded["qwen35_27b_2nm_hbm"].layers_per_asic, 8)
+        self.assertEqual(loaded["qwen35_27b_2nm_hbm"].global_period, 4)
+
+    def test_global_period_must_divide_the_layers_per_asic(self) -> None:
+        with self.assertRaises(ValueError):
+            replace(SMALL, layers_per_asic=4, global_every=3).validate()
+        self.assertEqual(replace(SMALL, layers_per_asic=8).global_period, 8)
+        self.assertEqual(replace(SMALL, layers_per_asic=8, global_every=4).global_period, 4)
 
     def test_board_power_helper_matches_simulation(self) -> None:
         from sim.appliance import board_power_w, energy_per_token_mj

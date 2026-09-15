@@ -99,7 +99,16 @@ class ASICLMConfig:
         values.update(overrides)
         return cls(**values)
 
-    PRESETS = ("qwen3_5_9b", "qwen3_5_4b")
+    @classmethod
+    def qwen3_5_27b(cls, **overrides) -> "ASICLMConfig":
+        """27B-class dense hybrid geometry (Qwen3.5-27B: hidden 5120, 64 layers,
+        FFN 17408, 24 query heads on the same 4 KV heads of 256).  The high-end
+        stand-in until a released 27B checkpoint fixes the exact shapes."""
+        values = dict(hidden_size=5120, num_layers=64, intermediate_size=17_408, num_attention_heads=24)
+        values.update(overrides)
+        return cls(**values)
+
+    PRESETS = ("qwen3_5_9b", "qwen3_5_4b", "qwen3_5_27b")
 
     @classmethod
     def from_preset(cls, name: str, **overrides) -> "ASICLMConfig":

@@ -21,6 +21,7 @@ class ApplianceConfig:
     clock_mhz: float = 500.0
     num_asics: int = 8
     layers_per_asic: int = 4
+    global_every: int = 0                    # a global layer every this many layers; 0 means one per ASIC (its last layer)
     resident_contexts: int = 32
     tokens_per_context: int = 16
     initial_context_tokens: int = 131_072
@@ -63,6 +64,10 @@ class ApplianceConfig:
     static_power_w: float = 70.0             # FPGA, DRAM idle, ASIC leakage/IO, housekeeping
     max_cycles: int = 2_000_000_000
     trace: bool = False
+
+    @property
+    def global_period(self) -> int:
+        return self.global_every or self.layers_per_asic
 
     @property
     def num_layers(self) -> int:
@@ -126,6 +131,8 @@ class ApplianceConfig:
             raise ValueError("energy model values cannot be negative")
         if self.memory_efficiency > 1:
             raise ValueError("memory_efficiency cannot exceed one")
+        if self.global_every < 0 or self.layers_per_asic % self.global_period:
+            raise ValueError("global_every must divide layers_per_asic")
 
     @classmethod
     def from_json(cls, path: str | Path) -> "ApplianceConfig":
@@ -257,7 +264,7 @@ class Simulation:
         self.config = config
         self.cycle = 0
         self.stages = [
-            Stage(i, (i + 1) % config.layers_per_asic == 0, deque())
+            Stage(i, (i + 1) % config.global_period == 0, deque())
             for i in range(config.num_layers)
         ] + [
             Stage(config.num_layers + i, False, deque(), is_head=True)

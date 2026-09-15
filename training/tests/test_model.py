@@ -24,6 +24,10 @@ class GeometryTest(unittest.TestCase):
         self.assertAlmostEqual(four.total / 1e9, 4.21, delta=0.05)
         self.assertAlmostEqual(nine.per_shard / 1e6, 866, delta=5)
         self.assertAlmostEqual(four.per_shard / 1e6, 447, delta=5)
+        # The 27B-class stand-in: hidden 5120, 64 layers, 1.43B coefficients per R,R,R,G group.
+        big = geometry_report(ASICLMConfig.from_preset("qwen3_5_27b"))
+        self.assertAlmostEqual(big.total / 1e9, 25.4, delta=0.1)
+        self.assertAlmostEqual(big.per_shard / 1e6, 1428, delta=10)
         # The stages are balanced within a few percent for both geometries.
         for report in (nine, four):
             self.assertLess(abs(report.recurrent_layer - report.global_layer) / report.recurrent_layer, 0.05)

@@ -41,6 +41,7 @@ LLM inference appliance built around the Qwen3.5 dense hybrid geometry.
 | --- | --- | ---: | ---: | ---: | ---: |
 | `qwen3_5_9b` (default) | Qwen3.5-9B-Base | 4096 | 8 × (3 R + 1 G) | 6.9B | 866M |
 | `qwen3_5_4b` | Qwen3.5-4B-Base | 2560 | 8 × (3 R + 1 G) | 3.6B | 447M |
+| `qwen3_5_27b` | 27B-class stand-in (Qwen3.5-27B shapes) | 5120 | 16 × (3 R + 1 G) | 22.9B | 1.43B per group, two per die |
 
 Both presets share the same recurrent heads (32 value × 16 key, 128-dim),
 attention heads (16 query × 4 KV, 256-dim), and therefore the same per-context
@@ -75,4 +76,5 @@ python -m sim.run --config sim/config/baseline.json     # 9B
 python -m sim.run --config sim/config/qwen35_4b.json    # 4B
 python -m sim.run --config sim/config/qwen35_9b_7nm_hbm.json   # 9B, 7 nm-class die, HBM
 python -m sim.run --config sim/config/qwen35_9b_3nm_hbm.json   # 9B, 3 nm-class die, HBM
+python -m sim.run --config sim/config/qwen35_27b_2nm_hbm.json  # 27B-class, 2 nm-class die, HBM4 (the high end)
 ```
