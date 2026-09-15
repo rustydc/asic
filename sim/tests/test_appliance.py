@@ -85,9 +85,62 @@ class SimulationTest(unittest.TestCase):
         )
         self.assertGreater(latency, interval)
 
+    def test_head_asics_extend_the_ring_without_memory(self) -> None:
+        config = replace(SMALL, num_head_asics=2, head_cycles=3, head_result_bytes=4)
+        simulation = Simulation(config)
+        self.assertEqual(len(simulation.stages), 10)
+        self.assertEqual(len(simulation.links), 3)
+        self.assertTrue(simulation.stages[8].is_head and simulation.stages[9].is_head)
+        result = simulation.run()
+        self.assertEqual(result.completed_tokens, 12)
+        self.assertEqual([stage.counters.accepted for stage in simulation.stages], [12] * 10)
+        self.assertEqual(len(result.memory_bytes_per_asic), config.num_asics)
+        self.assertEqual(simulation.stages[8].counters.memory_bytes, 0)
+        # The head hop carries the hidden vector plus the top-k partial result.
+        self.assertGreater(result.link_utilization[2], result.link_utilization[0])
+        self.assertGreater(result.mean_token_latency_cycles,
+                           Simulation(SMALL).run().mean_token_latency_cycles)
+
     def test_rejects_invalid_configuration(self) -> None:
         with self.assertRaises(ValueError):
             Simulation(replace(SMALL, fifo_depth=0))
+        with self.assertRaises(ValueError):
+            Simulation(replace(SMALL, mac_energy_pj=-1.0))
+
+    def test_energy_model_scales_with_mac_energy_and_throughput(self) -> None:
+        config = replace(SMALL, mac_energy_pj=2.0, layer_macs_per_token=1e9, num_head_asics=2,
+                         head_macs_per_token=5e8, static_power_w=10.0, memory_energy_pj_per_byte=1.0)
+        result = Simulation(config).run()
+        # 2 layer ASICs x 1e9 + 2 head ASICs x 5e8 = 3e9 MACs x 2 pJ = 6 mJ per token.
+        self.assertAlmostEqual(result.compute_energy_per_token_mj, 6.0)
+        self.assertAlmostEqual(result.compute_power_w, 6e-3 * result.aggregate_tokens_per_second)
+        self.assertAlmostEqual(result.layer_asic_power_w, 2e-3 * result.aggregate_tokens_per_second)
+        self.assertGreater(result.memory_power_w, 0.0)
+        self.assertAlmostEqual(result.board_power_w, result.compute_power_w + result.memory_power_w + 10.0)
+        doubled = Simulation(replace(config, mac_energy_pj=4.0)).run()
+        self.assertAlmostEqual(doubled.compute_power_w, 2 * result.compute_power_w)
+        self.assertAlmostEqual(doubled.memory_power_w, result.memory_power_w)
+
+    def test_shipped_configurations_load_and_validate(self) -> None:
+        configs = sorted((Path(__file__).resolve().parents[1] / "config").glob("*.json"))
+        self.assertGreaterEqual(len(configs), 4)
+        loaded = {path.stem: ApplianceConfig.from_json(path) for path in configs}
+        for config in loaded.values():
+            config.validate()
+        hbm = [name for name in loaded if "hbm" in name]
+        self.assertEqual(len(hbm), 2)
+        for name in hbm:
+            # HBM configurations: faster fabric, int4 KV at 16:1, far more bandwidth and contexts.
+            self.assertLess(loaded[name].recurrent_cycles, loaded["baseline"].recurrent_cycles)
+            self.assertGreater(loaded[name].memory_bytes_per_cycle, 10 * loaded["baseline"].memory_bytes_per_cycle)
+            self.assertGreater(loaded[name].resident_contexts, loaded["baseline"].resident_contexts)
+            self.assertLess(loaded[name].mac_energy_pj, loaded["baseline"].mac_energy_pj)
+
+    def test_board_power_helper_matches_simulation(self) -> None:
+        from sim.appliance import board_power_w, energy_per_token_mj
+        config = replace(SMALL, mac_energy_pj=3.0, layer_macs_per_token=866e6, static_power_w=70.0)
+        self.assertAlmostEqual(energy_per_token_mj(config), 2 * 866e6 * 3e-12 * 1e3)
+        self.assertAlmostEqual(board_power_w(config, 1000.0), 2 * 866e6 * 3e-12 * 1000.0 + 70.0)
 
 
 if __name__ == "__main__":

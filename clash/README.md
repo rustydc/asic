@@ -11,9 +11,11 @@ model implementation. It makes the first hardware boundary concrete:
 * a top entity suitable for Verilog or VHDL generation.
 
 The demo activation width is 16 elements. Expanding it directly to 4096 and
-copying the placeholder matrix is not the intended implementation. The next
-step is to replace a stage shell with a tiled/phase-driven fixed fabric, then use
-its synthesis and place-and-route results to select parallelism.
+copying the placeholder matrix is not the intended implementation: literal
+coefficients do not scale past a demo. The fabric tile that replaces the stage
+shell is specified in `fabric/` with synthesizable SystemVerilog in
+`fabric/rtl/` and a bit-exact Python model. The next step is to instantiate
+that tile array behind these stage boundaries.
 
 ## Generate RTL
 

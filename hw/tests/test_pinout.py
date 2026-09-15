@@ -1,0 +1,100 @@
+import copy
+import csv
+import json
+import tempfile
+import unittest
+from pathlib import Path
+
+from hw import pinout
+from hw.board import Board
+
+
+class PinoutTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.board = Board.load()
+        cls.pinout = pinout.derive(cls.board)
+
+    def test_requirements_follow_the_power_model(self) -> None:
+        need = self.pinout.requirements
+        rules = self.board.data["package_selection"]
+        self.assertAlmostEqual(need.core_amps, self.board.core_current_a("layer_asic", rules["rated_tokens_per_second"]))
+        self.assertEqual(need.core_balls, -(-int(round(need.core_amps * 1000)) // int(rules["amps_per_ball"] * 1000)))
+        self.assertEqual(need.signal_balls, 2 * 36 + 2 * 65 + 14)
+        self.assertEqual(need.total, need.signal_balls + need.signal_grounds + 2 * need.core_balls + sum(need.rail_balls.values()))
+
+    def test_smallest_sufficient_package_is_selected(self) -> None:
+        # At the 50K tokens/s rating the core needs 354 balls each of power and ground;
+        # only the 1225-ball 29 mm package carries that.  The 784-ball 23 mm package is
+        # enough at the 14.5K design point, and 400 balls never are.
+        self.assertEqual(self.pinout.package.name, "FCBGA1225_35x35_P0.8")
+        self.assertTrue(any(name == "FCBGA784_28x28_P0.8" for name, _ in self.pinout.rejected))
+        smaller = pinout.derive(self.board, rated_tokens_per_second=14_500)
+        self.assertEqual(smaller.package.name, "FCBGA784_28x28_P0.8")
+        self.assertTrue(any(name == "FCBGA400_20x20_P1.0" for name, _ in smaller.rejected))
+        self.assertGreater(self.pinout.requirements.core_balls, 3 * smaller.requirements.core_balls)
+
+    def test_ball_map_places_every_signal_once_in_the_outer_rows(self) -> None:
+        p = self.pinout.package
+        balls = self.pinout.balls
+        self.assertEqual(len(balls), p.balls)
+        self.assertEqual(len({b.name for b in balls}), p.balls)
+        signals = [(b.interface, b.signal) for b in balls if b.kind == "signal"]
+        self.assertEqual(len(signals), len(set(signals)))
+        self.assertEqual(len(signals), self.pinout.requirements.signal_balls)
+        link_in = [b for b in balls if b.interface == "link_in"]
+        self.assertEqual(len(link_in), 36)
+        self.assertEqual({b.col for b in link_in}, {0, 1})
+        rows = sorted({b.row for b in link_in})
+        self.assertEqual(rows, list(range(rows[0], rows[0] + 18)))
+        self.assertLessEqual(abs(rows[0] + 8.5 - (p.rows - 1) / 2), 0.5)   # centred on the edge
+        self.assertTrue(all(b.escape == ("W", b.col) for b in link_in))
+        self.assertTrue(all(b.escape == ("E", p.cols - 1 - b.col) for b in balls if b.interface == "link_out"))
+        memory = [b for b in balls if b.interface.startswith("lpddr")]
+        self.assertEqual(len(memory), 130)
+        self.assertTrue(all(b.row < rows[0] + 2 for b in memory))            # north rows
+        misc = [b for b in balls if b.interface in ("mgmt", "jtag", "refclk", "strap")]
+        self.assertTrue(all(b.row == p.rows - 1 for b in misc))              # south row
+        rules = self.board.data["package_selection"]
+        outer = [b for b in balls if b.kind == "signal" and b.interface.startswith("link")]
+        self.assertTrue(all(min(b.col, p.cols - 1 - b.col) < rules["signal_rows"] for b in outer))
+
+    def test_byte_lanes_are_followed_by_ground(self) -> None:
+        by_pos = {(b.row, b.col): b for b in self.pinout.balls}
+        ordered = [b for b in self.pinout.balls if b.interface == "lpddr_ch0"]
+        lane0 = [b for b in ordered if b.signal in {f"DQ{k}" for k in range(8)} | {"DQS0_P", "DQS0_N", "DMI0"}]
+        self.assertEqual(len(lane0), 11)
+        last = max(lane0, key=lambda b: (b.row, b.col))
+        after = by_pos.get((last.row, last.col + 1)) or by_pos.get((last.row + 1, 0))
+        self.assertEqual(after.kind, "ground")
+
+    def test_core_and_ground_counts_meet_the_requirement(self) -> None:
+        need = self.pinout.requirements
+        self.assertGreaterEqual(self.pinout.count("rail", "VDD_CORE"), need.core_balls)
+        self.assertGreaterEqual(self.pinout.count("ground"), need.ground_balls + need.signal_grounds)
+        for rail, count in need.rail_balls.items():
+            self.assertEqual(self.pinout.count("rail", rail), count)
+
+    def test_outputs_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory)
+            pinout.write_outputs(self.pinout, self.board, out)
+            with (out / "asic_ballmap.csv").open(encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            data = json.loads((out / "asic_ballmap.json").read_text(encoding="utf-8"))
+            report = (out / "report.md").read_text(encoding="utf-8")
+        self.assertEqual(len(rows), self.pinout.package.balls)
+        self.assertEqual(rows[0]["ball"], "A1")
+        self.assertEqual(data["package"]["name"], self.pinout.package.name)
+        self.assertEqual(sum(1 for b in data["balls"] if b["escape"]), 72)
+        self.assertIn("**selected**", report)
+
+    def test_no_candidate_is_an_error(self) -> None:
+        data = copy.deepcopy(self.board.data)
+        data["package_selection"]["candidates"] = data["package_selection"]["candidates"][:1]
+        with self.assertRaises(ValueError):
+            pinout.derive(Board(data))
+
+
+if __name__ == "__main__":
+    unittest.main()
