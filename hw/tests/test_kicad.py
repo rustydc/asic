@@ -1,4 +1,4 @@
-import copy
+import math
 import re
 import tempfile
 import unittest
@@ -30,39 +30,56 @@ class KicadGeneratorTest(unittest.TestCase):
         cls.board = Board.load()
         cls.design = kg.build_design(cls.board)
 
-    def physical_boxes(self, design):
-        boxes = []
-        for part in design.parts:
-            if part.body_w == 0:
-                continue
-            x, y = design.physical_xy(part)
-            w, h = design.physical_extent(part)
-            boxes.append((part.ref, x - w / 2, y - h / 2, x + w / 2, y + h / 2))
-        return boxes
-
     def test_every_component_is_placed_on_the_board(self) -> None:
         refs = {part.ref for part in self.design.parts}
         for ref in self.board.components:
             self.assertIn(ref, refs)
         ff = self.design.form_factor
-        self.assertEqual(ff.key, "1u")
-        for ref, x0, y0, x1, y1 in self.physical_boxes(self.design):
-            self.assertGreaterEqual(x0, 0.0, ref)
-            self.assertLessEqual(x1, ff.width, ref)
-            self.assertGreaterEqual(y0, 0.0, ref)
-            self.assertLessEqual(y1, ff.depth, ref)
+        for part in self.design.parts:
+            if part.body_w == 0:
+                continue
+            for x, y in part.corners():
+                self.assertGreaterEqual(x, 0.0, part.ref)
+                self.assertLessEqual(x, ff.width, part.ref)
+                self.assertGreaterEqual(y, 0.0, part.ref)
+                self.assertLessEqual(y, ff.depth, part.ref)
+
+    def test_ring_is_a_regular_polygon_with_memories_out_and_regulators_in(self) -> None:
+        lay = self.design.layout
+        refs = [source.component for source, _ in self.board.ring()]
+        self.assertEqual(len(lay.nodes), len(refs))
+        self.assertEqual(refs[0], "U_FPGA")
+        cx, cy = lay.centre
+        for k, ref in enumerate(refs):
+            part = self.design.part(ref)
+            self.assertAlmostEqual(math.dist((part.x, part.y), (cx, cy)), lay.radius, places=6, msg=ref)
+            # Tangential: the chip's local north points away from the centre.
+            nx, ny = part.direction(90.0)
+            self.assertAlmostEqual(nx * (cx - part.x) + ny * (cy - part.y), -lay.radius, places=6, msg=ref)
+            nxt = self.design.part(refs[(k + 1) % len(refs)])
+            self.assertAlmostEqual(math.dist((part.x, part.y), (nxt.x, nxt.y)), lay.side, places=6, msg=ref)
+            # Clockwise: the next chip is to the right of this one's link-out direction.
+            ox, oy = part.direction(0.0)
+            self.assertLess(ox * (nxt.y - part.y) - oy * (nxt.x - part.x), 0.0, ref)
+        for ref in self.board.instances("layer_asic"):
+            asic = self.design.part(ref)
+            for device in [b for a, b in self.board.nets["memory"]["channels"] if a.startswith(ref + ".")]:
+                mem = self.design.part(device.split(".")[0])
+                self.assertGreater(math.dist((mem.x, mem.y), (cx, cy)), lay.radius + 10.0, device)
+                self.assertAlmostEqual((mem.rotation - asic.rotation) % 360.0, 90.0, places=6)
+        for ref in self.board.instances("layer_asic") + self.board.instances("head_asic"):
+            asic = self.design.part(ref)
+            vrm = self.design.part(f"VRM_{ref[2:]}")
+            self.assertLess(math.dist((vrm.x, vrm.y), (cx, cy)), lay.radius - 10.0, ref)
+            self.assertAlmostEqual(vrm.rotation, asic.rotation, places=6)
 
     def test_chassis_keepouts_hold_only_their_connectors(self) -> None:
         ff = self.design.form_factor
-        allowed = {"psu_input", "fan_header", "host_cable", "rj45", "sfp_cage"}
         for part in self.design.parts:
-            if part.body_w == 0 or part.part_class in allowed:
+            if part.body_w == 0 or part.part_class in kg.KEEPOUT_RESIDENTS:
                 continue
-            x, y = self.design.physical_xy(part)
-            w, h = self.design.physical_extent(part)
             for name, (kx0, ky0, kx1, ky1) in ff.keepouts:
-                inside = x - w / 2 < kx1 and kx0 < x + w / 2 and y - h / 2 < ky1 and ky0 < y + h / 2
-                self.assertFalse(inside, f"{part.ref} in {name}")
+                self.assertFalse(kg.polygons_overlap(part.corners(), kg.rect(kx0, ky0, kx1, ky1)), f"{part.ref} in {name}")
         # The connectors sit on the edges they serve.
         self.assertLess(self.design.part("J_HOST").y, 12.0)
         self.assertTrue(all(self.design.part(f"J_FAN{k}").y > 340.0 for k in range(6)))
@@ -73,26 +90,25 @@ class KicadGeneratorTest(unittest.TestCase):
             kg.check_fit(moved)
 
     def test_no_two_bodies_overlap(self) -> None:
-        boxes = self.physical_boxes(self.design)
-        for i, (ra, ax0, ay0, ax1, ay1) in enumerate(boxes):
-            for rb, bx0, by0, bx1, by1 in boxes[i + 1:]:
-                overlap = ax0 < bx1 and bx0 < ax1 and ay0 < by1 and by0 < ay1
-                self.assertFalse(overlap, f"{ra} overlaps {rb}")
+        boxed = [p for p in self.design.parts if p.body_w > 0]
+        for i, a in enumerate(boxed):
+            for b in boxed[i + 1:]:
+                self.assertFalse(kg.polygons_overlap(a.corners(), b.corners()), f"{a.ref} overlaps {b.ref}")
+        # The oriented test is real: a rotated chip and its own memory would fail an axis-aligned box test.
+        asic = self.design.part("U_A1")
+        mem = self.design.part("U_M1a")
+        ax, ay = asic.extent()
+        mx, my = mem.extent()
+        self.assertTrue(abs(asic.x - mem.x) < (ax + mx) / 2 and abs(asic.y - mem.y) < (ay + my) / 2)
 
-    def test_pcie_card_form_factor_still_builds_at_the_card_rating(self) -> None:
-        data = copy.deepcopy(self.board.data)
-        data["board"]["form_factor_key"] = "pcie_card"
-        data["package_selection"]["rated_tokens_per_second"] = 14_500
-        design = kg.build_design(Board(data))
-        self.assertEqual(design.form_factor.key, "pcie_card")
-        self.assertEqual(design.pinout.package.name, "FCBGA784_28x28_P0.8")
-        self.assertTrue(all(hi <= kg.MAX_LINK_MM for _, hi in design.hop_lengths.values()), design.hop_lengths)
-        self.assertIn("J_PCIE", {p.ref for p in design.parts})
-        boxes = self.physical_boxes(design)
-        for ref, x0, y0, x1, y1 in boxes:
-            self.assertGreaterEqual(x0, 0.0, ref)
-            self.assertLessEqual(x1, design.form_factor.width, ref)
-            self.assertLessEqual(y1, design.form_factor.depth, ref)
+    def test_hops_bend_gently_and_the_ribbon_stays_on_one_layer(self) -> None:
+        for hop, bend in self.design.hop_bends.items():
+            self.assertLessEqual(bend, 25.0, hop)
+        layers = {t.layer for t in self.design.tracks if t.net.startswith("LINK")} - {"F.Cu"}
+        self.assertEqual(layers, {kg.LINK_LAYER})
+        hops = list(self.design.hop_lengths.values())
+        self.assertLess(max(hi for _, hi in hops), 45.0)          # every hop is short
+        self.assertLess(max(hi for _, hi in hops) - min(hi for _, hi in hops), 3.0)   # and alike
 
     def test_ring_is_fully_routed_within_the_link_limit(self) -> None:
         hops = kg.ring_hops(self.board)

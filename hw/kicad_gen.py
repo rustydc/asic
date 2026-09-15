@@ -5,27 +5,35 @@
 
 What it produces is a floorplan-level board, not a finished layout:
 
-* the board outline for the selected form factor: a host-attached 1U board
-  (PSU bay, PSU and fan connectors, a host PCIe cable connector, a BMC) or
-  the earlier full-length PCIe card;
-* every part of ``board.yaml`` placed (two rows of layer ASICs with their
-  LPDDR5X devices, the head ASICs and FPGA at the ring's start, DDR4, clock
-  generator, one core regulator block per ASIC and shared-rail regulator
-  blocks) on generated footprints, with the ASIC footprint built from the
+* the 1U board outline with its keep-outs (PSU bay, rear I/O strip, fan
+  row), the host PCIe cable connector, the BMC and its Ethernet, the PSU and
+  fan connectors and the SFP+ cage;
+* every part of ``board.yaml`` placed: the activation ring is a regular
+  polygon with one ring node per vertex (the FPGA, the eight layer ASICs and
+  the two head ASICs, eleven in all), each chip rotated tangentially so its
+  link-in edge faces the previous chip and its link-out edge the next, with
+  its two LPDDR5X devices on its outer edge and its core regulator on its
+  inner edge, rotated with it; the shared regulators and the clock generator
+  sit in the middle of the polygon; the ASIC footprint is built from the
   ball map that ``hw/pinout.py`` derives from the power model;
 * every net at the signal level, including the memory channels, PCIe and the
   management buses, so the schematic and the PCB agree;
 * a twelve-layer stackup, ground and power zones, via-in-pad on the rail
   balls, and the activation ring fully routed as ribbons with escape vias,
   checked against the link length limit;
-* a report with link lengths, escape density and core-rail current density.
+* a report with link lengths, bend angles, escape density and core-rail
+  current density.
 
-The ring is laid out in its own frame (u along the rows, v across) and the
-form factor maps that frame onto the physical board, so the same placement
-rules serve a card and a 1U board.  The memory, PCIe and management nets are
-present but unrouted: they need length matching and signal-integrity work
-that an autorouter would only imitate.  Decoupling capacitors and the small
-housekeeping parts are not placed.
+The polygon replaces the earlier two-row snake: every hop is the same short
+ribbon with two gentle bends, the two long hops of the snake (row change and
+closing hop) are gone, and no chip sits directly downstream of more than one
+other in the front-to-back airflow.  All eleven ring nodes are on the
+polygon because every chip takes the ring in on one edge and out on the
+opposite edge, so the loop cannot dip into the middle and come back without
+a hairpin.  The memory, PCIe and management nets are present but unrouted:
+they need length matching and signal-integrity work that an autorouter would
+only imitate.  Decoupling capacitors and the small housekeeping parts are not
+placed.
 
 The files are written directly in the KiCad 7 S-expression formats, so the
 generator needs only PyYAML; KiCad itself is used to open and check them.
@@ -48,20 +56,20 @@ OUTPUT_DIR = HERE / "kicad"
 PROJECT = "appliance"
 KICAD_ORIGIN = (20.0, 20.0)     # page offset so the outline sits inside the sheet
 
-LINK_LAYERS = ("In2.Cu", "In5.Cu")   # straight hops on the first; bent hops split by escape depth over both
+LINK_LAYER = "In2.Cu"         # every ring hop is one ribbon on this layer
 TRACK_WIDTH = 0.1
 VIA_SIZE, VIA_DRILL = 0.4, 0.2
 SMALL_VIA_SIZE = 0.3          # via-in-pad on the 0.35 mm memory balls
 ESCAPE_OUT = 2.7              # outer-column escape via distance beyond the ball, mm
 MAX_LINK_MM = 80.0
+MAX_BEND_DEG = 60.0           # a ribbon bend sharper than this is a placement error
 
 # Twelve-layer stackup: signal / ground / link signals / 12 V and I/O rails /
-# ground / link and memory signals / memory signals / ground / core rails / signals / ground / signal.
+# ground / memory signals / memory signals / ground / core rails / signals / ground / signal.
 COPPER_LAYERS = ["F.Cu", "In1.Cu", "In2.Cu", "In3.Cu", "In4.Cu", "In5.Cu", "In6.Cu", "In7.Cu",
                  "In8.Cu", "In9.Cu", "In10.Cu", "B.Cu"]
 LAYER_ROLES = {"F.Cu": "signal", "In1.Cu": "GND", "In2.Cu": "link signals", "In3.Cu": "12 V and I/O rails",
-               "In4.Cu": "GND", "In5.Cu": "link signals (second half of bent hops), memory signals",
-               "In6.Cu": "memory signals", "In7.Cu": "GND",
+               "In4.Cu": "GND", "In5.Cu": "memory signals", "In6.Cu": "memory signals", "In7.Cu": "GND",
                "In8.Cu": "core rails", "In9.Cu": "signal", "In10.Cu": "GND", "B.Cu": "signal"}
 GND_LAYERS = ["In1.Cu", "In4.Cu", "In7.Cu", "In10.Cu"]
 TOP_RAIL_LAYER, CORE_RAIL_LAYER = "In3.Cu", "In8.Cu"
@@ -78,41 +86,25 @@ def fmt(value: float) -> str:
     return "0" if text in ("-0", "") else text
 
 
-# --------------------------------------------------------------------------
-# Form factors: the ring frame and how it lands on the physical board
-# --------------------------------------------------------------------------
+Point = tuple[float, float]
 
-FRAME_V_MAX = 111.0   # the ring frame is a 111 mm wide strip; u runs along the rows
 
+# --------------------------------------------------------------------------
+# Form factor: the physical board (y up, the chassis rear at y = 0)
+# --------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class FormFactor:
     key: str
     description: str
     width: float                      # physical x, mm
-    depth: float                      # physical y, mm (y up; "rear" is y = 0)
-    frame_origin: tuple[float, float]
-    frame_rotation: int               # 0: u -> +x, v -> +y.  90: u -> +y, v -> -x
+    depth: float                      # physical y, mm
+    ring_centre: Point                # centre of the ring polygon
     keepouts: tuple[tuple[str, tuple[float, float, float, float]], ...] = ()
-    ring_u0: float = 100.0            # frame u of the first layer-ASIC column
-
-    def to_board(self, u: float, v: float) -> tuple[float, float]:
-        if self.frame_rotation == 90:
-            return self.frame_origin[0] + (FRAME_V_MAX - v), self.frame_origin[1] + u
-        return self.frame_origin[0] + u, self.frame_origin[1] + v
-
-    def vec(self, du: float, dv: float) -> tuple[float, float]:
-        return (-dv, du) if self.frame_rotation == 90 else (du, dv)
-
-    @property
-    def frame_u_max(self) -> float:
-        return (self.depth if self.frame_rotation == 90 else self.width) - self.frame_origin[1 if self.frame_rotation == 90 else 0]
 
 
 FORM_FACTORS = {
-    "pcie_card": FormFactor("pcie_card", "PCIe CEM full-length card", 312.0, 111.15, (0.0, 0.0), 0,
-                            (("card-edge contacts", (0.0, 0.0, 90.0, 8.0)), ("bracket", (0.0, 0.0, 5.0, 111.15))), 90.0),
-    "1u": FormFactor("1u", "1U rack chassis, single board, host-attached", 420.0, 360.0, (140.0, 8.0), 90,
+    "1u": FormFactor("1u", "1U rack chassis, single board, host-attached", 420.0, 360.0, (140.0, 190.0),
                      (("PSU bay (two CRPS)", (273.0, 0.0, 420.0, 190.0)),
                       ("rear I/O", (0.0, 0.0, 273.0, 12.0)),
                       ("front fans", (0.0, 352.0, 420.0, 360.0)))),
@@ -137,7 +129,7 @@ class Package:
     body_h: float
     ball: float = 0.45
 
-    def ball_xy(self, i: int, j: int) -> tuple[float, float]:
+    def ball_xy(self, i: int, j: int) -> Point:
         """Local position of ball row i (0 = north), column j (0 = west), y up."""
         x = (j - (self.cols - 1) / 2) * self.pitch
         y = ((self.rows - 1) / 2 - i) * self.pitch
@@ -166,22 +158,21 @@ class Part:
     footprint: str
     x: float
     y: float
-    rotation: int
+    rotation: float             # degrees counter-clockwise; local +x is the link-out direction of a ring chip
     body_w: float
     body_h: float
     pads: list[Pad] = field(default_factory=list)
     value: str = ""
     package: Package | None = None
-    physical: bool = False      # coordinates already on the physical board rather than in the ring frame
 
-    def local_to_board(self, x: float, y: float) -> tuple[float, float]:
-        if self.rotation == 180:
-            x, y = -x, -y
-        elif self.rotation == 90:
-            x, y = -y, x
-        elif self.rotation == 270:
-            x, y = y, -x
-        return self.x + x, self.y + y
+    def local_to_board(self, x: float, y: float) -> Point:
+        c, s = math.cos(math.radians(self.rotation)), math.sin(math.radians(self.rotation))
+        return self.x + x * c - y * s, self.y + x * s + y * c
+
+    def direction(self, local_angle_deg: float = 0.0) -> Point:
+        """Unit vector of a local direction (0 = local +x) on the board."""
+        a = math.radians(self.rotation + local_angle_deg)
+        return math.cos(a), math.sin(a)
 
     def pad(self, name: str) -> Pad:
         for pad in self.pads:
@@ -189,9 +180,16 @@ class Part:
                 return pad
         raise KeyError(f"{self.ref} has no pad {name}")
 
+    def corners(self, grow: float = 0.0) -> list[Point]:
+        """Body outline on the board, counter-clockwise from the local south-west corner."""
+        w, h = self.body_w / 2 + grow, self.body_h / 2 + grow
+        return [self.local_to_board(x, y) for x, y in ((-w, -h), (w, -h), (w, h), (-w, h))]
+
     def extent(self) -> tuple[float, float]:
-        """Body width and height in its frame after its own rotation."""
-        return (self.body_h, self.body_w) if self.rotation in (90, 270) else (self.body_w, self.body_h)
+        """Axis-aligned size of the rotated body."""
+        pts = self.corners()
+        xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+        return max(xs) - min(xs), max(ys) - min(ys)
 
 
 PACKAGES = {
@@ -353,36 +351,58 @@ def block_pads(width: float, height: float, nets: list[str], pitch: float = 2.0,
     return pads
 
 
-FINGER_ORIGIN = (45.0, 4.0)   # footprint origin of the card-edge connector (card form factor)
-
-
-def edge_finger_pads() -> list[Pad]:
-    """PCIe x8 card-edge contacts: 49 positions per side, 1.0 mm pitch, key after pin 11."""
-    a_side = {1: "PRSNT1#", 2: "+12V", 3: "+12V", 4: "GND", 5: "SMB_CLK", 6: "SMB_DAT", 7: "GND", 8: "+3V3",
-              9: "+3V3", 10: "+3V3AUX", 11: "WAKE#", 12: "PCIE_RESERVED", 13: "GND", 14: "PCIE_REFCLK_P",
-              15: "PCIE_REFCLK_N", 16: "GND", 17: "PCIE_PRSNT2#"}
-    b_side = {1: "+12V", 2: "+12V", 3: "+12V", 4: "GND", 5: "SMB_CLK", 6: "SMB_DAT", 7: "GND", 8: "+3V3",
-              9: "JTAG_TRST", 10: "+3V3AUX", 11: "WAKE#", 12: "PCIE_PERST#", 13: "GND"}
-    pads = []
-    for n in range(1, 50):
-        x = 12.5 + (n - 1) * 1.0 + (2.0 if n > 11 else 0.0)
-        for side, table, layers in (("A", a_side, '"F.Cu" "F.Mask"'), ("B", b_side, '"B.Cu" "B.Mask"')):
-            net = table.get(n, "GND")
-            if n >= 18 and side == "A":
-                k = n - 18
-                net = ["GND", f"PCIE_RX{{}}_P", f"PCIE_RX{{}}_N", "GND"][k % 4].format(min(k // 4, 7))
-            if n >= 14 and side == "B":
-                k = n - 14
-                net = ["GND", f"PCIE_TX{{}}_P", f"PCIE_TX{{}}_N", "GND"][k % 4].format(min(k // 4, 7))
-            pads.append(Pad(f"{side}{n}", x - FINGER_ORIGIN[0], 3.25 - FINGER_ORIGIN[1], net, shape="rect",
-                            size=(0.7, 5.5), layers=layers))
-    return pads
-
-
 def host_cable_nets(board: Board) -> list[str]:
     """SlimSAS 8i carries the eight lanes plus the sideband."""
     pcie = [f"PCIE_{s}" for s in expand_signals(board.kinds["pcie_gen4_x8"]["signals"])]
     return pcie + ["GND"] * (len(pcie) // 2)
+
+
+# --------------------------------------------------------------------------
+# Geometry helpers
+# --------------------------------------------------------------------------
+
+def polygons_overlap(a: list[Point], b: list[Point], margin: float = 0.0) -> bool:
+    """Separating-axis test for two convex polygons; ``margin`` is the minimum
+    gap that still counts as clear."""
+    for poly in (a, b):
+        for i in range(len(poly)):
+            p, q = poly[i], poly[(i + 1) % len(poly)]
+            ax, ay = -(q[1] - p[1]), q[0] - p[0]
+            length = math.hypot(ax, ay)
+            if length == 0:
+                continue
+            ax, ay = ax / length, ay / length
+            pa = [v[0] * ax + v[1] * ay for v in a]
+            pb = [v[0] * ax + v[1] * ay for v in b]
+            if max(pa) + 1e-9 <= min(pb) + margin or max(pb) + 1e-9 <= min(pa) + margin:
+                return False
+    return True
+
+
+def point_in_polygon(x: float, y: float, polygon: list[Point]) -> bool:
+    inside = False
+    n = len(polygon)
+    for i in range(n):
+        (x0, y0), (x1, y1) = polygon[i], polygon[(i + 1) % n]
+        if (y0 > y) != (y1 > y):
+            cross = x0 + (y - y0) * (x1 - x0) / (y1 - y0)
+            if x < cross:
+                inside = not inside
+    return inside
+
+
+def rect(x0: float, y0: float, x1: float, y1: float) -> list[Point]:
+    return [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+
+
+def local_rect(part: Part, x0: float, y0: float, x1: float, y1: float) -> list[Point]:
+    """A rectangle in a part's local frame, rotated with it onto the board."""
+    return [part.local_to_board(x, y) for x, y in ((x0, y0), (x1, y0), (x1, y1), (x0, y1))]
+
+
+def regular_polygon(centre: Point, radius: float, sides: int) -> list[Point]:
+    return [(centre[0] + radius * math.cos(2 * math.pi * k / sides), centre[1] + radius * math.sin(2 * math.pi * k / sides))
+            for k in range(sides)]
 
 
 # --------------------------------------------------------------------------
@@ -393,9 +413,8 @@ def host_cable_nets(board: Board) -> list[str]:
 class Track:
     layer: str
     net: str
-    points: list[tuple[float, float]]
+    points: list[Point]
     width: float = TRACK_WIDTH
-    physical: bool = False
 
     def length(self) -> float:
         return sum(math.dist(a, b) for a, b in zip(self.points, self.points[1:]))
@@ -408,48 +427,45 @@ class Via:
     net: str
     size: float = VIA_SIZE
     drill: float = VIA_DRILL
-    physical: bool = False
 
 
 @dataclass
 class Zone:
     layer: str
     net: str
-    polygon: list[tuple[float, float]]
+    polygon: list[Point]
     priority: int = 0
-    physical: bool = False
 
 
 @dataclass
-class Layout:
-    """Ring-frame placement derived from the ASIC body size."""
-    body: float
-    col_pitch: float
-    col_u: list[float]
-    row_v: dict[str, float]
-    vrm_v: float
-    head_u: dict[str, float]
-    fpga_uv: tuple[float, float]
+class RingLayout:
+    """The ring as a regular polygon: one node per ring chip, in ring order."""
+    centre: Point
+    radius: float
+    side: float                                    # centre-to-centre distance of neighbours
+    nodes: dict[str, tuple[float, float, float]]   # ref -> (x, y, rotation)
+    angles: dict[str, float]                       # ref -> polar angle of the node, degrees
 
 
-def layout_for(package: Package, u0: float = 100.0) -> Layout:
-    body = package.body_w
-    row_a = 72.0
-    row_b = row_a - (body + 8.0)                   # one band of regulators between the rows
-    col_pitch = max(56.0, body + 33.0)             # two regulators side by side with a gap, or the link gap
-    col_u = [u0 + k * col_pitch for k in range(4)]
-    head0 = col_u[0] - (body + 7.0)
-    head1 = head0 - (body + 7.0)
-    # The FPGA sits directly above H1 so the closing hop is a short bent ribbon
-    # up the frame edge into its west side; its east side feeds A0 with a jog.
-    # Its u position leaves the ribbon's last run (from the channel past H1's
-    # escapes into the FPGA's west escapes) exactly one bend run plus margin.
-    fpga_pkg = PACKAGES["fpga"]
-    channel_u = head1 - escape_reach(package) - bend_run(package.pitch)
-    fpga_u = channel_u + bend_run(fpga_pkg.pitch) + escape_reach(fpga_pkg) + 1.0
-    fpga_v = row_b + body / 2 + 2.5 + fpga_pkg.body_h / 2
-    return Layout(body, col_pitch, col_u, {"A": row_a, "B": row_b}, (row_a + row_b) / 2,
-                  {"U_H0": head0, "U_H1": head1}, (fpga_u, fpga_v))
+RING_GAP = 29.0        # neighbour spacing beyond the package body: escapes, ribbon runs and clearance
+FPGA_ANGLE = -90.0     # the FPGA is the ring node nearest the chassis rear
+
+
+def layout_for(board: Board, package: Package, ff: FormFactor) -> RingLayout:
+    refs = [source.component for source, _ in board.ring()]        # ring order, starting at the FPGA
+    n = len(refs)
+    side = package.body_w + RING_GAP
+    radius = side / (2 * math.sin(math.pi / n))
+    cx, cy = ff.ring_centre
+    nodes, angles = {}, {}
+    for k, ref in enumerate(refs):
+        # Clockwise around the polygon so each chip's local north (its memory
+        # edge) faces outward and its local +x (link out) points at the next chip.
+        angle = FPGA_ANGLE - k * 360.0 / n
+        a = math.radians(angle)
+        nodes[ref] = (cx + radius * math.cos(a), cy + radius * math.sin(a), (angle - 90.0) % 360.0)
+        angles[ref] = angle % 360.0
+    return RingLayout((cx, cy), radius, side, nodes, angles)
 
 
 VRM_W, VRM_H = 26.0, 5.5
@@ -461,12 +477,13 @@ class Design:
     board: Board
     form_factor: FormFactor
     pinout: pinout.Pinout | None = None
-    layout: Layout | None = None
+    layout: RingLayout | None = None
     parts: list[Part] = field(default_factory=list)
     tracks: list[Track] = field(default_factory=list)
     vias: list[Via] = field(default_factory=list)
     zones: list[Zone] = field(default_factory=list)
     hop_lengths: dict[str, tuple[float, float]] = field(default_factory=dict)   # hop -> (min, max) mm
+    hop_bends: dict[str, float] = field(default_factory=dict)                   # hop -> sharpest bend, degrees
     notes: list[str] = field(default_factory=list)
 
     def part(self, ref: str) -> Part:
@@ -483,25 +500,28 @@ class Design:
             names.add(track.net)
         return sorted(names)
 
-    def physical_xy(self, part: Part) -> tuple[float, float]:
-        return (part.x, part.y) if part.physical else self.form_factor.to_board(part.x, part.y)
+    def physical_xy(self, part: Part) -> Point:
+        return part.x, part.y
 
     def physical_extent(self, part: Part) -> tuple[float, float]:
-        w, h = part.extent()
-        if not part.physical and self.form_factor.frame_rotation == 90:
-            w, h = h, w
-        return w, h
+        return part.extent()
 
 
 def ring_hops(board: Board) -> list[tuple[str, str]]:
     return [(a.component, b.component) for a, b in board.ring()]
 
 
+def place_relative(anchor: Part, dx: float, dy: float, extra_rotation: float = 0.0) -> tuple[float, float, float]:
+    """Position and rotation of a part placed at a local offset of ``anchor``, rotating with it."""
+    x, y = anchor.local_to_board(dx, dy)
+    return x, y, (anchor.rotation + extra_rotation) % 360.0
+
+
 def build_design(board: Board) -> Design:
     pin = pinout.derive(board)
     asic_pkg = asic_package(pin)
     ff = select_form_factor(board)
-    lay = layout_for(asic_pkg, ff.ring_u0)
+    lay = layout_for(board, asic_pkg, ff)
     design = Design(board, ff, pinout=pin, layout=lay)
     hops = ring_hops(board)
     hop_in = {sink: h for h, (_, sink) in enumerate(hops)}
@@ -511,56 +531,40 @@ def build_design(board: Board) -> Design:
         asic, device = Endpoint.parse(a), Endpoint.parse(b)
         memory_of.setdefault(asic.component, {})[asic.interface] = device.component
 
-    # ASICs and their core regulators.
+    # ASICs on their polygon vertices, each with its core regulator on its inner (south) edge.
     for ref in board.instances("layer_asic") + board.instances("head_asic"):
-        comp = board.components[ref]
-        if ref in lay.head_u:
-            x, y = lay.head_u[ref], lay.row_v["B"]
-            rotation = 180
-        else:
-            row = comp["place"].split("row ")[1][0]
-            col = int(comp["place"].split("col ")[1])
-            x, y = lay.col_u[col], lay.row_v[row]
-            rotation = 180 if row == "B" else 0
+        x, y, rotation = lay.nodes[ref]
         pads = asic_ball_map(board, pin, board.class_of(ref), ref, hop_in[ref], hop_out[ref], memory_of.get(ref, {}))
-        design.parts.append(Part(ref, board.class_of(ref), asic_pkg.name, x, y, rotation, asic_pkg.body_w,
-                                 asic_pkg.body_h, pads, value=board.class_of(ref), package=asic_pkg))
-        vrot = 0
-        if ref in lay.head_u:
-            vx, vy = x + 2.0, lay.row_v["B"] - asic_pkg.body_h / 2 - 2.5 - VRM_H / 2   # heads have no memory below
-        elif ref == "U_A4":
-            # The end column's row-B regulator would sit in the row-change ribbon's channel; it goes past it.
-            reach = escape_reach(asic_pkg)
-            vx, vy = x + reach + bend_run(asic_pkg.pitch) + 2.25 + 1.0 + VRM_W / 2, lay.vrm_v
-        else:
-            vx, vy = (x - (asic_pkg.body_w / 2 + 3.0), lay.vrm_v) if rotation == 0 else (x + asic_pkg.body_w / 2 + 3.0, lay.vrm_v)
+        asic = Part(ref, board.class_of(ref), asic_pkg.name, x, y, rotation, asic_pkg.body_w, asic_pkg.body_h, pads,
+                    value=board.class_of(ref), package=asic_pkg)
+        design.parts.append(asic)
         core = f"VDD_CORE_{short_ref(ref)}"
         nets = ["+12V"] * 4 + [core] * 6 + ["GND"] * 6 + ["PMB_SCL", "PMB_SDA", f"VRM_EN_{short_ref(ref)}"]
+        vx, vy, vrot = place_relative(asic, 0.0, -(asic_pkg.body_h / 2 + 2.5 + VRM_H / 2))
         design.parts.append(Part(f"VRM_{short_ref(ref)}", "vrm_core", f"VRM_MODULE_{VRM_W:.0f}x{VRM_H:.0f}", vx, vy, vrot,
                                  VRM_W, VRM_H, block_pads(VRM_W, VRM_H, nets, pitch=2.3, pad_size=(1.2, 1.2)),
                                  value=f"core VRM {core}"))
 
-    # LPDDR5X beside their ASICs: row A above, row B below (rotated rows face them).
+    # LPDDR5X on the outer (north) edge of each layer ASIC, rotated with it.
     lpddr_signals = expand_signals(board.kinds["lpddr5x_x32"]["signals"])
     for asic_ref, channels in memory_of.items():
         asic = design.part(asic_ref)
+        pkg = PACKAGES["lpddr5x"]
         for index, (channel, device) in enumerate(sorted(channels.items())):
             dx = -9.5 if index == 0 else 9.5
-            if asic.rotation == 0:
-                x, y = asic.x + dx, asic.y + asic.body_h / 2 + 2.0 + 6.0
-            else:
-                x, y = asic.x - dx, asic.y - asic.body_h / 2 - 2.0 - 6.0
-            pkg = PACKAGES["lpddr5x"]
+            x, y, rotation = place_relative(asic, dx, asic.body_h / 2 + 2.0 + pkg.body_w / 2, 90.0)
             nets = [memory_net(asic_ref, channel[-3:], s) for s in lpddr_signals]
             pads = memory_ball_map(pkg, nets, [r for r in board.classes["lpddr5x"]["rails"]])
-            design.parts.append(Part(device, "lpddr5x", pkg.name, x, y, 90, pkg.body_w, pkg.body_h, pads,
+            design.parts.append(Part(device, "lpddr5x", pkg.name, x, y, rotation, pkg.body_w, pkg.body_h, pads,
                                      value="LPDDR5X x32", package=pkg))
 
-    # FPGA, DDR4, clock, shared regulators (ring frame).
-    fpga = board.instances("fpga")[0]
+    # FPGA on its vertex; DDR4 and its regulators on its outer (north) edge, its core regulator inside.
+    fpga_ref = board.instances("fpga")[0]
     pkg = PACKAGES["fpga"]
-    design.parts.append(Part(fpga, "fpga", pkg.name, lay.fpga_uv[0], lay.fpga_uv[1], 0, pkg.body_w, pkg.body_h,
-                             fpga_ball_map(board), value="FPGA", package=pkg))
+    x, y, rotation = lay.nodes[fpga_ref]
+    fpga = Part(fpga_ref, "fpga", pkg.name, x, y, rotation, pkg.body_w, pkg.body_h, fpga_ball_map(board),
+                value="FPGA", package=pkg)
+    design.parts.append(fpga)
     ddr_signals = expand_signals(board.kinds["ddr4_x16"]["signals"])
     for n, device in enumerate(board.instances("ddr4")):
         pkg = PACKAGES["ddr4"]
@@ -576,23 +580,22 @@ def build_design(board: Board) -> Design:
             else:
                 nets.append(f"DDR4_{s}")
         pads = memory_ball_map(pkg, nets, board.classes["ddr4"]["rails"])
-        x, y = (30.0 + 8.5 * n, lay.fpga_uv[1] + 20.5)      # a row beyond the FPGA, clear of the ring ribbon
-        design.parts.append(Part(device, "ddr4", pkg.name, x, y, 0, pkg.body_w, pkg.body_h, pads,
+        x, y, rotation = place_relative(fpga, -12.75 + 8.5 * n, fpga.body_h / 2 + 2.0 + pkg.body_h / 2)
+        design.parts.append(Part(device, "ddr4", pkg.name, x, y, rotation, pkg.body_w, pkg.body_h, pads,
                                  value="DDR4 x16", package=pkg))
+    shared = [("REG_FPGA", "VCCINT_0V85", place_relative(fpga, 0.0, -(fpga.body_h / 2 + 2.5 + REG_H / 2))),
+              ("REG_DDR", "VDD_1V2", place_relative(fpga, -11.0, fpga.body_h / 2 + 2.0 + PACKAGES["ddr4"].body_h + 2.0 + REG_H / 2)),
+              ("REG_3V3", "VDD_3V3", place_relative(fpga, 11.0, fpga.body_h / 2 + 2.0 + PACKAGES["ddr4"].body_h + 2.0 + REG_H / 2))]
+    # Shared rails and the clock generator in the middle of the polygon, equidistant from every chip.
+    cx, cy = lay.centre
     clk_nets = ["VDD_IO_1V8", "GND"] + [f"REFCLK_{short_ref(r)}_{p}" for r in board.nets["refclk"]["sinks"] for p in "PN"]
-    design.parts.append(Part("U_CLK", "clock_gen", "QFN64_9x9", 10.0, 13.0, 0, 9.0, 9.0,
+    design.parts.append(Part("U_CLK", "clock_gen", "QFN64_9x9", cx, cy, 0.0, 9.0, 9.0,
                              block_pads(9.0, 9.0, clk_nets[:24], pitch=0.7, pad_size=(0.3, 0.9)), value="Si5345"))
-    # The memory-rail regulators sit just outside the two memory bands, between columns 1 and 2.
-    mid_u = (lay.col_u[1] + lay.col_u[2]) / 2
-    mem_top = lay.row_v["A"] + lay.body / 2 + 14.0
-    mem_bottom = lay.row_v["B"] - lay.body / 2 - 14.0
-    shared = [("REG_1V8", "VDD_IO_1V8", (130.0, 105.0)), ("REG_1V05", "VDD2H_1V05", (mid_u, mem_top + 1.0 + REG_H / 2)),
-              ("REG_0V9", "VDD2L_0V9", (130.0, 11.5)), ("REG_0V3", "VDDQ_0V3", (mid_u, mem_bottom - 1.0 - REG_H / 2)),
-              ("REG_FPGA", "VCCINT_0V85", (57.0, lay.row_v["B"] + 19.5)), ("REG_DDR", "VDD_1V2", (72.0, lay.fpga_uv[1] + 14.5)),
-              ("REG_3V3", "VDD_3V3", (71.0, lay.fpga_uv[1] + 22.5))]
-    for ref, rail, (x, y) in shared:
+    shared += [("REG_1V8", "VDD_IO_1V8", (cx - 12.0, cy + 18.0, 0.0)), ("REG_1V05", "VDD2H_1V05", (cx + 12.0, cy + 18.0, 0.0)),
+               ("REG_0V9", "VDD2L_0V9", (cx - 12.0, cy - 18.0, 0.0)), ("REG_0V3", "VDDQ_0V3", (cx + 12.0, cy - 18.0, 0.0))]
+    for ref, rail, (x, y, rotation) in shared:
         nets = ["+12V"] * 3 + [rail] * 4 + ["GND"] * 3
-        design.parts.append(Part(ref, "regulator", f"REG_MODULE_{REG_W:.0f}x{REG_H:.0f}", x, y, 0, REG_W, REG_H,
+        design.parts.append(Part(ref, "regulator", f"REG_MODULE_{REG_W:.0f}x{REG_H:.0f}", x, y, rotation, REG_W, REG_H,
                                  block_pads(REG_W, REG_H, nets, pitch=1.8, pad_size=(1.2, 1.2)), value=f"{rail} regulator"))
     # Aliases so the memory-only rails have a source too.
     design.part("REG_1V8").pads[3].net = "VDD1_1V8"
@@ -604,7 +607,7 @@ def build_design(board: Board) -> Design:
     design.part("REG_1V8").pads[4].net = "VCCO_1V8"
     design.part("REG_0V9").pads[4].net = "VDD_PLL_0V9"
 
-    add_form_factor_parts(design)
+    add_chassis_parts(design)
 
     # Daisy chains: JTAG TDO -> next TDI.
     chain = board.nets["jtag"]["chain"]
@@ -620,63 +623,58 @@ def build_design(board: Board) -> Design:
     return design
 
 
-def add_form_factor_parts(design: Design) -> None:
-    """Connectors and housekeeping that depend on the enclosure, placed on the physical board."""
-    board, ff = design.board, design.form_factor
+def add_chassis_parts(design: Design) -> None:
+    """Connectors and housekeeping that belong to the enclosure: rear I/O
+    along y = 0, PSU bay at the rear right, fans along the front."""
+    board = design.board
+    fpga = design.part(board.instances("fpga")[0])
     sfp_nets = [f"SFP_{s}" for s in expand_signals(board.kinds["sfp_plus"]["signals"])] + ["VDD_3V3"] * 2 + ["GND"] * 4
-    if ff.key == "pcie_card":
-        design.parts.append(Part("J_SFP", "sfp_cage", "SFP_CAGE", 27.0, 103.0, 90, 14.0, 50.0,
-                                 block_pads(50.0, 14.0, sfp_nets, pitch=2.0), value="SFP+ cage"))   # opening at the bracket
-        design.parts.append(Part("J_PCIE", "pcie_edge", "PCIE_X8_EDGE", FINGER_ORIGIN[0], FINGER_ORIGIN[1], 0, 0.0, 0.0,
-                                 edge_finger_pads(), value="PCIe x8 edge"))
-        aux_nets = ["+12V"] * 6 + ["GND"] * 6 + ["AUX_SENSE0", "AUX_SENSE1", "AUX_SENSE2", "AUX_SENSE3"]
-        design.parts.append(Part("J_AUX", "aux_power", "12V-2x6", 302.0, 105.0, 0, 18.0, 10.0,
-                                 block_pads(18.0, 10.0, aux_nets, pitch=2.0), value="12V-2x6 aux"))
-        return
-    # 1U: rear I/O along y = 0, PSU bay at the rear right, fans along the front.
-    fpga_x, _ = design.physical_xy(design.part(board.instances("fpga")[0]))
-    # Beside the FPGA on the rear edge, clear of the closing ring ribbon that comes up the frame edge.
-    design.parts.append(Part("J_HOST", "host_cable", "SLIMSAS_8I", fpga_x - 30.0, 6.0, 0, 26.0, 9.0,
+    # Beside the FPGA on the rear edge, clear of its DDR4 row.
+    design.parts.append(Part("J_HOST", "host_cable", "SLIMSAS_8I", fpga.x - 34.0, 6.0, 0.0, 26.0, 9.0,
                              block_pads(26.0, 9.0, host_cable_nets(board), pitch=1.0, pad_size=(0.6, 1.5)),
-                             value="SlimSAS 8i host cable", physical=True))
-    design.parts.append(Part("J_SFP", "sfp_cage", "SFP_CAGE", 60.0, 27.0, 0, 14.0, 50.0,
-                             block_pads(50.0, 14.0, sfp_nets, pitch=2.0), value="SFP+ cage", physical=True))
+                             value="SlimSAS 8i host cable"))
+    design.parts.append(Part("J_SFP", "sfp_cage", "SFP_CAGE", 60.0, 27.0, 0.0, 14.0, 50.0,
+                             block_pads(50.0, 14.0, sfp_nets, pitch=2.0), value="SFP+ cage"))
     eth = [f"BMC_ETH{k}_{p}" for k in range(4) for p in "PN"]
-    design.parts.append(Part("J_BMC_NET", "rj45", "RJ45_MAGJACK", 30.0, 13.0, 0, 16.0, 21.0,
+    design.parts.append(Part("J_BMC_NET", "rj45", "RJ45_MAGJACK", 30.0, 13.0, 0.0, 16.0, 21.0,
                              block_pads(16.0, 21.0, eth + ["VDD_3V3", "GND", "GND", "GND"], pitch=1.6),
-                             value="BMC Ethernet", physical=True))
+                             value="BMC Ethernet"))
     fans = [f"FAN_{k}_{s}" for k in range(6) for s in ("PWM", "TACH")]
     bmc_nets = eth + fans + ["UART_TX", "UART_RX", "PMB_SCL", "PMB_SDA", "PSU_ON", "VDD_3V3", "VDD_3V3", "GND", "GND"]
-    design.parts.append(Part("U_BMC", "bmc", "BGA_BMC_21x21", 100.0, 60.0, 0, 21.0, 21.0,
-                             block_pads(21.0, 21.0, bmc_nets, pitch=1.2, pad_size=(0.6, 1.2)), value="BMC SoC",
-                             physical=True))
+    design.parts.append(Part("U_BMC", "bmc", "BGA_BMC_21x21", 30.0, 60.0, 0.0, 21.0, 21.0,
+                             block_pads(21.0, 21.0, bmc_nets, pitch=1.2, pad_size=(0.6, 1.2)), value="BMC SoC"))
     psu_nets = ["+12V"] * 6 + ["GND"] * 6 + ["PMB_SCL", "PMB_SDA", "PSU_ON", "GND"]
     for k, x in enumerate((300.0, 375.0)):
-        design.parts.append(Part(f"J_PSU{k}", "psu_input", "CRPS_BLADES", x, 180.0, 0, 40.0, 10.0,
+        design.parts.append(Part(f"J_PSU{k}", "psu_input", "CRPS_BLADES", x, 180.0, 0.0, 40.0, 10.0,
                                  block_pads(40.0, 10.0, psu_nets, pitch=2.8, pad_size=(1.6, 2.0)),
-                                 value="CRPS 12 V output", physical=True))
+                                 value="CRPS 12 V output"))
     for k in range(6):
         nets = ["+12V", "GND", f"FAN_{k}_PWM", f"FAN_{k}_TACH"]
-        design.parts.append(Part(f"J_FAN{k}", "fan_header", "FAN_4PIN", 35.0 + 70.0 * k, 348.0, 0, 10.0, 6.0,
-                                 block_pads(10.0, 6.0, nets, pitch=2.54, pad_size=(1.2, 1.5)), value="fan header",
-                                 physical=True))
+        design.parts.append(Part(f"J_FAN{k}", "fan_header", "FAN_4PIN", 35.0 + 70.0 * k, 348.0, 0.0, 10.0, 6.0,
+                                 block_pads(10.0, 6.0, nets, pitch=2.54, pad_size=(1.2, 1.5)), value="fan header"))
+
+
+KEEPOUT_RESIDENTS = ("psu_input", "fan_header", "host_cable", "rj45", "sfp_cage")   # live in their keep-outs by design
+BODY_GAP = 0.5      # minimum gap between any two bodies (matches the courtyard growth)
 
 
 def check_fit(design: Design) -> None:
-    """Every part inside the board and outside the keep-outs."""
+    """Every part inside the board, outside the keep-outs, and clear of every other part."""
     ff = design.form_factor
-    for part in design.parts:
-        if part.body_w == 0:
+    boxed = [p for p in design.parts if p.body_w > 0]
+    for part in boxed:
+        for x, y in part.corners():
+            if x < 0 or x > ff.width or y < 0 or y > ff.depth:
+                raise ValueError(f"{part.ref} does not fit the {ff.description} ({part.x:.1f}, {part.y:.1f})")
+        if part.part_class in KEEPOUT_RESIDENTS:
             continue
-        x, y = design.physical_xy(part)
-        w, h = design.physical_extent(part)
-        if x - w / 2 < 0 or x + w / 2 > ff.width or y - h / 2 < 0 or y + h / 2 > ff.depth:
-            raise ValueError(f"{part.ref} does not fit the {ff.description} ({x:.1f}, {y:.1f}, {w:.0f}x{h:.0f} mm)")
         for name, (kx0, ky0, kx1, ky1) in ff.keepouts:
-            if part.part_class in ("psu_input", "fan_header", "host_cable", "rj45", "sfp_cage", "pcie_edge"):
-                continue          # these live in their keep-outs by design
-            if x - w / 2 < kx1 and kx0 < x + w / 2 and y - h / 2 < ky1 and ky0 < y + h / 2:
+            if polygons_overlap(part.corners(), rect(kx0, ky0, kx1, ky1)):
                 raise ValueError(f"{part.ref} sits in the {name} keep-out")
+    for i, a in enumerate(boxed):
+        for b in boxed[i + 1:]:
+            if polygons_overlap(a.corners(), b.corners(), BODY_GAP):
+                raise ValueError(f"{a.ref} overlaps {b.ref}")
 
 
 # --------------------------------------------------------------------------
@@ -692,83 +690,46 @@ def is_rail(net: str | None, board: Board) -> bool:
 def add_power_vias(design: Design) -> None:
     """Via-in-pad on every ground and rail pad (as an FCBGA on an HDI board would
     have) so the planes connect to the packages, regulators and connectors."""
-    ff = design.form_factor
-
-    def inside(zone: Zone, x: float, y: float) -> bool:
-        xs, ys = [p[0] for p in zone.polygon], [p[1] for p in zone.polygon]
-        return min(xs) <= x <= max(xs) and min(ys) <= y <= max(ys)
-
     for part in design.parts:
-        if part.part_class == "pcie_edge":
-            continue
         for pad in part.pads:
             if not is_rail(pad.net, design.board):
                 continue
             x, y = part.local_to_board(pad.x, pad.y)
-            px, py = (x, y) if part.physical else ff.to_board(x, y)
             # Only where a zone of that net will actually pick the via up.
-            hit = False
-            for zone in design.zones:
-                if zone.net != pad.net:
-                    continue
-                if zone.physical and inside(zone, px, py):
-                    hit = True
-                elif not zone.physical and not part.physical and inside(zone, x, y):
-                    hit = True
-            if hit:
+            if any(zone.net == pad.net and point_in_polygon(x, y, zone.polygon) for zone in design.zones):
                 size = VIA_SIZE if min(pad.size) >= VIA_SIZE else SMALL_VIA_SIZE
-                design.vias.append(Via(x, y, pad.net, size=size, drill=size / 2, physical=part.physical))
+                design.vias.append(Via(x, y, pad.net, size=size, drill=size / 2))
 
 
 # --------------------------------------------------------------------------
-# Ring routing: escape vias plus orthogonal ribbons of 36 lanes
+# Ring routing: escape vias plus ribbons of 36 lanes with gentle bends
 # --------------------------------------------------------------------------
 
-BODY_LANE_PITCH = 0.25   # lane pitch in the body of a bent ribbon: a bent hop is split by escape depth
-                         # onto two layers, so each half has one-ball-pitch lanes at the vias and
-                         # converges to this in its body (0.1 mm tracks, 0.15 mm gaps)
-TAPER_SLOPE = 0.7        # steepest lane taper that keeps 0.1 mm between 0.25 mm-pitch lanes
-PATH_MARGIN = 0.6        # a ribbon path starts this far past the outer escape vias
-
-
-def half_body_width() -> float:
-    return 9 * BODY_LANE_PITCH          # 18 lanes at the body pitch
-
-
-def taper_for(pitch: float) -> float:
-    """Taper length for a port of this ball pitch: the outermost lane (9 pitches
-    out) converges to the body width at no more than TAPER_SLOPE."""
-    return max(6.0, (9.0 * pitch - half_body_width()) / TAPER_SLOPE)
-
-
-def bend_run(pitch: float) -> float:
-    """Straight run a path needs before or after a corner: the taper plus half the body width."""
-    return taper_for(pitch) + half_body_width() + 0.25
+PATH_RUN = 8.0           # a ribbon leaves and enters a port straight for this long before it may bend
+PATH_MARGIN = 0.6        # kept for the escape reach used by the report
 
 
 def escape_reach(package: Package) -> float:
-    """Distance from a package centre to a ribbon path end: past the outer escape vias."""
+    """Distance from a package centre to a point just past the outer escape vias, where a ribbon path starts or ends."""
     return (package.cols - 1) / 2 * package.pitch + ESCAPE_OUT + PATH_MARGIN
 
 
-def escape_via_local(pad: Pad, pitch: float) -> tuple[float, float]:
+def escape_via_local(pad: Pad, pitch: float) -> Point:
     """Escape via of a link ball: outer column straight out past the package
     edge, inner column a dogbone half a pitch diagonally, so the lanes of the
-    two columns interleave at half the ball pitch."""
+    two columns interleave at half the ball pitch.  The dogbone shift is the
+    same local direction on both edges, so lane k leaves on the east at the
+    offset it arrives at on the west of the next chip."""
     edge, depth = pad.escape
     dog = pitch / 2
     if edge == "E":
         return (pad.x + ESCAPE_OUT, pad.y) if depth == 0 else (pad.x + dog, pad.y + dog)
     if edge == "W":
         return (pad.x - ESCAPE_OUT, pad.y) if depth == 0 else (pad.x - dog, pad.y + dog)
-    if edge == "S":
-        # Mirrored dogbone: the south edge receives lanes from a rotated chip,
-        # whose inner-column lanes sit half a pitch the other way.
-        return (pad.x, pad.y - ESCAPE_OUT) if depth == 0 else (pad.x - dog, pad.y - dog)
-    return (pad.x, pad.y + ESCAPE_OUT) if depth == 0 else (pad.x + dog, pad.y + dog)
+    raise ValueError(f"link balls escape east or west, not {edge}")
 
 
-def escape_via(part: Part, pad: Pad) -> tuple[float, float]:
+def escape_via(part: Part, pad: Pad) -> Point:
     return part.local_to_board(*escape_via_local(pad, part.package.pitch))
 
 
@@ -776,70 +737,65 @@ def escape_pads(part: Part, edge_local: str) -> list[Pad]:
     return [pad for pad in part.pads if pad.escape and pad.escape[0] == edge_local]
 
 
-def lane_centre(part: Part, edge_local: str) -> tuple[float, float]:
-    """Frame centre of a link port's escape vias; a ribbon path ends here."""
+def lane_centre(part: Part, edge_local: str) -> Point:
+    """Board centre of a link port's escape vias; a ribbon path starts or ends here."""
     vias = [escape_via(part, pad) for pad in escape_pads(part, edge_local)]
     return sum(v[0] for v in vias) / len(vias), sum(v[1] for v in vias) / len(vias)
 
 
-def corner_at(b0: tuple[float, float], ua: tuple[float, float], ub: tuple[float, float],
-              da: float, db: float) -> tuple[float, float]:
-    """Corner of two orthogonal offset lines: lateral ``da`` on the segment with
-    direction ``ua`` and ``db`` on the one with ``ub``, meeting at centreline point ``b0``."""
+def unit(a: Point, b: Point) -> Point:
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    length = math.hypot(dx, dy)
+    return dx / length, dy / length
+
+
+def turn_deg(ua: Point, ub: Point) -> float:
+    """Unsigned angle between two unit vectors, degrees."""
+    dot = max(-1.0, min(1.0, ua[0] * ub[0] + ua[1] * ub[1]))
+    return math.degrees(math.acos(dot))
+
+
+def corner_at(b0: Point, ua: Point, ub: Point, da: float, db: float) -> Point:
+    """Corner of two offset lines: lateral ``da`` on the segment with direction
+    ``ua`` and ``db`` on the one with ``ub``, the centrelines meeting at ``b0``."""
     na, nb = (-ua[1], ua[0]), (-ub[1], ub[0])
     pa = (b0[0] + da * na[0], b0[1] + da * na[1])
     pb = (b0[0] + db * nb[0], b0[1] + db * nb[1])
-    return (pb[0], pa[1]) if abs(ua[0]) > 0.5 else (pa[0], pb[1])
+    det = ub[0] * ua[1] - ua[0] * ub[1]
+    if abs(det) < 1e-9:                       # collinear segments: the offset line is the same
+        return pa
+    rx, ry = pb[0] - pa[0], pb[1] - pa[1]
+    t = (rx * (-ub[1]) - (-ub[0]) * ry) / det
+    return pa[0] + t * ua[0], pa[1] + t * ua[1]
 
 
-def ribbon(path: list[tuple[float, float]], starts: dict[str, tuple[float, float]],
-           end_vias: list[tuple[str | None, tuple[float, float]]], body_compression: float = 1.0,
-           end_scale: float = 1.0, taper_start: float = 10.0,
-           taper_end: float = 10.0) -> tuple[dict[str, list[tuple[float, float]]], dict[str, str]]:
-    """Route each start via along the orthogonal centreline ``path`` at its own
-    lateral offset and finish on the end via lying on the same lane.
-
-    Between the first and last waypoints of a multi-segment path the lanes
-    converge to ``body_compression`` of their offset (when the first and last
-    segments are long enough for the tapers), so a bend costs the outer lane
-    little.  ``end_scale`` is the ratio of the end part's lane pitch to the
-    start part's, for hops between packages of different ball pitch.
-    Returns the polylines per net and the mapping end-via-pad -> net.
+def ribbon(path: list[Point], starts: dict[str, Point], end_vias: list[tuple[str | None, Point]],
+           end_scale: float = 1.0) -> tuple[dict[str, list[Point]], dict[str, str]]:
+    """Route each start via along the polyline ``path`` at its own lateral
+    offset and finish on the end via lying on the same lane.  ``end_scale`` is
+    the ratio of the end part's lane pitch to the start part's, for hops
+    between packages of different ball pitch; the lanes converge over the
+    last segment.  Returns the polylines per net and the mapping end-via-pad -> net.
     """
-    def unit(a, b):
-        dx, dy = b[0] - a[0], b[1] - a[1]
-        length = math.hypot(dx, dy)
-        return dx / length, dy / length
-
     segments = list(zip(path, path[1:]))
-    lengths = [math.dist(a, b) for a, b in segments]
-    compress = 1.0
-    if len(segments) >= 2 and lengths[0] >= taper_start and lengths[-1] >= taper_end:
-        compress = body_compression
-    taper = compress < 1.0 or end_scale != 1.0
-    tracks: dict[str, list[tuple[float, float]]] = {}
+    tracks: dict[str, list[Point]] = {}
     assignment: dict[str, str] = {}
     used: set[int] = set()
+    u0 = unit(*segments[0])
+    n0 = (-u0[1], u0[0])                              # left normal
+    ul = unit(*segments[-1])
+    nl = (-ul[1], ul[0])
     for net, start in starts.items():
-        u0 = unit(*segments[0])
-        n0 = (-u0[1], u0[0])                              # left normal
         d = (start[0] - path[0][0]) * n0[0] + (start[1] - path[0][1]) * n0[1]
-        dc = d * compress
         d_end = d * end_scale
         points = [start]
-        if taper:
-            points.append((path[0][0] + d * n0[0], path[0][1] + d * n0[1]))
-            if compress < 1.0:
-                points.append((path[0][0] + u0[0] * taper_start + dc * n0[0], path[0][1] + u0[1] * taper_start + dc * n0[1]))
         for (a0, b0), (a1, b1) in zip(segments, segments[1:]):
-            points.append(corner_at(b0, unit(a0, b0), unit(a1, b1), dc, dc))
-        ul = unit(*segments[-1])
-        nl = (-ul[1], ul[0])
-        if taper:
-            if compress < 1.0:
-                points.append((path[-1][0] - ul[0] * taper_end + dc * nl[0], path[-1][1] - ul[1] * taper_end + dc * nl[1]))
+            points.append(corner_at(b0, unit(a0, b0), unit(a1, b1), d, d))
+        if end_scale != 1.0:
+            # Converge over the last segment: leave its corner at d, arrive at d_end.
+            if len(segments) == 1:
+                points.append((path[0][0] + d * n0[0], path[0][1] + d * n0[1]))
             points.append((path[-1][0] + d_end * nl[0], path[-1][1] + d_end * nl[1]))
-        # End via: the one on this lane (same lateral offset on the last segment).
         best, best_err = None, 1e9
         for index, (pad_name, via) in enumerate(end_vias):
             if index in used:
@@ -858,51 +814,45 @@ def ribbon(path: list[tuple[float, float]], starts: dict[str, tuple[float, float
     return tracks, assignment
 
 
-def hop_path(source: Part, sink: Part) -> tuple[list[tuple[float, float]], str, str]:
-    """Centreline (ring frame) and the local edges used for each hop.  Returns (path, source_edge, sink_edge)."""
-    out_x = escape_reach(source.package)
-    in_x = escape_reach(sink.package)
-    run_out, run_in = bend_run(source.package.pitch), bend_run(sink.package.pitch)
-    # Paths run through the centre of each port's escape vias, so the lane
-    # offsets are symmetric at both ends whatever rows the ball map uses.
-    if source.part_class == "fpga":
-        # FPGA east edge to A0 west edge with a jog to A0's row.
-        x0 = source.x + out_x
-        x1 = sink.x - in_x
-        mid = (x0 + x1) / 2
-        y0 = lane_centre(source, "E")[1]
-        y1 = lane_centre(sink, "W")[1]
-        return [(x0, y0), (mid, y0), (mid, y1), (x1, y1)], "E", "W"
-    if sink.part_class == "fpga":
-        # H1 (rotated: link_out on its physical west) west, then north up the
-        # frame edge into the FPGA's west edge; the FPGA sits just above H1.
-        x0 = source.x - out_x
-        y0 = lane_centre(source, "E")[1]
-        channel_x = x0 - run_out
-        y1 = lane_centre(sink, "W")[1]
-        x1 = sink.x - in_x
-        if x1 - channel_x < run_in:
-            raise ValueError(f"{source.ref} -> {sink.ref}: the FPGA needs {run_in - (x1 - channel_x):.1f} mm more room east of the channel")
-        return [(x0, y0), (channel_x, y0), (channel_x, y1), (x1, y1)], "E", "W"
-    y0, y1 = lane_centre(source, "E")[1], lane_centre(sink, "W")[1]
-    if source.rotation == sink.rotation:
-        if abs(y0 - y1) > 1e-6:
-            raise ValueError(f"{source.ref} -> {sink.ref}: ports are not aligned ({y0:.2f} vs {y1:.2f})")
-        if source.rotation == 0:
-            return [(source.x + out_x, y0), (sink.x - in_x, y1)], "E", "W"
-        return [(source.x - out_x, y0), (sink.x + in_x, y1)], "E", "W"
-    # Row change: east out of the last row-A chip, south, west into the rotated chip below.
-    channel_x = source.x + out_x + run_out
-    return [(source.x + out_x, y0), (channel_x, y0), (channel_x, y1), (sink.x + in_x, y1)], "E", "W"
+def hop_path(source: Part, sink: Part) -> tuple[list[Point], float]:
+    """Centreline of a hop: straight out of the source's link-out port, straight
+    into the sink's link-in port, one segment between.  Returns the path and
+    the sharpest bend in degrees."""
+    u_out, u_in = source.direction(0.0), sink.direction(0.0)
+    # The path starts and ends just past the outer escape vias, on the lane
+    # centreline, so lanes converging to another pitch are settled before
+    # they pass the vias.
+    r0, r1 = escape_reach(source.package), escape_reach(sink.package)
+    lc0, lc1 = lane_centre(source, "E"), lane_centre(sink, "W")
+    n_out, n_in = (-u_out[1], u_out[0]), (-u_in[1], u_in[0])
+    d0 = (lc0[0] - source.x) * n_out[0] + (lc0[1] - source.y) * n_out[1]      # lateral offset of the port centre
+    d1 = (lc1[0] - sink.x) * n_in[0] + (lc1[1] - sink.y) * n_in[1]
+    p0 = (source.x + r0 * u_out[0] + d0 * n_out[0], source.y + r0 * u_out[1] + d0 * n_out[1])
+    p1 = (sink.x - r1 * u_in[0] + d1 * n_in[0], sink.y - r1 * u_in[1] + d1 * n_in[1])
+    c0 = (p0[0] + PATH_RUN * u_out[0], p0[1] + PATH_RUN * u_out[1])
+    c1 = (p1[0] - PATH_RUN * u_in[0], p1[1] - PATH_RUN * u_in[1])
+    if math.dist(c0, c1) < 2.0:
+        raise ValueError(f"{source.ref} -> {sink.ref}: ports too close for a ribbon ({math.dist(p0, p1):.1f} mm apart)")
+    mid = unit(c0, c1)
+    bends = (turn_deg(u_out, mid), turn_deg(mid, u_in))
+    if max(bends) > MAX_BEND_DEG:
+        raise ValueError(f"{source.ref} -> {sink.ref}: ribbon would bend {max(bends):.0f} degrees; the chips do not face each other")
+    path = [p0]
+    if bends[0] > 0.5:
+        path.append(c0)
+    if bends[1] > 0.5:
+        path.append(c1)
+    path.append(p1)
+    return path, max(bends)
 
 
 def route_ring(design: Design) -> None:
     board = design.board
     for hop, (src_ref, dst_ref) in enumerate(ring_hops(board)):
         source, sink = design.part(src_ref), design.part(dst_ref)
-        path, src_edge, dst_edge = hop_path(source, sink)
-        src_pads = escape_pads(source, src_edge)
-        dst_pads = escape_pads(sink, dst_edge)
+        path, bend = hop_path(source, sink)
+        src_pads = escape_pads(source, "E")
+        dst_pads = escape_pads(sink, "W")
         # Escape stubs and vias on both ends.
         for part, pads in ((source, src_pads), (sink, dst_pads)):
             for pad in pads:
@@ -911,78 +861,64 @@ def route_ring(design: Design) -> None:
                 net = pad.net or f"__{part.ref}_{pad.name}"
                 design.vias.append(Via(vx, vy, net))
                 design.tracks.append(Track("F.Cu", net, [(px, py), (vx, vy)]))
-        known_is_source = all(pad.net for pad in src_pads)
-        if not known_is_source:
+        # The FPGA's link pins get their nets from the ribbon, so a hop into
+        # or out of an unassigned port is routed from the assigned end.
+        if not all(pad.net for pad in src_pads):
             path = list(reversed(path))
             src_pads, dst_pads = dst_pads, src_pads
             source, sink = sink, source
-        # A straight hop is one ribbon on the first link layer.  A bent hop is
-        # split by escape depth (outer-column lanes, dogbone lanes) onto the
-        # two link layers so each half is narrow enough to bend within the
-        # length limit.  Lanes of one depth are one ball pitch apart, and the
-        # end part may have a different pitch.
-        groups = [(LINK_LAYERS[0], (0, 1))] if len(path) == 2 else [(LINK_LAYERS[0], (0,)), (LINK_LAYERS[1], (1,))]
-        body_compression = BODY_LANE_PITCH / source.package.pitch
-        end_scale = sink.package.pitch / source.package.pitch
+        starts = {pad.net: escape_via(source, pad) for pad in src_pads}
+        ends = [(pad.name, escape_via(sink, pad)) for pad in dst_pads]
+        tracks, assignment = ribbon(path, starts, ends, sink.package.pitch / source.package.pitch)
+        for pad_name, net in assignment.items():
+            pad = sink.pad(pad_name)
+            if pad.net is None:
+                pad.net = net
+                for via in design.vias:
+                    if via.net == f"__{sink.ref}_{pad_name}":
+                        via.net = net
+                for track in design.tracks:
+                    if track.net == f"__{sink.ref}_{pad_name}":
+                        track.net = net
+            elif pad.net != net:
+                raise ValueError(f"hop {hop}: lane of {net} arrives at {sink.ref}.{pad_name} carrying {pad.net}")
         lengths = []
-        for layer, depths in groups:
-            starts = {pad.net: escape_via(source, pad) for pad in src_pads if pad.escape[1] in depths}
-            ends = [(pad.name, escape_via(sink, pad)) for pad in dst_pads if pad.escape[1] in depths]
-            tracks, assignment = ribbon(path, starts, ends, body_compression, end_scale,
-                                        taper_for(source.package.pitch), taper_for(sink.package.pitch))
-            for pad_name, net in assignment.items():
-                pad = sink.pad(pad_name)
-                if pad.net is None:
-                    pad.net = net
-                    for via in design.vias:
-                        if via.net == f"__{sink.ref}_{pad_name}":
-                            via.net = net
-                    for track in design.tracks:
-                        if track.net == f"__{sink.ref}_{pad_name}":
-                            track.net = net
-                elif pad.net != net:
-                    raise ValueError(f"hop {hop}: lane of {net} arrives at {sink.ref}.{pad_name} carrying {pad.net}")
-            for net, points in tracks.items():
-                track = Track(layer, net, points)
-                design.tracks.append(track)
-                lengths.append(track.length())
+        for net, points in tracks.items():
+            track = Track(LINK_LAYER, net, points)
+            design.tracks.append(track)
+            lengths.append(track.length())
         design.hop_lengths[f"{src_ref} -> {dst_ref}"] = (min(lengths), max(lengths))
+        design.hop_bends[f"{src_ref} -> {dst_ref}"] = bend
 
 
 # --------------------------------------------------------------------------
 # Zones
 # --------------------------------------------------------------------------
 
-def rect(x0: float, y0: float, x1: float, y1: float) -> list[tuple[float, float]]:
-    return [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
-
-
 def add_zones(design: Design) -> None:
     ff, lay = design.form_factor, design.layout
     outline = rect(1.0, 1.0, ff.width - 1.0, ff.depth - 1.0)
     for layer in GND_LAYERS:
-        design.zones.append(Zone(layer, "GND", outline, physical=True))
-    # 12 V from the supply inputs across the top rail layer.
-    design.zones.append(Zone(TOP_RAIL_LAYER, "+12V", outline, priority=0, physical=True))
-    # Memory PHY rail under both memory bands, I/O rail along the regulator strip (ring frame).
-    a_top = lay.row_v["A"] + lay.body / 2
-    b_bottom = lay.row_v["B"] - lay.body / 2
-    design.zones.append(Zone(TOP_RAIL_LAYER, "VDD2H_1V05", rect(85.0, max(2.0, b_bottom - 16.0), 300.0, b_bottom - 1.0), priority=1))
-    design.zones.append(Zone(TOP_RAIL_LAYER, "VDD2H_1V05", rect(85.0, a_top + 1.0, 300.0, a_top + 14.0), priority=1))
-    design.zones.append(Zone(TOP_RAIL_LAYER, "VDD_IO_1V8", rect(85.0, a_top + 14.5, 300.0, FRAME_V_MAX - 1.0), priority=1))
-    # Core rails: one island per ASIC covering the package and its regulator.
+        design.zones.append(Zone(layer, "GND", outline))
+    # 12 V from the supply inputs across the top rail layer; the I/O rail as a
+    # disc under the whole ring; the memory-PHY rail as an island under each
+    # chip's two memories, rotated with them.
+    design.zones.append(Zone(TOP_RAIL_LAYER, "+12V", outline, priority=0))
+    asic_body = design.pinout.package.body
+    design.zones.append(Zone(TOP_RAIL_LAYER, "VDD_IO_1V8", regular_polygon(lay.centre, lay.radius + asic_body / 2 + 2.0, 36), priority=1))
+    for part in design.parts:
+        if part.part_class == "layer_asic":
+            design.zones.append(Zone(TOP_RAIL_LAYER, "VDD2H_1V05",
+                                     local_rect(part, -19.5, part.body_h / 2 + 1.0, 19.5, part.body_h / 2 + 15.5), priority=2))
+    # Core rails: one island per ASIC covering the package and its regulator on the inner edge.
     for part in design.parts:
         if part.part_class in ("layer_asic", "head_asic"):
-            vrm = design.part(f"VRM_{short_ref(part.ref)}")
-            vw, vh = vrm.extent()
-            x0 = min(part.x - part.body_w / 2, vrm.x - vw / 2) - 1.0
-            x1 = max(part.x + part.body_w / 2, vrm.x + vw / 2) + 1.0
-            y0 = min(part.y - part.body_h / 2, vrm.y - vh / 2) - 1.0
-            y1 = max(part.y + part.body_h / 2, vrm.y + vh / 2) + 1.0
-            design.zones.append(Zone(CORE_RAIL_LAYER, f"VDD_CORE_{short_ref(part.ref)}", rect(x0, y0, x1, y1), 1))
+            design.zones.append(Zone(CORE_RAIL_LAYER, f"VDD_CORE_{short_ref(part.ref)}",
+                                     local_rect(part, -(part.body_w / 2 + 1.0), -(part.body_h / 2 + 2.5 + VRM_H + 1.0),
+                                                part.body_w / 2 + 1.0, part.body_h / 2 + 1.0), 1))
     fpga = design.part(design.board.instances("fpga")[0])
     design.zones.append(Zone(CORE_RAIL_LAYER, "VCCINT_0V85",
-                             rect(fpga.x - 15.0, fpga.y - 15.0, fpga.x + 15.0, fpga.y + 27.0), 1))
+                             local_rect(fpga, -15.0, -(fpga.body_h / 2 + 2.5 + REG_H + 1.0), 15.0, 15.0), 1))
 
 
 # --------------------------------------------------------------------------
@@ -1002,7 +938,7 @@ def core_current_density(design: Design) -> list[tuple[str, float, float, float]
 
 
 def report_markdown(design: Design) -> str:
-    board, ff = design.board, design.form_factor
+    board, ff, lay = design.board, design.form_factor, design.layout
     lines = ["# KiCad floorplan report", "",
              "Generated by `python -m hw.kicad_gen` from `hw/board.yaml`. Do not edit.", "",
              f"{ff.description}: {ff.width:.0f} x {ff.depth:.0f} mm, {len(COPPER_LAYERS)} copper layers, "
@@ -1013,15 +949,17 @@ def report_markdown(design: Design) -> str:
     lines += [f"| {layer} | {role} |" for layer, role in LAYER_ROLES.items()]
     pin = design.pinout
     pitch = pin.package.pitch
-    lines += ["", "## Activation ring", "", f"36 lanes per hop, {TRACK_WIDTH} mm tracks. A straight hop is one "
-              f"ribbon on {LINK_LAYERS[0]} at {pitch / 2} mm lane pitch (outer-column and dogbone vias interleaved). "
-              f"A bent hop is split by escape depth into two 18-lane ribbons on {LINK_LAYERS[0]} and {LINK_LAYERS[1]}, "
-              f"each tapering over {taper_for(pitch):.1f} mm from {pitch} mm at the vias to {BODY_LANE_PITCH} mm in its "
-              f"body so the corners cost the outer lane little; the FPGA end rescales to its own "
-              f"{PACKAGES['fpga'].pitch} mm pitch. Limit {MAX_LINK_MM:.0f} mm per `board.yaml`.", "",
-              "| Hop | Shortest lane (mm) | Longest lane (mm) | Within limit |", "| --- | ---: | ---: | --- |"]
+    n = len(lay.nodes)
+    lines += ["", "## Activation ring", "",
+              f"The ring is a regular {n}-gon of {lay.side:.0f} mm side ({lay.radius:.0f} mm circumradius) centred at "
+              f"({lay.centre[0]:.0f}, {lay.centre[1]:.0f}), one ring node per vertex, each chip rotated tangentially "
+              f"(its link-out edge faces the next chip {360 / n:.1f} degrees round), memories outward, core regulator inward. "
+              f"Every hop is one 36-lane ribbon on {LINK_LAYER} at {pitch / 2} mm lane pitch (outer-column and dogbone vias "
+              f"interleaved), {TRACK_WIDTH} mm tracks, leaving and entering the ports straight for {PATH_RUN:.0f} mm with "
+              f"two bends between. Limit {MAX_LINK_MM:.0f} mm per `board.yaml`.", "",
+              "| Hop | Shortest lane (mm) | Longest lane (mm) | Sharpest bend | Within limit |", "| --- | ---: | ---: | ---: | --- |"]
     for hop, (lo, hi) in design.hop_lengths.items():
-        lines.append(f"| {hop} | {lo:.1f} | {hi:.1f} | {'yes' if hi <= MAX_LINK_MM else 'NO'} |")
+        lines.append(f"| {hop} | {lo:.1f} | {hi:.1f} | {design.hop_bends[hop]:.0f} deg | {'yes' if hi <= MAX_LINK_MM else 'NO'} |")
     pkg = pin.package
     need = pin.requirements
     signal_rows = int(board.data["package_selection"]["signal_rows"])
@@ -1058,10 +996,8 @@ def report_markdown(design: Design) -> str:
 # KiCad writers
 # --------------------------------------------------------------------------
 
-def kicad_xy(design: Design, x: float, y: float, physical: bool) -> tuple[float, float]:
-    """Frame or physical point to KiCad page coordinates (y down)."""
-    if not physical:
-        x, y = design.form_factor.to_board(x, y)
+def kicad_xy(design: Design, x: float, y: float) -> Point:
+    """Board point to KiCad page coordinates (y down)."""
     return x + KICAD_ORIGIN[0], KICAD_ORIGIN[1] + (design.form_factor.depth - y)
 
 
@@ -1070,8 +1006,8 @@ def write_pcb(design: Design, path: Path) -> None:
     nets = ["", *design.nets()]
     net_id = {name: index for index, name in enumerate(nets)}
 
-    def K(x: float, y: float, physical: bool = False) -> str:
-        kx, ky = kicad_xy(design, x, y, physical)
+    def K(x: float, y: float) -> str:
+        kx, ky = kicad_xy(design, x, y)
         return f"{fmt(kx)} {fmt(ky)}"
 
     out = ["(kicad_pcb (version 20221018) (generator asic_kicad_gen)", "",
@@ -1097,23 +1033,24 @@ def write_pcb(design: Design, path: Path) -> None:
     for name, index in net_id.items():
         out.append(f'  (net {index} "{name}")')
     out.append("")
-    # Outline and keep-outs (physical).
+    # Outline and keep-outs.
     corners = [(0.0, 0.0), (ff.width, 0.0), (ff.width, ff.depth), (0.0, ff.depth)]
     for a, b in zip(corners, corners[1:] + corners[:1]):
-        out.append(f'  (gr_line (start {K(*a, True)}) (end {K(*b, True)}) '
+        out.append(f'  (gr_line (start {K(*a)}) (end {K(*b)}) '
                    f'(stroke (width 0.1) (type default)) (layer "Edge.Cuts") (tstamp {uid()}))')
     for name, (x0, y0, x1, y1) in ff.keepouts:
-        out.append(f'  (gr_rect (start {K(x0, y1, True)}) (end {K(x1, y0, True)}) '
+        out.append(f'  (gr_rect (start {K(x0, y1)}) (end {K(x1, y0)}) '
                    f'(stroke (width 0.1) (type dash)) (fill none) (layer "Dwgs.User") (tstamp {uid()}))')
-        out.append(f'  (gr_text "{name}" (at {K((x0 + x1) / 2, (y0 + y1) / 2, True)}) (layer "Dwgs.User") (tstamp {uid()}) '
+        out.append(f'  (gr_text "{name}" (at {K((x0 + x1) / 2, (y0 + y1) / 2)}) (layer "Dwgs.User") (tstamp {uid()}) '
                    f'(effects (font (size 2 2) (thickness 0.3))))')
     out.append(f'  (gr_text "{PROJECT}: {ff.description}, floorplan generated from hw/board.yaml" '
-               f'(at {K(ff.width / 2, ff.depth + 6, True)}) (layer "Cmts.User") (tstamp {uid()}) '
+               f'(at {K(ff.width / 2, ff.depth + 6)}) (layer "Cmts.User") (tstamp {uid()}) '
                f'(effects (font (size 3 3) (thickness 0.4))))')
     out.append("")
-    # Footprints.
+    # Footprints: written unrotated at the part position, with every pad and
+    # outline point already rotated, so any angle works the same way.
     for part in design.parts:
-        px, py = kicad_xy(design, part.x, part.y, part.physical)
+        px, py = kicad_xy(design, part.x, part.y)
         out.append(f'  (footprint "appliance:{part.footprint}" (layer "F.Cu") (tstamp {uid()}) (at {fmt(px)} {fmt(py)})')
         out.append(f'    (property "Sheetfile" "{PROJECT}.kicad_sch")')
         out.append("    (attr smd)")
@@ -1122,44 +1059,38 @@ def write_pcb(design: Design, path: Path) -> None:
                    f' (effects (font (size 1.5 1.5) (thickness 0.2))))')
         out.append(f'    (fp_text value "{part.value}" (at 0 2) (layer "F.Fab") (tstamp {uid()})'
                    f' (effects (font (size 1 1) (thickness 0.15))))')
-        w, h = design.physical_extent(part)
-        if w > 0:
+
+        def local(bx: float, by: float) -> Point:
+            return bx - part.x, -(by - part.y)
+
+        if part.body_w > 0:
             for layer, grow in (("F.SilkS", 0.0), ("F.CrtYd", 0.5), ("F.Fab", 0.0)):
-                out.append(f'    (fp_rect (start {fmt(-w / 2 - grow)} {fmt(-h / 2 - grow)}) (end {fmt(w / 2 + grow)} {fmt(h / 2 + grow)}) '
-                           f'(stroke (width 0.1) (type default)) (fill none) (layer "{layer}") (tstamp {uid()}))')
-
-        def local(pad_x: float, pad_y: float) -> tuple[float, float]:
-            bx, by = part.local_to_board(pad_x, pad_y)
-            dx, dy = bx - part.x, by - part.y
-            if not part.physical:
-                dx, dy = ff.vec(dx, dy)
-            return dx, -dy
-
+                pts = " ".join(f"(xy {fmt(lx)} {fmt(ly)})" for lx, ly in (local(*c) for c in part.corners(grow)))
+                out.append(f'    (fp_poly (pts {pts}) (stroke (width 0.1) (type default)) (fill none) '
+                           f'(layer "{layer}") (tstamp {uid()}))')
         if part.package:
             # Pin-1 mark beside ball A1.
-            ax, ay = local(*part.package.ball_xy(0, 0))
+            ax, ay = local(*part.local_to_board(*part.package.ball_xy(0, 0)))
             out.append(f'    (fp_circle (center {fmt(ax - 0.8)} {fmt(ay - 0.8)}) (end {fmt(ax - 0.4)} {fmt(ay - 0.8)}) '
                        f'(stroke (width 0.15) (type default)) (fill none) (layer "F.SilkS") (tstamp {uid()}))')
         for pad in part.pads:
-            lx, ly = local(pad.x, pad.y)
-            size = pad.size
-            if not part.physical and ff.frame_rotation == 90 and pad.shape == "rect":
-                size = (pad.size[1], pad.size[0])
+            lx, ly = local(*part.local_to_board(pad.x, pad.y))
+            angle = f" {fmt(part.rotation)}" if pad.shape == "rect" and part.rotation else ""
             net = f' (net {net_id[pad.net]} "{pad.net}")' if pad.net else ""
-            out.append(f'    (pad "{pad.name}" smd {pad.shape} (at {fmt(lx)} {fmt(ly)}) (size {fmt(size[0])} {fmt(size[1])}) '
+            out.append(f'    (pad "{pad.name}" smd {pad.shape} (at {fmt(lx)} {fmt(ly)}{angle}) (size {fmt(pad.size[0])} {fmt(pad.size[1])}) '
                        f'(layers {pad.layers}){net} (tstamp {uid()}))')
         out.append("  )")
     out.append("")
     for track in design.tracks:
         for a, b in zip(track.points, track.points[1:]):
-            out.append(f'  (segment (start {K(*a, track.physical)}) (end {K(*b, track.physical)}) '
+            out.append(f'  (segment (start {K(*a)}) (end {K(*b)}) '
                        f'(width {fmt(track.width)}) (layer "{track.layer}") (net {net_id[track.net]}) (tstamp {uid()}))')
     for via in design.vias:
-        out.append(f'  (via (at {K(via.x, via.y, via.physical)}) (size {fmt(via.size)}) (drill {fmt(via.drill)}) '
+        out.append(f'  (via (at {K(via.x, via.y)}) (size {fmt(via.size)}) (drill {fmt(via.drill)}) '
                    f'(layers "F.Cu" "B.Cu") (net {net_id[via.net]}) (tstamp {uid()}))')
     out.append("")
     for zone in design.zones:
-        pts = " ".join(f"(xy {K(x, y, zone.physical)})" for x, y in zone.polygon)
+        pts = " ".join(f"(xy {K(x, y)})" for x, y in zone.polygon)
         out.append(f'  (zone (net {net_id[zone.net]}) (net_name "{zone.net}") (layer "{zone.layer}") (tstamp {uid()}) '
                    f'(hatch edge 0.5) (priority {zone.priority}) (connect_pads (clearance 0.2)) (min_thickness 0.25) '
                    f'(filled_areas_thickness no) (fill yes (thermal_gap 0.3) (thermal_bridge_width 0.3)) '
@@ -1237,8 +1168,8 @@ def write_schematic(design: Design, path: Path) -> None:
     root_uuid = uid()
     groups = {"asics": lambda p: p.part_class in ("layer_asic", "head_asic"),
               "memory": lambda p: p.part_class in ("lpddr5x", "ddr4"),
-              "fpga": lambda p: p.part_class in ("fpga", "clock_gen", "sfp_cage", "pcie_edge", "host_cable", "bmc", "rj45"),
-              "power": lambda p: p.part_class in ("vrm_core", "regulator", "aux_power", "psu_input", "fan_header")}
+              "fpga": lambda p: p.part_class in ("fpga", "clock_gen", "sfp_cage", "host_cable", "bmc", "rj45"),
+              "power": lambda p: p.part_class in ("vrm_core", "regulator", "psu_input", "fan_header")}
     sheet_uuids = {name: uid() for name in groups}
     root = [f"(kicad_sch (version 20230121) (generator asic_kicad_gen)", f"  (uuid {root_uuid})", '  (paper "A3")',
             "  (lib_symbols)"]
@@ -1312,15 +1243,17 @@ def floorplan_svg(design: Design) -> str:
     w, h = ff.width * scale + 40, ff.depth * scale + 70
     fills = {"layer_asic": "#dbe8f7", "head_asic": "#f7dbdb", "lpddr5x": "#e8f3e8", "ddr4": "#e8f3e8",
              "fpga": "#fff2cc", "vrm_core": "#f3e6d0", "regulator": "#eeeeee", "clock_gen": "#eeeeee",
-             "sfp_cage": "#dddddd", "aux_power": "#dddddd", "pcie_edge": "#dddddd", "host_cable": "#dddddd",
-             "psu_input": "#dddddd", "fan_header": "#dddddd", "bmc": "#fff2cc", "rj45": "#dddddd"}
-    layer_colors = {LINK_LAYERS[0]: "#1f5fbf", LINK_LAYERS[1]: "#bf5f1f", "F.Cu": "#999999"}
+             "sfp_cage": "#dddddd", "host_cable": "#dddddd", "psu_input": "#dddddd", "fan_header": "#dddddd",
+             "bmc": "#fff2cc", "rj45": "#dddddd"}
 
     def sx(x: float) -> float:
         return 20 + x * scale
 
     def sy(y: float) -> float:
         return 20 + (ff.depth - y) * scale
+
+    def poly(points: list[Point]) -> str:
+        return " ".join(f"{sx(x):.1f},{sy(y):.1f}" for x, y in points)
 
     parts = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w:.0f} {h:.0f}" font-family="sans-serif" font-size="11">',
              f'<rect width="{w:.0f}" height="{h:.0f}" fill="#fafafa"/>',
@@ -1332,28 +1265,21 @@ def floorplan_svg(design: Design) -> str:
         parts.append(f'<text x="{sx(x0) + 4}" y="{sy(y1) + 12}" fill="#777">{name}</text>')
     for zone in design.zones:
         if zone.layer == CORE_RAIL_LAYER:
-            pts = [ff.to_board(*p) for p in zone.polygon]
-            xs, ys = [p[0] for p in pts], [p[1] for p in pts]
-            parts.append(f'<rect x="{sx(min(xs))}" y="{sy(max(ys))}" width="{(max(xs) - min(xs)) * scale}" '
-                         f'height="{(max(ys) - min(ys)) * scale}" fill="#f9e9e9" stroke="none"/>')
+            parts.append(f'<polygon points="{poly(zone.polygon)}" fill="#f9e9e9" stroke="none"/>')
     for part in design.parts:
         if part.body_w == 0:
             continue
-        x, y = design.physical_xy(part)
-        bw, bh = design.physical_extent(part)
-        parts.append(f'<rect x="{sx(x - bw / 2)}" y="{sy(y + bh / 2)}" width="{bw * scale}" height="{bh * scale}" '
-                     f'fill="{fills.get(part.part_class, "#eee")}" stroke="#333" stroke-width="1"/>')
-        size = 10 if bw > 15 else 6
-        parts.append(f'<text x="{sx(x)}" y="{sy(y) + size / 3}" text-anchor="middle" font-size="{size}">{part.ref}</text>')
+        parts.append(f'<polygon points="{poly(part.corners())}" fill="{fills.get(part.part_class, "#eee")}" '
+                     f'stroke="#333" stroke-width="1"/>')
+        size = 10 if min(part.body_w, part.body_h) > 15 else 6
+        parts.append(f'<text x="{sx(part.x)}" y="{sy(part.y) + size / 3}" text-anchor="middle" font-size="{size}">{part.ref}</text>')
     for track in design.tracks:
         if track.layer == "F.Cu":
             continue
-        pts = [p if track.physical else ff.to_board(*p) for p in track.points]
-        points = " ".join(f"{sx(x):.1f},{sy(y):.1f}" for x, y in pts)
-        parts.append(f'<polyline points="{points}" fill="none" stroke="{layer_colors.get(track.layer, "#000")}" stroke-width="0.6"/>')
+        parts.append(f'<polyline points="{poly(track.points)}" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>')
     parts.append(f'<text x="{sx(2)}" y="{h - 40}" fill="#333">{ff.description}. Generated from hw/board.yaml by '
-                 f'hw/kicad_gen.py. Blue: ring ribbons on {LINK_LAYERS[0]}; orange: second half of bent hops on '
-                 f'{LINK_LAYERS[1]}; pink: core-rail islands on {CORE_RAIL_LAYER}. Rear of the chassis at the bottom.</text>')
+                 f'hw/kicad_gen.py. Blue: ring ribbons on {LINK_LAYER}; pink: core-rail islands on {CORE_RAIL_LAYER}. '
+                 f'Rear of the chassis at the bottom.</text>')
     parts.append(f'<text x="{sx(2)}" y="{h - 24}" fill="#333">Memory, PCIe and management nets are unrouted. Longest lane per hop: '
                  + "; ".join(f"{hop.replace('U_', '')} {hi:.0f} mm" for hop, (_, hi) in design.hop_lengths.items()) + "</text>")
     parts.append("</svg>")
@@ -1385,11 +1311,13 @@ def main() -> None:
             print(report_markdown(design))
         return
     design = generate(board, args.output)
+    lay = design.layout
     print(f"wrote {args.output}/{PROJECT}.kicad_pcb ({design.form_factor.description}): {len(design.parts)} footprints, "
           f"{len(design.nets())} nets, {len(design.tracks)} tracks, {len(design.vias)} vias, "
-          f"ASIC package {design.pinout.package.name}")
+          f"ASIC package {design.pinout.package.name}, ring {len(lay.nodes)}-gon of {lay.side:.0f} mm side")
     for hop, (lo, hi) in design.hop_lengths.items():
-        print(f"  {hop}: {lo:.1f} to {hi:.1f} mm{'' if hi <= MAX_LINK_MM else '  OVER LIMIT'}")
+        print(f"  {hop}: {lo:.1f} to {hi:.1f} mm, bend {design.hop_bends[hop]:.0f} deg"
+              f"{'' if hi <= MAX_LINK_MM else '  OVER LIMIT'}")
 
 
 if __name__ == "__main__":

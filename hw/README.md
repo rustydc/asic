@@ -19,19 +19,16 @@ energy model below moved it out of the slot. At 3 pJ per MAC the board
 draws 0.5 to 1.6 kW of input across the throughput range, which is a rack
 power supply and a row of fans, not a 600 W auxiliary connector on a
 passively cooled card. The 1U also has the room the 50K tokens/s package
-needs (29 mm bodies, 62 mm column pitch, 76 mm row-change hop) and a
-management controller. The chassis layout:
+needs (29 mm bodies on a 280 mm ring) and a management controller. The
+chassis layout:
 
 * rear panel: the SlimSAS 8i host connector next to the FPGA, the BMC's
   RJ45, the optional SFP+ cage, the status LEDs;
 * rear right: the PSU bay with two CRPS modules in a 1+1 redundant pair;
-* the ring runs front to back down the middle of the board, FPGA and head
-  ASICs at the rear, the row change under the front fans;
-* front: six 40 mm fans blowing front to back over the two ASIC rows.
-
-The KiCad generator keeps the card as a second form factor
-(`form_factor_key: pcie_card`), which still builds at the 14.5K rating with
-the 23 mm package; the tests check both.
+* the activation ring is a regular polygon in the left two thirds of the
+  board, the FPGA at its rear vertex, the shared regulators and the clock
+  generator in its middle;
+* front: six 40 mm fans blowing front to back across the ring.
 
 ## Population
 
@@ -62,10 +59,14 @@ Each hop is the 32-bit source-synchronous DDR link from the architecture doc
 vector unchanged and append their top-k logits and partial softmax sum, so no
 broadcast path is needed. The FPGA merges the two lists and samples.
 
-Layer ASICs sit in two rows of four so the ring snakes out along row A and
-back along row B, ending next to the FPGA. Both head chips sit at the rear
-end of row B, the FPGA directly beside H1. Each layer ASIC has one LPDDR5X
-device on either side.
+On the board the eleven ring nodes sit on the vertices of a regular 11-gon,
+clockwise from the FPGA at the rear, each chip rotated so its link-in edge
+faces the previous chip and its link-out edge the next. Every hop is then
+the same short ribbon. Each layer ASIC's two LPDDR5X devices sit on its
+outer edge and its core regulator on its inner edge, rotated with it. All
+eleven nodes are on the polygon, heads and FPGA included, because a chip
+takes the ring in on one edge and out on the opposite edge: a loop that
+dipped into the middle for the heads would have to hairpin back out.
 
 Management is a SPI bus from the FPGA with one chip select per ASIC, a JTAG
 chain through all eleven devices, and a fanned-out reference clock. Each ASIC
@@ -178,21 +179,21 @@ nets.
 
 ![Floorplan](kicad/floorplan.svg)
 
-The ring is laid out in its own frame (u along the rows, v across them) and
-the form factor maps that frame onto the physical board: on the 1U the
-frame is rotated so the rows run front to back, with the FPGA and the head
-ASICs at the rear beside the host connector. What the project contains:
+What the project contains:
 
 * the 420 × 360 mm 1U board with its keep-outs (PSU bay, rear I/O strip,
   fan row), the SlimSAS host connector, the BMC and its RJ45, the two CRPS
   receptacles, six fan headers and the SFP+ cage, all placed physically and
   checked against the keep-outs;
 * all 44 parts of `board.yaml` on generated footprints, plus one core
-  regulator block per ASIC and seven shared-rail regulator blocks. Row A
-  runs rear to front and row B is rotated 180 degrees so the ring snakes
-  back; the memories sit outside the rows, the regulators between them,
-  and the two head ASICs at the rear of row B with the FPGA beside H1 so
-  the closing hop stays short;
+  regulator block per ASIC and seven shared-rail regulator blocks. The
+  eleven ring chips sit on a regular 11-gon of 58 mm side (103 mm
+  circumradius), each rotated tangentially, with its memories on the
+  outer edge and its core regulator on the inner edge rotated with it;
+  the FPGA's DDR4 and their regulators sit on its outer edge at the rear,
+  the shared regulators and the clock generator in the middle of the
+  polygon. Footprints are written with every pad and outline point
+  already rotated, so any angle works;
 * the ASIC ball map derived by `hw/pinout.py` (see above), shared by all ten
   ASICs, with the head ASICs' memory balls unconnected. The FPGA's link pins
   are assigned by the ribbon router; its other pins are placeholders;
@@ -203,12 +204,11 @@ ASICs at the rear beside the host connector. What the project contains:
 * a twelve-layer stackup with four ground planes, a 12 V and I/O rail layer
   and a core-rail layer, via-in-pad on every ground and rail ball a zone can
   reach, and ground, 12 V, memory-PHY and core-rail zones;
-* the activation ring fully routed: each straight hop is one 36-lane ribbon
-  on In2.Cu, and each bent hop is split by escape depth into two 18-lane
-  ribbons on In2.Cu and In5.Cu that taper from the ball pitch to 0.25 mm in
-  their body so the corners stay cheap. Every hop is within the 80 mm link
-  limit; the longest are the row change at 76 mm and the closing hop into
-  the FPGA at 74 mm.
+* the activation ring fully routed: every hop is one 36-lane ribbon on
+  In2.Cu at half the ball pitch that leaves and enters the ports straight
+  and bends twice, by 16 to 20 degrees, in between. The longest lane of
+  any hop is 39 mm against the 80 mm link limit, and all eleven hops are
+  alike.
 
 What it does not contain, on purpose: routed memory, PCIe or management nets
 (length matching and signal integrity are interactive work), decoupling,
@@ -220,23 +220,27 @@ ASIC draws about 177 A, which is over 80 A/mm² on a single 2 oz plane across
 the package width, so the real board needs the regulator against the package
 with several plane layers between them.
 
-Floorplan findings from routing the ring, on the card and again on the 1U:
+Why a polygon and not the two-row snake of the earlier drafts:
 
-* The head ASICs must sit beside the FPGA. The card's first draft put them
-  at the bracket end and the closing hop came to 85 mm.
-* With the 29 mm package the closing hop into the FPGA's south edge was
-  95 mm. The FPGA now sits directly beside H1 and takes the ring on its
-  west edge, which brings the hop to 74 mm; the PCIe pins moved to the
-  FPGA's south edge, towards the host connector.
-* The row-change hop meets the limit only with the rows one regulator band
-  apart, the lanes compressed to 0.25 mm and the ribbon split over two
-  layers; at the via pitch on one layer it was 105 mm on the card. With
-  29 mm bodies it is 76 mm, so the package rating has used up the margin.
-  If the single-ended 1.8 V link keeps its 80 mm budget these constraints
-  are real; the LVDS fallback in `board.yaml` would relax them.
-* The 1U is mostly empty: the ring strip is 111 mm wide on a 420 mm board.
-  That is room for the regulators to spread out, for a second board
-  revision to carry two rings, or for a shorter chassis.
+* The snake had two hops that carried all the risk, the row change and the
+  closing hop into the FPGA, at 76 and 74 mm against the 80 mm limit with
+  the 29 mm package, and only with the lanes compressed to 0.25 mm and
+  split over two layers. On the polygon the longest lane anywhere is
+  39 mm on one layer at the natural lane pitch, so the single-ended 1.8 V
+  link has its margin back and the LVDS fallback is no longer needed for
+  length.
+* Airflow: in the snake each row of four sat in series in the front-to-back
+  air, so the rear chip of a row breathed air heated by three 140 W
+  packages. On the polygon the vertices are staggered and no chip sits
+  directly behind more than one other.
+* The chips are rotated by multiples of 32.7 degrees, so the memory escape
+  routing and the regulators sit at angles to the board axes. KiCad and
+  the fab do not mind; the memory length matching is no harder than on
+  axis.
+* The middle of the polygon (160 mm across) holds the clock generator,
+  equidistant from every chip, and the shared regulators. The right third
+  of the board is free apart from the PSU bay, so a shorter chassis is
+  possible.
 
 ## Open items before schematic entry in an EDA tool
 
@@ -258,5 +262,5 @@ Floorplan findings from routing the ring, on the card and again on the 1U:
    link tolerates; the fallback is a Gen3 cable or a redriver at the
    rear panel.
 7. Thermal: 1.4 kW of load in 1U at 50K tokens/s is at the limit of
-   front-to-back air over 29 mm packages; the 25K row (0.8 kW) is the
-   comfortable air-cooled point.
+   front-to-back air over 29 mm packages even with the staggered polygon;
+   the 25K row (0.8 kW) is the comfortable air-cooled point.

@@ -257,28 +257,30 @@ class Board:
         return "\n".join(lines) + "\n"
 
     def svg(self) -> str:
-        """Block diagram: FPGA at the left, layer ASICs snaking in two rows, heads closing the ring."""
-        W, H = 1180, 560
+        """Block diagram: the eleven ring nodes on a regular polygon, clockwise
+        from the FPGA at the bottom (the chassis rear), memories outside."""
+        import math
+        W, H = 1180, 900
         box_w, box_h = 96, 60
         mem_w, mem_h = 40, 22
-        col_x = [300, 470, 640, 810]
-        row_y = {"A": 110, "B": 330}
-        pos: dict[str, tuple[int, int]] = {"U_FPGA": (60, 220), "U_H0": (60, 400), "U_H1": (60, 480)}
-        for ref in self.instances("layer_asic"):
-            place = self.components[ref]["place"]
-            row = place.split("row ")[1][0]
-            col = int(place.split("col ")[1])
-            pos[ref] = (col_x[col], row_y[row])
+        cx, cy, radius = 590, 420, 300
+        refs = [source.component for source, _ in self.ring()]
+        n = len(refs)
+        angle = {ref: -90.0 - k * 360.0 / n for k, ref in enumerate(refs)}       # clockwise, FPGA at the bottom
+        pos: dict[str, tuple[float, float]] = {}
+        for ref, a in angle.items():
+            h = box_h + 20 if ref == "U_FPGA" else box_h
+            pos[ref] = (cx + radius * math.cos(math.radians(a)) - box_w / 2, cy - radius * math.sin(math.radians(a)) - h / 2)
         parts = ['<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 %d %d" font-family="sans-serif" font-size="12">' % (W, H),
                  f'<rect width="{W}" height="{H}" fill="#fafafa"/>',
                  f'<text x="20" y="28" font-size="16" font-weight="bold">{self.data["board"]["name"]}: block diagram</text>',
                  f'<text x="20" y="46" fill="#555">{self.data["board"]["form_factor"]}</text>']
 
-        def box(ref: str, x: int, y: int, w: int, h: int, fill: str, label: str, sub: str = "") -> None:
-            parts.append(f'<rect x="{x}" y="{y}" width="{w}" height="{h}" rx="6" fill="{fill}" stroke="#333"/>')
-            parts.append(f'<text x="{x + w / 2}" y="{y + 20}" text-anchor="middle" font-weight="bold">{label}</text>')
+        def box(ref: str, x: float, y: float, w: float, h: float, fill: str, label: str, sub: str = "") -> None:
+            parts.append(f'<rect x="{x:.1f}" y="{y:.1f}" width="{w}" height="{h}" rx="6" fill="{fill}" stroke="#333"/>')
+            parts.append(f'<text x="{x + w / 2:.1f}" y="{y + 20:.1f}" text-anchor="middle" font-weight="bold">{label}</text>')
             if sub:
-                parts.append(f'<text x="{x + w / 2}" y="{y + 38}" text-anchor="middle" fill="#333">{sub}</text>')
+                parts.append(f'<text x="{x + w / 2:.1f}" y="{y + 38:.1f}" text-anchor="middle" fill="#333">{sub}</text>')
 
         def rect(ref: str) -> tuple[float, float, float, float]:
             x, y = pos[ref]
@@ -292,8 +294,8 @@ class Board:
         def clip_to_edge(ref: str, x_from: float, y_from: float) -> tuple[float, float]:
             """Point where the segment from (x_from, y_from) to ref's centre meets ref's box edge."""
             x1, y1, x2, y2 = rect(ref)
-            cx, cy = centre(ref)
-            dx, dy = cx - x_from, cy - y_from
+            cx_, cy_ = centre(ref)
+            dx, dy = cx_ - x_from, cy_ - y_from
             candidates = []
             for edge, delta in ((x1, dx), (x2, dx)):
                 if delta:
@@ -315,52 +317,54 @@ class Board:
                      '<path d="M0,0 L8,4 L0,8 z" fill="#1f5fbf"/></marker></defs>')
         line_style = 'stroke="#1f5fbf" stroke-width="2.5" marker-end="url(#arrow)" fill="none"'
         for source, sink in self.ring():
-            if sink.component == "U_FPGA":
-                # Closing hop: route left of the head chips back up to the FPGA.
-                sx, sy, _, _ = rect(source.component)
-                _, fy1, _, fy2 = rect(sink.component)
-                mid_y = sy + box_h / 2
-                parts.append(f'<polyline points="{sx},{mid_y} {sx - 30},{mid_y} {sx - 30},{fy2 + 12} {sx + 10},{fy2 + 12} {sx + 10},{fy2}" {line_style}/>')
-                continue
             (cx1, cy1), (cx2, cy2) = centre(source.component), centre(sink.component)
             x1, y1 = clip_to_edge(source.component, cx2, cy2)
             x2, y2 = clip_to_edge(sink.component, cx1, cy1)
             parts.append(f'<line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}" {line_style}/>')
-        # Memory devices beside each layer ASIC.
+        # Memory devices outside each layer ASIC, along the radius.
         memory_of: dict[str, list[str]] = {}
         for a, b in self.nets["memory"]["channels"]:
             memory_of.setdefault(Endpoint.parse(a).component, []).append(Endpoint.parse(b).component)
         for ref in self.instances("layer_asic"):
-            x, y = pos[ref]
+            a = math.radians(angle[ref])
+            ux, uy = math.cos(a), -math.sin(a)                     # outward, SVG y down
+            tx, ty = -uy, ux                                       # tangent
+            ex, ey = centre(ref)
             for index, device in enumerate(memory_of.get(ref, [])):
-                my = y - mem_h - 8 if index == 0 else y + box_h + 8
-                parts.append(f'<rect x="{x + 28}" y="{my}" width="{mem_w}" height="{mem_h}" fill="#e8f3e8" stroke="#333"/>')
-                parts.append(f'<text x="{x + 28 + mem_w / 2}" y="{my + 15}" text-anchor="middle" font-size="10">{device[2:]}</text>')
-                parts.append(f'<line x1="{x + box_w / 2}" y1="{my + (mem_h if index == 0 else 0)}" x2="{x + box_w / 2}" '
-                             f'y2="{y + (0 if index == 0 else box_h)}" stroke="#2a7a2a" stroke-width="2"/>')
+                side = -1 if index == 0 else 1
+                mx = ex + ux * 62 + tx * side * 26 - mem_w / 2
+                my = ey + uy * 62 + ty * side * 26 - mem_h / 2
+                parts.append(f'<rect x="{mx:.1f}" y="{my:.1f}" width="{mem_w}" height="{mem_h}" fill="#e8f3e8" stroke="#333"/>')
+                parts.append(f'<text x="{mx + mem_w / 2:.1f}" y="{my + 15:.1f}" text-anchor="middle" font-size="10">{device[2:]}</text>')
+                sx, sy = clip_to_edge(ref, mx + mem_w / 2, my + mem_h / 2)
+                parts.append(f'<line x1="{mx + mem_w / 2:.1f}" y1="{my + mem_h / 2:.1f}" x2="{sx:.1f}" y2="{sy:.1f}" stroke="#2a7a2a" stroke-width="2"/>')
         # Boxes.
         fx, fy = pos["U_FPGA"]
         box("U_FPGA", fx, fy, box_w, box_h + 20, "#fff2cc", "U_FPGA", "PCIe Gen4 x8 (cable)")
-        parts.append(f'<rect x="{fx - 40}" y="{fy + 10}" width="30" height="60" fill="#ddd" stroke="#333"/>')
-        parts.append(f'<text x="{fx - 25}" y="{fy + 44}" text-anchor="middle" font-size="9" transform="rotate(-90 {fx - 25} {fy + 44})">host cable</text>')
-        parts.append(f'<rect x="{fx + box_w + 12}" y="{fy + 52}" width="56" height="18" fill="#eee" stroke="#333"/>')
-        parts.append(f'<text x="{fx + box_w + 40}" y="{fy + 65}" text-anchor="middle" font-size="9">DDR4 x64</text>')
-        parts.append(f'<line x1="{fx + box_w}" y1="{fy + 61}" x2="{fx + box_w + 12}" y2="{fy + 61}" stroke="#333"/>')
-        parts.append(f'<rect x="{fx - 40}" y="{fy - 40}" width="60" height="18" fill="#eee" stroke="#333" stroke-dasharray="3,2"/>')
-        parts.append(f'<text x="{fx - 10}" y="{fy - 27}" text-anchor="middle" font-size="9">SFP+ (opt)</text>')
+        parts.append(f'<rect x="{fx + 18:.1f}" y="{fy + box_h + 32:.1f}" width="60" height="18" fill="#ddd" stroke="#333"/>')
+        parts.append(f'<text x="{fx + 48:.1f}" y="{fy + box_h + 45:.1f}" text-anchor="middle" font-size="9">host cable</text>')
+        parts.append(f'<line x1="{fx + 48:.1f}" y1="{fy + box_h + 20:.1f}" x2="{fx + 48:.1f}" y2="{fy + box_h + 32:.1f}" stroke="#333"/>')
+        parts.append(f'<rect x="{fx + box_w + 12:.1f}" y="{fy + 52:.1f}" width="56" height="18" fill="#eee" stroke="#333"/>')
+        parts.append(f'<text x="{fx + box_w + 40:.1f}" y="{fy + 65:.1f}" text-anchor="middle" font-size="9">DDR4 x64</text>')
+        parts.append(f'<line x1="{fx + box_w:.1f}" y1="{fy + 61:.1f}" x2="{fx + box_w + 12:.1f}" y2="{fy + 61:.1f}" stroke="#333"/>')
+        parts.append(f'<rect x="{fx - 72:.1f}" y="{fy + 52:.1f}" width="60" height="18" fill="#eee" stroke="#333" stroke-dasharray="3,2"/>')
+        parts.append(f'<text x="{fx - 42:.1f}" y="{fy + 65:.1f}" text-anchor="middle" font-size="9">SFP+ (opt)</text>')
         for ref in self.instances("layer_asic"):
             x, y = pos[ref]
             box(ref, x, y, box_w, box_h, "#dbe8f7", ref, f"L{self.components[ref]['layers']}")
         for ref in self.instances("head_asic"):
             x, y = pos[ref]
             box(ref, x, y, box_w, box_h, "#f7dbdb", ref, "head mode")
+        parts.append(f'<rect x="{cx - 48}" y="{cy - 30}" width="96" height="60" rx="6" fill="#eee" stroke="#333"/>')
+        parts.append(f'<text x="{cx}" y="{cy - 6}" text-anchor="middle" font-weight="bold">U_CLK</text>')
+        parts.append(f'<text x="{cx}" y="{cy + 12}" text-anchor="middle" font-size="10">shared regulators</text>')
         # Legend and budgets.
         load, input_w = self.power_budget_w()
-        parts.append(f'<text x="300" y="{H - 40}" fill="#333">Blue: activation ring, {self.signal_count("link")}-signal '
-                     f'source-synchronous link per hop. Green: LPDDR5X x32 channels. '
-                     f'Power budget {load:.0f} W load / {input_w:.0f} W input (placeholders).</text>')
-        parts.append(f'<text x="300" y="{H - 20}" fill="#333">Management SPI, JTAG chain, and reference clock fan out '
-                     f'from U_FPGA / U_CLK to all ten ASICs (not drawn).</text>')
+        parts.append(f'<text x="20" y="{H - 40}" fill="#333">Blue: activation ring, {self.signal_count("link")}-signal '
+                     f'source-synchronous link per hop, clockwise on a regular {n}-gon from the FPGA at the rear. '
+                     f'Green: LPDDR5X x32 channels. Power budget {load:.0f} W load / {input_w:.0f} W input.</text>')
+        parts.append(f'<text x="20" y="{H - 20}" fill="#333">Management SPI, JTAG chain, and reference clock fan out '
+                     f'from U_FPGA / U_CLK to all ten ASICs (not drawn); the BMC, PSUs and fans are off the ring.</text>')
         parts.append("</svg>")
         return "\n".join(parts) + "\n"
 

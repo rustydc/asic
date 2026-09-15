@@ -7,8 +7,8 @@
 
 board:
   name: asic-llm-appliance-a0
-  form_factor: 1U rack chassis, one 420 x 360 mm board, host-attached over a PCIe cable, front-to-back fans, redundant CRPS
-  form_factor_key: 1u          # selects the enclosure model in hw/kicad_gen.py (1u or pcie_card)
+  form_factor: 1U rack chassis, one 420 x 360 mm board, host-attached over a PCIe cable, front-to-back fans, redundant CRPS; the activation ring is a regular 11-gon
+  form_factor_key: 1u          # selects the enclosure model in hw/kicad_gen.py
   host_interface: PCIe Gen4 x8 over a SlimSAS 8i cable to a host adapter card (x4 electrically sufficient; see hw/README.md)
   power_input:
     # Two CRPS modules in a 1+1 redundant pair; one carries the whole load, so
@@ -144,17 +144,17 @@ part_classes:
 
 # Instances.
 components:
-  U_FPGA: {class: fpga, place: rear, beside the host connector}
-  U_A0: {class: layer_asic, layers: "0-3",   place: "row A, col 0"}
-  U_A1: {class: layer_asic, layers: "4-7",   place: "row A, col 1"}
-  U_A2: {class: layer_asic, layers: "8-11",  place: "row A, col 2"}
-  U_A3: {class: layer_asic, layers: "12-15", place: "row A, col 3"}
-  U_A4: {class: layer_asic, layers: "16-19", place: "row B, col 3"}
-  U_A5: {class: layer_asic, layers: "20-23", place: "row B, col 2"}
-  U_A6: {class: layer_asic, layers: "24-27", place: "row B, col 1"}
-  U_A7: {class: layer_asic, layers: "28-31", place: "row B, col 0"}
-  U_H0: {class: head_asic, vocab_rows: "0-124159",      place: under the FPGA, row B}
-  U_H1: {class: head_asic, vocab_rows: "124160-248319", place: under the FPGA, row B}
+  U_FPGA: {class: fpga, place: ring vertex 0, rear, beside the host connector}
+  U_A0: {class: layer_asic, layers: "0-3",   place: ring vertex 1}
+  U_A1: {class: layer_asic, layers: "4-7",   place: ring vertex 2}
+  U_A2: {class: layer_asic, layers: "8-11",  place: ring vertex 3}
+  U_A3: {class: layer_asic, layers: "12-15", place: ring vertex 4}
+  U_A4: {class: layer_asic, layers: "16-19", place: ring vertex 5}
+  U_A5: {class: layer_asic, layers: "20-23", place: ring vertex 6}
+  U_A6: {class: layer_asic, layers: "24-27", place: ring vertex 7}
+  U_A7: {class: layer_asic, layers: "28-31", place: ring vertex 8}
+  U_H0: {class: head_asic, vocab_rows: "0-124159",      place: ring vertex 9}
+  U_H1: {class: head_asic, vocab_rows: "124160-248319", place: ring vertex 10}
   U_M0a: {class: lpddr5x}
   U_M0b: {class: lpddr5x}
   U_M1a: {class: lpddr5x}
@@ -190,7 +190,11 @@ components:
   J_FAN5: {class: fan_header}
 
 # Point-to-point buses. `link` is the activation ring; each hop is one
-# source-synchronous parallel link (see interface_kinds).
+# source-synchronous parallel link (see interface_kinds).  On the board the
+# eleven ring nodes sit on the vertices of a regular polygon in this order,
+# clockwise from the FPGA at the rear, each chip rotated so its link-out
+# edge faces the next chip; the KiCad generator derives the placement from
+# this list.
 nets:
   ring:
     kind: link

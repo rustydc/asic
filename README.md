@@ -32,7 +32,8 @@ LLM inference appliance built around the Qwen3.5 dense hybrid geometry.
   diagram, a derivation of the ASIC package and ball map from the power
   model and the interface list, and a generator that turns the description
   into a KiCad 7 project with the board outline and chassis keep-outs,
-  placement, stackup, all nets, and the activation ring routed.
+  the ring placed as a regular polygon of rotated chips, stackup, all
+  nets, and the activation ring routed.
 
 ## Reference geometries
 
