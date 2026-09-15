@@ -63,6 +63,19 @@ keeps every memory parameter identical and scales fabric cycles by the
 446M/865M per-shard parameter ratio. `activation_bytes` assumes int8 activations
 of the hidden width (4096 or 2560).
 
+Each result also carries an energy model: `mac_energy_pj` times the MACs
+per token of every layer and head ASIC (`layer_macs_per_token`,
+`head_macs_per_token`) gives compute energy per token, the accumulated
+global-stage memory traffic times `memory_energy_pj_per_byte` gives memory
+energy, and `static_power_w` is the fixed floor (FPGA, DRAM idle, ASIC
+leakage and I/O). The result reports energy per token, compute, memory and
+board power at the measured throughput, and the dynamic power of one layer
+ASIC. The 3 pJ per MAC in both configurations is the ASAP7 signoff figure
+(0.39 pJ at default activity, `fabric/results/pnr_asap7_signoff.json`)
+derated for real activity and projected to a 28 nm-class node; a 7 nm-class
+die would be about 1 pJ. The sweep adds the same two columns at each
+point's global-stage ceiling.
+
 Fabric cycle scales, global phase timing, sustained memory efficiency, and link
 throughput are hypotheses to be replaced with RTL and memory-system
 measurements. The baseline uses a 10 MHz architecture tick (100 ns), while
@@ -80,3 +93,10 @@ percent, and the ring links under 4 percent. The global memory interval is
 half index scan and half selected-KV transfer. The sweep shows int4 KV plus
 8:1 compression recovers 30K tokens/s at 75 GB/s and 40K at 100 GB/s; 16:1
 compression with int4 KV reaches the 50K ceiling at 100 GB/s.
+
+Power scales with that throughput, not with the fabric clock. At 3 pJ per
+MAC the 9B token costs 24 mJ of compute and about 1.3 mJ of memory traffic,
+so the 14.5K tokens/s baseline is 346 W of compute, 20 W of memory and
+436 W for the board, 38 W of it in each layer ASIC; the sweep points that
+reach 40K tokens/s cost about 1.06 kW. The energy per MAC, which the
+process sets, is the lever: at 1 pJ the same points are 150 W and 400 W.

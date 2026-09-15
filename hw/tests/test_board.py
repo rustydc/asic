@@ -30,6 +30,26 @@ class BoardTest(unittest.TestCase):
         _, input_w = self.board.power_budget_w()
         self.assertLess(input_w, self.board.power_available_w())
 
+    def test_asic_power_follows_the_energy_model(self) -> None:
+        model = self.board.power_model
+        spec = self.board.classes["layer_asic"]
+        tps = 10_000.0
+        expected = spec["static_w"] + tps * (float(spec["macs_per_token"]) * model["mac_energy_pj"]
+                                             + model["memory_bytes_per_token_per_asic"] * model["memory_energy_pj_per_byte"]) * 1e-12
+        self.assertAlmostEqual(self.board.part_power_w("layer_asic", tps), expected)
+        self.assertAlmostEqual(self.board.part_power_w("head_asic", 0.0), self.board.classes["head_asic"]["static_w"])
+        self.assertEqual(self.board.part_power_w("fpga", tps), self.board.classes["fpga"]["tdp_w"])
+        low, _ = self.board.power_budget_w(5_000)
+        high, _ = self.board.power_budget_w(50_000)
+        self.assertGreater(high, 2 * low)
+        self.assertGreater(self.board.core_current_a("layer_asic", 50_000), 100)
+
+    def test_checks_catch_power_over_input(self) -> None:
+        data = copy.deepcopy(self.board.data)
+        data["power_model"]["design_tokens_per_second"] = 100_000
+        problems = Board(data).check()
+        self.assertTrue(any("power budget" in p for p in problems))
+
     def test_checks_catch_missing_memory(self) -> None:
         data = copy.deepcopy(self.board.data)
         data["nets"]["memory"]["channels"].pop()

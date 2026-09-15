@@ -21,12 +21,14 @@ LLM inference appliance built around the Qwen3.5 dense hybrid geometry.
   deliberately small fixed-coefficient datapath for early RTL and P&R work.
 * [`sim/`](sim/) contains the cycle-stepped 32-stage appliance simulator for
   scheduling, phased global execution, backpressure, link, memory-bandwidth,
-  and retrieval-geometry sweep experiments.
+  and retrieval-geometry sweep experiments, with an energy model that turns
+  the measured energy per MAC into board power at the simulated throughput.
 * [`training/`](training/) contains the Qwen3.5 checkpoint importer, the
   retrieval candidates, and a layer-wise activation-distillation harness.
 * [`hw/`](hw/) contains the block-level board description (eight layer ASICs,
   two head-mode ASICs, sixteen LPDDR5X devices, one PCIe FPGA), its consistency
-  checks, and the rendered block diagram.
+  checks including a throughput-driven power budget, and the rendered block
+  diagram.
 
 ## Reference geometries
 

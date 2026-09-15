@@ -104,6 +104,28 @@ class SimulationTest(unittest.TestCase):
     def test_rejects_invalid_configuration(self) -> None:
         with self.assertRaises(ValueError):
             Simulation(replace(SMALL, fifo_depth=0))
+        with self.assertRaises(ValueError):
+            Simulation(replace(SMALL, mac_energy_pj=-1.0))
+
+    def test_energy_model_scales_with_mac_energy_and_throughput(self) -> None:
+        config = replace(SMALL, mac_energy_pj=2.0, layer_macs_per_token=1e9, num_head_asics=2,
+                         head_macs_per_token=5e8, static_power_w=10.0, memory_energy_pj_per_byte=1.0)
+        result = Simulation(config).run()
+        # 2 layer ASICs x 1e9 + 2 head ASICs x 5e8 = 3e9 MACs x 2 pJ = 6 mJ per token.
+        self.assertAlmostEqual(result.compute_energy_per_token_mj, 6.0)
+        self.assertAlmostEqual(result.compute_power_w, 6e-3 * result.aggregate_tokens_per_second)
+        self.assertAlmostEqual(result.layer_asic_power_w, 2e-3 * result.aggregate_tokens_per_second)
+        self.assertGreater(result.memory_power_w, 0.0)
+        self.assertAlmostEqual(result.board_power_w, result.compute_power_w + result.memory_power_w + 10.0)
+        doubled = Simulation(replace(config, mac_energy_pj=4.0)).run()
+        self.assertAlmostEqual(doubled.compute_power_w, 2 * result.compute_power_w)
+        self.assertAlmostEqual(doubled.memory_power_w, result.memory_power_w)
+
+    def test_board_power_helper_matches_simulation(self) -> None:
+        from sim.appliance import board_power_w, energy_per_token_mj
+        config = replace(SMALL, mac_energy_pj=3.0, layer_macs_per_token=866e6, static_power_w=70.0)
+        self.assertAlmostEqual(energy_per_token_mj(config), 2 * 866e6 * 3e-12 * 1e3)
+        self.assertAlmostEqual(board_power_w(config, 1000.0), 2 * 866e6 * 3e-12 * 1000.0 + 70.0)
 
 
 if __name__ == "__main__":

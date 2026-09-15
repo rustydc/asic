@@ -9,7 +9,7 @@ import sys
 from collections import deque
 from dataclasses import replace
 
-from sim.appliance import ApplianceConfig, Simulation, Stage, WorkItem
+from sim.appliance import ApplianceConfig, Simulation, Stage, WorkItem, board_power_w, energy_per_token_mj
 
 
 def comma_numbers(value: str, kind: type = int) -> list:
@@ -34,7 +34,7 @@ def main() -> None:
     fields = [
         "index_dim", "index_bits", "compression_ratio", "kv_element_bytes", "top_blocks",
         "bandwidth_gbps", "bytes_per_token_per_asic", "global_latency_us", "global_interval_us",
-        "global_ceiling_tokens_per_second",
+        "global_ceiling_tokens_per_second", "energy_per_token_mj", "board_power_at_ceiling_w",
     ]
     writer = csv.DictWriter(output, fieldnames=fields)
     writer.writeheader()
@@ -62,6 +62,9 @@ def main() -> None:
             item = WorkItem(0, config.initial_context_tokens, 0, 0)
             stage = Stage(config.layers_per_asic - 1, True, deque())
             latency, interval, memory_bytes = simulation._timing(stage, item)
+            ceiling = config.clock_mhz * 1_000_000 / interval
+            # Memory energy counts the global stage of every layer ASIC.
+            memory_bytes_per_token = memory_bytes * config.num_asics
             writer.writerow({
                 "index_dim": index_dim,
                 "index_bits": index_bits,
@@ -72,9 +75,9 @@ def main() -> None:
                 "bytes_per_token_per_asic": memory_bytes,
                 "global_latency_us": round(latency / config.clock_mhz, 3),
                 "global_interval_us": round(interval / config.clock_mhz, 3),
-                "global_ceiling_tokens_per_second": round(
-                    config.clock_mhz * 1_000_000 / interval, 1
-                ),
+                "global_ceiling_tokens_per_second": round(ceiling, 1),
+                "energy_per_token_mj": round(energy_per_token_mj(config), 3),
+                "board_power_at_ceiling_w": round(board_power_w(config, ceiling, memory_bytes_per_token), 1),
             })
     finally:
         if args.output:

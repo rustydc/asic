@@ -222,10 +222,11 @@ Actual compressed-state formats and measured access traces must close both
 capacity and bandwidth before architecture freeze.
 
 The FPGA owns PCIe Gen4 (x8 wired, x4 sufficient) and 4 GB of DDR4 for the
-embedding table and context metadata. Power-over-Ethernet cannot supply the
-board's roughly 190 W, and PCIe gives lower host latency than a network hop, so
-the first board is a PCIe card with an optional SFP+ cage for a later
-standalone mode (see `hw/README.md`).
+embedding table and context metadata. Power-over-Ethernet cannot supply a
+board that draws hundreds of watts, and PCIe gives lower host latency than a
+network hop, so the first board is a PCIe card with a 12V-2x6 auxiliary
+connector and an optional SFP+ cage for a later standalone mode (see
+`hw/README.md`).
 
 The FPGA owns the host protocol, scheduling, sampling, context allocation,
 bring-up, telemetry, error recovery, and performance counters. Speculative
@@ -254,6 +255,19 @@ target needs some combination of int4 KV storage, 8:1 or 16:1 compression,
 fewer retrieved blocks, and 75-100 GB/s sustained bandwidth. Those are now the
 first parameters the software model must qualify.
 
+Power follows throughput. The column datapath measures 0.39 pJ per
+multiply-accumulate on ASAP7 at default activity after detailed routing and
+extraction (`fabric/results/pnr_asap7_signoff.json`); derated for real
+activity and projected to a 28 nm-class node that is about 3 pJ, so a 9B
+token costs roughly 24 mJ of compute across the ten ASICs. The simulator and
+the board model both carry that figure: the 14.5K tokens/s baseline is about
+440 W of board load, 25K tokens/s about 700 W, and 50K tokens/s 1.3 kW, with a
+layer ASIC's core rail between 50 A and 180 A. A 7 nm-class process at about
+1 pJ per MAC divides all of those by three. The choice of node is therefore
+as much a power-supply decision as an area one, and the on-die grid must be
+sized from measured current: the ASAP7 slice lost half its supply on the
+platform's default grid at 1.7 W/mm².
+
 ## Development gates
 
 1. **Software model:** import the Qwen3.5 weights, recover acceptable quality
@@ -274,5 +288,6 @@ The largest open risks are fixed-connectivity routing density, global-stage
 memory bandwidth at the Qwen3.5 KV width, model-quality loss from replacing
 full attention with windowed retrieval in the eight global layers,
 architecture-specific weight quantization (especially below 4 bits on the 4B),
-placement of the 1B-parameter LM head, external-memory PHY effort, and yield
+placement of the 1B-parameter LM head, external-memory PHY effort, power
+delivery at hundreds of watts per board and over 100 A per die, and yield
 across eight large coefficient variants.

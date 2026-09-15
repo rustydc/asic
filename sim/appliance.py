@@ -52,6 +52,15 @@ class ApplianceConfig:
     num_head_asics: int = 0
     head_cycles: int = 40
     head_result_bytes: int = 768
+    # Energy model.  mac_energy_pj is the switching plus internal energy of one
+    # fixed-weight multiply-accumulate in the column datapath: 0.39 pJ measured
+    # on ASAP7 at default activity (fabric/results/pnr_asap7_signoff.json), about
+    # 1 pJ derated for real activity, 2 to 4 pJ projected to a 28 nm-class node.
+    mac_energy_pj: float = 3.0
+    layer_macs_per_token: float = 866e6      # per layer ASIC (9B: 4 layers of ~216M coefficients)
+    head_macs_per_token: float = 508e6       # per head ASIC (half of the 248320 x 4096 head)
+    memory_energy_pj_per_byte: float = 40.0  # LPDDR5X plus PHY, ~5 pJ/bit end to end
+    static_power_w: float = 70.0             # FPGA, DRAM idle, ASIC leakage/IO, housekeeping
     max_cycles: int = 2_000_000_000
     trace: bool = False
 
@@ -112,6 +121,9 @@ class ApplianceConfig:
                 or self.warmup_tokens_per_context < 0 or self.num_head_asics < 0
                 or self.head_result_bytes < 0):
             raise ValueError("sampling, overhead, warm-up, and head values cannot be negative")
+        if min(self.mac_energy_pj, self.layer_macs_per_token, self.head_macs_per_token,
+               self.memory_energy_pj_per_byte, self.static_power_w) < 0:
+            raise ValueError("energy model values cannot be negative")
         if self.memory_efficiency > 1:
             raise ValueError("memory_efficiency cannot exceed one")
 
@@ -212,9 +224,29 @@ class SimulationResult:
     fifo_high_watermarks: tuple[int, ...]
     link_utilization: tuple[float, ...]
     memory_bytes_per_asic: tuple[int, ...]
+    # Energy model at the measured throughput (see ApplianceConfig.mac_energy_pj).
+    compute_energy_per_token_mj: float
+    memory_energy_per_token_mj: float
+    compute_power_w: float          # all layer and head ASICs
+    memory_power_w: float           # LPDDR traffic of the global stages
+    board_power_w: float            # compute + memory + static_power_w
+    layer_asic_power_w: float       # dynamic power of one layer ASIC
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+def energy_per_token_mj(config: ApplianceConfig) -> float:
+    """Compute energy for one token through every layer and head ASIC, in millijoules."""
+    macs = config.num_asics * config.layer_macs_per_token + config.num_head_asics * config.head_macs_per_token
+    return macs * config.mac_energy_pj * 1e-12 * 1e3
+
+
+def board_power_w(config: ApplianceConfig, tokens_per_second: float, memory_bytes_per_token: float = 0.0) -> float:
+    """Board power at a throughput: compute plus memory traffic plus the static floor."""
+    compute = energy_per_token_mj(config) * 1e-3 * tokens_per_second
+    memory = memory_bytes_per_token * config.memory_energy_pj_per_byte * 1e-12 * tokens_per_second
+    return compute + memory + config.static_power_w
 
 
 class Simulation:
@@ -441,6 +473,16 @@ class Simulation:
         measurement_start = self.measurement_start_cycle or 0
         measurement_cycles = self.cycle - measurement_start
         seconds = measurement_cycles / (self.config.clock_mhz * 1_000_000)
+        tokens_per_second = completed / seconds
+        cfg = self.config
+        # Memory traffic is accumulated over the whole run (warm-up included),
+        # so per-token bytes use every token the pipeline processed.
+        all_tokens = cfg.resident_contexts * self._target_tokens()
+        memory_bytes_per_token = sum(self.memory_bytes_per_asic) / all_tokens
+        compute_mj = energy_per_token_mj(cfg)
+        memory_mj = memory_bytes_per_token * cfg.memory_energy_pj_per_byte * 1e-12 * 1e3
+        compute_w = compute_mj * 1e-3 * tokens_per_second
+        memory_w = memory_mj * 1e-3 * tokens_per_second
         return SimulationResult(
             cycles=self.cycle,
             measurement_cycles=measurement_cycles,
@@ -453,6 +495,12 @@ class Simulation:
             fifo_high_watermarks=tuple(self.fifo_high_watermarks),
             link_utilization=tuple(cycles / self.cycle for cycles in self.link_busy_cycles),
             memory_bytes_per_asic=tuple(self.memory_bytes_per_asic),
+            compute_energy_per_token_mj=compute_mj,
+            memory_energy_per_token_mj=memory_mj,
+            compute_power_w=compute_w,
+            memory_power_w=memory_w,
+            board_power_w=compute_w + memory_w + cfg.static_power_w,
+            layer_asic_power_w=cfg.layer_macs_per_token * cfg.mac_energy_pj * 1e-12 * tokens_per_second,
         )
 
     def write_chrome_trace(self, path: str | Path) -> None:

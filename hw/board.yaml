@@ -11,17 +11,36 @@ board:
   host_interface: PCIe Gen4 x8 (x4 electrically sufficient; see hw/README.md)
   power_input:
     - {name: PCIe slot 12 V, watts: 66}
-    - {name: 8-pin PCIe aux 12 V, watts: 150}
-    - {name: second 8-pin aux (footprint only)}
+    - {name: 12V-2x6 (12VHPWR) aux 12 V, watts: 600}
+  # The auxiliary connector follows from the energy model below: at the
+  # simulator's 14.5K tokens/s ceiling and 3 pJ per MAC the ASICs alone draw
+  # about 390 W, so the two 8-pin connectors of the first draft (300 W) are
+  # not enough.  A 7 nm-class die at ~1 pJ/MAC would bring the board back
+  # under one 8-pin connector.
 
-# Part classes. `rails` lists the supply rails each part needs; `tdp_w` is a
-# placeholder power budget per instance.
+# Energy model for the ASICs.  Dynamic power is throughput times energy per
+# token; the per-MAC energy is the one number measured so far (0.39 pJ on
+# ASAP7 at default activity, fabric/results/pnr_asap7_signoff.json), derated
+# for real activity and projected to a 28 nm-class node.  The design point
+# is the simulator's global-stage ceiling (sim/README.md).
+power_model:
+  mac_energy_pj: 3.0
+  design_tokens_per_second: 14500
+  memory_energy_pj_per_byte: 40.0
+  memory_bytes_per_token_per_asic: 4200000   # index scan + selected KV at 128K, int8, 4:1
+  report_tokens_per_second: [5000, 14500, 25000, 50000]
+
+# Part classes. `rails` lists the supply rails each part needs.  `tdp_w` is a
+# placeholder budget per instance; the ASICs instead carry `static_w` plus
+# `macs_per_token`, and their power follows from the model above.
 part_classes:
   layer_asic:
     description: fixed-weight 4-layer shard die (personalized coefficient masks)
     package: FCBGA ~23 mm, ~400 balls (placeholder)
     rails: [VDD_CORE, VDD_IO_1V8, VDD_PLL_0V9, VDD2H_1V05, VDDQ_0V3]
-    tdp_w: 12
+    static_w: 3
+    macs_per_token: 866000000
+    memory_traffic: true
     interfaces:
       link_in: {kind: link}
       link_out: {kind: link}
@@ -35,7 +54,8 @@ part_classes:
     description: same die as layer_asic, head-mode personalization (LM head half)
     package: FCBGA ~23 mm, ~400 balls (placeholder)
     rails: [VDD_CORE, VDD_IO_1V8, VDD_PLL_0V9]
-    tdp_w: 8
+    static_w: 2
+    macs_per_token: 508000000
     interfaces:
       link_in: {kind: link}
       link_out: {kind: link}
@@ -212,7 +232,7 @@ power_tree:
   input_bus: 12 V (slot + 8-pin aux, ORed with ideal-diode controllers)
   regulator_efficiency: 0.85
   rails:
-    VDD_CORE:    {volts: 0.80, per: [layer_asic, head_asic], note: one PoL buck per ASIC, PMBus, ~12 A each (placeholder)}
+    VDD_CORE:    {volts: 0.80, per: [layer_asic, head_asic], note: one multiphase PoL buck per ASIC, PMBus; ~50 A each at the design point, ~170 A at 50K tokens/s (from power_model)}
     VDD_PLL_0V9: {volts: 0.90, per: [layer_asic, head_asic], note: LDO from 1.8 V, one per ASIC}
     VDD_IO_1V8:  {volts: 1.80, shared: true, note: ASIC IO, link IO, clock gen}
     VDD2H_1V05:  {volts: 1.05, shared: true, note: LPDDR5X VDD2H and ASIC PHY}

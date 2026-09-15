@@ -46,11 +46,27 @@ has a two-pin mode strap (layer or head).
 
 ## Power
 
-Placeholder budget: 12 W per layer ASIC, 8 W per head ASIC, 1 W per LPDDR5X,
-25 W FPGA. That is 158 W of load and about 186 W of 12 V input at 85 percent
-regulator efficiency, against 216 W available from the slot plus one 8-pin
-auxiliary connector. A second 8-pin footprint is on the board in case the
-ASIC power comes in high.
+ASIC power is no longer a placeholder: it is throughput times energy per
+token, from the `power_model` block in `board.yaml`. The one measured input
+is the energy of a fixed-weight multiply-accumulate in the column datapath,
+0.39 pJ on ASAP7 at the tool's default activity
+(`fabric/results/pnr_asap7_signoff.json`), which derates to about 1 pJ for
+real activity and projects to 2 to 4 pJ on a 28 nm-class node; the model
+carries 3 pJ. Each layer ASIC does 866M MACs per token (9B geometry), each
+head ASIC 508M, and the layer ASICs also move about 4.2 MB per token of
+index and KV traffic at roughly 40 pJ per byte. The other parts keep fixed
+budgets (1 W per LPDDR5X, 25 W FPGA).
+
+At the simulator's 14.5K tokens/s ceiling that is 43 W per layer ASIC and
+439 W of load, 517 W of 12 V input at 85 percent regulator efficiency.
+`board.md` tabulates the same at 5K, 25K and 50K tokens/s: the board runs
+from about 235 W to 1.6 kW of input across the throughput range, and a
+layer ASIC's core rail goes from 20 A to 180 A at 0.8 V. The first draft's
+slot plus one 8-pin connector (216 W) is therefore replaced by a 12V-2x6
+(12VHPWR) connector, 600 W plus the slot's 66 W, and each ASIC needs a
+multiphase core regulator. A 7 nm-class die at about 1 pJ per MAC would
+put the whole range back under 600 W and the design point under one 8-pin
+connector; the process choice is the biggest lever on the power supply.
 
 The power tree is a 12 V intermediate bus into point-of-load regulators. Each
 ASIC gets its own core buck with PMBus telemetry so per-chip current is
@@ -60,9 +76,9 @@ rails, and 3.3 V housekeeping are shared.
 ## Host interface: PCIe, and why not Ethernet or PoE
 
 **PoE is out.** The highest PoE class (802.3bt Type 4) delivers 71 W to the
-device. This board needs about 190 W. Even a 4B-geometry build with lighter
-ASICs would sit well above the PoE ceiling once the FPGA and memory are
-counted.
+device. This board needs hundreds of watts at any useful throughput. Even a
+4B-geometry build at the lowest rate in the table sits well above the PoE
+ceiling once the FPGA and memory are counted.
 
 **Ethernet as the data path is viable but not the first build.** The token
 traffic is tiny. At 50K tokens/s with a few hundred bytes per token, both
@@ -86,8 +102,9 @@ would then need its own 12 V supply rather than a host slot.
 ## Open items before schematic entry in an EDA tool
 
 1. ASIC package and ball map (blocked on the physical-design gate).
-2. Measured ASIC power, which sets the core regulator sizing and whether the
-   second auxiliary connector is populated.
+2. Measured energy per MAC on the target process, which sets the core
+   regulator sizing and the auxiliary connector; the 3 pJ in `board.yaml` is
+   a projection from the ASAP7 signoff run.
 3. Link I/O standard: 1.8 V single-ended at 500 Mb/s per pin needs a signal
    integrity check at 80 mm; fall back to eight LVDS pairs at 2 Gb/s if it
    fails.

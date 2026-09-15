@@ -32,5 +32,10 @@
   "num_head_asics": 2,
   "head_cycles": 26,
   "head_result_bytes": 768,
+  "mac_energy_pj": 3.0,
+  "layer_macs_per_token": 866000000,
+  "head_macs_per_token": 508000000,
+  "memory_energy_pj_per_byte": 40.0,
+  "static_power_w": 70.0,
   "max_cycles": 50000000
 }

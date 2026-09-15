@@ -102,6 +102,6 @@
 <rect x="60" y="480" width="96" height="60" rx="6" fill="#f7dbdb" stroke="#333"/>
 <text x="108.0" y="500" text-anchor="middle" font-weight="bold">U_H1</text>
 <text x="108.0" y="518" text-anchor="middle" fill="#333">head mode</text>
-<text x="300" y="520" fill="#333">Blue: activation ring, 36-signal source-synchronous link per hop. Green: LPDDR5X x32 channels. Power budget 158 W load / 186 W input (placeholders).</text>
+<text x="300" y="520" fill="#333">Blue: activation ring, 36-signal source-synchronous link per hop. Green: LPDDR5X x32 channels. Power budget 439 W load / 517 W input (placeholders).</text>
 <text x="300" y="540" fill="#333">Management SPI, JTAG chain, and reference clock fan out from U_FPGA / U_CLK to all ten ASICs (not drawn).</text>
 </svg>
