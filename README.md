@@ -68,4 +68,6 @@ Simulate both geometries:
 ```bash
 python -m sim.run --config sim/config/baseline.json     # 9B
 python -m sim.run --config sim/config/qwen35_4b.json    # 4B
+python -m sim.run --config sim/config/qwen35_9b_7nm_hbm.json   # 9B, 7 nm-class die, HBM
+python -m sim.run --config sim/config/qwen35_9b_3nm_hbm.json   # 9B, 3 nm-class die, HBM
 ```

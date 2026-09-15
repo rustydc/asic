@@ -121,6 +121,21 @@ class SimulationTest(unittest.TestCase):
         self.assertAlmostEqual(doubled.compute_power_w, 2 * result.compute_power_w)
         self.assertAlmostEqual(doubled.memory_power_w, result.memory_power_w)
 
+    def test_shipped_configurations_load_and_validate(self) -> None:
+        configs = sorted((Path(__file__).resolve().parents[1] / "config").glob("*.json"))
+        self.assertGreaterEqual(len(configs), 4)
+        loaded = {path.stem: ApplianceConfig.from_json(path) for path in configs}
+        for config in loaded.values():
+            config.validate()
+        hbm = [name for name in loaded if "hbm" in name]
+        self.assertEqual(len(hbm), 2)
+        for name in hbm:
+            # HBM configurations: faster fabric, int4 KV at 16:1, far more bandwidth and contexts.
+            self.assertLess(loaded[name].recurrent_cycles, loaded["baseline"].recurrent_cycles)
+            self.assertGreater(loaded[name].memory_bytes_per_cycle, 10 * loaded["baseline"].memory_bytes_per_cycle)
+            self.assertGreater(loaded[name].resident_contexts, loaded["baseline"].resident_contexts)
+            self.assertLess(loaded[name].mac_energy_pj, loaded["baseline"].mac_energy_pj)
+
     def test_board_power_helper_matches_simulation(self) -> None:
         from sim.appliance import board_power_w, energy_per_token_mj
         config = replace(SMALL, mac_energy_pj=3.0, layer_macs_per_token=866e6, static_power_w=70.0)

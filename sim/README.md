@@ -30,6 +30,8 @@ From the repository root:
 python -m unittest discover -s sim/tests -t .
 python -m sim.run --config sim/config/baseline.json      # Qwen3.5-9B geometry
 python -m sim.run --config sim/config/qwen35_4b.json     # Qwen3.5-4B geometry
+python -m sim.run --config sim/config/qwen35_9b_7nm_hbm.json   # 7 nm-class die, HBM per ASIC
+python -m sim.run --config sim/config/qwen35_9b_3nm_hbm.json   # 3 nm-class die, HBM per ASIC
 python -m sim.run --config sim/config/baseline.json --trace trace.json
 python -m sim.sweep --kv-element-bytes 1,0.5 --top-blocks 32,16 --output retrieval-sweep.csv
 ```
@@ -62,6 +64,17 @@ bottleneck regardless. The 4B configuration
 keeps every memory parameter identical and scales fabric cycles by the
 446M/865M per-shard parameter ratio. `activation_bytes` assumes int8 activations
 of the hidden width (4096 or 2560).
+
+Two further configurations ask where the ceiling goes once the memory
+wall is removed. `qwen35_9b_7nm_hbm.json` puts the 9B geometry on a
+7 nm-class die at the ASAP7 signoff clock of 1.43 GHz (57 ticks per layer)
+with one HBM3E stack per layer ASIC (1 TB/s, int4 KV at 16:1, 128 resident
+contexts), an 8 GB/s ring link, 1 pJ per MAC and 200 W of static power for
+the stacks and FPGA. `qwen35_9b_3nm_hbm.json` extrapolates to 2 GHz
+(41 ticks), 1.5 TB/s, 256 contexts, a 16 GB/s link and 0.5 pJ per MAC. The
+global index-scan compute placeholder scales with the clock and with the
+four times fewer compressed positions. Neither models pass-level
+pipelining, so a layer stage still admits one token per layer latency.
 
 Each result also carries an energy model: `mac_energy_pj` times the MACs
 per token of every layer and head ASIC (`layer_macs_per_token`,
@@ -100,3 +113,15 @@ so the 14.5K tokens/s baseline is 346 W of compute, 20 W of memory and
 436 W for the board, 38 W of it in each layer ASIC; the sweep points that
 reach 40K tokens/s cost about 1.06 kW. The energy per MAC, which the
 process sets, is the lever: at 1 pJ the same points are 150 W and 400 W.
+
+With HBM the wall moves to the fabric. The 7 nm-class configuration
+reaches 169K tokens/s at 230 µs mean latency with every layer stage at
+99 percent, the global memory phases short, the links at 12 percent and
+the head stages at 25 percent; the 3 nm-class one reaches 236K tokens/s
+at 165 µs. The limiter in both is the un-pipelined pass rate, one token
+per 8192 fabric cycles per stage, so pass-level pipelining (item 4 in the
+fabric README) is worth up to four times more, and the 128 or 256
+contexts are not yet binding. Power is the other wall: 1.6 kW for the
+board at 7 nm (147 W per layer ASIC, 7.9 mJ per token) and 1.2 kW at 3 nm
+(102 W per layer ASIC, 4.0 mJ per token), so both are liquid-cooled boxes
+rather than cards.
