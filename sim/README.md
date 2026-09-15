@@ -132,36 +132,41 @@ rather than cards.
 hybrid geometry (`qwen3_5_27b` preset: hidden 5120, 64 layers, FFN 17408,
 22.9B body coefficients; the Qwen3.5-27B shapes stand in until a released
 27B checkpoint fixes them) on a 2 nm-class die with one HBM4 stack per
-layer ASIC. The eight layer ASICs each hold eight layers, two `R,R,R,G`
-groups, so `global_every` is 4 (the default global layer per ASIC would
-halve the retrieval traffic). The die is sized by the fabric mapping at a
-tenth of the 28 nm-class density placeholder: 2.86B coefficients in 9332
-tiles is about 76 mm² of fabric per layer die, 16 mm² per head die (114
-and 24 mm² at the 3 nm-class 0.15 scale). The fabric runs at 2.5 GHz, so a
+layer ASIC: four layer ASICs of sixteen layers, four `R,R,R,G` groups
+each, so `global_every` is 4 (the default global layer per ASIC would
+quarter the retrieval traffic), and one head ASIC holding the whole LM
+head. The die is sized by the fabric mapping at a tenth of the 28 nm-class
+density placeholder: 5.71B coefficients in 18,664 tiles is about 152 mm²
+of fabric per layer die, and the head fills 42 percent of the same die
+(227 mm² at the 3 nm-class 0.15 scale). The fabric runs at 2.5 GHz, so a
 layer is four passes of 2560 cycles, 4.1 µs: the deeper tile costs exactly
 what the faster clock returns. `qwen35_9b_2nm_hbm.json` is the same die
-with the 9B geometry, and `qwen35_27b_3nm_hbm.json` the 27B on the 3 nm
-die, as controls. HBM4 is taken as 2 TB/s per die at 25 pJ per byte, the
-MAC at 0.35 pJ, and the static floor at 250 W.
+family with the 9B geometry on eight dies, and `qwen35_27b_3nm_hbm.json`
+the 27B on the 3 nm die, as controls. HBM4 is taken as 2 TB/s per die at
+25 pJ per byte, the MAC at 0.35 pJ, and the static floor at 250 W.
 
-| Configuration | Tokens/s | Latency (µs) | Compute (mJ/token) | Board (W) | Layer ASIC (W) |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| 9B, 3 nm-class | 236K | 165 | 4.0 | 1,230 | 102 |
-| 9B, 2 nm-class | 291K | 133 | 2.8 | 1,150 | 88 |
-| 27B, 3 nm-class | 189K | 367 | 12.1 | 2,620 | 270 |
-| 27B, 2 nm-class | 234K | 295 | 8.4 | 2,370 | 234 |
+| Configuration | Dies | Tokens/s | Latency (µs) | Compute (mJ/token) | Board (W) | Layer ASIC (W) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 9B, 3 nm-class | 8 + 2 | 236K | 165 | 4.0 | 1,230 | 102 |
+| 9B, 2 nm-class | 8 + 2 | 291K | 133 | 2.8 | 1,150 | 88 |
+| 27B, 3 nm-class | 4 + 1 | 189K | 367 | 12.1 | 2,620 | 540 |
+| 27B, 2 nm-class | 4 + 1 | 234K | 292 | 8.4 | 2,370 | 468 |
 
 Four things follow. The 27B on 2 nm lands at the same throughput as the 9B
 on 3 nm, 234K tokens/s, because the ceiling is still the un-pipelined pass
 rate and a layer takes the same 4.1 µs; the extra layers add pipeline
-depth, not interval, so latency grows to 295 µs for 66 stages, still inside
-the 250 to 500 µs target but near its top. Power is the wall that moves:
-8.4 mJ per token is 2.0 kW of compute at that throughput, 234 W per layer
-die, which is liquid cooling and a bigger box than the 1U; at the 50K
-tokens/s target the same appliance draws about 0.7 kW and fits the 1U's
-supply. The HBM is not what the model size needs: the sixteen global
-layers move 16 GB per ASIC over the run, 4 MB per token, which is 920 GB/s
-per die at 234K tokens/s but only 200 GB/s at 50K, within reach of four
-LPDDR5X channels or GDDR7, so HBM buys the throughput, not the 27B. And the
-package grows again: 234 W at 0.8 V is about 290 A per die, which the
-pinout rules turn into roughly 1,500 balls.
+depth, not interval, so latency grows to 292 µs for 65 stages, still inside
+the 250 to 500 µs target but near its top. The number of dies does not
+enter: eight dies of eight layers or four of sixteen give the same tokens
+per second and the same board power, and only per-die power and bandwidth
+change (the 8 + 2 split of the 27B is 234 W and 920 GB/s per die). Power is
+the wall that moves: 8.4 mJ per token is 2.0 kW of compute at that
+throughput, 468 W per layer die on the 4 + 1 board, which is liquid cooling
+and a bigger supply than the 9B's 1U; at the 50K tokens/s target the same
+appliance draws about 0.7 kW, 100 W per die, and fits the current chassis.
+The HBM is not what the model size needs: the sixteen global layers move
+8 MB per token per die, which is 1.8 TB/s per die at 234K tokens/s but
+400 GB/s at 50K, within reach of GDDR7 or four LPDDR5X channels, so HBM
+buys the throughput, not the 27B. And the package grows: 468 W at 0.8 V is
+about 650 A per die, which the pinout rules turn into a 55 × 55 array
+(`hw/board_27b.yaml`).

@@ -1,0 +1,2006 @@
+** Drc report for hw/kicad_27b/appliance.kicad_pcb **
+** Created on 2026-09-15 07:01:34 **
+
+** Found 0 DRC violations **
+
+** Found 499 unconnected pads **
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(21.0000 mm, 379.0000 mm): Zone [+12V] on In3.Cu
+    @(21.0000 mm, 379.0000 mm): Zone [+12V] on In3.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(21.0000 mm, 379.0000 mm): Zone [+12V] on In3.Cu
+    @(21.0000 mm, 379.0000 mm): Zone [+12V] on In3.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(21.0000 mm, 379.0000 mm): Zone [+12V] on In3.Cu
+    @(21.0000 mm, 379.0000 mm): Zone [+12V] on In3.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(21.0000 mm, 379.0000 mm): Zone [+12V] on In3.Cu
+    @(21.0000 mm, 379.0000 mm): Zone [+12V] on In3.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(21.0000 mm, 379.0000 mm): Zone [+12V] on In3.Cu
+    @(21.0000 mm, 379.0000 mm): Zone [+12V] on In3.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(21.0000 mm, 379.0000 mm): Zone [+12V] on In3.Cu
+    @(21.0000 mm, 379.0000 mm): Zone [+12V] on In3.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(21.0000 mm, 379.0000 mm): Zone [+12V] on In3.Cu
+    @(21.0000 mm, 379.0000 mm): Zone [+12V] on In3.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(21.0000 mm, 379.0000 mm): Zone [+12V] on In3.Cu
+    @(21.0000 mm, 379.0000 mm): Zone [+12V] on In3.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(21.0000 mm, 379.0000 mm): Zone [+12V] on In3.Cu
+    @(21.0000 mm, 379.0000 mm): Zone [+12V] on In3.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(113.5639 mm, 169.8296 mm): Pad 3 [+12V] of VRM_A1 on F.Cu
+    @(114.7139 mm, 167.8378 mm): Pad 4 [+12V] of VRM_A1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(119.3139 mm, 220.1296 mm): Pad 3 [+12V] of VRM_A0 on F.Cu
+    @(118.1639 mm, 218.1378 mm): Pad 4 [+12V] of VRM_A0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(21.0000 mm, 379.0000 mm): Zone [+12V] on In3.Cu
+    @(21.0000 mm, 379.0000 mm): Zone [+12V] on In3.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(21.0000 mm, 379.0000 mm): Zone [+12V] on In3.Cu
+    @(21.0000 mm, 379.0000 mm): Zone [+12V] on In3.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(21.0000 mm, 379.0000 mm): Zone [+12V] on In3.Cu
+    @(21.0000 mm, 379.0000 mm): Zone [+12V] on In3.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(21.0000 mm, 379.0000 mm): Zone [+12V] on In3.Cu
+    @(21.0000 mm, 379.0000 mm): Zone [+12V] on In3.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(21.0000 mm, 379.0000 mm): Zone [+12V] on In3.Cu
+    @(21.0000 mm, 379.0000 mm): Zone [+12V] on In3.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(112.4139 mm, 171.8215 mm): Pad 2 [+12V] of VRM_A1 on F.Cu
+    @(113.5639 mm, 169.8296 mm): Pad 3 [+12V] of VRM_A1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(21.0000 mm, 379.0000 mm): Zone [+12V] on In3.Cu
+    @(21.0000 mm, 379.0000 mm): Zone [+12V] on In3.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(111.2639 mm, 173.8134 mm): Via [+12V] on F.Cu - B.Cu
+    @(112.4139 mm, 171.8215 mm): Pad 2 [+12V] of VRM_A1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(21.0000 mm, 379.0000 mm): Zone [+12V] on In3.Cu
+    @(21.0000 mm, 379.0000 mm): Zone [+12V] on In3.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(21.0000 mm, 379.0000 mm): Zone [+12V] on In3.Cu
+    @(21.0000 mm, 379.0000 mm): Zone [+12V] on In3.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(21.0000 mm, 379.0000 mm): Zone [+12V] on In3.Cu
+    @(21.0000 mm, 379.0000 mm): Zone [+12V] on In3.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(119.3139 mm, 220.1296 mm): Pad 3 [+12V] of VRM_A0 on F.Cu
+    @(120.4639 mm, 222.1215 mm): Via [+12V] on F.Cu - B.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(21.0000 mm, 379.0000 mm): Zone [+12V] on In3.Cu
+    @(21.0000 mm, 379.0000 mm): Zone [+12V] on In3.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(21.0000 mm, 379.0000 mm): Zone [+12V] on In3.Cu
+    @(21.0000 mm, 379.0000 mm): Zone [+12V] on In3.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(144.4000 mm, 202.4500 mm): Via [+12V] on F.Cu - B.Cu
+    @(118.1639 mm, 218.1378 mm): Pad 4 [+12V] of VRM_A0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(144.4000 mm, 182.4500 mm): Via [+12V] on F.Cu - B.Cu
+    @(114.7139 mm, 167.8378 mm): Pad 4 [+12V] of VRM_A1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(21.0000 mm, 379.0000 mm): Zone [+12V] on In3.Cu
+    @(21.0000 mm, 379.0000 mm): Zone [+12V] on In3.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(21.0000 mm, 379.0000 mm): Zone [+12V] on In3.Cu
+    @(21.0000 mm, 379.0000 mm): Zone [+12V] on In3.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(21.0000 mm, 379.0000 mm): Zone [+12V] on In3.Cu
+    @(21.0000 mm, 379.0000 mm): Zone [+12V] on In3.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(21.0000 mm, 379.0000 mm): Zone [+12V] on In3.Cu
+    @(21.0000 mm, 379.0000 mm): Zone [+12V] on In3.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(21.0000 mm, 379.0000 mm): Zone [+12V] on In3.Cu
+    @(21.0000 mm, 379.0000 mm): Zone [+12V] on In3.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(42.8000 mm, 329.7000 mm): Pad 2 [BMC_ETH0_N] of U_BMC on F.Cu
+    @(47.6000 mm, 376.5000 mm): Pad 2 [BMC_ETH0_N] of J_BMC_NET on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(41.6000 mm, 329.7000 mm): Pad 1 [BMC_ETH0_P] of U_BMC on F.Cu
+    @(46.0000 mm, 376.5000 mm): Pad 1 [BMC_ETH0_P] of J_BMC_NET on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(45.2000 mm, 329.7000 mm): Pad 4 [BMC_ETH1_N] of U_BMC on F.Cu
+    @(50.8000 mm, 376.5000 mm): Pad 4 [BMC_ETH1_N] of J_BMC_NET on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(44.0000 mm, 329.7000 mm): Pad 3 [BMC_ETH1_P] of U_BMC on F.Cu
+    @(49.2000 mm, 376.5000 mm): Pad 3 [BMC_ETH1_P] of J_BMC_NET on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(47.6000 mm, 329.7000 mm): Pad 6 [BMC_ETH2_N] of U_BMC on F.Cu
+    @(54.0000 mm, 376.5000 mm): Pad 6 [BMC_ETH2_N] of J_BMC_NET on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(46.4000 mm, 329.7000 mm): Pad 5 [BMC_ETH2_P] of U_BMC on F.Cu
+    @(52.4000 mm, 376.5000 mm): Pad 5 [BMC_ETH2_P] of J_BMC_NET on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(47.6000 mm, 357.5000 mm): Pad 8 [BMC_ETH3_N] of J_BMC_NET on F.Cu
+    @(50.0000 mm, 329.7000 mm): Pad 8 [BMC_ETH3_N] of U_BMC on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(46.0000 mm, 357.5000 mm): Pad 7 [BMC_ETH3_P] of J_BMC_NET on F.Cu
+    @(48.8000 mm, 329.7000 mm): Pad 7 [BMC_ETH3_P] of U_BMC on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(145.2500 mm, 293.0000 mm): Pad K7 [DDR4_ADDR_CMD0] of U_D3 on F.Cu
+    @(153.7500 mm, 293.0000 mm): Pad K7 [DDR4_ADDR_CMD0] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(153.7500 mm, 293.0000 mm): Pad K7 [DDR4_ADDR_CMD0] of U_D2 on F.Cu
+    @(162.2500 mm, 293.0000 mm): Pad K7 [DDR4_ADDR_CMD0] of U_D1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(162.2500 mm, 293.0000 mm): Pad K7 [DDR4_ADDR_CMD0] of U_D1 on F.Cu
+    @(170.7500 mm, 293.0000 mm): Pad K7 [DDR4_ADDR_CMD0] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(162.2500 mm, 293.0000 mm): Pad K7 [DDR4_ADDR_CMD0] of U_D1 on F.Cu
+    @(162.5000 mm, 284.5000 mm): Pad D11 [DDR4_ADDR_CMD0] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(144.4500 mm, 293.0000 mm): Pad K8 [DDR4_ADDR_CMD1] of U_D3 on F.Cu
+    @(152.9500 mm, 293.0000 mm): Pad K8 [DDR4_ADDR_CMD1] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(152.9500 mm, 293.0000 mm): Pad K8 [DDR4_ADDR_CMD1] of U_D2 on F.Cu
+    @(161.4500 mm, 293.0000 mm): Pad K8 [DDR4_ADDR_CMD1] of U_D1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(161.4500 mm, 293.0000 mm): Pad K8 [DDR4_ADDR_CMD1] of U_D1 on F.Cu
+    @(169.9500 mm, 293.0000 mm): Pad K8 [DDR4_ADDR_CMD1] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(161.4500 mm, 293.0000 mm): Pad K8 [DDR4_ADDR_CMD1] of U_D1 on F.Cu
+    @(161.5000 mm, 284.5000 mm): Pad D12 [DDR4_ADDR_CMD1] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(150.0500 mm, 294.6000 mm): Pad H1 [DDR4_ADDR_CMD10] of U_D3 on F.Cu
+    @(158.5500 mm, 294.6000 mm): Pad H1 [DDR4_ADDR_CMD10] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(158.5500 mm, 294.6000 mm): Pad H1 [DDR4_ADDR_CMD10] of U_D2 on F.Cu
+    @(167.0500 mm, 294.6000 mm): Pad H1 [DDR4_ADDR_CMD10] of U_D1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(167.0500 mm, 294.6000 mm): Pad H1 [DDR4_ADDR_CMD10] of U_D1 on F.Cu
+    @(175.5500 mm, 294.6000 mm): Pad H1 [DDR4_ADDR_CMD10] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(152.5000 mm, 284.5000 mm): Pad D21 [DDR4_ADDR_CMD10] of U_FPGA on F.Cu
+    @(150.0500 mm, 294.6000 mm): Pad H1 [DDR4_ADDR_CMD10] of U_D3 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(149.2500 mm, 294.6000 mm): Pad H2 [DDR4_ADDR_CMD11] of U_D3 on F.Cu
+    @(157.7500 mm, 294.6000 mm): Pad H2 [DDR4_ADDR_CMD11] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(157.7500 mm, 294.6000 mm): Pad H2 [DDR4_ADDR_CMD11] of U_D2 on F.Cu
+    @(166.2500 mm, 294.6000 mm): Pad H2 [DDR4_ADDR_CMD11] of U_D1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(166.2500 mm, 294.6000 mm): Pad H2 [DDR4_ADDR_CMD11] of U_D1 on F.Cu
+    @(174.7500 mm, 294.6000 mm): Pad H2 [DDR4_ADDR_CMD11] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(151.5000 mm, 284.5000 mm): Pad D22 [DDR4_ADDR_CMD11] of U_FPGA on F.Cu
+    @(149.2500 mm, 294.6000 mm): Pad H2 [DDR4_ADDR_CMD11] of U_D3 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(148.4500 mm, 294.6000 mm): Pad H3 [DDR4_ADDR_CMD12] of U_D3 on F.Cu
+    @(156.9500 mm, 294.6000 mm): Pad H3 [DDR4_ADDR_CMD12] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(156.9500 mm, 294.6000 mm): Pad H3 [DDR4_ADDR_CMD12] of U_D2 on F.Cu
+    @(165.4500 mm, 294.6000 mm): Pad H3 [DDR4_ADDR_CMD12] of U_D1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(165.4500 mm, 294.6000 mm): Pad H3 [DDR4_ADDR_CMD12] of U_D1 on F.Cu
+    @(173.9500 mm, 294.6000 mm): Pad H3 [DDR4_ADDR_CMD12] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(150.5000 mm, 284.5000 mm): Pad D23 [DDR4_ADDR_CMD12] of U_FPGA on F.Cu
+    @(148.4500 mm, 294.6000 mm): Pad H3 [DDR4_ADDR_CMD12] of U_D3 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(147.6500 mm, 294.6000 mm): Pad H4 [DDR4_ADDR_CMD13] of U_D3 on F.Cu
+    @(156.1500 mm, 294.6000 mm): Pad H4 [DDR4_ADDR_CMD13] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(156.1500 mm, 294.6000 mm): Pad H4 [DDR4_ADDR_CMD13] of U_D2 on F.Cu
+    @(164.6500 mm, 294.6000 mm): Pad H4 [DDR4_ADDR_CMD13] of U_D1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(164.6500 mm, 294.6000 mm): Pad H4 [DDR4_ADDR_CMD13] of U_D1 on F.Cu
+    @(173.1500 mm, 294.6000 mm): Pad H4 [DDR4_ADDR_CMD13] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(149.5000 mm, 284.5000 mm): Pad D24 [DDR4_ADDR_CMD13] of U_FPGA on F.Cu
+    @(147.6500 mm, 294.6000 mm): Pad H4 [DDR4_ADDR_CMD13] of U_D3 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(146.8500 mm, 294.6000 mm): Pad H5 [DDR4_ADDR_CMD14] of U_D3 on F.Cu
+    @(155.3500 mm, 294.6000 mm): Pad H5 [DDR4_ADDR_CMD14] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(155.3500 mm, 294.6000 mm): Pad H5 [DDR4_ADDR_CMD14] of U_D2 on F.Cu
+    @(163.8500 mm, 294.6000 mm): Pad H5 [DDR4_ADDR_CMD14] of U_D1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(163.8500 mm, 294.6000 mm): Pad H5 [DDR4_ADDR_CMD14] of U_D1 on F.Cu
+    @(172.3500 mm, 294.6000 mm): Pad H5 [DDR4_ADDR_CMD14] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(148.5000 mm, 284.5000 mm): Pad D25 [DDR4_ADDR_CMD14] of U_FPGA on F.Cu
+    @(146.8500 mm, 294.6000 mm): Pad H5 [DDR4_ADDR_CMD14] of U_D3 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(146.0500 mm, 294.6000 mm): Pad H6 [DDR4_ADDR_CMD15] of U_D3 on F.Cu
+    @(154.5500 mm, 294.6000 mm): Pad H6 [DDR4_ADDR_CMD15] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(154.5500 mm, 294.6000 mm): Pad H6 [DDR4_ADDR_CMD15] of U_D2 on F.Cu
+    @(163.0500 mm, 294.6000 mm): Pad H6 [DDR4_ADDR_CMD15] of U_D1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(163.0500 mm, 294.6000 mm): Pad H6 [DDR4_ADDR_CMD15] of U_D1 on F.Cu
+    @(171.5500 mm, 294.6000 mm): Pad H6 [DDR4_ADDR_CMD15] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(147.5000 mm, 284.5000 mm): Pad D26 [DDR4_ADDR_CMD15] of U_FPGA on F.Cu
+    @(146.0500 mm, 294.6000 mm): Pad H6 [DDR4_ADDR_CMD15] of U_D3 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(145.2500 mm, 294.6000 mm): Pad H7 [DDR4_ADDR_CMD16] of U_D3 on F.Cu
+    @(153.7500 mm, 294.6000 mm): Pad H7 [DDR4_ADDR_CMD16] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(153.7500 mm, 294.6000 mm): Pad H7 [DDR4_ADDR_CMD16] of U_D2 on F.Cu
+    @(162.2500 mm, 294.6000 mm): Pad H7 [DDR4_ADDR_CMD16] of U_D1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(162.2500 mm, 294.6000 mm): Pad H7 [DDR4_ADDR_CMD16] of U_D1 on F.Cu
+    @(170.7500 mm, 294.6000 mm): Pad H7 [DDR4_ADDR_CMD16] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(170.7500 mm, 294.6000 mm): Pad H7 [DDR4_ADDR_CMD16] of U_D0 on F.Cu
+    @(170.5000 mm, 283.5000 mm): Pad E3 [DDR4_ADDR_CMD16] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(144.4500 mm, 294.6000 mm): Pad H8 [DDR4_ADDR_CMD17] of U_D3 on F.Cu
+    @(152.9500 mm, 294.6000 mm): Pad H8 [DDR4_ADDR_CMD17] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(152.9500 mm, 294.6000 mm): Pad H8 [DDR4_ADDR_CMD17] of U_D2 on F.Cu
+    @(161.4500 mm, 294.6000 mm): Pad H8 [DDR4_ADDR_CMD17] of U_D1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(161.4500 mm, 294.6000 mm): Pad H8 [DDR4_ADDR_CMD17] of U_D1 on F.Cu
+    @(169.9500 mm, 294.6000 mm): Pad H8 [DDR4_ADDR_CMD17] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(169.9500 mm, 294.6000 mm): Pad H8 [DDR4_ADDR_CMD17] of U_D0 on F.Cu
+    @(169.5000 mm, 283.5000 mm): Pad E4 [DDR4_ADDR_CMD17] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(150.0500 mm, 295.4000 mm): Pad G1 [DDR4_ADDR_CMD18] of U_D3 on F.Cu
+    @(158.5500 mm, 295.4000 mm): Pad G1 [DDR4_ADDR_CMD18] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(158.5500 mm, 295.4000 mm): Pad G1 [DDR4_ADDR_CMD18] of U_D2 on F.Cu
+    @(167.0500 mm, 295.4000 mm): Pad G1 [DDR4_ADDR_CMD18] of U_D1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(167.0500 mm, 295.4000 mm): Pad G1 [DDR4_ADDR_CMD18] of U_D1 on F.Cu
+    @(175.5500 mm, 295.4000 mm): Pad G1 [DDR4_ADDR_CMD18] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(167.0500 mm, 295.4000 mm): Pad G1 [DDR4_ADDR_CMD18] of U_D1 on F.Cu
+    @(168.5000 mm, 283.5000 mm): Pad E5 [DDR4_ADDR_CMD18] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(149.2500 mm, 295.4000 mm): Pad G2 [DDR4_ADDR_CMD19] of U_D3 on F.Cu
+    @(157.7500 mm, 295.4000 mm): Pad G2 [DDR4_ADDR_CMD19] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(157.7500 mm, 295.4000 mm): Pad G2 [DDR4_ADDR_CMD19] of U_D2 on F.Cu
+    @(166.2500 mm, 295.4000 mm): Pad G2 [DDR4_ADDR_CMD19] of U_D1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(166.2500 mm, 295.4000 mm): Pad G2 [DDR4_ADDR_CMD19] of U_D1 on F.Cu
+    @(174.7500 mm, 295.4000 mm): Pad G2 [DDR4_ADDR_CMD19] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(166.2500 mm, 295.4000 mm): Pad G2 [DDR4_ADDR_CMD19] of U_D1 on F.Cu
+    @(167.5000 mm, 283.5000 mm): Pad E6 [DDR4_ADDR_CMD19] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(158.5500 mm, 293.8000 mm): Pad J1 [DDR4_ADDR_CMD2] of U_D2 on F.Cu
+    @(167.0500 mm, 293.8000 mm): Pad J1 [DDR4_ADDR_CMD2] of U_D1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(150.0500 mm, 293.8000 mm): Pad J1 [DDR4_ADDR_CMD2] of U_D3 on F.Cu
+    @(158.5500 mm, 293.8000 mm): Pad J1 [DDR4_ADDR_CMD2] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(167.0500 mm, 293.8000 mm): Pad J1 [DDR4_ADDR_CMD2] of U_D1 on F.Cu
+    @(175.5500 mm, 293.8000 mm): Pad J1 [DDR4_ADDR_CMD2] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(160.5000 mm, 284.5000 mm): Pad D13 [DDR4_ADDR_CMD2] of U_FPGA on F.Cu
+    @(158.5500 mm, 293.8000 mm): Pad J1 [DDR4_ADDR_CMD2] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(148.4500 mm, 295.4000 mm): Pad G3 [DDR4_ADDR_CMD20] of U_D3 on F.Cu
+    @(156.9500 mm, 295.4000 mm): Pad G3 [DDR4_ADDR_CMD20] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(156.9500 mm, 295.4000 mm): Pad G3 [DDR4_ADDR_CMD20] of U_D2 on F.Cu
+    @(165.4500 mm, 295.4000 mm): Pad G3 [DDR4_ADDR_CMD20] of U_D1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(165.4500 mm, 295.4000 mm): Pad G3 [DDR4_ADDR_CMD20] of U_D1 on F.Cu
+    @(173.9500 mm, 295.4000 mm): Pad G3 [DDR4_ADDR_CMD20] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(165.4500 mm, 295.4000 mm): Pad G3 [DDR4_ADDR_CMD20] of U_D1 on F.Cu
+    @(166.5000 mm, 283.5000 mm): Pad E7 [DDR4_ADDR_CMD20] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(147.6500 mm, 295.4000 mm): Pad G4 [DDR4_ADDR_CMD21] of U_D3 on F.Cu
+    @(156.1500 mm, 295.4000 mm): Pad G4 [DDR4_ADDR_CMD21] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(156.1500 mm, 295.4000 mm): Pad G4 [DDR4_ADDR_CMD21] of U_D2 on F.Cu
+    @(164.6500 mm, 295.4000 mm): Pad G4 [DDR4_ADDR_CMD21] of U_D1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(164.6500 mm, 295.4000 mm): Pad G4 [DDR4_ADDR_CMD21] of U_D1 on F.Cu
+    @(173.1500 mm, 295.4000 mm): Pad G4 [DDR4_ADDR_CMD21] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(164.6500 mm, 295.4000 mm): Pad G4 [DDR4_ADDR_CMD21] of U_D1 on F.Cu
+    @(165.5000 mm, 283.5000 mm): Pad E8 [DDR4_ADDR_CMD21] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(146.8500 mm, 295.4000 mm): Pad G5 [DDR4_ADDR_CMD22] of U_D3 on F.Cu
+    @(155.3500 mm, 295.4000 mm): Pad G5 [DDR4_ADDR_CMD22] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(155.3500 mm, 295.4000 mm): Pad G5 [DDR4_ADDR_CMD22] of U_D2 on F.Cu
+    @(163.8500 mm, 295.4000 mm): Pad G5 [DDR4_ADDR_CMD22] of U_D1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(163.8500 mm, 295.4000 mm): Pad G5 [DDR4_ADDR_CMD22] of U_D1 on F.Cu
+    @(172.3500 mm, 295.4000 mm): Pad G5 [DDR4_ADDR_CMD22] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(163.8500 mm, 295.4000 mm): Pad G5 [DDR4_ADDR_CMD22] of U_D1 on F.Cu
+    @(164.5000 mm, 283.5000 mm): Pad E9 [DDR4_ADDR_CMD22] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(146.0500 mm, 295.4000 mm): Pad G6 [DDR4_ADDR_CMD23] of U_D3 on F.Cu
+    @(154.5500 mm, 295.4000 mm): Pad G6 [DDR4_ADDR_CMD23] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(154.5500 mm, 295.4000 mm): Pad G6 [DDR4_ADDR_CMD23] of U_D2 on F.Cu
+    @(163.0500 mm, 295.4000 mm): Pad G6 [DDR4_ADDR_CMD23] of U_D1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(163.0500 mm, 295.4000 mm): Pad G6 [DDR4_ADDR_CMD23] of U_D1 on F.Cu
+    @(171.5500 mm, 295.4000 mm): Pad G6 [DDR4_ADDR_CMD23] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(163.0500 mm, 295.4000 mm): Pad G6 [DDR4_ADDR_CMD23] of U_D1 on F.Cu
+    @(163.5000 mm, 283.5000 mm): Pad E10 [DDR4_ADDR_CMD23] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(145.2500 mm, 295.4000 mm): Pad G7 [DDR4_ADDR_CMD24] of U_D3 on F.Cu
+    @(153.7500 mm, 295.4000 mm): Pad G7 [DDR4_ADDR_CMD24] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(153.7500 mm, 295.4000 mm): Pad G7 [DDR4_ADDR_CMD24] of U_D2 on F.Cu
+    @(162.2500 mm, 295.4000 mm): Pad G7 [DDR4_ADDR_CMD24] of U_D1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(162.2500 mm, 295.4000 mm): Pad G7 [DDR4_ADDR_CMD24] of U_D1 on F.Cu
+    @(170.7500 mm, 295.4000 mm): Pad G7 [DDR4_ADDR_CMD24] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(162.2500 mm, 295.4000 mm): Pad G7 [DDR4_ADDR_CMD24] of U_D1 on F.Cu
+    @(162.5000 mm, 283.5000 mm): Pad E11 [DDR4_ADDR_CMD24] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(144.4500 mm, 295.4000 mm): Pad G8 [DDR4_ADDR_CMD25] of U_D3 on F.Cu
+    @(152.9500 mm, 295.4000 mm): Pad G8 [DDR4_ADDR_CMD25] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(152.9500 mm, 295.4000 mm): Pad G8 [DDR4_ADDR_CMD25] of U_D2 on F.Cu
+    @(161.4500 mm, 295.4000 mm): Pad G8 [DDR4_ADDR_CMD25] of U_D1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(161.4500 mm, 295.4000 mm): Pad G8 [DDR4_ADDR_CMD25] of U_D1 on F.Cu
+    @(169.9500 mm, 295.4000 mm): Pad G8 [DDR4_ADDR_CMD25] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(161.4500 mm, 295.4000 mm): Pad G8 [DDR4_ADDR_CMD25] of U_D1 on F.Cu
+    @(161.5000 mm, 283.5000 mm): Pad E12 [DDR4_ADDR_CMD25] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(158.5500 mm, 296.2000 mm): Pad F1 [DDR4_ADDR_CMD26] of U_D2 on F.Cu
+    @(167.0500 mm, 296.2000 mm): Pad F1 [DDR4_ADDR_CMD26] of U_D1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(150.0500 mm, 296.2000 mm): Pad F1 [DDR4_ADDR_CMD26] of U_D3 on F.Cu
+    @(158.5500 mm, 296.2000 mm): Pad F1 [DDR4_ADDR_CMD26] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(167.0500 mm, 296.2000 mm): Pad F1 [DDR4_ADDR_CMD26] of U_D1 on F.Cu
+    @(175.5500 mm, 296.2000 mm): Pad F1 [DDR4_ADDR_CMD26] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(160.5000 mm, 283.5000 mm): Pad E13 [DDR4_ADDR_CMD26] of U_FPGA on F.Cu
+    @(158.5500 mm, 296.2000 mm): Pad F1 [DDR4_ADDR_CMD26] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(157.7500 mm, 296.2000 mm): Pad F2 [DDR4_ADDR_CMD27] of U_D2 on F.Cu
+    @(166.2500 mm, 296.2000 mm): Pad F2 [DDR4_ADDR_CMD27] of U_D1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(149.2500 mm, 296.2000 mm): Pad F2 [DDR4_ADDR_CMD27] of U_D3 on F.Cu
+    @(157.7500 mm, 296.2000 mm): Pad F2 [DDR4_ADDR_CMD27] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(166.2500 mm, 296.2000 mm): Pad F2 [DDR4_ADDR_CMD27] of U_D1 on F.Cu
+    @(174.7500 mm, 296.2000 mm): Pad F2 [DDR4_ADDR_CMD27] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(159.5000 mm, 283.5000 mm): Pad E14 [DDR4_ADDR_CMD27] of U_FPGA on F.Cu
+    @(157.7500 mm, 296.2000 mm): Pad F2 [DDR4_ADDR_CMD27] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(157.7500 mm, 293.8000 mm): Pad J2 [DDR4_ADDR_CMD3] of U_D2 on F.Cu
+    @(166.2500 mm, 293.8000 mm): Pad J2 [DDR4_ADDR_CMD3] of U_D1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(149.2500 mm, 293.8000 mm): Pad J2 [DDR4_ADDR_CMD3] of U_D3 on F.Cu
+    @(157.7500 mm, 293.8000 mm): Pad J2 [DDR4_ADDR_CMD3] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(166.2500 mm, 293.8000 mm): Pad J2 [DDR4_ADDR_CMD3] of U_D1 on F.Cu
+    @(174.7500 mm, 293.8000 mm): Pad J2 [DDR4_ADDR_CMD3] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(159.5000 mm, 284.5000 mm): Pad D14 [DDR4_ADDR_CMD3] of U_FPGA on F.Cu
+    @(157.7500 mm, 293.8000 mm): Pad J2 [DDR4_ADDR_CMD3] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(156.9500 mm, 293.8000 mm): Pad J3 [DDR4_ADDR_CMD4] of U_D2 on F.Cu
+    @(165.4500 mm, 293.8000 mm): Pad J3 [DDR4_ADDR_CMD4] of U_D1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(148.4500 mm, 293.8000 mm): Pad J3 [DDR4_ADDR_CMD4] of U_D3 on F.Cu
+    @(156.9500 mm, 293.8000 mm): Pad J3 [DDR4_ADDR_CMD4] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(165.4500 mm, 293.8000 mm): Pad J3 [DDR4_ADDR_CMD4] of U_D1 on F.Cu
+    @(173.9500 mm, 293.8000 mm): Pad J3 [DDR4_ADDR_CMD4] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(158.5000 mm, 284.5000 mm): Pad D15 [DDR4_ADDR_CMD4] of U_FPGA on F.Cu
+    @(156.9500 mm, 293.8000 mm): Pad J3 [DDR4_ADDR_CMD4] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(156.1500 mm, 293.8000 mm): Pad J4 [DDR4_ADDR_CMD5] of U_D2 on F.Cu
+    @(164.6500 mm, 293.8000 mm): Pad J4 [DDR4_ADDR_CMD5] of U_D1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(147.6500 mm, 293.8000 mm): Pad J4 [DDR4_ADDR_CMD5] of U_D3 on F.Cu
+    @(156.1500 mm, 293.8000 mm): Pad J4 [DDR4_ADDR_CMD5] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(164.6500 mm, 293.8000 mm): Pad J4 [DDR4_ADDR_CMD5] of U_D1 on F.Cu
+    @(173.1500 mm, 293.8000 mm): Pad J4 [DDR4_ADDR_CMD5] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(157.5000 mm, 284.5000 mm): Pad D16 [DDR4_ADDR_CMD5] of U_FPGA on F.Cu
+    @(156.1500 mm, 293.8000 mm): Pad J4 [DDR4_ADDR_CMD5] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(155.3500 mm, 293.8000 mm): Pad J5 [DDR4_ADDR_CMD6] of U_D2 on F.Cu
+    @(163.8500 mm, 293.8000 mm): Pad J5 [DDR4_ADDR_CMD6] of U_D1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(146.8500 mm, 293.8000 mm): Pad J5 [DDR4_ADDR_CMD6] of U_D3 on F.Cu
+    @(155.3500 mm, 293.8000 mm): Pad J5 [DDR4_ADDR_CMD6] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(163.8500 mm, 293.8000 mm): Pad J5 [DDR4_ADDR_CMD6] of U_D1 on F.Cu
+    @(172.3500 mm, 293.8000 mm): Pad J5 [DDR4_ADDR_CMD6] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(156.5000 mm, 284.5000 mm): Pad D17 [DDR4_ADDR_CMD6] of U_FPGA on F.Cu
+    @(155.3500 mm, 293.8000 mm): Pad J5 [DDR4_ADDR_CMD6] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(154.5500 mm, 293.8000 mm): Pad J6 [DDR4_ADDR_CMD7] of U_D2 on F.Cu
+    @(163.0500 mm, 293.8000 mm): Pad J6 [DDR4_ADDR_CMD7] of U_D1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(146.0500 mm, 293.8000 mm): Pad J6 [DDR4_ADDR_CMD7] of U_D3 on F.Cu
+    @(154.5500 mm, 293.8000 mm): Pad J6 [DDR4_ADDR_CMD7] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(163.0500 mm, 293.8000 mm): Pad J6 [DDR4_ADDR_CMD7] of U_D1 on F.Cu
+    @(171.5500 mm, 293.8000 mm): Pad J6 [DDR4_ADDR_CMD7] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(155.5000 mm, 284.5000 mm): Pad D18 [DDR4_ADDR_CMD7] of U_FPGA on F.Cu
+    @(154.5500 mm, 293.8000 mm): Pad J6 [DDR4_ADDR_CMD7] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(153.7500 mm, 293.8000 mm): Pad J7 [DDR4_ADDR_CMD8] of U_D2 on F.Cu
+    @(162.2500 mm, 293.8000 mm): Pad J7 [DDR4_ADDR_CMD8] of U_D1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(145.2500 mm, 293.8000 mm): Pad J7 [DDR4_ADDR_CMD8] of U_D3 on F.Cu
+    @(153.7500 mm, 293.8000 mm): Pad J7 [DDR4_ADDR_CMD8] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(162.2500 mm, 293.8000 mm): Pad J7 [DDR4_ADDR_CMD8] of U_D1 on F.Cu
+    @(170.7500 mm, 293.8000 mm): Pad J7 [DDR4_ADDR_CMD8] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(154.5000 mm, 284.5000 mm): Pad D19 [DDR4_ADDR_CMD8] of U_FPGA on F.Cu
+    @(153.7500 mm, 293.8000 mm): Pad J7 [DDR4_ADDR_CMD8] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(152.9500 mm, 293.8000 mm): Pad J8 [DDR4_ADDR_CMD9] of U_D2 on F.Cu
+    @(161.4500 mm, 293.8000 mm): Pad J8 [DDR4_ADDR_CMD9] of U_D1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(144.4500 mm, 293.8000 mm): Pad J8 [DDR4_ADDR_CMD9] of U_D3 on F.Cu
+    @(152.9500 mm, 293.8000 mm): Pad J8 [DDR4_ADDR_CMD9] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(161.4500 mm, 293.8000 mm): Pad J8 [DDR4_ADDR_CMD9] of U_D1 on F.Cu
+    @(169.9500 mm, 293.8000 mm): Pad J8 [DDR4_ADDR_CMD9] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(153.5000 mm, 284.5000 mm): Pad D20 [DDR4_ADDR_CMD9] of U_FPGA on F.Cu
+    @(152.9500 mm, 293.8000 mm): Pad J8 [DDR4_ADDR_CMD9] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(156.1500 mm, 296.2000 mm): Pad F4 [DDR4_CK_N] of U_D2 on F.Cu
+    @(164.6500 mm, 296.2000 mm): Pad F4 [DDR4_CK_N] of U_D1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(147.6500 mm, 296.2000 mm): Pad F4 [DDR4_CK_N] of U_D3 on F.Cu
+    @(156.1500 mm, 296.2000 mm): Pad F4 [DDR4_CK_N] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(164.6500 mm, 296.2000 mm): Pad F4 [DDR4_CK_N] of U_D1 on F.Cu
+    @(173.1500 mm, 296.2000 mm): Pad F4 [DDR4_CK_N] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(157.5000 mm, 283.5000 mm): Pad E16 [DDR4_CK_N] of U_FPGA on F.Cu
+    @(156.1500 mm, 296.2000 mm): Pad F4 [DDR4_CK_N] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(156.9500 mm, 296.2000 mm): Pad F3 [DDR4_CK_P] of U_D2 on F.Cu
+    @(165.4500 mm, 296.2000 mm): Pad F3 [DDR4_CK_P] of U_D1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(148.4500 mm, 296.2000 mm): Pad F3 [DDR4_CK_P] of U_D3 on F.Cu
+    @(156.9500 mm, 296.2000 mm): Pad F3 [DDR4_CK_P] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(165.4500 mm, 296.2000 mm): Pad F3 [DDR4_CK_P] of U_D1 on F.Cu
+    @(173.9500 mm, 296.2000 mm): Pad F3 [DDR4_CK_P] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(158.5000 mm, 283.5000 mm): Pad E15 [DDR4_CK_P] of U_FPGA on F.Cu
+    @(156.9500 mm, 296.2000 mm): Pad F3 [DDR4_CK_P] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(155.3500 mm, 296.2000 mm): Pad F5 [DDR4_CTRL0] of U_D2 on F.Cu
+    @(163.8500 mm, 296.2000 mm): Pad F5 [DDR4_CTRL0] of U_D1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(146.8500 mm, 296.2000 mm): Pad F5 [DDR4_CTRL0] of U_D3 on F.Cu
+    @(155.3500 mm, 296.2000 mm): Pad F5 [DDR4_CTRL0] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(163.8500 mm, 296.2000 mm): Pad F5 [DDR4_CTRL0] of U_D1 on F.Cu
+    @(172.3500 mm, 296.2000 mm): Pad F5 [DDR4_CTRL0] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(156.5000 mm, 283.5000 mm): Pad E17 [DDR4_CTRL0] of U_FPGA on F.Cu
+    @(155.3500 mm, 296.2000 mm): Pad F5 [DDR4_CTRL0] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(154.5500 mm, 296.2000 mm): Pad F6 [DDR4_CTRL1] of U_D2 on F.Cu
+    @(163.0500 mm, 296.2000 mm): Pad F6 [DDR4_CTRL1] of U_D1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(146.0500 mm, 296.2000 mm): Pad F6 [DDR4_CTRL1] of U_D3 on F.Cu
+    @(154.5500 mm, 296.2000 mm): Pad F6 [DDR4_CTRL1] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(163.0500 mm, 296.2000 mm): Pad F6 [DDR4_CTRL1] of U_D1 on F.Cu
+    @(171.5500 mm, 296.2000 mm): Pad F6 [DDR4_CTRL1] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(155.5000 mm, 283.5000 mm): Pad E18 [DDR4_CTRL1] of U_FPGA on F.Cu
+    @(154.5500 mm, 296.2000 mm): Pad F6 [DDR4_CTRL1] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(153.7500 mm, 296.2000 mm): Pad F7 [DDR4_CTRL2] of U_D2 on F.Cu
+    @(162.2500 mm, 296.2000 mm): Pad F7 [DDR4_CTRL2] of U_D1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(145.2500 mm, 296.2000 mm): Pad F7 [DDR4_CTRL2] of U_D3 on F.Cu
+    @(153.7500 mm, 296.2000 mm): Pad F7 [DDR4_CTRL2] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(162.2500 mm, 296.2000 mm): Pad F7 [DDR4_CTRL2] of U_D1 on F.Cu
+    @(170.7500 mm, 296.2000 mm): Pad F7 [DDR4_CTRL2] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(154.5000 mm, 283.5000 mm): Pad E19 [DDR4_CTRL2] of U_FPGA on F.Cu
+    @(153.7500 mm, 296.2000 mm): Pad F7 [DDR4_CTRL2] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(152.9500 mm, 296.2000 mm): Pad F8 [DDR4_CTRL3] of U_D2 on F.Cu
+    @(161.4500 mm, 296.2000 mm): Pad F8 [DDR4_CTRL3] of U_D1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(144.4500 mm, 296.2000 mm): Pad F8 [DDR4_CTRL3] of U_D3 on F.Cu
+    @(152.9500 mm, 296.2000 mm): Pad F8 [DDR4_CTRL3] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(161.4500 mm, 296.2000 mm): Pad F8 [DDR4_CTRL3] of U_D1 on F.Cu
+    @(169.9500 mm, 296.2000 mm): Pad F8 [DDR4_CTRL3] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(153.5000 mm, 283.5000 mm): Pad E20 [DDR4_CTRL3] of U_FPGA on F.Cu
+    @(152.9500 mm, 296.2000 mm): Pad F8 [DDR4_CTRL3] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(150.0500 mm, 297.0000 mm): Pad E1 [DDR4_CTRL4] of U_D3 on F.Cu
+    @(158.5500 mm, 297.0000 mm): Pad E1 [DDR4_CTRL4] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(158.5500 mm, 297.0000 mm): Pad E1 [DDR4_CTRL4] of U_D2 on F.Cu
+    @(167.0500 mm, 297.0000 mm): Pad E1 [DDR4_CTRL4] of U_D1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(167.0500 mm, 297.0000 mm): Pad E1 [DDR4_CTRL4] of U_D1 on F.Cu
+    @(175.5500 mm, 297.0000 mm): Pad E1 [DDR4_CTRL4] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(152.5000 mm, 283.5000 mm): Pad E21 [DDR4_CTRL4] of U_FPGA on F.Cu
+    @(150.0500 mm, 297.0000 mm): Pad E1 [DDR4_CTRL4] of U_D3 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(149.2500 mm, 297.0000 mm): Pad E2 [DDR4_CTRL5] of U_D3 on F.Cu
+    @(157.7500 mm, 297.0000 mm): Pad E2 [DDR4_CTRL5] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(157.7500 mm, 297.0000 mm): Pad E2 [DDR4_CTRL5] of U_D2 on F.Cu
+    @(166.2500 mm, 297.0000 mm): Pad E2 [DDR4_CTRL5] of U_D1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(166.2500 mm, 297.0000 mm): Pad E2 [DDR4_CTRL5] of U_D1 on F.Cu
+    @(174.7500 mm, 297.0000 mm): Pad E2 [DDR4_CTRL5] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(151.5000 mm, 283.5000 mm): Pad E22 [DDR4_CTRL5] of U_FPGA on F.Cu
+    @(149.2500 mm, 297.0000 mm): Pad E2 [DDR4_CTRL5] of U_D3 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(170.5000 mm, 284.5000 mm): Pad D3 [DDR4_DM0] of U_FPGA on F.Cu
+    @(172.3500 mm, 293.0000 mm): Pad K5 [DDR4_DM0] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(169.5000 mm, 284.5000 mm): Pad D4 [DDR4_DM1] of U_FPGA on F.Cu
+    @(171.5500 mm, 293.0000 mm): Pad K6 [DDR4_DM1] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(163.8500 mm, 293.0000 mm): Pad K5 [DDR4_DM2] of U_D1 on F.Cu
+    @(168.5000 mm, 284.5000 mm): Pad D5 [DDR4_DM2] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(163.0500 mm, 293.0000 mm): Pad K6 [DDR4_DM3] of U_D1 on F.Cu
+    @(167.5000 mm, 284.5000 mm): Pad D6 [DDR4_DM3] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(155.3500 mm, 293.0000 mm): Pad K5 [DDR4_DM4] of U_D2 on F.Cu
+    @(166.5000 mm, 284.5000 mm): Pad D7 [DDR4_DM4] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(154.5500 mm, 293.0000 mm): Pad K6 [DDR4_DM5] of U_D2 on F.Cu
+    @(165.5000 mm, 284.5000 mm): Pad D8 [DDR4_DM5] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(146.8500 mm, 293.0000 mm): Pad K5 [DDR4_DM6] of U_D3 on F.Cu
+    @(164.5000 mm, 284.5000 mm): Pad D9 [DDR4_DM6] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(146.0500 mm, 293.0000 mm): Pad K6 [DDR4_DM7] of U_D3 on F.Cu
+    @(163.5000 mm, 284.5000 mm): Pad D10 [DDR4_DM7] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(172.5000 mm, 287.5000 mm): Pad A1 [DDR4_DQ0] of U_FPGA on F.Cu
+    @(175.5500 mm, 291.4000 mm): Pad M1 [DDR4_DQ0] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(171.5000 mm, 287.5000 mm): Pad A2 [DDR4_DQ1] of U_FPGA on F.Cu
+    @(174.7500 mm, 291.4000 mm): Pad M2 [DDR4_DQ1] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(162.5000 mm, 287.5000 mm): Pad A11 [DDR4_DQ10] of U_FPGA on F.Cu
+    @(173.9500 mm, 292.2000 mm): Pad L3 [DDR4_DQ10] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(161.5000 mm, 287.5000 mm): Pad A12 [DDR4_DQ11] of U_FPGA on F.Cu
+    @(173.1500 mm, 292.2000 mm): Pad L4 [DDR4_DQ11] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(160.5000 mm, 287.5000 mm): Pad A13 [DDR4_DQ12] of U_FPGA on F.Cu
+    @(172.3500 mm, 292.2000 mm): Pad L5 [DDR4_DQ12] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(159.5000 mm, 287.5000 mm): Pad A14 [DDR4_DQ13] of U_FPGA on F.Cu
+    @(171.5500 mm, 292.2000 mm): Pad L6 [DDR4_DQ13] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(158.5000 mm, 287.5000 mm): Pad A15 [DDR4_DQ14] of U_FPGA on F.Cu
+    @(170.7500 mm, 292.2000 mm): Pad L7 [DDR4_DQ14] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(157.5000 mm, 287.5000 mm): Pad A16 [DDR4_DQ15] of U_FPGA on F.Cu
+    @(169.9500 mm, 292.2000 mm): Pad L8 [DDR4_DQ15] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(156.5000 mm, 287.5000 mm): Pad A17 [DDR4_DQ16] of U_FPGA on F.Cu
+    @(167.0500 mm, 291.4000 mm): Pad M1 [DDR4_DQ16] of U_D1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(155.5000 mm, 287.5000 mm): Pad A18 [DDR4_DQ17] of U_FPGA on F.Cu
+    @(166.2500 mm, 291.4000 mm): Pad M2 [DDR4_DQ17] of U_D1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(154.5000 mm, 287.5000 mm): Pad A19 [DDR4_DQ18] of U_FPGA on F.Cu
+    @(165.4500 mm, 291.4000 mm): Pad M3 [DDR4_DQ18] of U_D1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(153.5000 mm, 287.5000 mm): Pad A20 [DDR4_DQ19] of U_FPGA on F.Cu
+    @(164.6500 mm, 291.4000 mm): Pad M4 [DDR4_DQ19] of U_D1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(170.5000 mm, 287.5000 mm): Pad A3 [DDR4_DQ2] of U_FPGA on F.Cu
+    @(173.9500 mm, 291.4000 mm): Pad M3 [DDR4_DQ2] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(152.5000 mm, 287.5000 mm): Pad A21 [DDR4_DQ20] of U_FPGA on F.Cu
+    @(163.8500 mm, 291.4000 mm): Pad M5 [DDR4_DQ20] of U_D1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(151.5000 mm, 287.5000 mm): Pad A22 [DDR4_DQ21] of U_FPGA on F.Cu
+    @(163.0500 mm, 291.4000 mm): Pad M6 [DDR4_DQ21] of U_D1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(150.5000 mm, 287.5000 mm): Pad A23 [DDR4_DQ22] of U_FPGA on F.Cu
+    @(162.2500 mm, 291.4000 mm): Pad M7 [DDR4_DQ22] of U_D1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(149.5000 mm, 287.5000 mm): Pad A24 [DDR4_DQ23] of U_FPGA on F.Cu
+    @(161.4500 mm, 291.4000 mm): Pad M8 [DDR4_DQ23] of U_D1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(148.5000 mm, 287.5000 mm): Pad A25 [DDR4_DQ24] of U_FPGA on F.Cu
+    @(167.0500 mm, 292.2000 mm): Pad L1 [DDR4_DQ24] of U_D1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(147.5000 mm, 287.5000 mm): Pad A26 [DDR4_DQ25] of U_FPGA on F.Cu
+    @(166.2500 mm, 292.2000 mm): Pad L2 [DDR4_DQ25] of U_D1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(165.4500 mm, 292.2000 mm): Pad L3 [DDR4_DQ26] of U_D1 on F.Cu
+    @(172.5000 mm, 286.5000 mm): Pad B1 [DDR4_DQ26] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(164.6500 mm, 292.2000 mm): Pad L4 [DDR4_DQ27] of U_D1 on F.Cu
+    @(171.5000 mm, 286.5000 mm): Pad B2 [DDR4_DQ27] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(163.8500 mm, 292.2000 mm): Pad L5 [DDR4_DQ28] of U_D1 on F.Cu
+    @(170.5000 mm, 286.5000 mm): Pad B3 [DDR4_DQ28] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(163.0500 mm, 292.2000 mm): Pad L6 [DDR4_DQ29] of U_D1 on F.Cu
+    @(169.5000 mm, 286.5000 mm): Pad B4 [DDR4_DQ29] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(169.5000 mm, 287.5000 mm): Pad A4 [DDR4_DQ3] of U_FPGA on F.Cu
+    @(173.1500 mm, 291.4000 mm): Pad M4 [DDR4_DQ3] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(162.2500 mm, 292.2000 mm): Pad L7 [DDR4_DQ30] of U_D1 on F.Cu
+    @(168.5000 mm, 286.5000 mm): Pad B5 [DDR4_DQ30] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(161.4500 mm, 292.2000 mm): Pad L8 [DDR4_DQ31] of U_D1 on F.Cu
+    @(167.5000 mm, 286.5000 mm): Pad B6 [DDR4_DQ31] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(158.5500 mm, 291.4000 mm): Pad M1 [DDR4_DQ32] of U_D2 on F.Cu
+    @(166.5000 mm, 286.5000 mm): Pad B7 [DDR4_DQ32] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(157.7500 mm, 291.4000 mm): Pad M2 [DDR4_DQ33] of U_D2 on F.Cu
+    @(165.5000 mm, 286.5000 mm): Pad B8 [DDR4_DQ33] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(156.9500 mm, 291.4000 mm): Pad M3 [DDR4_DQ34] of U_D2 on F.Cu
+    @(164.5000 mm, 286.5000 mm): Pad B9 [DDR4_DQ34] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(156.1500 mm, 291.4000 mm): Pad M4 [DDR4_DQ35] of U_D2 on F.Cu
+    @(163.5000 mm, 286.5000 mm): Pad B10 [DDR4_DQ35] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(155.3500 mm, 291.4000 mm): Pad M5 [DDR4_DQ36] of U_D2 on F.Cu
+    @(162.5000 mm, 286.5000 mm): Pad B11 [DDR4_DQ36] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(154.5500 mm, 291.4000 mm): Pad M6 [DDR4_DQ37] of U_D2 on F.Cu
+    @(161.5000 mm, 286.5000 mm): Pad B12 [DDR4_DQ37] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(153.7500 mm, 291.4000 mm): Pad M7 [DDR4_DQ38] of U_D2 on F.Cu
+    @(160.5000 mm, 286.5000 mm): Pad B13 [DDR4_DQ38] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(152.9500 mm, 291.4000 mm): Pad M8 [DDR4_DQ39] of U_D2 on F.Cu
+    @(159.5000 mm, 286.5000 mm): Pad B14 [DDR4_DQ39] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(168.5000 mm, 287.5000 mm): Pad A5 [DDR4_DQ4] of U_FPGA on F.Cu
+    @(172.3500 mm, 291.4000 mm): Pad M5 [DDR4_DQ4] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(158.5000 mm, 286.5000 mm): Pad B15 [DDR4_DQ40] of U_FPGA on F.Cu
+    @(158.5500 mm, 292.2000 mm): Pad L1 [DDR4_DQ40] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(157.5000 mm, 286.5000 mm): Pad B16 [DDR4_DQ41] of U_FPGA on F.Cu
+    @(157.7500 mm, 292.2000 mm): Pad L2 [DDR4_DQ41] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(156.5000 mm, 286.5000 mm): Pad B17 [DDR4_DQ42] of U_FPGA on F.Cu
+    @(156.9500 mm, 292.2000 mm): Pad L3 [DDR4_DQ42] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(155.5000 mm, 286.5000 mm): Pad B18 [DDR4_DQ43] of U_FPGA on F.Cu
+    @(156.1500 mm, 292.2000 mm): Pad L4 [DDR4_DQ43] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(154.5000 mm, 286.5000 mm): Pad B19 [DDR4_DQ44] of U_FPGA on F.Cu
+    @(155.3500 mm, 292.2000 mm): Pad L5 [DDR4_DQ44] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(153.5000 mm, 286.5000 mm): Pad B20 [DDR4_DQ45] of U_FPGA on F.Cu
+    @(154.5500 mm, 292.2000 mm): Pad L6 [DDR4_DQ45] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(152.5000 mm, 286.5000 mm): Pad B21 [DDR4_DQ46] of U_FPGA on F.Cu
+    @(153.7500 mm, 292.2000 mm): Pad L7 [DDR4_DQ46] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(151.5000 mm, 286.5000 mm): Pad B22 [DDR4_DQ47] of U_FPGA on F.Cu
+    @(152.9500 mm, 292.2000 mm): Pad L8 [DDR4_DQ47] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(150.0500 mm, 291.4000 mm): Pad M1 [DDR4_DQ48] of U_D3 on F.Cu
+    @(150.5000 mm, 286.5000 mm): Pad B23 [DDR4_DQ48] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(149.2500 mm, 291.4000 mm): Pad M2 [DDR4_DQ49] of U_D3 on F.Cu
+    @(149.5000 mm, 286.5000 mm): Pad B24 [DDR4_DQ49] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(167.5000 mm, 287.5000 mm): Pad A6 [DDR4_DQ5] of U_FPGA on F.Cu
+    @(171.5500 mm, 291.4000 mm): Pad M6 [DDR4_DQ5] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(148.4500 mm, 291.4000 mm): Pad M3 [DDR4_DQ50] of U_D3 on F.Cu
+    @(148.5000 mm, 286.5000 mm): Pad B25 [DDR4_DQ50] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(147.5000 mm, 286.5000 mm): Pad B26 [DDR4_DQ51] of U_FPGA on F.Cu
+    @(147.6500 mm, 291.4000 mm): Pad M4 [DDR4_DQ51] of U_D3 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(146.8500 mm, 291.4000 mm): Pad M5 [DDR4_DQ52] of U_D3 on F.Cu
+    @(172.5000 mm, 285.5000 mm): Pad C1 [DDR4_DQ52] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(146.0500 mm, 291.4000 mm): Pad M6 [DDR4_DQ53] of U_D3 on F.Cu
+    @(171.5000 mm, 285.5000 mm): Pad C2 [DDR4_DQ53] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(145.2500 mm, 291.4000 mm): Pad M7 [DDR4_DQ54] of U_D3 on F.Cu
+    @(170.5000 mm, 285.5000 mm): Pad C3 [DDR4_DQ54] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(144.4500 mm, 291.4000 mm): Pad M8 [DDR4_DQ55] of U_D3 on F.Cu
+    @(169.5000 mm, 285.5000 mm): Pad C4 [DDR4_DQ55] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(150.0500 mm, 292.2000 mm): Pad L1 [DDR4_DQ56] of U_D3 on F.Cu
+    @(168.5000 mm, 285.5000 mm): Pad C5 [DDR4_DQ56] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(149.2500 mm, 292.2000 mm): Pad L2 [DDR4_DQ57] of U_D3 on F.Cu
+    @(167.5000 mm, 285.5000 mm): Pad C6 [DDR4_DQ57] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(148.4500 mm, 292.2000 mm): Pad L3 [DDR4_DQ58] of U_D3 on F.Cu
+    @(166.5000 mm, 285.5000 mm): Pad C7 [DDR4_DQ58] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(147.6500 mm, 292.2000 mm): Pad L4 [DDR4_DQ59] of U_D3 on F.Cu
+    @(165.5000 mm, 285.5000 mm): Pad C8 [DDR4_DQ59] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(166.5000 mm, 287.5000 mm): Pad A7 [DDR4_DQ6] of U_FPGA on F.Cu
+    @(170.7500 mm, 291.4000 mm): Pad M7 [DDR4_DQ6] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(146.8500 mm, 292.2000 mm): Pad L5 [DDR4_DQ60] of U_D3 on F.Cu
+    @(164.5000 mm, 285.5000 mm): Pad C9 [DDR4_DQ60] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(146.0500 mm, 292.2000 mm): Pad L6 [DDR4_DQ61] of U_D3 on F.Cu
+    @(163.5000 mm, 285.5000 mm): Pad C10 [DDR4_DQ61] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(145.2500 mm, 292.2000 mm): Pad L7 [DDR4_DQ62] of U_D3 on F.Cu
+    @(162.5000 mm, 285.5000 mm): Pad C11 [DDR4_DQ62] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(144.4500 mm, 292.2000 mm): Pad L8 [DDR4_DQ63] of U_D3 on F.Cu
+    @(161.5000 mm, 285.5000 mm): Pad C12 [DDR4_DQ63] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(165.5000 mm, 287.5000 mm): Pad A8 [DDR4_DQ7] of U_FPGA on F.Cu
+    @(169.9500 mm, 291.4000 mm): Pad M8 [DDR4_DQ7] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(164.5000 mm, 287.5000 mm): Pad A9 [DDR4_DQ8] of U_FPGA on F.Cu
+    @(175.5500 mm, 292.2000 mm): Pad L1 [DDR4_DQ8] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(163.5000 mm, 287.5000 mm): Pad A10 [DDR4_DQ9] of U_FPGA on F.Cu
+    @(174.7500 mm, 292.2000 mm): Pad L2 [DDR4_DQ9] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(159.5000 mm, 285.5000 mm): Pad C14 [DDR4_DQS0_N] of U_FPGA on F.Cu
+    @(174.7500 mm, 293.0000 mm): Pad K2 [DDR4_DQS0_N] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(160.5000 mm, 285.5000 mm): Pad C13 [DDR4_DQS0_P] of U_FPGA on F.Cu
+    @(175.5500 mm, 293.0000 mm): Pad K1 [DDR4_DQS0_P] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(157.5000 mm, 285.5000 mm): Pad C16 [DDR4_DQS1_N] of U_FPGA on F.Cu
+    @(173.1500 mm, 293.0000 mm): Pad K4 [DDR4_DQS1_N] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(158.5000 mm, 285.5000 mm): Pad C15 [DDR4_DQS1_P] of U_FPGA on F.Cu
+    @(173.9500 mm, 293.0000 mm): Pad K3 [DDR4_DQS1_P] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(155.5000 mm, 285.5000 mm): Pad C18 [DDR4_DQS2_N] of U_FPGA on F.Cu
+    @(166.2500 mm, 293.0000 mm): Pad K2 [DDR4_DQS2_N] of U_D1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(156.5000 mm, 285.5000 mm): Pad C17 [DDR4_DQS2_P] of U_FPGA on F.Cu
+    @(167.0500 mm, 293.0000 mm): Pad K1 [DDR4_DQS2_P] of U_D1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(153.5000 mm, 285.5000 mm): Pad C20 [DDR4_DQS3_N] of U_FPGA on F.Cu
+    @(164.6500 mm, 293.0000 mm): Pad K4 [DDR4_DQS3_N] of U_D1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(154.5000 mm, 285.5000 mm): Pad C19 [DDR4_DQS3_P] of U_FPGA on F.Cu
+    @(165.4500 mm, 293.0000 mm): Pad K3 [DDR4_DQS3_P] of U_D1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(151.5000 mm, 285.5000 mm): Pad C22 [DDR4_DQS4_N] of U_FPGA on F.Cu
+    @(157.7500 mm, 293.0000 mm): Pad K2 [DDR4_DQS4_N] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(152.5000 mm, 285.5000 mm): Pad C21 [DDR4_DQS4_P] of U_FPGA on F.Cu
+    @(158.5500 mm, 293.0000 mm): Pad K1 [DDR4_DQS4_P] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(149.5000 mm, 285.5000 mm): Pad C24 [DDR4_DQS5_N] of U_FPGA on F.Cu
+    @(156.1500 mm, 293.0000 mm): Pad K4 [DDR4_DQS5_N] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(150.5000 mm, 285.5000 mm): Pad C23 [DDR4_DQS5_P] of U_FPGA on F.Cu
+    @(156.9500 mm, 293.0000 mm): Pad K3 [DDR4_DQS5_P] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(147.5000 mm, 285.5000 mm): Pad C26 [DDR4_DQS6_N] of U_FPGA on F.Cu
+    @(149.2500 mm, 293.0000 mm): Pad K2 [DDR4_DQS6_N] of U_D3 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(148.5000 mm, 285.5000 mm): Pad C25 [DDR4_DQS6_P] of U_FPGA on F.Cu
+    @(150.0500 mm, 293.0000 mm): Pad K1 [DDR4_DQS6_P] of U_D3 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(147.6500 mm, 293.0000 mm): Pad K4 [DDR4_DQS7_N] of U_D3 on F.Cu
+    @(171.5000 mm, 284.5000 mm): Pad D2 [DDR4_DQS7_N] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(148.4500 mm, 293.0000 mm): Pad K3 [DDR4_DQS7_P] of U_D3 on F.Cu
+    @(172.5000 mm, 284.5000 mm): Pad D1 [DDR4_DQS7_P] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(51.2000 mm, 329.7000 mm): Pad 9 [FAN_0_PWM] of U_BMC on F.Cu
+    @(53.7300 mm, 29.9500 mm): Pad 3 [FAN_0_PWM] of J_FAN0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(52.4000 mm, 329.7000 mm): Pad 10 [FAN_0_TACH] of U_BMC on F.Cu
+    @(56.2700 mm, 29.9500 mm): Pad 4 [FAN_0_TACH] of J_FAN0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(53.6000 mm, 329.7000 mm): Pad 11 [FAN_1_PWM] of U_BMC on F.Cu
+    @(123.7300 mm, 29.9500 mm): Pad 3 [FAN_1_PWM] of J_FAN1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(54.8000 mm, 329.7000 mm): Pad 12 [FAN_1_TACH] of U_BMC on F.Cu
+    @(126.2700 mm, 29.9500 mm): Pad 4 [FAN_1_TACH] of J_FAN1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(56.0000 mm, 329.7000 mm): Pad 13 [FAN_2_PWM] of U_BMC on F.Cu
+    @(193.7300 mm, 29.9500 mm): Pad 3 [FAN_2_PWM] of J_FAN2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(57.2000 mm, 329.7000 mm): Pad 14 [FAN_2_TACH] of U_BMC on F.Cu
+    @(196.2700 mm, 29.9500 mm): Pad 4 [FAN_2_TACH] of J_FAN2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(58.4000 mm, 329.7000 mm): Pad 15 [FAN_3_PWM] of U_BMC on F.Cu
+    @(263.7300 mm, 29.9500 mm): Pad 3 [FAN_3_PWM] of J_FAN3 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(41.6000 mm, 310.3000 mm): Pad 16 [FAN_3_TACH] of U_BMC on F.Cu
+    @(266.2700 mm, 29.9500 mm): Pad 4 [FAN_3_TACH] of J_FAN3 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(42.8000 mm, 310.3000 mm): Pad 17 [FAN_4_PWM] of U_BMC on F.Cu
+    @(333.7300 mm, 29.9500 mm): Pad 3 [FAN_4_PWM] of J_FAN4 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(44.0000 mm, 310.3000 mm): Pad 18 [FAN_4_TACH] of U_BMC on F.Cu
+    @(336.2700 mm, 29.9500 mm): Pad 4 [FAN_4_TACH] of J_FAN4 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(45.2000 mm, 310.3000 mm): Pad 19 [FAN_5_PWM] of U_BMC on F.Cu
+    @(403.7300 mm, 29.9500 mm): Pad 3 [FAN_5_PWM] of J_FAN5 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(46.4000 mm, 310.3000 mm): Pad 20 [FAN_5_TACH] of U_BMC on F.Cu
+    @(406.2700 mm, 29.9500 mm): Pad 4 [FAN_5_TACH] of J_FAN5 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(119.2705 mm, 235.4545 mm): Pad BR9 [JTAG_TCK] of U_A0 on F.Cu
+    @(159.5000 mm, 265.5000 mm): Pad AC14 [JTAG_TCK] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(219.7295 mm, 202.5455 mm): Pad BR9 [JTAG_TCK] of U_H0 on F.Cu
+    @(200.7295 mm, 144.5455 mm): Pad BR9 [JTAG_TCK] of U_A3 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(100.2705 mm, 177.4545 mm): Pad BR9 [JTAG_TCK] of U_A1 on F.Cu
+    @(119.2705 mm, 235.4545 mm): Pad BR9 [JTAG_TCK] of U_A0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(200.7295 mm, 144.5455 mm): Pad BR9 [JTAG_TCK] of U_A3 on F.Cu
+    @(141.0000 mm, 132.0000 mm): Pad BR9 [JTAG_TCK] of U_A2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(141.0000 mm, 132.0000 mm): Pad BR9 [JTAG_TCK] of U_A2 on F.Cu
+    @(100.2705 mm, 177.4545 mm): Pad BR9 [JTAG_TCK] of U_A1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(101.2705 mm, 175.7224 mm): Pad BR11 [JTAG_TDO_A0] of U_A1 on F.Cu
+    @(117.2705 mm, 231.9904 mm): Pad BR13 [JTAG_TDO_A0] of U_A0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(102.2705 mm, 173.9904 mm): Pad BR13 [JTAG_TDO_A1] of U_A1 on F.Cu
+    @(143.0000 mm, 132.0000 mm): Pad BR11 [JTAG_TDO_A1] of U_A2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(145.0000 mm, 132.0000 mm): Pad BR13 [JTAG_TDO_A2] of U_A2 on F.Cu
+    @(201.7295 mm, 146.2776 mm): Pad BR11 [JTAG_TDO_A2] of U_A3 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(202.7295 mm, 148.0096 mm): Pad BR13 [JTAG_TDO_A3] of U_A3 on F.Cu
+    @(218.7295 mm, 204.2776 mm): Pad BR11 [JTAG_TDO_A3] of U_H0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(118.2705 mm, 233.7224 mm): Pad BR11 [JTAG_TDO_FPGA] of U_A0 on F.Cu
+    @(156.5000 mm, 265.5000 mm): Pad AC17 [JTAG_TDO_FPGA] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(118.7705 mm, 234.5885 mm): Pad BR10 [JTAG_TMS] of U_A0 on F.Cu
+    @(158.5000 mm, 265.5000 mm): Pad AC15 [JTAG_TMS] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(219.2295 mm, 203.4115 mm): Pad BR10 [JTAG_TMS] of U_H0 on F.Cu
+    @(201.2295 mm, 145.4115 mm): Pad BR10 [JTAG_TMS] of U_A3 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(100.7705 mm, 176.5885 mm): Pad BR10 [JTAG_TMS] of U_A1 on F.Cu
+    @(118.7705 mm, 234.5885 mm): Pad BR10 [JTAG_TMS] of U_A0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(201.2295 mm, 145.4115 mm): Pad BR10 [JTAG_TMS] of U_A3 on F.Cu
+    @(142.0000 mm, 132.0000 mm): Pad BR10 [JTAG_TMS] of U_A2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(142.0000 mm, 132.0000 mm): Pad BR10 [JTAG_TMS] of U_A2 on F.Cu
+    @(100.7705 mm, 176.5885 mm): Pad BR10 [JTAG_TMS] of U_A1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(116.7705 mm, 231.1244 mm): Pad BR14 [JTAG_TRST] of U_A0 on F.Cu
+    @(155.5000 mm, 265.5000 mm): Pad AC18 [JTAG_TRST] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(217.2295 mm, 206.8756 mm): Pad BR14 [JTAG_TRST] of U_H0 on F.Cu
+    @(203.2295 mm, 148.8756 mm): Pad BR14 [JTAG_TRST] of U_A3 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(102.7705 mm, 173.1244 mm): Pad BR14 [JTAG_TRST] of U_A1 on F.Cu
+    @(116.7705 mm, 231.1244 mm): Pad BR14 [JTAG_TRST] of U_A0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(203.2295 mm, 148.8756 mm): Pad BR14 [JTAG_TRST] of U_A3 on F.Cu
+    @(146.0000 mm, 132.0000 mm): Pad BR14 [JTAG_TRST] of U_A2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(146.0000 mm, 132.0000 mm): Pad BR14 [JTAG_TRST] of U_A2 on F.Cu
+    @(102.7705 mm, 173.1244 mm): Pad BR14 [JTAG_TRST] of U_A1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(120.7705 mm, 238.0526 mm): Pad BR6 [MGMT_CS_A0] of U_A0 on F.Cu
+    @(169.5000 mm, 265.5000 mm): Pad AC4 [MGMT_CS_A0] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(98.7705 mm, 180.0526 mm): Pad BR6 [MGMT_CS_A1] of U_A1 on F.Cu
+    @(167.5000 mm, 265.5000 mm): Pad AC6 [MGMT_CS_A1] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(138.0000 mm, 132.0000 mm): Pad BR6 [MGMT_CS_A2] of U_A2 on F.Cu
+    @(165.5000 mm, 265.5000 mm): Pad AC8 [MGMT_CS_A2] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(163.5000 mm, 265.5000 mm): Pad AC10 [MGMT_CS_A3] of U_FPGA on F.Cu
+    @(199.2295 mm, 141.9474 mm): Pad BR6 [MGMT_CS_A3] of U_A3 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(161.5000 mm, 265.5000 mm): Pad AC12 [MGMT_CS_H0] of U_FPGA on F.Cu
+    @(221.2295 mm, 199.9474 mm): Pad BR6 [MGMT_CS_H0] of U_H0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(119.7705 mm, 236.3205 mm): Pad BR8 [MGMT_IRQ_A0] of U_A0 on F.Cu
+    @(168.5000 mm, 265.5000 mm): Pad AC5 [MGMT_IRQ_A0] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(99.7705 mm, 178.3205 mm): Pad BR8 [MGMT_IRQ_A1] of U_A1 on F.Cu
+    @(166.5000 mm, 265.5000 mm): Pad AC7 [MGMT_IRQ_A1] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(140.0000 mm, 132.0000 mm): Pad BR8 [MGMT_IRQ_A2] of U_A2 on F.Cu
+    @(164.5000 mm, 265.5000 mm): Pad AC9 [MGMT_IRQ_A2] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(162.5000 mm, 265.5000 mm): Pad AC11 [MGMT_IRQ_A3] of U_FPGA on F.Cu
+    @(200.2295 mm, 143.6795 mm): Pad BR8 [MGMT_IRQ_A3] of U_A3 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(160.5000 mm, 265.5000 mm): Pad AC13 [MGMT_IRQ_H0] of U_FPGA on F.Cu
+    @(220.2295 mm, 201.6795 mm): Pad BR8 [MGMT_IRQ_H0] of U_H0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(121.2705 mm, 238.9186 mm): Pad BR5 [MGMT_MISO] of U_A0 on F.Cu
+    @(170.5000 mm, 265.5000 mm): Pad AC3 [MGMT_MISO] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(221.7295 mm, 199.0814 mm): Pad BR5 [MGMT_MISO] of U_H0 on F.Cu
+    @(198.7295 mm, 141.0814 mm): Pad BR5 [MGMT_MISO] of U_A3 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(98.2705 mm, 180.9186 mm): Pad BR5 [MGMT_MISO] of U_A1 on F.Cu
+    @(121.2705 mm, 238.9186 mm): Pad BR5 [MGMT_MISO] of U_A0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(198.7295 mm, 141.0814 mm): Pad BR5 [MGMT_MISO] of U_A3 on F.Cu
+    @(137.0000 mm, 132.0000 mm): Pad BR5 [MGMT_MISO] of U_A2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(137.0000 mm, 132.0000 mm): Pad BR5 [MGMT_MISO] of U_A2 on F.Cu
+    @(98.2705 mm, 180.9186 mm): Pad BR5 [MGMT_MISO] of U_A1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(121.7705 mm, 239.7846 mm): Pad BR4 [MGMT_MOSI] of U_A0 on F.Cu
+    @(171.5000 mm, 265.5000 mm): Pad AC2 [MGMT_MOSI] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(222.2295 mm, 198.2154 mm): Pad BR4 [MGMT_MOSI] of U_H0 on F.Cu
+    @(198.2295 mm, 140.2154 mm): Pad BR4 [MGMT_MOSI] of U_A3 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(97.7705 mm, 181.7846 mm): Pad BR4 [MGMT_MOSI] of U_A1 on F.Cu
+    @(121.7705 mm, 239.7846 mm): Pad BR4 [MGMT_MOSI] of U_A0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(136.0000 mm, 132.0000 mm): Pad BR4 [MGMT_MOSI] of U_A2 on F.Cu
+    @(97.7705 mm, 181.7846 mm): Pad BR4 [MGMT_MOSI] of U_A1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(198.2295 mm, 140.2154 mm): Pad BR4 [MGMT_MOSI] of U_A3 on F.Cu
+    @(136.0000 mm, 132.0000 mm): Pad BR4 [MGMT_MOSI] of U_A2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(122.2705 mm, 240.6506 mm): Pad BR3 [MGMT_SCLK] of U_A0 on F.Cu
+    @(172.5000 mm, 265.5000 mm): Pad AC1 [MGMT_SCLK] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(135.0000 mm, 132.0000 mm): Pad BR3 [MGMT_SCLK] of U_A2 on F.Cu
+    @(97.2705 mm, 182.6506 mm): Pad BR3 [MGMT_SCLK] of U_A1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(222.7295 mm, 197.3494 mm): Pad BR3 [MGMT_SCLK] of U_H0 on F.Cu
+    @(197.7295 mm, 139.3494 mm): Pad BR3 [MGMT_SCLK] of U_A3 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(97.2705 mm, 182.6506 mm): Pad BR3 [MGMT_SCLK] of U_A1 on F.Cu
+    @(122.2705 mm, 240.6506 mm): Pad BR3 [MGMT_SCLK] of U_A0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(197.7295 mm, 139.3494 mm): Pad BR3 [MGMT_SCLK] of U_A3 on F.Cu
+    @(135.0000 mm, 132.0000 mm): Pad BR3 [MGMT_SCLK] of U_A2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(152.5000 mm, 272.5000 mm): Pad T21 [MGTAVCC] of U_FPGA on F.Cu
+    @(159.5000 mm, 275.5000 mm): Pad N14 [MGTAVCC] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(152.5000 mm, 272.5000 mm): Pad T21 [MGTAVCC] of U_FPGA on F.Cu
+    @(149.5000 mm, 281.5000 mm): Pad G24 [MGTAVCC] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(149.5000 mm, 263.5000 mm): Pad AE24 [MGTAVCC] of U_FPGA on F.Cu
+    @(152.5000 mm, 272.5000 mm): Pad T21 [MGTAVCC] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(168.5000 mm, 266.5000 mm): Pad AB5 [MGTAVCC] of U_FPGA on F.Cu
+    @(161.8000 mm, 258.2000 mm): Pad 10 [MGTAVCC] of REG_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(159.5000 mm, 275.5000 mm): Pad N14 [MGTAVCC] of U_FPGA on F.Cu
+    @(168.5000 mm, 266.5000 mm): Pad AB5 [MGTAVCC] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(169.5000 mm, 269.5000 mm): Pad W4 [MGTAVTT] of U_FPGA on F.Cu
+    @(162.5000 mm, 266.5000 mm): Pad AB11 [MGTAVTT] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(162.5000 mm, 266.5000 mm): Pad AB11 [MGTAVTT] of U_FPGA on F.Cu
+    @(160.0000 mm, 258.2000 mm): Pad 11 [MGTAVTT] of REG_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(166.5000 mm, 278.5000 mm): Pad K7 [MGTAVTT] of U_FPGA on F.Cu
+    @(169.5000 mm, 269.5000 mm): Pad W4 [MGTAVTT] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(153.5000 mm, 275.5000 mm): Pad N20 [MGTAVTT] of U_FPGA on F.Cu
+    @(162.5000 mm, 266.5000 mm): Pad AB11 [MGTAVTT] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(120.0000 mm, 370.4500 mm): Pad 35 [PCIE_PERST] of J_HOST on F.Cu
+    @(158.5000 mm, 263.5000 mm): Pad AE15 [PCIE_PERST] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(119.0000 mm, 370.4500 mm): Pad 34 [PCIE_REFCLK_N] of J_HOST on F.Cu
+    @(159.5000 mm, 263.5000 mm): Pad AE14 [PCIE_REFCLK_N] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(118.0000 mm, 370.4500 mm): Pad 33 [PCIE_REFCLK_P] of J_HOST on F.Cu
+    @(160.5000 mm, 263.5000 mm): Pad AE13 [PCIE_REFCLK_P] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(130.0000 mm, 377.5500 mm): Pad 18 [PCIE_RX0_N] of J_HOST on F.Cu
+    @(153.5000 mm, 262.5000 mm): Pad AF20 [PCIE_RX0_N] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(129.0000 mm, 377.5500 mm): Pad 17 [PCIE_RX0_P] of J_HOST on F.Cu
+    @(154.5000 mm, 262.5000 mm): Pad AF19 [PCIE_RX0_P] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(132.0000 mm, 377.5500 mm): Pad 20 [PCIE_RX1_N] of J_HOST on F.Cu
+    @(151.5000 mm, 262.5000 mm): Pad AF22 [PCIE_RX1_N] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(131.0000 mm, 377.5500 mm): Pad 19 [PCIE_RX1_P] of J_HOST on F.Cu
+    @(152.5000 mm, 262.5000 mm): Pad AF21 [PCIE_RX1_P] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(134.0000 mm, 377.5500 mm): Pad 22 [PCIE_RX2_N] of J_HOST on F.Cu
+    @(149.5000 mm, 262.5000 mm): Pad AF24 [PCIE_RX2_N] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(133.0000 mm, 377.5500 mm): Pad 21 [PCIE_RX2_P] of J_HOST on F.Cu
+    @(150.5000 mm, 262.5000 mm): Pad AF23 [PCIE_RX2_P] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(136.0000 mm, 377.5500 mm): Pad 24 [PCIE_RX3_N] of J_HOST on F.Cu
+    @(169.5000 mm, 263.5000 mm): Pad AE4 [PCIE_RX3_N] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(135.0000 mm, 377.5500 mm): Pad 23 [PCIE_RX3_P] of J_HOST on F.Cu
+    @(170.5000 mm, 263.5000 mm): Pad AE3 [PCIE_RX3_P] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(138.0000 mm, 377.5500 mm): Pad 26 [PCIE_RX4_N] of J_HOST on F.Cu
+    @(167.5000 mm, 263.5000 mm): Pad AE6 [PCIE_RX4_N] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(137.0000 mm, 377.5500 mm): Pad 25 [PCIE_RX4_P] of J_HOST on F.Cu
+    @(168.5000 mm, 263.5000 mm): Pad AE5 [PCIE_RX4_P] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(113.0000 mm, 370.4500 mm): Pad 28 [PCIE_RX5_N] of J_HOST on F.Cu
+    @(165.5000 mm, 263.5000 mm): Pad AE8 [PCIE_RX5_N] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(139.0000 mm, 377.5500 mm): Pad 27 [PCIE_RX5_P] of J_HOST on F.Cu
+    @(166.5000 mm, 263.5000 mm): Pad AE7 [PCIE_RX5_P] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(115.0000 mm, 370.4500 mm): Pad 30 [PCIE_RX6_N] of J_HOST on F.Cu
+    @(163.5000 mm, 263.5000 mm): Pad AE10 [PCIE_RX6_N] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(114.0000 mm, 370.4500 mm): Pad 29 [PCIE_RX6_P] of J_HOST on F.Cu
+    @(164.5000 mm, 263.5000 mm): Pad AE9 [PCIE_RX6_P] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(117.0000 mm, 370.4500 mm): Pad 32 [PCIE_RX7_N] of J_HOST on F.Cu
+    @(161.5000 mm, 263.5000 mm): Pad AE12 [PCIE_RX7_N] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(116.0000 mm, 370.4500 mm): Pad 31 [PCIE_RX7_P] of J_HOST on F.Cu
+    @(162.5000 mm, 263.5000 mm): Pad AE11 [PCIE_RX7_P] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(114.0000 mm, 377.5500 mm): Pad 2 [PCIE_TX0_N] of J_HOST on F.Cu
+    @(169.5000 mm, 262.5000 mm): Pad AF4 [PCIE_TX0_N] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(113.0000 mm, 377.5500 mm): Pad 1 [PCIE_TX0_P] of J_HOST on F.Cu
+    @(170.5000 mm, 262.5000 mm): Pad AF3 [PCIE_TX0_P] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(116.0000 mm, 377.5500 mm): Pad 4 [PCIE_TX1_N] of J_HOST on F.Cu
+    @(167.5000 mm, 262.5000 mm): Pad AF6 [PCIE_TX1_N] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(115.0000 mm, 377.5500 mm): Pad 3 [PCIE_TX1_P] of J_HOST on F.Cu
+    @(168.5000 mm, 262.5000 mm): Pad AF5 [PCIE_TX1_P] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(118.0000 mm, 377.5500 mm): Pad 6 [PCIE_TX2_N] of J_HOST on F.Cu
+    @(165.5000 mm, 262.5000 mm): Pad AF8 [PCIE_TX2_N] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(117.0000 mm, 377.5500 mm): Pad 5 [PCIE_TX2_P] of J_HOST on F.Cu
+    @(166.5000 mm, 262.5000 mm): Pad AF7 [PCIE_TX2_P] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(120.0000 mm, 377.5500 mm): Pad 8 [PCIE_TX3_N] of J_HOST on F.Cu
+    @(163.5000 mm, 262.5000 mm): Pad AF10 [PCIE_TX3_N] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(119.0000 mm, 377.5500 mm): Pad 7 [PCIE_TX3_P] of J_HOST on F.Cu
+    @(164.5000 mm, 262.5000 mm): Pad AF9 [PCIE_TX3_P] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(122.0000 mm, 377.5500 mm): Pad 10 [PCIE_TX4_N] of J_HOST on F.Cu
+    @(161.5000 mm, 262.5000 mm): Pad AF12 [PCIE_TX4_N] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(121.0000 mm, 377.5500 mm): Pad 9 [PCIE_TX4_P] of J_HOST on F.Cu
+    @(162.5000 mm, 262.5000 mm): Pad AF11 [PCIE_TX4_P] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(124.0000 mm, 377.5500 mm): Pad 12 [PCIE_TX5_N] of J_HOST on F.Cu
+    @(159.5000 mm, 262.5000 mm): Pad AF14 [PCIE_TX5_N] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(123.0000 mm, 377.5500 mm): Pad 11 [PCIE_TX5_P] of J_HOST on F.Cu
+    @(160.5000 mm, 262.5000 mm): Pad AF13 [PCIE_TX5_P] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(126.0000 mm, 377.5500 mm): Pad 14 [PCIE_TX6_N] of J_HOST on F.Cu
+    @(157.5000 mm, 262.5000 mm): Pad AF16 [PCIE_TX6_N] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(125.0000 mm, 377.5500 mm): Pad 13 [PCIE_TX6_P] of J_HOST on F.Cu
+    @(158.5000 mm, 262.5000 mm): Pad AF15 [PCIE_TX6_P] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(128.0000 mm, 377.5500 mm): Pad 16 [PCIE_TX7_N] of J_HOST on F.Cu
+    @(155.5000 mm, 262.5000 mm): Pad AF18 [PCIE_TX7_N] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(127.0000 mm, 377.5500 mm): Pad 15 [PCIE_TX7_P] of J_HOST on F.Cu
+    @(156.5000 mm, 262.5000 mm): Pad AF17 [PCIE_TX7_P] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(121.0000 mm, 370.4500 mm): Pad 36 [PCIE_WAKE] of J_HOST on F.Cu
+    @(157.5000 mm, 263.5000 mm): Pad AE16 [PCIE_WAKE] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(163.4500 mm, 135.8000 mm): Pad 17 [PMB_SCL] of VRM_A2 on F.Cu
+    @(114.7865 mm, 159.9122 mm): Pad 17 [PMB_SCL] of VRM_A1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(163.4500 mm, 135.8000 mm): Pad 17 [PMB_SCL] of VRM_A2 on F.Cu
+    @(208.6635 mm, 165.8878 mm): Pad 17 [PMB_SCL] of VRM_A3 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(111.3365 mm, 214.1122 mm): Pad 17 [PMB_SCL] of VRM_A0 on F.Cu
+    @(114.7865 mm, 159.9122 mm): Pad 17 [PMB_SCL] of VRM_A1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(205.2135 mm, 220.0878 mm): Pad 17 [PMB_SCL] of VRM_H0 on F.Cu
+    @(208.6635 mm, 165.8878 mm): Pad 17 [PMB_SCL] of VRM_A3 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(321.4000 mm, 196.2000 mm): Pad 13 [PMB_SCL] of J_PSU0 on F.Cu
+    @(396.4000 mm, 196.2000 mm): Pad 13 [PMB_SCL] of J_PSU1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(50.0000 mm, 310.3000 mm): Pad 23 [PMB_SCL] of U_BMC on F.Cu
+    @(111.3365 mm, 214.1122 mm): Pad 17 [PMB_SCL] of VRM_A0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(321.4000 mm, 196.2000 mm): Pad 13 [PMB_SCL] of J_PSU0 on F.Cu
+    @(208.6635 mm, 165.8878 mm): Pad 17 [PMB_SCL] of VRM_A3 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(165.7500 mm, 135.8000 mm): Pad 18 [PMB_SDA] of VRM_A2 on F.Cu
+    @(209.8135 mm, 167.8796 mm): Pad 18 [PMB_SDA] of VRM_A3 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(165.7500 mm, 135.8000 mm): Pad 18 [PMB_SDA] of VRM_A2 on F.Cu
+    @(115.9365 mm, 157.9204 mm): Pad 18 [PMB_SDA] of VRM_A1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(209.8135 mm, 167.8796 mm): Pad 18 [PMB_SDA] of VRM_A3 on F.Cu
+    @(204.0635 mm, 222.0796 mm): Pad 18 [PMB_SDA] of VRM_H0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(110.1865 mm, 212.1204 mm): Pad 18 [PMB_SDA] of VRM_A0 on F.Cu
+    @(115.9365 mm, 157.9204 mm): Pad 18 [PMB_SDA] of VRM_A1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(324.2000 mm, 196.2000 mm): Pad 14 [PMB_SDA] of J_PSU0 on F.Cu
+    @(399.2000 mm, 196.2000 mm): Pad 14 [PMB_SDA] of J_PSU1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(51.2000 mm, 310.3000 mm): Pad 24 [PMB_SDA] of U_BMC on F.Cu
+    @(110.1865 mm, 212.1204 mm): Pad 18 [PMB_SDA] of VRM_A0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(209.8135 mm, 167.8796 mm): Pad 18 [PMB_SDA] of VRM_A3 on F.Cu
+    @(324.2000 mm, 196.2000 mm): Pad 14 [PMB_SDA] of J_PSU0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(402.0000 mm, 196.2000 mm): Pad 15 [PSU_ON] of J_PSU1 on F.Cu
+    @(327.0000 mm, 196.2000 mm): Pad 15 [PSU_ON] of J_PSU0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(327.0000 mm, 196.2000 mm): Pad 15 [PSU_ON] of J_PSU0 on F.Cu
+    @(52.4000 mm, 310.3000 mm): Pad 25 [PSU_ON] of U_BMC on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(115.7705 mm, 229.3923 mm): Pad BR16 [REFCLK_A0_N] of U_A0 on F.Cu
+    @(161.4000 mm, 193.8500 mm): Pad 6 [REFCLK_A0_N] of U_CLK on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(116.2705 mm, 230.2583 mm): Pad BR15 [REFCLK_A0_P] of U_A0 on F.Cu
+    @(160.7000 mm, 193.8500 mm): Pad 5 [REFCLK_A0_P] of U_CLK on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(103.7705 mm, 171.3923 mm): Pad BR16 [REFCLK_A1_N] of U_A1 on F.Cu
+    @(157.9000 mm, 186.1500 mm): Pad 8 [REFCLK_A1_N] of U_CLK on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(103.2705 mm, 172.2583 mm): Pad BR15 [REFCLK_A1_P] of U_A1 on F.Cu
+    @(162.1000 mm, 193.8500 mm): Pad 7 [REFCLK_A1_P] of U_CLK on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(148.0000 mm, 132.0000 mm): Pad BR16 [REFCLK_A2_N] of U_A2 on F.Cu
+    @(159.3000 mm, 186.1500 mm): Pad 10 [REFCLK_A2_N] of U_CLK on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(147.0000 mm, 132.0000 mm): Pad BR15 [REFCLK_A2_P] of U_A2 on F.Cu
+    @(158.6000 mm, 186.1500 mm): Pad 9 [REFCLK_A2_P] of U_CLK on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(160.7000 mm, 186.1500 mm): Pad 12 [REFCLK_A3_N] of U_CLK on F.Cu
+    @(204.2295 mm, 150.6077 mm): Pad BR16 [REFCLK_A3_N] of U_A3 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(160.0000 mm, 186.1500 mm): Pad 11 [REFCLK_A3_P] of U_CLK on F.Cu
+    @(203.7295 mm, 149.7417 mm): Pad BR15 [REFCLK_A3_P] of U_A3 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(153.5000 mm, 265.5000 mm): Pad AC20 [REFCLK_FPGA_N] of U_FPGA on F.Cu
+    @(160.0000 mm, 193.8500 mm): Pad 4 [REFCLK_FPGA_N] of U_CLK on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(154.5000 mm, 265.5000 mm): Pad AC19 [REFCLK_FPGA_P] of U_FPGA on F.Cu
+    @(159.3000 mm, 193.8500 mm): Pad 3 [REFCLK_FPGA_P] of U_CLK on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(162.1000 mm, 186.1500 mm): Pad 14 [REFCLK_H0_N] of U_CLK on F.Cu
+    @(216.2295 mm, 208.6077 mm): Pad BR16 [REFCLK_H0_N] of U_H0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(161.4000 mm, 186.1500 mm): Pad 13 [REFCLK_H0_P] of U_CLK on F.Cu
+    @(216.7295 mm, 207.7417 mm): Pad BR15 [REFCLK_H0_P] of U_H0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(85.0000 mm, 359.0000 mm): Pad 7 [SFP_CTRL0] of J_SFP on F.Cu
+    @(170.5000 mm, 264.5000 mm): Pad AD3 [SFP_CTRL0] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(87.0000 mm, 359.0000 mm): Pad 8 [SFP_CTRL1] of J_SFP on F.Cu
+    @(169.5000 mm, 264.5000 mm): Pad AD4 [SFP_CTRL1] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(73.0000 mm, 347.0000 mm): Pad 9 [SFP_CTRL2] of J_SFP on F.Cu
+    @(168.5000 mm, 264.5000 mm): Pad AD5 [SFP_CTRL2] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(75.0000 mm, 347.0000 mm): Pad 10 [SFP_CTRL3] of J_SFP on F.Cu
+    @(167.5000 mm, 264.5000 mm): Pad AD6 [SFP_CTRL3] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(81.0000 mm, 359.0000 mm): Pad 5 [SFP_I2C0] of J_SFP on F.Cu
+    @(172.5000 mm, 264.5000 mm): Pad AD1 [SFP_I2C0] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(83.0000 mm, 359.0000 mm): Pad 6 [SFP_I2C1] of J_SFP on F.Cu
+    @(171.5000 mm, 264.5000 mm): Pad AD2 [SFP_I2C1] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(79.0000 mm, 359.0000 mm): Pad 4 [SFP_RX_N] of J_SFP on F.Cu
+    @(149.5000 mm, 265.5000 mm): Pad AC24 [SFP_RX_N] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(77.0000 mm, 359.0000 mm): Pad 3 [SFP_RX_P] of J_SFP on F.Cu
+    @(150.5000 mm, 265.5000 mm): Pad AC23 [SFP_RX_P] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(75.0000 mm, 359.0000 mm): Pad 2 [SFP_TX_N] of J_SFP on F.Cu
+    @(151.5000 mm, 265.5000 mm): Pad AC22 [SFP_TX_N] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(73.0000 mm, 359.0000 mm): Pad 1 [SFP_TX_P] of J_SFP on F.Cu
+    @(152.5000 mm, 265.5000 mm): Pad AC21 [SFP_TX_P] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(48.8000 mm, 310.3000 mm): Pad 22 [UART_RX] of U_BMC on F.Cu
+    @(159.5000 mm, 264.5000 mm): Pad AD14 [UART_RX] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(47.6000 mm, 310.3000 mm): Pad 21 [UART_TX] of U_BMC on F.Cu
+    @(160.5000 mm, 264.5000 mm): Pad AD13 [UART_TX] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(163.5000 mm, 269.5000 mm): Pad W10 [VCCAUX_1V8] of U_FPGA on F.Cu
+    @(170.5000 mm, 272.5000 mm): Pad T3 [VCCAUX_1V8] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(163.5000 mm, 269.5000 mm): Pad W10 [VCCAUX_1V8] of U_FPGA on F.Cu
+    @(156.5000 mm, 266.5000 mm): Pad AB17 [VCCAUX_1V8] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(160.5000 mm, 278.5000 mm): Pad K13 [VCCAUX_1V8] of U_FPGA on F.Cu
+    @(167.5000 mm, 281.5000 mm): Pad G6 [VCCAUX_1V8] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(167.5000 mm, 281.5000 mm): Pad G6 [VCCAUX_1V8] of U_FPGA on F.Cu
+    @(170.5000 mm, 272.5000 mm): Pad T3 [VCCAUX_1V8] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(154.6000 mm, 253.3000 mm): Pad 7 [VCCAUX_1V8] of REG_FPGA on F.Cu
+    @(156.5000 mm, 266.5000 mm): Pad AB17 [VCCAUX_1V8] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(155.5000 mm, 263.5000 mm): Pad AE18 [VCCO_1V2] of U_FPGA on F.Cu
+    @(151.5000 mm, 269.5000 mm): Pad W22 [VCCO_1V2] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(165.5000 mm, 275.5000 mm): Pad N8 [VCCO_1V2] of U_FPGA on F.Cu
+    @(158.5000 mm, 272.5000 mm): Pad T15 [VCCO_1V2] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(158.5000 mm, 272.5000 mm): Pad T15 [VCCO_1V2] of U_FPGA on F.Cu
+    @(151.5000 mm, 269.5000 mm): Pad W22 [VCCO_1V2] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(155.5000 mm, 281.5000 mm): Pad G18 [VCCO_1V2] of U_FPGA on F.Cu
+    @(158.5000 mm, 272.5000 mm): Pad T15 [VCCO_1V2] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(163.6000 mm, 258.2000 mm): Pad 9 [VCCO_1V2] of REG_FPGA on F.Cu
+    @(155.5000 mm, 263.5000 mm): Pad AE18 [VCCO_1V2] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(150.5000 mm, 266.5000 mm): Pad AB23 [VCCO_1V8] of U_FPGA on F.Cu
+    @(157.5000 mm, 269.5000 mm): Pad W16 [VCCO_1V8] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(164.5000 mm, 272.5000 mm): Pad T9 [VCCO_1V8] of U_FPGA on F.Cu
+    @(157.5000 mm, 269.5000 mm): Pad W16 [VCCO_1V8] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(154.5000 mm, 278.5000 mm): Pad K19 [VCCO_1V8] of U_FPGA on F.Cu
+    @(161.5000 mm, 281.5000 mm): Pad G12 [VCCO_1V8] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(161.5000 mm, 281.5000 mm): Pad G12 [VCCO_1V8] of U_FPGA on F.Cu
+    @(164.5000 mm, 272.5000 mm): Pad T9 [VCCO_1V8] of U_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(157.5000 mm, 269.5000 mm): Pad W16 [VCCO_1V8] of U_FPGA on F.Cu
+    @(165.4000 mm, 258.2000 mm): Pad 8 [VCCO_1V8] of REG_FPGA on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(62.9333 mm, 150.1244 mm): Pad J14 [VDDQ_HBM_0V4] of U_A1 on F.Cu
+    @(61.5673 mm, 150.4904 mm): Pad H13 [VDDQ_HBM_0V4] of U_A1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(75.2013 mm, 124.8756 mm): Pad G42 [VDDQ_HBM_0V4] of U_A1 on F.Cu
+    @(76.5673 mm, 124.5096 mm): Pad H43 [VDDQ_HBM_0V4] of U_A1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(67.9333 mm, 141.4641 mm): Pad J24 [VDDQ_HBM_0V4] of U_A1 on F.Cu
+    @(66.5673 mm, 141.8301 mm): Pad H23 [VDDQ_HBM_0V4] of U_A1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(81.9333 mm, 262.7846 mm): Pad J4 [VDDQ_HBM_0V4] of U_A0 on F.Cu
+    @(81.5673 mm, 264.1506 mm): Pad H3 [VDDQ_HBM_0V4] of U_A0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(243.0667 mm, 125.8756 mm): Pad J14 [VDDQ_HBM_0V4] of U_A3 on F.Cu
+    @(243.4327 mm, 124.5096 mm): Pad H13 [VDDQ_HBM_0V4] of U_A3 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(238.0667 mm, 117.2154 mm): Pad J4 [VDDQ_HBM_0V4] of U_A3 on F.Cu
+    @(238.4327 mm, 115.8494 mm): Pad H3 [VDDQ_HBM_0V4] of U_A3 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(81.5673 mm, 115.8494 mm): Pad H53 [VDDQ_HBM_0V4] of U_A1 on F.Cu
+    @(80.2013 mm, 116.2154 mm): Pad G52 [VDDQ_HBM_0V4] of U_A1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(61.5673 mm, 229.5096 mm): Pad H43 [VDDQ_HBM_0V4] of U_A0 on F.Cu
+    @(61.2013 mm, 230.8756 mm): Pad G42 [VDDQ_HBM_0V4] of U_A0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(76.9333 mm, 254.1244 mm): Pad J14 [VDDQ_HBM_0V4] of U_A0 on F.Cu
+    @(76.5673 mm, 255.4904 mm): Pad H13 [VDDQ_HBM_0V4] of U_A0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(253.7987 mm, 140.4641 mm): Pad G32 [VDDQ_HBM_0V4] of U_A3 on F.Cu
+    @(253.4327 mm, 141.8301 mm): Pad H33 [VDDQ_HBM_0V4] of U_A3 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(71.5673 mm, 133.1699 mm): Pad H33 [VDDQ_HBM_0V4] of U_A1 on F.Cu
+    @(70.2013 mm, 133.5359 mm): Pad G32 [VDDQ_HBM_0V4] of U_A1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(56.2013 mm, 222.2154 mm): Pad G52 [VDDQ_HBM_0V4] of U_A0 on F.Cu
+    @(56.5673 mm, 220.8494 mm): Pad H53 [VDDQ_HBM_0V4] of U_A0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(263.4327 mm, 159.1506 mm): Pad H53 [VDDQ_HBM_0V4] of U_A3 on F.Cu
+    @(263.7987 mm, 157.7846 mm): Pad G52 [VDDQ_HBM_0V4] of U_A3 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(56.5673 mm, 159.1506 mm): Pad H3 [VDDQ_HBM_0V4] of U_A1 on F.Cu
+    @(57.9333 mm, 158.7846 mm): Pad J4 [VDDQ_HBM_0V4] of U_A1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(66.2013 mm, 239.5359 mm): Pad G32 [VDDQ_HBM_0V4] of U_A0 on F.Cu
+    @(66.5673 mm, 238.1699 mm): Pad H33 [VDDQ_HBM_0V4] of U_A0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(248.0667 mm, 134.5359 mm): Pad J24 [VDDQ_HBM_0V4] of U_A3 on F.Cu
+    @(248.4327 mm, 133.1699 mm): Pad H23 [VDDQ_HBM_0V4] of U_A3 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(258.4327 mm, 150.4904 mm): Pad H43 [VDDQ_HBM_0V4] of U_A3 on F.Cu
+    @(258.7987 mm, 149.1244 mm): Pad G42 [VDDQ_HBM_0V4] of U_A3 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(71.9333 mm, 245.4641 mm): Pad J24 [VDDQ_HBM_0V4] of U_A0 on F.Cu
+    @(71.5673 mm, 246.8301 mm): Pad H23 [VDDQ_HBM_0V4] of U_A0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(155.0000 mm, 85.0000 mm): Pad H23 [VDDQ_HBM_0V4] of U_A2 on F.Cu
+    @(156.0000 mm, 86.0000 mm): Pad J24 [VDDQ_HBM_0V4] of U_A2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(165.0000 mm, 85.0000 mm): Pad H33 [VDDQ_HBM_0V4] of U_A2 on F.Cu
+    @(164.0000 mm, 84.0000 mm): Pad G32 [VDDQ_HBM_0V4] of U_A2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(136.0000 mm, 86.0000 mm): Pad J4 [VDDQ_HBM_0V4] of U_A2 on F.Cu
+    @(135.0000 mm, 85.0000 mm): Pad H3 [VDDQ_HBM_0V4] of U_A2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(146.0000 mm, 86.0000 mm): Pad J14 [VDDQ_HBM_0V4] of U_A2 on F.Cu
+    @(145.0000 mm, 85.0000 mm): Pad H13 [VDDQ_HBM_0V4] of U_A2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(175.0000 mm, 85.0000 mm): Pad H43 [VDDQ_HBM_0V4] of U_A2 on F.Cu
+    @(174.0000 mm, 84.0000 mm): Pad G42 [VDDQ_HBM_0V4] of U_A2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(185.0000 mm, 85.0000 mm): Pad H53 [VDDQ_HBM_0V4] of U_A2 on F.Cu
+    @(184.0000 mm, 84.0000 mm): Pad G52 [VDDQ_HBM_0V4] of U_A2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(149.8000 mm, 202.4500 mm): Pad 4 [VDDQ_HBM_0V4] of REG_HBM_0V4 on F.Cu
+    @(151.6000 mm, 202.4500 mm): Pad 5 [VDDQ_HBM_0V4] of REG_HBM_0V4 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(149.8000 mm, 202.4500 mm): Pad 4 [VDDQ_HBM_0V4] of REG_HBM_0V4 on F.Cu
+    @(144.4000 mm, 197.5500 mm): Pad 6 [VDDQ_HBM_0V4] of REG_HBM_0V4 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(71.9333 mm, 245.4641 mm): Pad J24 [VDDQ_HBM_0V4] of U_A0 on F.Cu
+    @(66.2013 mm, 239.5359 mm): Pad G32 [VDDQ_HBM_0V4] of U_A0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(248.0667 mm, 134.5359 mm): Pad J24 [VDDQ_HBM_0V4] of U_A3 on F.Cu
+    @(253.7987 mm, 140.4641 mm): Pad G32 [VDDQ_HBM_0V4] of U_A3 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(156.0000 mm, 86.0000 mm): Pad J24 [VDDQ_HBM_0V4] of U_A2 on F.Cu
+    @(164.0000 mm, 84.0000 mm): Pad G32 [VDDQ_HBM_0V4] of U_A2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(70.2013 mm, 133.5359 mm): Pad G32 [VDDQ_HBM_0V4] of U_A1 on F.Cu
+    @(67.9333 mm, 141.4641 mm): Pad J24 [VDDQ_HBM_0V4] of U_A1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(243.4327 mm, 124.5096 mm): Pad H13 [VDDQ_HBM_0V4] of U_A3 on F.Cu
+    @(238.0667 mm, 117.2154 mm): Pad J4 [VDDQ_HBM_0V4] of U_A3 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(61.5673 mm, 229.5096 mm): Pad H43 [VDDQ_HBM_0V4] of U_A0 on F.Cu
+    @(56.2013 mm, 222.2154 mm): Pad G52 [VDDQ_HBM_0V4] of U_A0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(76.5673 mm, 255.4904 mm): Pad H13 [VDDQ_HBM_0V4] of U_A0 on F.Cu
+    @(81.9333 mm, 262.7846 mm): Pad J4 [VDDQ_HBM_0V4] of U_A0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(258.4327 mm, 150.4904 mm): Pad H43 [VDDQ_HBM_0V4] of U_A3 on F.Cu
+    @(263.7987 mm, 157.7846 mm): Pad G52 [VDDQ_HBM_0V4] of U_A3 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(80.2013 mm, 116.2154 mm): Pad G52 [VDDQ_HBM_0V4] of U_A1 on F.Cu
+    @(76.5673 mm, 124.5096 mm): Pad H43 [VDDQ_HBM_0V4] of U_A1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(61.5673 mm, 150.4904 mm): Pad H13 [VDDQ_HBM_0V4] of U_A1 on F.Cu
+    @(57.9333 mm, 158.7846 mm): Pad J4 [VDDQ_HBM_0V4] of U_A1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(136.0000 mm, 86.0000 mm): Pad J4 [VDDQ_HBM_0V4] of U_A2 on F.Cu
+    @(145.0000 mm, 85.0000 mm): Pad H13 [VDDQ_HBM_0V4] of U_A2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(165.0000 mm, 85.0000 mm): Pad H33 [VDDQ_HBM_0V4] of U_A2 on F.Cu
+    @(174.0000 mm, 84.0000 mm): Pad G42 [VDDQ_HBM_0V4] of U_A2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(184.0000 mm, 84.0000 mm): Pad G52 [VDDQ_HBM_0V4] of U_A2 on F.Cu
+    @(175.0000 mm, 85.0000 mm): Pad H43 [VDDQ_HBM_0V4] of U_A2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(155.0000 mm, 85.0000 mm): Pad H23 [VDDQ_HBM_0V4] of U_A2 on F.Cu
+    @(146.0000 mm, 86.0000 mm): Pad J14 [VDDQ_HBM_0V4] of U_A2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(61.2013 mm, 230.8756 mm): Pad G42 [VDDQ_HBM_0V4] of U_A0 on F.Cu
+    @(66.5673 mm, 238.1699 mm): Pad H33 [VDDQ_HBM_0V4] of U_A0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(71.5673 mm, 246.8301 mm): Pad H23 [VDDQ_HBM_0V4] of U_A0 on F.Cu
+    @(76.9333 mm, 254.1244 mm): Pad J14 [VDDQ_HBM_0V4] of U_A0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(253.4327 mm, 141.8301 mm): Pad H33 [VDDQ_HBM_0V4] of U_A3 on F.Cu
+    @(258.7987 mm, 149.1244 mm): Pad G42 [VDDQ_HBM_0V4] of U_A3 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(243.0667 mm, 125.8756 mm): Pad J14 [VDDQ_HBM_0V4] of U_A3 on F.Cu
+    @(248.4327 mm, 133.1699 mm): Pad H23 [VDDQ_HBM_0V4] of U_A3 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(62.9333 mm, 150.1244 mm): Pad J14 [VDDQ_HBM_0V4] of U_A1 on F.Cu
+    @(66.5673 mm, 141.8301 mm): Pad H23 [VDDQ_HBM_0V4] of U_A1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(75.2013 mm, 124.8756 mm): Pad G42 [VDDQ_HBM_0V4] of U_A1 on F.Cu
+    @(71.5673 mm, 133.1699 mm): Pad H33 [VDDQ_HBM_0V4] of U_A1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(81.5673 mm, 115.8494 mm): Pad H53 [VDDQ_HBM_0V4] of U_A1 on F.Cu
+    @(135.0000 mm, 85.0000 mm): Pad H3 [VDDQ_HBM_0V4] of U_A2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(185.0000 mm, 85.0000 mm): Pad H53 [VDDQ_HBM_0V4] of U_A2 on F.Cu
+    @(238.4327 mm, 115.8494 mm): Pad H3 [VDDQ_HBM_0V4] of U_A3 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(56.5673 mm, 159.1506 mm): Pad H3 [VDDQ_HBM_0V4] of U_A1 on F.Cu
+    @(56.5673 mm, 220.8494 mm): Pad H53 [VDDQ_HBM_0V4] of U_A0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(144.4000 mm, 197.5500 mm): Pad 6 [VDDQ_HBM_0V4] of REG_HBM_0V4 on F.Cu
+    @(71.9333 mm, 245.4641 mm): Pad J24 [VDDQ_HBM_0V4] of U_A0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(162.2500 mm, 297.8000 mm): Pad D7 [VDD_1V2] of U_D1 on F.Cu
+    @(161.4500 mm, 298.6000 mm): Pad C8 [VDD_1V2] of U_D1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(147.6500 mm, 298.6000 mm): Pad C4 [VDD_1V2] of U_D3 on F.Cu
+    @(148.4500 mm, 297.8000 mm): Pad D3 [VDD_1V2] of U_D3 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(173.9500 mm, 299.4000 mm): Pad B3 [VDD_1V2] of U_D0 on F.Cu
+    @(173.1500 mm, 300.2000 mm): Pad A4 [VDD_1V2] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(145.2500 mm, 299.4000 mm): Pad B7 [VDD_1V2] of U_D3 on F.Cu
+    @(144.4500 mm, 300.2000 mm): Pad A8 [VDD_1V2] of U_D3 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(145.2500 mm, 299.4000 mm): Pad B7 [VDD_1V2] of U_D3 on F.Cu
+    @(144.4500 mm, 298.6000 mm): Pad C8 [VDD_1V2] of U_D3 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(145.2500 mm, 297.8000 mm): Pad D7 [VDD_1V2] of U_D3 on F.Cu
+    @(144.4500 mm, 298.6000 mm): Pad C8 [VDD_1V2] of U_D3 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(144.4500 mm, 297.0000 mm): Pad E8 [VDD_1V2] of U_D3 on F.Cu
+    @(145.2500 mm, 297.8000 mm): Pad D7 [VDD_1V2] of U_D3 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(161.4500 mm, 300.2000 mm): Pad A8 [VDD_1V2] of U_D1 on F.Cu
+    @(162.2500 mm, 299.4000 mm): Pad B7 [VDD_1V2] of U_D1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(162.2500 mm, 299.4000 mm): Pad B7 [VDD_1V2] of U_D1 on F.Cu
+    @(161.4500 mm, 298.6000 mm): Pad C8 [VDD_1V2] of U_D1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(148.4500 mm, 297.8000 mm): Pad D3 [VDD_1V2] of U_D3 on F.Cu
+    @(147.6500 mm, 297.0000 mm): Pad E4 [VDD_1V2] of U_D3 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(162.2500 mm, 297.8000 mm): Pad D7 [VDD_1V2] of U_D1 on F.Cu
+    @(161.4500 mm, 297.0000 mm): Pad E8 [VDD_1V2] of U_D1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(164.6500 mm, 300.2000 mm): Pad A4 [VDD_1V2] of U_D1 on F.Cu
+    @(165.4500 mm, 299.4000 mm): Pad B3 [VDD_1V2] of U_D1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(165.4500 mm, 299.4000 mm): Pad B3 [VDD_1V2] of U_D1 on F.Cu
+    @(164.6500 mm, 298.6000 mm): Pad C4 [VDD_1V2] of U_D1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(165.4500 mm, 297.8000 mm): Pad D3 [VDD_1V2] of U_D1 on F.Cu
+    @(164.6500 mm, 297.0000 mm): Pad E4 [VDD_1V2] of U_D1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(164.6500 mm, 298.6000 mm): Pad C4 [VDD_1V2] of U_D1 on F.Cu
+    @(165.4500 mm, 297.8000 mm): Pad D3 [VDD_1V2] of U_D1 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(152.9500 mm, 297.0000 mm): Pad E8 [VDD_1V2] of U_D2 on F.Cu
+    @(153.7500 mm, 297.8000 mm): Pad D7 [VDD_1V2] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(152.9500 mm, 298.6000 mm): Pad C8 [VDD_1V2] of U_D2 on F.Cu
+    @(153.7500 mm, 297.8000 mm): Pad D7 [VDD_1V2] of U_D2 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(169.9500 mm, 300.2000 mm): Pad A8 [VDD_1V2] of U_D0 on F.Cu
+    @(170.7500 mm, 299.4000 mm): Pad B7 [VDD_1V2] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(170.7500 mm, 299.4000 mm): Pad B7 [VDD_1V2] of U_D0 on F.Cu
+    @(169.9500 mm, 298.6000 mm): Pad C8 [VDD_1V2] of U_D0 on F.Cu
+[unconnected_items]: Missing connection between items
+    Local override; Severity: warning
+    @(169.9500 mm, 298.6000 mm): Pad C8 [VDD_1V2] of U_D0 on F.Cu
+    @(170.7500 mm, 297.8000 mm): Pad D7 [VDD_1V2] of U_D0 on F.Cu
+
+** Found 0 Footprint errors **
+
+** End of Report **

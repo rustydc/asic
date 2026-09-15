@@ -54,7 +54,7 @@ class BoardTest(unittest.TestCase):
         data = copy.deepcopy(self.board.data)
         data["nets"]["memory"]["channels"].pop()
         problems = Board(data).check()
-        self.assertTrue(any("needs two LPDDR channels" in p for p in problems))
+        self.assertTrue(any("needs memory channels" in p for p in problems))
         self.assertTrue(any("unattached memory" in p for p in problems))
 
     def test_checks_catch_broken_ring(self) -> None:

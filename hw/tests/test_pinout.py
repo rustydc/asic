@@ -89,6 +89,16 @@ class PinoutTest(unittest.TestCase):
         self.assertEqual(sum(1 for b in data["balls"] if b["escape"]), 72)
         self.assertIn("**selected**", report)
 
+    def test_in_package_memory_leaves_the_north_rows_to_power(self) -> None:
+        board = Board.load(Path(__file__).resolve().parents[1] / "board_27b.yaml")
+        p = pinout.derive(board)
+        self.assertEqual(p.package.name, "FCBGA3025_55x55_P1.0")
+        self.assertEqual(p.requirements.signal_balls, 2 * 36 + 14)
+        self.assertEqual(sum(1 for b in p.balls if b.interface.startswith("lpddr")), 0)
+        self.assertGreaterEqual(p.count("rail", "VDD_CORE"), p.requirements.core_balls)
+        self.assertEqual(p.count("rail", "VDD_HBM_1V1"), 24)
+        self.assertIn("HBM", pinout.report_markdown(p, board))
+
     def test_no_candidate_is_an_error(self) -> None:
         data = copy.deepcopy(self.board.data)
         data["package_selection"]["candidates"] = data["package_selection"]["candidates"][:1]

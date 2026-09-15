@@ -74,7 +74,8 @@ LAYER_ROLES = {"F.Cu": "signal", "In1.Cu": "GND", "In2.Cu": "link signals", "In3
 GND_LAYERS = ["In1.Cu", "In4.Cu", "In7.Cu", "In10.Cu"]
 TOP_RAIL_LAYER, CORE_RAIL_LAYER = "In3.Cu", "In8.Cu"
 
-ROW_LETTERS = list("ABCDEFGHJKLMNPRTUVWY") + ["A" + c for c in "ABCDEFGHJKLMNPRTUVWY"]
+_JEDEC = "ABCDEFGHJKLMNPRTUVWY"
+ROW_LETTERS = list(_JEDEC) + [p + c for p in _JEDEC for c in _JEDEC]   # A..Y, AA..AY, BA.., 420 rows
 
 
 def uid() -> str:
@@ -374,7 +375,7 @@ def polygons_overlap(a: list[Point], b: list[Point], margin: float = 0.0) -> boo
             ax, ay = ax / length, ay / length
             pa = [v[0] * ax + v[1] * ay for v in a]
             pb = [v[0] * ax + v[1] * ay for v in b]
-            if max(pa) + 1e-9 <= min(pb) + margin or max(pb) + 1e-9 <= min(pa) + margin:
+            if max(pa) + margin <= min(pb) + 1e-9 or max(pb) + margin <= min(pa) + 1e-9:
                 return False
     return True
 
@@ -455,7 +456,7 @@ FPGA_ANGLE = -90.0     # the FPGA is the ring node nearest the chassis rear
 def layout_for(board: Board, package: Package, ff: FormFactor) -> RingLayout:
     refs = [source.component for source, _ in board.ring()]        # ring order, starting at the FPGA
     n = len(refs)
-    side = package.body_w + RING_GAP
+    side = package.body_w + float(board.data["board"].get("ring_gap_mm", RING_GAP))
     radius = side / (2 * math.sin(math.pi / n))
     cx, cy = ff.ring_centre
     nodes, angles = {}, {}
@@ -546,8 +547,9 @@ def build_design(board: Board) -> Design:
                                  VRM_W, VRM_H, block_pads(VRM_W, VRM_H, nets, pitch=2.3, pad_size=(1.2, 1.2)),
                                  value=f"core VRM {core}"))
 
-    # LPDDR5X on the outer (north) edge of each layer ASIC, rotated with it.
-    lpddr_signals = expand_signals(board.kinds["lpddr5x_x32"]["signals"])
+    # LPDDR5X on the outer (north) edge of each layer ASIC, rotated with it
+    # (none when the memory is HBM in the package).
+    lpddr_signals = pinout.memory_signals(board)
     for asic_ref, channels in memory_of.items():
         asic = design.part(asic_ref)
         pkg = PACKAGES["lpddr5x"]
@@ -555,7 +557,7 @@ def build_design(board: Board) -> Design:
             dx = -9.5 if index == 0 else 9.5
             x, y, rotation = place_relative(asic, dx, asic.body_h / 2 + 2.0 + pkg.body_w / 2, 90.0)
             nets = [memory_net(asic_ref, channel[-3:], s) for s in lpddr_signals]
-            pads = memory_ball_map(pkg, nets, [r for r in board.classes["lpddr5x"]["rails"]])
+            pads = memory_ball_map(pkg, nets, [r for r in board.classes[board.class_of(device)]["rails"]])
             design.parts.append(Part(device, "lpddr5x", pkg.name, x, y, rotation, pkg.body_w, pkg.body_h, pads,
                                      value="LPDDR5X x32", package=pkg))
 
@@ -584,29 +586,30 @@ def build_design(board: Board) -> Design:
         x, y, rotation = place_relative(fpga, -12.75 + 8.5 * n, fpga.body_h / 2 + 2.0 + pkg.body_h / 2)
         design.parts.append(Part(device, "ddr4", pkg.name, x, y, rotation, pkg.body_w, pkg.body_h, pads,
                                  value="DDR4 x16", package=pkg))
-    shared = [("REG_FPGA", "VCCINT_0V85", place_relative(fpga, 0.0, -(fpga.body_h / 2 + 2.5 + REG_H / 2))),
-              ("REG_DDR", "VDD_1V2", place_relative(fpga, -11.0, fpga.body_h / 2 + 2.0 + PACKAGES["ddr4"].body_h + 2.0 + REG_H / 2)),
-              ("REG_3V3", "VDD_3V3", place_relative(fpga, 11.0, fpga.body_h / 2 + 2.0 + PACKAGES["ddr4"].body_h + 2.0 + REG_H / 2))]
-    # Shared rails and the clock generator in the middle of the polygon, equidistant from every chip.
+    # Regulators follow the power tree: the FPGA's own rails on one block on its
+    # inner edge, the DDR4 rails and 3.3 V beside its DDR4 row, every other
+    # shared rail on its own block in the middle of the polygon beside the clock
+    # generator, equidistant from every chip.
+    tree = board.data["power_tree"]["rails"]
+    fpga_rails = [r for r, spec in tree.items() if spec.get("per") == ["fpga"]]
+    ddr_rails = [r for r in board.classes["ddr4"]["rails"]] if "ddr4" in board.classes else []
+    centre_rails = [r for r, spec in tree.items() if spec.get("shared") and r not in ddr_rails and r != "VDD_3V3"]
+    blocks = [("REG_FPGA", fpga_rails, place_relative(fpga, 0.0, -(fpga.body_h / 2 + 2.5 + REG_H / 2))),
+              ("REG_DDR", ddr_rails, place_relative(fpga, -11.0, fpga.body_h / 2 + 2.0 + PACKAGES["ddr4"].body_h + 2.0 + REG_H / 2)),
+              ("REG_3V3", ["VDD_3V3"], place_relative(fpga, 11.0, fpga.body_h / 2 + 2.0 + PACKAGES["ddr4"].body_h + 2.0 + REG_H / 2))]
     cx, cy = lay.centre
     clk_nets = ["VDD_IO_1V8", "GND"] + [f"REFCLK_{short_ref(r)}_{p}" for r in board.nets["refclk"]["sinks"] for p in "PN"]
     design.parts.append(Part("U_CLK", "clock_gen", "QFN64_9x9", cx, cy, 0.0, 9.0, 9.0,
                              block_pads(9.0, 9.0, clk_nets[:24], pitch=0.7, pad_size=(0.3, 0.9)), value="Si5345"))
-    shared += [("REG_1V8", "VDD_IO_1V8", (cx - 12.0, cy + 18.0, 0.0)), ("REG_1V05", "VDD2H_1V05", (cx + 12.0, cy + 18.0, 0.0)),
-               ("REG_0V9", "VDD2L_0V9", (cx - 12.0, cy - 18.0, 0.0)), ("REG_0V3", "VDDQ_0V3", (cx + 12.0, cy - 18.0, 0.0))]
-    for ref, rail, (x, y, rotation) in shared:
-        nets = ["+12V"] * 3 + [rail] * 4 + ["GND"] * 3
+    for k, rail in enumerate(centre_rails):
+        row, col = k // 2, k % 2
+        y = cy + (10.0 + 8.0 * (row // 2)) * (1 if row % 2 == 0 else -1)
+        blocks.append((f"REG_{rail.split('_', 1)[-1]}" if rail.count("_") else f"REG_{rail}", [rail], (cx + (12.0 if col else -12.0), y, 0.0)))
+    for ref, rails, (x, y, rotation) in blocks:
+        nets = ["+12V"] * 3 + [rails[0]] * 3 + rails[1:] + ["GND"] * 3
         design.parts.append(Part(ref, "regulator", f"REG_MODULE_{REG_W:.0f}x{REG_H:.0f}", x, y, rotation, REG_W, REG_H,
-                                 block_pads(REG_W, REG_H, nets, pitch=1.8, pad_size=(1.2, 1.2)), value=f"{rail} regulator"))
-    # Aliases so the memory-only rails have a source too.
-    design.part("REG_1V8").pads[3].net = "VDD1_1V8"
-    design.part("REG_DDR").pads[5].net = "VPP_2V5"
-    design.part("REG_FPGA").pads[4].net = "VCCAUX_1V8"
-    design.part("REG_FPGA").pads[5].net = "MGTAVCC"
-    design.part("REG_FPGA").pads[6].net = "MGTAVTT"
-    design.part("REG_1V05").pads[4].net = "VCCO_1V2"
-    design.part("REG_1V8").pads[4].net = "VCCO_1V8"
-    design.part("REG_0V9").pads[4].net = "VDD_PLL_0V9"
+                                 block_pads(REG_W, REG_H, nets, pitch=1.8, pad_size=(1.2, 1.2)),
+                                 value=f"{', '.join(rails)} regulator"))
 
     add_chassis_parts(design)
 
@@ -907,10 +910,13 @@ def add_zones(design: Design) -> None:
     design.zones.append(Zone(TOP_RAIL_LAYER, "+12V", outline, priority=0))
     asic_body = design.pinout.package.body
     design.zones.append(Zone(TOP_RAIL_LAYER, "VDD_IO_1V8", regular_polygon(lay.centre, lay.radius + asic_body / 2 + 2.0, 36), priority=1))
-    for part in design.parts:
-        if part.part_class == "layer_asic":
-            design.zones.append(Zone(TOP_RAIL_LAYER, "VDD2H_1V05",
-                                     local_rect(part, -19.5, part.body_h / 2 + 1.0, 19.5, part.body_h / 2 + 15.5), priority=2))
+    memory_parts = [p for p in design.parts if p.part_class == "lpddr5x"]
+    if memory_parts:
+        phy_rail = design.board.classes["lpddr5x"]["rails"][1]     # VDD2H: the PHY rail shared with the ASIC
+        for part in design.parts:
+            if part.part_class == "layer_asic":
+                design.zones.append(Zone(TOP_RAIL_LAYER, phy_rail,
+                                         local_rect(part, -19.5, part.body_h / 2 + 1.0, 19.5, part.body_h / 2 + 15.5), priority=2))
     # Core rails: one island per ASIC covering the package and its regulator on the inner edge.
     for part in design.parts:
         if part.part_class in ("layer_asic", "head_asic"):
@@ -966,15 +972,20 @@ def report_markdown(design: Design) -> str:
     signal_rows = int(board.data["package_selection"]["signal_rows"])
     deep = sum(1 for b in pin.balls if b.kind == "signal" and
                min(b.row, b.col, pkg.rows - 1 - b.row, pkg.cols - 1 - b.col) >= signal_rows)
-    memory_rows = 1 + max(b.row for b in pin.balls if b.kind == "signal" and b.interface.startswith("lpddr"))
+    memory_balls = [b for b in pin.balls if b.kind == "signal" and b.interface.startswith("lpddr")]
+    if memory_balls:
+        memory_rows = 1 + max(b.row for b in memory_balls)
+        memory_text = (f"{len(memory_balls)} LPDDR signals on the north {memory_rows} rows, {len(memory_balls) / pkg.body:.1f} per mm "
+                       f"of edge, of which {deep} sit deeper than the outer {signal_rows} rows and need microvias or a build-up "
+                       "layer pair to escape. The memory nets are not routed here.")
+    else:
+        memory_text = "No memory balls: the HBM stack sits on the package interposer."
     lines += ["", "## ASIC package and escape density", "",
               f"{pkg.name}: {pkg.cols}x{pkg.rows} balls at {pkg.pitch} mm, {pkg.body:.0f} mm body, selected by "
               f"`hw/pinout.py` for {need.core_amps:.0f} A of core current at {need.rated_tokens_per_second:.0f} tokens/s "
-              f"({need.total} balls needed; see `hw/pinout/report.md`). "
+              f"({need.total} balls needed; see the pinout report). "
               f"Per edge: 36 link signals on two columns of 18 rows ({36 / (18 * pkg.pitch):.1f} signals per mm of edge); "
-              f"130 LPDDR signals on the north {memory_rows} rows, {130 / pkg.body:.1f} per mm of edge, of which {deep} "
-              f"sit deeper than the outer {signal_rows} rows and need microvias or a build-up layer pair to escape. "
-              "The memory nets are not routed here.", "",
+              + memory_text, "",
               "## Core rail current", "",
               "One 2 oz (70 um) plane across the package width, at 50K tokens/s from the board power model:", "",
               "| ASIC | Current (A) | Section per plane (mm2) | A/mm2 on one plane | Planes for 30 A/mm2 |",
@@ -1301,9 +1312,11 @@ def generate(board: Board, output: Path) -> Design:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, default=HERE / "board.yaml")
-    parser.add_argument("--output", type=Path, default=OUTPUT_DIR)
+    parser.add_argument("--output", type=Path, default=None, help="defaults to hw/kicad for board.yaml, hw/kicad_<suffix> otherwise")
     parser.add_argument("--check", action="store_true", help="generate into a temporary directory and print the report")
     args = parser.parse_args()
+    if args.output is None:
+        args.output = OUTPUT_DIR if args.source.stem == "board" else HERE / f"kicad_{args.source.stem.replace('board_', '')}"
     board = Board.load(args.source)
     if args.check:
         import tempfile

@@ -1,0 +1,247 @@
+# Appliance board, high-end variant: block-level schematic capture.
+#
+# The 27B-class geometry on a 2 nm-class die: four layer ASICs of sixteen
+# layers each and one head ASIC holding the whole LM head, each layer ASIC
+# with an HBM4 stack in its package, direct-to-chip liquid cooling.  Same
+# schema as board.yaml; `python -m hw.board --source hw/board_27b.yaml`
+# checks it, `python -m hw.pinout --source ...` and `python -m hw.kicad_gen
+# --source ...` derive the package and the KiCad project.  Every electrical
+# number is a budget to validate.
+
+board:
+  name: asic-llm-appliance-27b-a0
+  form_factor: 1U rack chassis, one 420 x 360 mm board, host-attached over a PCIe cable, direct-to-chip liquid cooling with a rear manifold, redundant CRPS; the activation ring is a regular 6-gon
+  form_factor_key: 1u
+  ring_gap_mm: 30            # neighbour spacing beyond the 55 mm package: 10 mm between bodies for the cold plates (17 mm on the 11-gon of 29 mm packages)
+  host_interface: PCIe Gen4 x8 over a SlimSAS 8i cable to a host adapter card
+  cooling: one cold plate per layer ASIC and the head ASIC (about 525 W each at the rating, 235 W/cm2 over the package), facility water through a rear quick-disconnect pair; fans only for the regulators, DDR4 and the FPGA
+  power_input:
+    - {name: CRPS 12 V, 1+1 redundant pair (two 3000 W modules), watts: 3000}
+
+# Energy model: the 2 nm-class die at 0.35 pJ per MAC (0.39 pJ measured on
+# ASAP7 at default activity, derated and scaled two nodes), HBM4 at 25 pJ
+# per byte.  The design point is the simulator's fabric ceiling for this
+# geometry (sim/config/qwen35_27b_2nm_hbm.json); the 50K row is the product
+# target, where the same board draws a quarter of the power.
+power_model:
+  mac_energy_pj: 0.35
+  design_tokens_per_second: 234000
+  memory_energy_pj_per_byte: 25.0
+  memory_bytes_per_token_per_asic: 8000000    # four global layers per die: index scan + selected KV at 128K, int4, 16:1
+  report_tokens_per_second: [50000, 117000, 234000]
+
+package_selection:
+  rated_tokens_per_second: 234000
+  amps_per_ball: 0.5
+  signals_per_ground: 4
+  signal_rows: 3
+  edges: {link_in: W, link_out: E, lpddr: N, misc: S}
+  rail_balls: {VDD_IO_1V8: 8, VDD_PLL_0V9: 2, VDD_HBM_1V1: 24, VDDQ_HBM_0V4: 12}
+  candidates:
+    - {name: FCBGA1225_35x35_P0.8, cols: 35, rows: 35, pitch: 0.8, body: 29.0, ball: 0.40}
+    - {name: FCBGA2025_45x45_P1.0, cols: 45, rows: 45, pitch: 1.0, body: 47.5, ball: 0.45}
+    - {name: FCBGA3025_55x55_P1.0, cols: 55, rows: 55, pitch: 1.0, body: 55.0, ball: 0.45}
+    - {name: FCBGA3844_62x62_P1.0, cols: 62, rows: 62, pitch: 1.0, body: 62.5, ball: 0.45}
+
+part_classes:
+  layer_asic:
+    description: fixed-weight 16-layer shard die (four R,R,R,G groups, 5.71B coefficients) with one HBM4 stack on a 2.5D interposer
+    package: FCBGA with HBM4 on the interposer, derived by hw/pinout.py from package_selection (55x55 at 1.0 mm at the rating)
+    rails: [VDD_CORE, VDD_IO_1V8, VDD_PLL_0V9, VDD_HBM_1V1, VDDQ_HBM_0V4]
+    static_w: 10
+    macs_per_token: 5712000000
+    memory_traffic: true
+    interfaces:
+      link_in: {kind: link}
+      link_out: {kind: link}
+      mgmt: {kind: mgmt_spi}
+      jtag: {kind: jtag}
+      refclk: {kind: refclk}
+      mode: {kind: strap, value: LAYER}
+  head_asic:
+    description: same die, head-mode personalization holding the whole 248K-row LM head (1.27B coefficients, 42 percent of the tiles); no HBM
+    package: same package and ball map as layer_asic (HBM rails unconnected)
+    rails: [VDD_CORE, VDD_IO_1V8, VDD_PLL_0V9]
+    static_w: 5
+    macs_per_token: 1272000000
+    interfaces:
+      link_in: {kind: link}
+      link_out: {kind: link}
+      mgmt: {kind: mgmt_spi}
+      jtag: {kind: jtag}
+      refclk: {kind: refclk}
+      mode: {kind: strap, value: HEAD}
+  fpga:
+    description: controller FPGA with hard PCIe Gen4 block and DDR4 controller (AU25P/KU5P class)
+    package: FFVB676 or similar
+    rails: [VCCINT_0V85, VCCAUX_1V8, VCCO_1V8, VCCO_1V2, MGTAVCC, MGTAVTT]
+    tdp_w: 25
+    interfaces:
+      pcie: {kind: pcie_gen4_x8}
+      link_out: {kind: link}
+      link_in: {kind: link}
+      ddr4: {kind: ddr4_x64}
+      mgmt_master: {kind: mgmt_spi}
+      jtag: {kind: jtag}
+      refclk: {kind: refclk}
+      sfp: {kind: sfp_plus, optional: true}
+      qspi: {kind: qspi}
+      uart: {kind: uart}
+  ddr4:
+    description: DDR4 x16 for the embedding table and context metadata (4 x16 = x64, 4 GB)
+    package: 96-ball FBGA
+    rails: [VDD_1V2, VPP_2V5]
+    tdp_w: 0.75
+    interfaces:
+      channel: {kind: ddr4_x16}
+  clock_gen:
+    description: low-jitter clock generator, 12+ outputs (Si5345 class)
+    rails: [VDD_IO_1V8]
+    tdp_w: 0.5
+  sfp_cage:
+    description: SFP+ cage on the rear panel for standalone 10GbE operation (optional fit)
+    rails: [VDD_3V3]
+    tdp_w: 1.5
+  host_cable:
+    description: SlimSAS 8i (SFF-8654) receptacle, PCIe Gen4 x8 plus sideband, to a host adapter card
+    rails: []
+    tdp_w: 0
+  bmc:
+    description: baseboard management controller (AST2600 class) with its own Ethernet, fans, PSU PMBus, coolant leak and flow sensing, FPGA UART
+    rails: [VDD_3V3]
+    tdp_w: 5
+  rj45:
+    description: BMC management Ethernet, rear panel
+    rails: [VDD_3V3]
+    tdp_w: 0.5
+  psu_input:
+    description: CRPS 12 V output blade receptacle (one per module) with PMBus and enable
+    rails: []
+    tdp_w: 0
+  fan_header:
+    description: 4-pin PWM fan header, one per 40 mm front fan (regulators, DDR4, FPGA; the ASICs are on cold plates)
+    rails: []
+    tdp_w: 12
+
+components:
+  U_FPGA: {class: fpga, place: ring vertex 0, rear, beside the host connector}
+  U_A0: {class: layer_asic, layers: "0-15",  place: ring vertex 1}
+  U_A1: {class: layer_asic, layers: "16-31", place: ring vertex 2}
+  U_A2: {class: layer_asic, layers: "32-47", place: ring vertex 3}
+  U_A3: {class: layer_asic, layers: "48-63", place: ring vertex 4}
+  U_H0: {class: head_asic, vocab_rows: "0-248319", place: ring vertex 5}
+  U_D0: {class: ddr4}
+  U_D1: {class: ddr4}
+  U_D2: {class: ddr4}
+  U_D3: {class: ddr4}
+  U_CLK: {class: clock_gen}
+  U_BMC: {class: bmc}
+  J_HOST: {class: host_cable}
+  J_SFP: {class: sfp_cage}
+  J_BMC_NET: {class: rj45}
+  J_PSU0: {class: psu_input}
+  J_PSU1: {class: psu_input}
+  J_FAN0: {class: fan_header}
+  J_FAN1: {class: fan_header}
+  J_FAN2: {class: fan_header}
+  J_FAN3: {class: fan_header}
+  J_FAN4: {class: fan_header}
+  J_FAN5: {class: fan_header}
+
+# The six ring nodes sit on the vertices of a regular hexagon in this order,
+# clockwise from the FPGA at the rear.  The HBM is in the package, so there
+# are no memory channels on the board.
+nets:
+  ring:
+    kind: link
+    hops:
+      - [U_FPGA.link_out, U_A0.link_in]
+      - [U_A0.link_out, U_A1.link_in]
+      - [U_A1.link_out, U_A2.link_in]
+      - [U_A2.link_out, U_A3.link_in]
+      - [U_A3.link_out, U_H0.link_in]
+      - [U_H0.link_out, U_FPGA.link_in]
+  memory:
+    kind: hbm4_in_package
+    channels: []
+  fpga_ddr4:
+    kind: ddr4_x16
+    channels:
+      - [U_FPGA.ddr4, U_D0.channel]
+      - [U_FPGA.ddr4, U_D1.channel]
+      - [U_FPGA.ddr4, U_D2.channel]
+      - [U_FPGA.ddr4, U_D3.channel]
+  mgmt:
+    kind: mgmt_spi
+    master: U_FPGA.mgmt_master
+    slaves: [U_A0, U_A1, U_A2, U_A3, U_H0]
+  jtag:
+    kind: jtag
+    chain: [U_FPGA, U_A0, U_A1, U_A2, U_A3, U_H0]
+  refclk:
+    kind: refclk
+    source: U_CLK
+    sinks: [U_FPGA, U_A0, U_A1, U_A2, U_A3, U_H0]
+
+interface_kinds:
+  link:
+    description: 32-bit source-synchronous DDR parallel link, 500 MHz clock (4 GB/s raw), ready/valid, CRC in packet; 1.3 GB/s used at 234K tokens/s with the 5 KB hidden vector
+    signals: {data: 32, clock: 1, valid: 1, ready_back: 1, sof: 1}
+    io_standard: 1.8 V LVCMOS series-terminated (placeholder; LVDS x8 at 4 Gb/s is the fallback)
+    max_length_mm: 80
+  hbm4_in_package:
+    description: one HBM4 stack per layer ASIC on the package interposer, 2 TB/s; no board signals
+    signals: {}
+  ddr4_x16:
+    signals: {dq: 16, dqs_pairs: 2, dm: 2, addr_cmd: 28, ck_pairs: 1, ctrl: 6}
+  ddr4_x64:
+    description: FPGA-side aggregate of four ddr4_x16 devices
+    signals: {dq: 64, dqs_pairs: 8, dm: 8, addr_cmd: 28, ck_pairs: 1, ctrl: 6}
+  pcie_gen4_x8:
+    signals: {tx_pairs: 8, rx_pairs: 8, refclk_pair: 1, perst: 1, wake: 1}
+  mgmt_spi:
+    description: SPI from FPGA, one chip select per ASIC; telemetry, config, thermal diode readout
+    signals: {sclk: 1, mosi: 1, miso: 1, cs: 1, irq: 1}
+  jtag:
+    signals: {tck: 1, tms: 1, tdi: 1, tdo: 1, trst: 1}
+  refclk:
+    signals: {clk_pair: 1}
+  strap:
+    signals: {pins: 2}
+  sfp_plus:
+    signals: {tx_pair: 1, rx_pair: 1, i2c: 2, ctrl: 4}
+  qspi:
+    signals: {pins: 6}
+  uart:
+    signals: {pins: 2}
+
+# Power tree: 12 V from the CRPS modules, then point-of-load regulators.  The
+# core rail is the problem: about 650 A per die at the rating, which wants
+# the multiphase regulator on the package substrate or backside power on
+# the die rather than a board plane.
+power_tree:
+  input_bus: 12 V from two CRPS modules, 1+1 redundant, PMBus to the BMC
+  regulator_efficiency: 0.85
+  rails:
+    VDD_CORE:     {volts: 0.80, per: [layer_asic, head_asic], note: multiphase PoL per ASIC, PMBus; ~650 A per layer die at the rating, ~140 A at 50K tokens/s}
+    VDD_PLL_0V9:  {volts: 0.90, per: [layer_asic, head_asic], note: LDO from 1.8 V, one per ASIC}
+    VDD_IO_1V8:   {volts: 1.80, shared: true, note: ASIC IO, link IO, clock gen}
+    VDD_HBM_1V1:  {volts: 1.10, shared: true, note: HBM4 core and PHY, one regulator feeding all four packages}
+    VDDQ_HBM_0V4: {volts: 0.40, shared: true, note: HBM4 IO}
+    VCCINT_0V85:  {volts: 0.85, per: [fpga]}
+    VCCAUX_1V8:   {volts: 1.80, per: [fpga]}
+    VCCO_1V8:     {volts: 1.80, per: [fpga]}
+    VCCO_1V2:     {volts: 1.20, per: [fpga], note: DDR4 IO}
+    MGTAVCC:      {volts: 0.90, per: [fpga], note: PCIe/SFP transceivers}
+    MGTAVTT:      {volts: 1.20, per: [fpga]}
+    VDD_1V2:      {volts: 1.20, shared: true, note: DDR4}
+    VPP_2V5:      {volts: 2.50, shared: true, note: DDR4}
+    VDD_3V3:      {volts: 3.30, shared: true, note: SFP, BMC, EEPROM, LEDs, misc}
+
+misc:
+  - board ID EEPROM (I2C)
+  - coolant inlet and outlet temperature, flow and leak sensors to the BMC; per-ASIC thermal diode via mgmt SPI
+  - PMBus on VDD_CORE regulators for per-ASIC current telemetry
+  - FPGA config QSPI flash, JTAG header, UART debug header
+  - six 40 mm fan headers, PWM and tach to the BMC
+  - status LEDs on the rear panel

@@ -42,7 +42,8 @@ from hw.board import Board
 HERE = Path(__file__).parent
 OUTPUT_DIR = HERE / "pinout"
 
-ROW_LETTERS = list("ABCDEFGHJKLMNPRTUVWY") + ["A" + c for c in "ABCDEFGHJKLMNPRTUVWY"]
+_JEDEC = "ABCDEFGHJKLMNPRTUVWY"
+ROW_LETTERS = list(_JEDEC) + [p + c for p in _JEDEC for c in _JEDEC]   # A..Y, AA..AY, BA.., 420 rows
 
 
 @dataclass(frozen=True)
@@ -161,12 +162,28 @@ def requirements(board: Board, rated_tokens_per_second: float | None = None) -> 
     tps = float(rules["rated_tokens_per_second"] if rated_tokens_per_second is None else rated_tokens_per_second)
     amps = board.core_current_a("layer_asic", tps)
     link = len(expand_signals(board.kinds["link"]["signals"]))
-    lpddr = len(expand_signals(board.kinds["lpddr5x_x32"]["signals"]))
-    signal_balls = 2 * link + 2 * lpddr + len(MISC_SIGNALS)
+    signal_balls = 2 * link + memory_signal_count(board) + len(MISC_SIGNALS)
     signal_grounds = math.ceil(signal_balls / rules["signals_per_ground"])
     core_balls = math.ceil(amps / rules["amps_per_ball"])
-    rails = {"VDD_IO_1V8": 8, "VDD_PLL_0V9": 2, "VDD2H_1V05": 12, "VDDQ_0V3": 12}
+    rails = dict(rules.get("rail_balls", {"VDD_IO_1V8": 8, "VDD_PLL_0V9": 2, "VDD2H_1V05": 12, "VDDQ_0V3": 12}))
     return Requirements(tps, amps, signal_balls, signal_grounds, core_balls, core_balls, rails)
+
+
+def memory_channels(board: Board) -> list[str]:
+    """On-board memory channels of a layer ASIC (empty when the memory sits in the package)."""
+    return board.memory_interfaces("layer_asic")
+
+
+def memory_signals(board: Board) -> list[str]:
+    channels = memory_channels(board)
+    if not channels:
+        return []
+    kind = board.classes["layer_asic"]["interfaces"][channels[0]]["kind"]
+    return expand_signals(board.kinds[kind]["signals"])
+
+
+def memory_signal_count(board: Board) -> int:
+    return len(memory_channels(board)) * len(memory_signals(board))
 
 
 def candidates(board: Board) -> list[PackageSpec]:
@@ -193,7 +210,7 @@ def assign(board: Board, package: PackageSpec, need: Requirements) -> list[Ball]
     rules = board.data["package_selection"]
     edges = rules["edges"]
     link = expand_signals(board.kinds["link"]["signals"])
-    lpddr = expand_signals(board.kinds["lpddr5x_x32"]["signals"])
+    lpddr = memory_signals(board)
     taken: dict[tuple[int, int], Ball] = {}
 
     def place(i: int, j: int, kind: str, interface: str = "", signal: str = "", escape=None) -> None:
@@ -225,7 +242,7 @@ def assign(board: Board, package: PackageSpec, need: Requirements) -> list[Ball]
                 if (i, j) not in taken:
                     yield i, j
     north = north_positions()
-    for channel in ("lpddr_ch0", "lpddr_ch1"):
+    for channel in memory_channels(board):
         for lane in lpddr_lanes(lpddr):
             for signal in lane:
                 i, j = next(north)
@@ -314,7 +331,7 @@ def report_markdown(pinout: Pinout, board: Board) -> str:
              f"({board.data['power_model']['mac_energy_pj']} pJ per MAC, {board.data['power_tree']['rails']['VDD_CORE']['volts']} V), "
              f"one ball per {rules['amps_per_ball']} A.", "",
              "| Need | Balls |", "| --- | ---: |",
-             f"| Signals ({2 * 36} link, {2 * 65} memory, {len(MISC_SIGNALS)} management) | {need.signal_balls} |",
+             f"| Signals ({2 * 36} link, {memory_signal_count(board)} memory, {len(MISC_SIGNALS)} management) | {need.signal_balls} |",
              f"| Signal ground returns (1 per {rules['signals_per_ground']}) | {need.signal_grounds} |",
              f"| Core rail | {need.core_balls} |", f"| Ground for the core | {need.ground_balls} |"]
     for rail, count in need.rail_balls.items():
@@ -329,8 +346,9 @@ def report_markdown(pinout: Pinout, board: Board) -> str:
               f"| link_in | {pinout.count('signal', 'link_in')} | {rules['edges']['link_in']} edge, columns 1-2, rows "
               f"{(p.rows - LINK_ROWS) // 2 + 1}-{(p.rows - LINK_ROWS) // 2 + LINK_ROWS} |",
               f"| link_out | {pinout.count('signal', 'link_out')} | {rules['edges']['link_out']} edge, same rows |",
-              f"| lpddr_ch0, lpddr_ch1 | {pinout.count('signal', 'lpddr_ch0') + pinout.count('signal', 'lpddr_ch1')} | "
-              f"{rules['edges']['lpddr']} rows, byte lanes with a ground after each |",
+              *([f"| {', '.join(memory_channels(board))} | {sum(pinout.count('signal', c) for c in memory_channels(board))} | "
+                 f"{rules['edges']['lpddr']} rows, byte lanes with a ground after each |"] if memory_channels(board)
+                else ["| memory | 0 | in the package (HBM on the interposer), no balls |"]),
               f"| mgmt, jtag, refclk, strap | {sum(pinout.count('signal', i) for i in ('mgmt', 'jtag', 'refclk', 'strap'))} | "
               f"{rules['edges']['misc']} row |",
               f"| VDD_CORE | {pinout.count('rail', 'VDD_CORE')} | interior checkerboard |",
@@ -343,8 +361,9 @@ def report_markdown(pinout: Pinout, board: Board) -> str:
               "(these need a microvia or build-up escape on the PCB).", "",
               "## What the packaging house gets", "",
               "* this map as `asic_ballmap.csv`, with the edge each interface must face;",
-              "* the die-edge assignment it implies: link ports on the west and east die edges, both LPDDR5X PHYs "
-              "on the north edge, management on the south;",
+              "* the die-edge assignment it implies: link ports on the west and east die edges, "
+              + ("both LPDDR5X PHYs on the north edge, " if memory_channels(board) else "the HBM PHY on the north edge towards the stack, ")
+              + "management on the south;",
               f"* the core current ({need.core_amps:.0f} A at the rating, {board.core_current_a('layer_asic', 50_000):.0f} A "
               "at 50K tokens/s) for the bump map and the substrate power planes.", "",
               "The substrate design, the bump map and the final ball map come back from them; the loop usually runs "

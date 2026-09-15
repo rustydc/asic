@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1180 900" font-family="sans-serif" font-size="12">
+<rect width="1180" height="900" fill="#fafafa"/>
+<text x="20" y="28" font-size="16" font-weight="bold">asic-llm-appliance-27b-a0: block diagram</text>
+<text x="20" y="46" fill="#555">1U rack chassis, one 420 x 360 mm board, host-attached over a PCIe cable, direct-to-chip liquid cooling with a rear manifold, redundant CRPS; the activation ring is a regular 6-gon</text>
+<defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#1f5fbf"/></marker></defs>
+<line x1="542.0" y1="692.3" x2="378.2" y2="597.7" stroke="#1f5fbf" stroke-width="2.5" marker-end="url(#arrow)" fill="none"/>
+<line x1="330.2" y1="540.0" x2="330.2" y2="300.0" stroke="#1f5fbf" stroke-width="2.5" marker-end="url(#arrow)" fill="none"/>
+<line x1="378.2" y1="242.3" x2="542.0" y2="147.7" stroke="#1f5fbf" stroke-width="2.5" marker-end="url(#arrow)" fill="none"/>
+<line x1="638.0" y1="147.7" x2="801.8" y2="242.3" stroke="#1f5fbf" stroke-width="2.5" marker-end="url(#arrow)" fill="none"/>
+<line x1="849.8" y1="300.0" x2="849.8" y2="540.0" stroke="#1f5fbf" stroke-width="2.5" marker-end="url(#arrow)" fill="none"/>
+<line x1="801.8" y1="597.7" x2="638.0" y2="692.3" stroke="#1f5fbf" stroke-width="2.5" marker-end="url(#arrow)" fill="none"/>
+<rect x="542.0" y="680.0" width="96" height="80" rx="6" fill="#fff2cc" stroke="#333"/>
+<text x="590.0" y="700.0" text-anchor="middle" font-weight="bold">U_FPGA</text>
+<text x="590.0" y="718.0" text-anchor="middle" fill="#333">PCIe Gen4 x8 (cable)</text>
+<rect x="560.0" y="772.0" width="60" height="18" fill="#ddd" stroke="#333"/>
+<text x="590.0" y="785.0" text-anchor="middle" font-size="9">host cable</text>
+<line x1="590.0" y1="760.0" x2="590.0" y2="772.0" stroke="#333"/>
+<rect x="650.0" y="732.0" width="56" height="18" fill="#eee" stroke="#333"/>
+<text x="678.0" y="745.0" text-anchor="middle" font-size="9">DDR4 x64</text>
+<line x1="638.0" y1="741.0" x2="650.0" y2="741.0" stroke="#333"/>
+<rect x="470.0" y="732.0" width="60" height="18" fill="#eee" stroke="#333" stroke-dasharray="3,2"/>
+<text x="500.0" y="745.0" text-anchor="middle" font-size="9">SFP+ (opt)</text>
+<rect x="282.2" y="540.0" width="96" height="60" rx="6" fill="#dbe8f7" stroke="#333"/>
+<text x="330.2" y="560.0" text-anchor="middle" font-weight="bold">U_A0</text>
+<text x="330.2" y="578.0" text-anchor="middle" fill="#333">L0-15</text>
+<rect x="282.2" y="240.0" width="96" height="60" rx="6" fill="#dbe8f7" stroke="#333"/>
+<text x="330.2" y="260.0" text-anchor="middle" font-weight="bold">U_A1</text>
+<text x="330.2" y="278.0" text-anchor="middle" fill="#333">L16-31</text>
+<rect x="542.0" y="90.0" width="96" height="60" rx="6" fill="#dbe8f7" stroke="#333"/>
+<text x="590.0" y="110.0" text-anchor="middle" font-weight="bold">U_A2</text>
+<text x="590.0" y="128.0" text-anchor="middle" fill="#333">L32-47</text>
+<rect x="801.8" y="240.0" width="96" height="60" rx="6" fill="#dbe8f7" stroke="#333"/>
+<text x="849.8" y="260.0" text-anchor="middle" font-weight="bold">U_A3</text>
+<text x="849.8" y="278.0" text-anchor="middle" fill="#333">L48-63</text>
+<rect x="801.8" y="540.0" width="96" height="60" rx="6" fill="#f7dbdb" stroke="#333"/>
+<text x="849.8" y="560.0" text-anchor="middle" font-weight="bold">U_H0</text>
+<text x="849.8" y="578.0" text-anchor="middle" fill="#333">head mode</text>
+<rect x="542" y="390" width="96" height="60" rx="6" fill="#eee" stroke="#333"/>
+<text x="590" y="414" text-anchor="middle" font-weight="bold">U_CLK</text>
+<text x="590" y="432" text-anchor="middle" font-size="10">shared regulators</text>
+<text x="20" y="860" fill="#333">Blue: activation ring, 36-signal source-synchronous link per hop, clockwise on a regular 6-gon from the FPGA at the rear. Green: LPDDR5X x32 channels. Power budget 2315 W load / 2724 W input.</text>
+<text x="20" y="880" fill="#333">Management SPI, JTAG chain, and reference clock fan out from U_FPGA / U_CLK to all ten ASICs (not drawn); the BMC, PSUs and fans are off the ring.</text>
+</svg>

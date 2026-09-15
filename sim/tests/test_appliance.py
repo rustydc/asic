@@ -141,7 +141,9 @@ class SimulationTest(unittest.TestCase):
             config = loaded[name]
             expected_globals = config.num_layers // (4 if "27b" in name else config.layers_per_asic)
             self.assertEqual(sum(1 for i in range(config.num_layers) if (i + 1) % config.global_period == 0), expected_globals, name)
-        self.assertEqual(loaded["qwen35_27b_2nm_hbm"].layers_per_asic, 8)
+        self.assertEqual(loaded["qwen35_27b_2nm_hbm"].layers_per_asic, 16)
+        self.assertEqual(loaded["qwen35_27b_2nm_hbm"].num_asics, 4)
+        self.assertEqual(loaded["qwen35_27b_2nm_hbm"].num_head_asics, 1)
         self.assertEqual(loaded["qwen35_27b_2nm_hbm"].global_period, 4)
 
     def test_global_period_must_divide_the_layers_per_asic(self) -> None:

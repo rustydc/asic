@@ -243,6 +243,43 @@ Why a polygon and not the two-row snake of the earlier drafts:
   of the board is free apart from the PSU bay, so a shorter chassis is
   possible.
 
+## The high-end variant: four layer ASICs and one head, HBM in the package
+
+`board_27b.yaml` describes the 27B-class appliance on a 2 nm-class die
+(`sim/config/qwen35_27b_2nm_hbm.json`): four layer ASICs of sixteen layers
+each (5.71B coefficients, about 152 mm² of fabric), one head ASIC holding
+the whole LM head at 42 percent of the same die, and an HBM4 stack on each
+layer ASIC's interposer, so there is no memory on the board. The same
+tools take it as a source (`--source hw/board_27b.yaml`) and write
+`board_27b.md`, `board_27b.svg`, `pinout_27b/` and `kicad_27b/`:
+
+* five via personalisations per model instead of ten, and one product
+  family with the 9B if that moves to the same eight-layer die;
+* at the rating of 234K tokens/s (the fabric ceiling) the board draws
+  2.3 kW of load, 2.7 kW of input from a 1+1 pair of 3000 W CRPS modules,
+  and 525 W per layer die; at the 50K target it is a quarter of that;
+* the package is a 55 × 55 array at 1.0 mm (3,025 balls, 2,778 needed):
+  656 A on the core rail at the rating, 1,312 core balls, no memory balls,
+  the north edge free for the HBM PHY towards the stack;
+* the ring is a regular hexagon of 85 mm side with 10 mm between the
+  packages for the cold plates; every hop is under 65 mm with bends of
+  30 to 42 degrees, and pcbnew DRC reports only the unrouted nets;
+* the regulators follow the power tree: one block per shared rail (I/O,
+  HBM core, HBM I/O) in the middle of the hexagon, the FPGA's rails on one
+  block, DDR4 rails and 3.3 V beside the DDR4 row.
+
+Cooling is direct-to-chip liquid. 525 W over a 55 mm package is about
+175 W/cm² at the lid and 250 to 300 W/cm² at the die, which a lidless
+microchannel cold plate handles with about 25 K of rise at 1 to 2 l/min
+per plate; through a lid and a conventional cold plate the junction lands
+near 95 °C, which is marginal. The board therefore assumes bare-die cold
+plates, a rear quick-disconnect pair, coolant flow and leak sensing on the
+BMC, and fans only for the regulators, DDR4 and FPGA. The 12 V input at
+2.7 kW is 225 A across the board, and the per-die core rail at 656 A wants
+the multiphase regulator on the package substrate or backside power
+delivery on the die; the 26 mm regulator block on the board is a
+placeholder for that decision, not a design.
+
 ## Open items before schematic entry in an EDA tool
 
 1. ASIC package and ball map: the derived map in `hw/pinout/` goes to the

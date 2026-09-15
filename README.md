@@ -25,15 +25,17 @@ LLM inference appliance built around the Qwen3.5 dense hybrid geometry.
   the measured energy per MAC into board power at the simulated throughput.
 * [`training/`](training/) contains the Qwen3.5 checkpoint importer, the
   retrieval candidates, and a layer-wise activation-distillation harness.
-* [`hw/`](hw/) contains the block-level board description of the host-attached
-  1U (eight layer ASICs, two head-mode ASICs, sixteen LPDDR5X devices, one
-  FPGA on a PCIe cable, a BMC, redundant CRPS supplies), its consistency
-  checks including a throughput-driven power budget, the rendered block
-  diagram, a derivation of the ASIC package and ball map from the power
-  model and the interface list, and a generator that turns the description
-  into a KiCad 7 project with the board outline and chassis keep-outs,
-  the ring placed as a regular polygon of rotated chips, stackup, all
-  nets, and the activation ring routed.
+* [`hw/`](hw/) contains the block-level board descriptions of the host-attached
+  1U: the 9B board (eight layer ASICs, two head-mode ASICs, sixteen LPDDR5X
+  devices, one FPGA on a PCIe cable, a BMC, redundant CRPS supplies) and
+  the 27B-class high-end variant (four sixteen-layer ASICs with HBM4 in
+  the package, one head ASIC, liquid cooled), their consistency checks
+  including a throughput-driven power budget, the rendered block diagrams,
+  a derivation of the ASIC package and ball map from the power model and
+  the interface list, and a generator that turns either description into a
+  KiCad 7 project with the board outline and chassis keep-outs, the ring
+  placed as a regular polygon of rotated chips, stackup, all nets, and the
+  activation ring routed.
 
 ## Reference geometries
 

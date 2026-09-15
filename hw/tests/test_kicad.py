@@ -101,6 +101,27 @@ class KicadGeneratorTest(unittest.TestCase):
         mx, my = mem.extent()
         self.assertTrue(abs(asic.x - mem.x) < (ax + mx) / 2 and abs(asic.y - mem.y) < (ay + my) / 2)
 
+    def test_27b_variant_is_a_hexagon_of_hbm_packages_without_board_memory(self) -> None:
+        board = Board.load(Path(__file__).resolve().parents[1] / "board_27b.yaml")
+        self.assertEqual(board.check(), [])
+        design = kg.build_design(board)
+        lay = design.layout
+        self.assertEqual(len(lay.nodes), 6)
+        self.assertEqual(design.pinout.package.name, "FCBGA3025_55x55_P1.0")
+        self.assertEqual([p.ref for p in design.parts if p.part_class == "lpddr5x"], [])
+        self.assertEqual(len([p for p in design.parts if p.part_class == "head_asic"]), 1)
+        self.assertTrue(all(hi <= kg.MAX_LINK_MM for _, hi in design.hop_lengths.values()), design.hop_lengths)
+        self.assertLessEqual(max(design.hop_bends.values()), kg.MAX_BEND_DEG)
+        # Every shared rail of the power tree has a regulator and no ASIC rail is left without a source.
+        regulators = {pad.net for p in design.parts if p.part_class == "regulator" for pad in p.pads}
+        for rail, spec in board.data["power_tree"]["rails"].items():
+            if spec.get("shared") or spec.get("per") == ["fpga"]:
+                self.assertIn(rail, regulators, rail)
+        boxed = [p for p in design.parts if p.body_w > 0]
+        for i, a in enumerate(boxed):
+            for b in boxed[i + 1:]:
+                self.assertFalse(kg.polygons_overlap(a.corners(), b.corners()), f"{a.ref} overlaps {b.ref}")
+
     def test_hops_bend_gently_and_the_ribbon_stays_on_one_layer(self) -> None:
         for hop, bend in self.design.hop_bends.items():
             self.assertLessEqual(bend, 25.0, hop)

@@ -71,6 +71,11 @@ class Board:
             total += count * (2 if name.endswith("pair") or name.endswith("pairs") else 1)
         return total
 
+    def memory_interfaces(self, part_class: str) -> list[str]:
+        """Names of the class's on-board memory channel interfaces (none when the memory is in the package)."""
+        return sorted(name for name, spec in self.classes[part_class].get("interfaces", {}).items()
+                      if spec["kind"].startswith("lpddr"))
+
     def pin_budget(self, refdes: str) -> int:
         part = self.classes[self.class_of(refdes)]
         return sum(self.signal_count(spec["kind"]) for spec in part["interfaces"].values())
@@ -201,8 +206,9 @@ class Board:
             used_devices.add(device.component)
         for ref in self.instances("layer_asic"):
             channels = sorted(attached[ref])
-            if channels != ["lpddr_ch0", "lpddr_ch1"]:
-                problems.append(f"{ref} needs two LPDDR channels, has {channels}")
+            wanted = self.memory_interfaces("layer_asic")
+            if channels != wanted:
+                problems.append(f"{ref} needs memory channels {wanted}, has {channels}")
         for ref in self.instances("head_asic"):
             if attached[ref]:
                 problems.append(f"{ref} is a head ASIC and must not have memory attached")
@@ -384,9 +390,10 @@ def main() -> None:
     print(f"board OK: {len(board.components)} components, {len(board.ring())} ring hops, "
           f"{load:.0f} W load / {input_w:.0f} W input of {board.power_available_w():.0f} W available")
     if not args.check:
-        (HERE / "board.svg").write_text(board.svg(), encoding="utf-8")
-        (HERE / "board.md").write_text(board.summary_markdown(), encoding="utf-8")
-        print("wrote hw/board.svg and hw/board.md")
+        stem = args.source.stem
+        (HERE / f"{stem}.svg").write_text(board.svg(), encoding="utf-8")
+        (HERE / f"{stem}.md").write_text(board.summary_markdown(), encoding="utf-8")
+        print(f"wrote hw/{stem}.svg and hw/{stem}.md")
 
 
 if __name__ == "__main__":

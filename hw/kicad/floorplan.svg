@@ -108,14 +108,16 @@
 <text x="473.0" y="870.9631217690114" text-anchor="middle" font-size="6">REG_DDR</text>
 <polygon points="437.0,859.2 377.0,859.2 377.0,878.7 437.0,878.7" fill="#eeeeee" stroke="#333" stroke-width="1"/>
 <text x="407.0" y="870.9631217690114" text-anchor="middle" font-size="6">REG_3V3</text>
+<polygon points="374.0,509.8 434.0,509.8 434.0,490.2 374.0,490.2" fill="#eeeeee" stroke="#333" stroke-width="1"/>
+<text x="404.0" y="502.0" text-anchor="middle" font-size="6">REG_IO_1V8</text>
+<polygon points="446.0,509.8 506.0,509.8 506.0,490.2 446.0,490.2" fill="#eeeeee" stroke="#333" stroke-width="1"/>
+<text x="476.0" y="502.0" text-anchor="middle" font-size="6">REG_1V05</text>
+<polygon points="374.0,569.8 434.0,569.8 434.0,550.2 374.0,550.2" fill="#eeeeee" stroke="#333" stroke-width="1"/>
+<text x="404.0" y="562.0" text-anchor="middle" font-size="6">REG_0V9</text>
+<polygon points="446.0,569.8 506.0,569.8 506.0,550.2 446.0,550.2" fill="#eeeeee" stroke="#333" stroke-width="1"/>
+<text x="476.0" y="562.0" text-anchor="middle" font-size="6">REG_0V3</text>
 <polygon points="374.0,485.8 434.0,485.8 434.0,466.2 374.0,466.2" fill="#eeeeee" stroke="#333" stroke-width="1"/>
 <text x="404.0" y="478.0" text-anchor="middle" font-size="6">REG_1V8</text>
-<polygon points="446.0,485.8 506.0,485.8 506.0,466.2 446.0,466.2" fill="#eeeeee" stroke="#333" stroke-width="1"/>
-<text x="476.0" y="478.0" text-anchor="middle" font-size="6">REG_1V05</text>
-<polygon points="374.0,593.8 434.0,593.8 434.0,574.2 374.0,574.2" fill="#eeeeee" stroke="#333" stroke-width="1"/>
-<text x="404.0" y="586.0" text-anchor="middle" font-size="6">REG_0V9</text>
-<polygon points="446.0,593.8 506.0,593.8 506.0,574.2 446.0,574.2" fill="#eeeeee" stroke="#333" stroke-width="1"/>
-<text x="476.0" y="586.0" text-anchor="middle" font-size="6">REG_0V3</text>
 <polygon points="299.0,1095.5 377.0,1095.5 377.0,1068.5 299.0,1068.5" fill="#dddddd" stroke="#333" stroke-width="1"/>
 <text x="338.0" y="1084.0" text-anchor="middle" font-size="6">J_HOST</text>
 <polygon points="179.0,1094.0 221.0,1094.0 221.0,944.0 179.0,944.0" fill="#dddddd" stroke="#333" stroke-width="1"/>
