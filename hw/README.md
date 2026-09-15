@@ -99,6 +99,66 @@ FPGA transceivers are there anyway, so a later firmware can serve a UDP or
 gRPC-style token protocol over 10GbE with no board change. A standalone box
 would then need its own 12 V supply rather than a host slot.
 
+## KiCad project
+
+`python -m hw.kicad_gen` turns `board.yaml` into a KiCad 7 project under
+`hw/kicad/` (`appliance.kicad_pro`, `.kicad_pcb`, `.kicad_sch` with four
+sub-sheets, `report.md`, `floorplan.svg`). It regenerates from the YAML, so
+the description stays the source of truth. The files are written directly in
+KiCad's S-expression formats; the generator itself needs only PyYAML, and
+KiCad is used to open and check the result. The tests run KiCad's own
+design-rule check when its `pcbnew` Python module is installed (`apt install
+kicad` on Ubuntu 24.04) and pass with no violation other than the unrouted
+nets.
+
+![Floorplan](kicad/floorplan.svg)
+
+What the project contains:
+
+* the 312 × 111 mm full-length card with the x8 edge fingers, the bracket
+  keep-out, the SFP+ cage and the 12V-2x6 auxiliary connector;
+* all 33 parts of `board.yaml` on generated footprints, plus one core
+  regulator block per ASIC and seven shared-rail regulator blocks. Row A
+  runs left to right and row B is rotated 180 degrees so the ring snakes
+  back; the memories sit outside the rows, the regulators between them,
+  and the two head ASICs under the FPGA so the closing hop stays short;
+* a placeholder ball map shared by all ten ASICs: link in on the west edge,
+  link out on the east (two columns of 18 rows each), both LPDDR channels on
+  the north region, management on the south row, ground and rails elsewhere.
+  The FPGA's link pins are assigned by the ribbon router; its other pins are
+  placeholders too;
+* every net at the signal level (1,744 nets), so schematic and board agree:
+  ring links, sixteen LPDDR5X channels, the DDR4 x64, PCIe, management SPI,
+  JTAG chain, reference clocks, mode straps and rails;
+* a twelve-layer stackup with four ground planes, a 12 V and I/O rail layer
+  and a core-rail layer, via-in-pad on every ground and rail ball a zone can
+  reach, and ground, 12 V, memory-PHY and core-rail zones;
+* the activation ring fully routed: each straight hop is one 36-lane ribbon
+  on In2.Cu, and each bent hop is split by escape depth into two 18-lane
+  ribbons on In2.Cu and In5.Cu that taper from the 1 mm via pitch to 0.25 mm
+  in their body so the corners stay cheap. Every hop is within the 80 mm
+  link limit; the longest are the closing hop to the FPGA at 77 mm and the
+  row change at 75 mm.
+
+What it does not contain, on purpose: routed memory, PCIe or management nets
+(length matching and signal integrity are interactive work), decoupling,
+regulator internals, thermal vias, mounting holes, or a real ASIC ball map.
+`report.md` carries the link lengths, the escape density (the 130 memory
+signals per ASIC north edge need a build-up layer pair to escape), and the
+core-rail current density: at 50K tokens/s a layer ASIC draws about 180 A,
+which is over 100 A/mm² on a single 2 oz plane across the package width, so
+the real board needs the regulator against the package with several plane
+layers between them.
+
+Two floorplan findings came out of routing the ring. The first draft put the
+head ASICs at the bracket end and the closing hop came to 85 mm, over the
+link limit; moving the heads under the FPGA fixed it. The row-change hop
+between A3 and A4 only meets the limit with the rows 31 mm apart, the lanes
+compressed to 0.25 mm and the ribbon split over two layers; a single-layer
+ribbon at the via pitch was 105 mm. If the single-ended 1.8 V link keeps its
+80 mm budget, those constraints are real; the LVDS fallback in `board.yaml`
+would relax them.
+
 ## Open items before schematic entry in an EDA tool
 
 1. ASIC package and ball map (blocked on the physical-design gate).
