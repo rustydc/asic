@@ -447,7 +447,8 @@ class RingLayout:
     angles: dict[str, float]                       # ref -> polar angle of the node, degrees
 
 
-RING_GAP = 29.0        # neighbour spacing beyond the package body: escapes, ribbon runs and clearance
+RING_GAP = 17.0        # neighbour spacing beyond the package body: escapes, ribbon runs and clearance
+                       # (15 mm still passes DRC; below that the ports are too close for a ribbon)
 FPGA_ANGLE = -90.0     # the FPGA is the ring node nearest the chassis rear
 
 
@@ -705,7 +706,7 @@ def add_power_vias(design: Design) -> None:
 # Ring routing: escape vias plus ribbons of 36 lanes with gentle bends
 # --------------------------------------------------------------------------
 
-PATH_RUN = 8.0           # a ribbon leaves and enters a port straight for this long before it may bend
+PATH_RUN = 5.0           # a ribbon leaves and enters a port straight for this long before it may bend
 PATH_MARGIN = 0.6        # kept for the escape reach used by the report
 
 

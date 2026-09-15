@@ -19,7 +19,7 @@ energy model below moved it out of the slot. At 3 pJ per MAC the board
 draws 0.5 to 1.6 kW of input across the throughput range, which is a rack
 power supply and a row of fans, not a 600 W auxiliary connector on a
 passively cooled card. The 1U also has the room the 50K tokens/s package
-needs (29 mm bodies on a 280 mm ring) and a management controller. The
+needs (29 mm bodies on a 230 mm ring) and a management controller. The
 chassis layout:
 
 * rear panel: the SlimSAS 8i host connector next to the FPGA, the BMC's
@@ -187,7 +187,7 @@ What the project contains:
   checked against the keep-outs;
 * all 44 parts of `board.yaml` on generated footprints, plus one core
   regulator block per ASIC and seven shared-rail regulator blocks. The
-  eleven ring chips sit on a regular 11-gon of 58 mm side (103 mm
+  eleven ring chips sit on a regular 11-gon of 46 mm side (82 mm
   circumradius), each rotated tangentially, with its memories on the
   outer edge and its core regulator on the inner edge rotated with it;
   the FPGA's DDR4 and their regulators sit on its outer edge at the rear,
@@ -206,9 +206,10 @@ What the project contains:
   reach, and ground, 12 V, memory-PHY and core-rail zones;
 * the activation ring fully routed: every hop is one 36-lane ribbon on
   In2.Cu at half the ball pitch that leaves and enters the ports straight
-  and bends twice, by 16 to 20 degrees, in between. The longest lane of
-  any hop is 39 mm against the 80 mm link limit, and all eleven hops are
-  alike.
+  and bends twice, by up to 23 degrees, in between. The longest lane of
+  any hop is 27 mm against the 80 mm link limit, and all eleven hops are
+  alike. The side is the package body plus 17 mm; 15 mm still passes
+  DRC, and below that the ports are too close for a ribbon to bend.
 
 What it does not contain, on purpose: routed memory, PCIe or management nets
 (length matching and signal integrity are interactive work), decoupling,
@@ -226,7 +227,7 @@ Why a polygon and not the two-row snake of the earlier drafts:
   closing hop into the FPGA, at 76 and 74 mm against the 80 mm limit with
   the 29 mm package, and only with the lanes compressed to 0.25 mm and
   split over two layers. On the polygon the longest lane anywhere is
-  39 mm on one layer at the natural lane pitch, so the single-ended 1.8 V
+  27 mm on one layer at the natural lane pitch, so the single-ended 1.8 V
   link has its margin back and the LVDS fallback is no longer needed for
   length.
 * Airflow: in the snake each row of four sat in series in the front-to-back
@@ -237,7 +238,7 @@ Why a polygon and not the two-row snake of the earlier drafts:
   routing and the regulators sit at angles to the board axes. KiCad and
   the fab do not mind; the memory length matching is no harder than on
   axis.
-* The middle of the polygon (160 mm across) holds the clock generator,
+* The middle of the polygon (110 mm across) holds the clock generator,
   equidistant from every chip, and the shared regulators. The right third
   of the board is free apart from the PSU bay, so a shorter chassis is
   possible.
