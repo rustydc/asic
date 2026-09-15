@@ -30,13 +30,31 @@ power_model:
   memory_bytes_per_token_per_asic: 4200000   # index scan + selected KV at 128K, int8, 4:1
   report_tokens_per_second: [5000, 14500, 25000, 50000]
 
+# ASIC package and ball map.  `python -m hw.pinout` derives them from the
+# interface list, the power model and these rules: the core rail needs one
+# ball per `amps_per_ball` at `rated_tokens_per_second`, ground matches it
+# plus one return per `signals_per_ground` signal balls, signals must fit the
+# outer `signal_rows` rows, and the smallest candidate that satisfies all of
+# that wins.  The KiCad generator uses the same derived map.
+package_selection:
+  rated_tokens_per_second: 14500
+  amps_per_ball: 0.5
+  signals_per_ground: 4
+  signal_rows: 3
+  edges: {link_in: W, link_out: E, lpddr: N, misc: S}
+  candidates:
+    - {name: FCBGA400_20x20_P1.0, cols: 20, rows: 20, pitch: 1.0, body: 23.0, ball: 0.45}
+    - {name: FCBGA784_28x28_P0.8, cols: 28, rows: 28, pitch: 0.8, body: 23.0, ball: 0.40}
+    - {name: FCBGA961_31x31_P1.0, cols: 31, rows: 31, pitch: 1.0, body: 33.0, ball: 0.45}
+    - {name: FCBGA1225_35x35_P0.8, cols: 35, rows: 35, pitch: 0.8, body: 29.0, ball: 0.40}
+
 # Part classes. `rails` lists the supply rails each part needs.  `tdp_w` is a
 # placeholder budget per instance; the ASICs instead carry `static_w` plus
 # `macs_per_token`, and their power follows from the model above.
 part_classes:
   layer_asic:
     description: fixed-weight 4-layer shard die (personalized coefficient masks)
-    package: FCBGA ~23 mm, ~400 balls (placeholder)
+    package: FCBGA, derived by hw/pinout.py from package_selection (28x28 at 0.8 mm, 23 mm at the design point)
     rails: [VDD_CORE, VDD_IO_1V8, VDD_PLL_0V9, VDD2H_1V05, VDDQ_0V3]
     static_w: 3
     macs_per_token: 866000000
@@ -52,7 +70,7 @@ part_classes:
       mode: {kind: strap, value: LAYER}
   head_asic:
     description: same die as layer_asic, head-mode personalization (LM head half)
-    package: FCBGA ~23 mm, ~400 balls (placeholder)
+    package: same package and ball map as layer_asic (memory balls unconnected)
     rails: [VDD_CORE, VDD_IO_1V8, VDD_PLL_0V9]
     static_w: 2
     macs_per_token: 508000000

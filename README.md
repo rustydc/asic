@@ -28,9 +28,10 @@ LLM inference appliance built around the Qwen3.5 dense hybrid geometry.
 * [`hw/`](hw/) contains the block-level board description (eight layer ASICs,
   two head-mode ASICs, sixteen LPDDR5X devices, one PCIe FPGA), its consistency
   checks including a throughput-driven power budget, the rendered block
-  diagram, and a generator that turns the description into a KiCad 7 project
-  with the card outline, placement, stackup, all nets, and the activation
-  ring routed.
+  diagram, a derivation of the ASIC package and ball map from the power
+  model and the interface list, and a generator that turns the description
+  into a KiCad 7 project with the card outline, placement, stackup, all
+  nets, and the activation ring routed.
 
 ## Reference geometries
 

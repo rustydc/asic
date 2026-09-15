@@ -42,6 +42,7 @@ from typing import Iterable
 
 import yaml
 
+from hw import pinout
 from hw.board import Board, Endpoint
 
 HERE = Path(__file__).parent
@@ -158,11 +159,17 @@ class Part:
 
 
 PACKAGES = {
-    "asic": Package("FCBGA400_20x20_P1.0", 20, 20, 1.0, 23.0, 23.0),
     "fpga": Package("FFVB676_26x26_P1.0", 26, 26, 1.0, 27.0, 27.0, 0.5),
     "lpddr5x": Package("FBGA315_15x21_P0.8", 15, 21, 0.8, 12.0, 16.8, 0.35),
     "ddr4": Package("FBGA96_8x12_P0.8", 8, 12, 0.8, 7.5, 10.6, 0.35),
 }
+MAX_ASIC_BODY_MM = 23.5   # the placement below (column pitch, row gap, memory offsets) assumes this
+
+
+def asic_package(pin: pinout.Pinout) -> Package:
+    """The ASIC package is whatever hw/pinout.py selected from the power model."""
+    p = pin.package
+    return Package(p.name, p.cols, p.rows, p.pitch, p.body, p.body, p.ball)
 
 
 def expand_signals(signals: dict[str, int]) -> list[str]:
@@ -206,59 +213,44 @@ def link_signals(board: Board) -> list[str]:
     return expand_signals(board.kinds["link"]["signals"])
 
 
-def asic_ball_map(board: Board, part_class: str, ref: str, hop_in: int, hop_out: int,
-                  memory_channels: dict[str, str]) -> list[Pad]:
-    """Placeholder ball map shared by every ASIC.
+def misc_net(ref: str, interface: str, signal: str) -> str:
+    """Net names of the small interfaces: shared SPI and JTAG lines, per-chip selects,
+    chained TDI/TDO (rewired in build_design), per-chip reference clock and straps."""
+    me = short_ref(ref)
+    if interface == "mgmt":
+        return f"MGMT_{signal}_{me}" if signal in ("CS", "IRQ") else f"MGMT_{signal}"
+    if interface == "jtag":
+        return f"JTAG_{signal}_{me}" if signal in ("TDI", "TDO") else f"JTAG_{signal}"
+    if interface == "refclk":
+        return f"REFCLK_{me}_{signal[-1]}"
+    return f"{signal}_{me}"
 
-    West edge (columns 1-2, rows 3-20): link_in; east edge: link_out; north
-    region: both LPDDR channels; south row: management, JTAG, reference clock
-    and mode strap; everything else alternates ground and the core rail with
-    a few I/O and memory-PHY rail balls.
-    """
-    pkg = PACKAGES["asic"]
-    spec = board.classes[part_class]
-    rails = list(spec["rails"])
-    link = link_signals(board)
-    lpddr = expand_signals(board.kinds["lpddr5x_x32"]["signals"])
-    assigned: dict[tuple[int, int], tuple[str | None, tuple[str, int] | None]] = {}
-    for k, signal in enumerate(link):
-        i = 2 + k // 2
-        assigned[(i, 0 if k % 2 == 0 else 1)] = (ring_net(hop_in, signal), ("W", k % 2))
-        assigned[(i, 19 if k % 2 == 0 else 18)] = (ring_net(hop_out, signal), ("E", k % 2))
-    north = [(i, j) for i in range(2) for j in range(20)] + [(i, j) for i in range(2, 8) for j in range(2, 18)]
-    slots = iter(north)
-    for channel in ("lpddr_ch0", "lpddr_ch1"):
-        for signal in lpddr:
-            pos = next(slots)
-            device = memory_channels.get(channel)
-            assigned[pos] = (memory_net(ref, channel[-3:], signal) if device else None, None)
-    south = iter((19, j) for j in range(2, 16))
-    misc = [("MGMT_SCLK", None), ("MGMT_MOSI", None), ("MGMT_MISO", None),
-            (f"MGMT_CS_{short_ref(ref)}", None), (f"MGMT_IRQ_{short_ref(ref)}", None),
-            ("JTAG_TCK", None), ("JTAG_TMS", None), (f"JTAG_TDI_{short_ref(ref)}", None),
-            (f"JTAG_TDO_{short_ref(ref)}", None), ("JTAG_TRST", None),
-            (f"REFCLK_{short_ref(ref)}_P", None), (f"REFCLK_{short_ref(ref)}_N", None),
-            (f"MODE0_{short_ref(ref)}", None), (f"MODE1_{short_ref(ref)}", None)]
-    for net, _ in misc:
-        assigned[next(south)] = (net, None)
-    io_rails = [r for r in rails if r not in ("VDD_CORE",)]
+
+def asic_ball_map(board: Board, pin: pinout.Pinout, part_class: str, ref: str, hop_in: int, hop_out: int,
+                  memory_channels: dict[str, str]) -> list[Pad]:
+    """Pads of one ASIC from the derived ball map: the same map for every
+    ASIC, with this chip's nets on it.  Head ASICs leave the memory balls and
+    memory-PHY rails unconnected."""
+    rails = set(board.classes[part_class]["rails"])
     pads = []
-    io_index = 0
-    for i in range(pkg.rows):
-        for j in range(pkg.cols):
-            x, y = pkg.ball_xy(i, j)
-            if (i, j) in assigned:
-                net, escape = assigned[(i, j)]
+    for ball in pin.balls:
+        net: str | None
+        if ball.kind == "signal":
+            if ball.interface == "link_in":
+                net = ring_net(hop_in, ball.signal)
+            elif ball.interface == "link_out":
+                net = ring_net(hop_out, ball.signal)
+            elif ball.interface.startswith("lpddr_"):
+                net = memory_net(ref, ball.interface[-3:], ball.signal) if memory_channels.get(ball.interface) else None
             else:
-                escape = None
-                if (i + j) % 2 == 0:
-                    net = "GND"
-                elif (i * 7 + j * 3) % 11 == 0 and io_rails:
-                    net = io_rails[io_index % len(io_rails)]
-                    io_index += 1
-                else:
-                    net = f"VDD_CORE_{short_ref(ref)}"
-            pads.append(Pad(pkg.ball_name(i, j), x, y, net, escape=escape))
+                net = misc_net(ref, ball.interface, ball.signal)
+        elif ball.kind == "ground":
+            net = "GND"
+        elif ball.interface == "VDD_CORE":
+            net = f"VDD_CORE_{short_ref(ref)}"
+        else:
+            net = ball.interface if ball.interface in rails else None
+        pads.append(Pad(ball.name, ball.x, ball.y, net, size=(pin.package.ball, pin.package.ball), escape=ball.escape))
     return pads
 
 
@@ -401,6 +393,7 @@ class Zone:
 @dataclass
 class Design:
     board: Board
+    pinout: pinout.Pinout | None = None
     parts: list[Part] = field(default_factory=list)
     tracks: list[Track] = field(default_factory=list)
     vias: list[Via] = field(default_factory=list)
@@ -446,11 +439,14 @@ def escape_reach(package: Package) -> float:
     return (package.cols - 1) / 2 * package.pitch + ESCAPE_OUT + PATH_MARGIN
 
 
-ROW_CHANGE_CHANNEL_X = COL_X[3] + escape_reach(PACKAGES["asic"]) + BEND_RUN
-
-
 def build_design(board: Board) -> Design:
-    design = Design(board)
+    pin = pinout.derive(board)
+    asic_pkg = asic_package(pin)
+    if asic_pkg.body_w > MAX_ASIC_BODY_MM:
+        raise ValueError(f"the derived package {asic_pkg.name} is {asic_pkg.body_w:.0f} mm; the placement in "
+                         f"hw/kicad_gen.py (column pitch, row gap, memory offsets) fits at most {MAX_ASIC_BODY_MM} mm. "
+                         "Lower package_selection.rated_tokens_per_second or rework the floorplan.")
+    design = Design(board, pinout=pin)
     hops = ring_hops(board)
     hop_in = {sink: h for h, (_, sink) in enumerate(hops)}
     hop_out = {source: h for h, (source, _) in enumerate(hops)}
@@ -470,8 +466,8 @@ def build_design(board: Board) -> Design:
             col = int(comp["place"].split("col ")[1])
             x, y = COL_X[col], ROW_Y[row]
             rotation = 180 if row == "B" else 0
-        pkg = PACKAGES["asic"]
-        pads = asic_ball_map(board, board.class_of(ref), ref, hop_in[ref], hop_out[ref], memory_of.get(ref, {}))
+        pkg = asic_pkg
+        pads = asic_ball_map(board, pin, board.class_of(ref), ref, hop_in[ref], hop_out[ref], memory_of.get(ref, {}))
         design.parts.append(Part(ref, board.class_of(ref), pkg.name, x, y, rotation, pkg.body_w, pkg.body_h, pads,
                                  value=board.class_of(ref), package=pkg))
         # Core regulator block between the rows, beside its ASIC.
@@ -604,26 +600,40 @@ def add_power_vias(design: Design) -> None:
 # Ring routing: escape vias plus orthogonal ribbons of 36 lanes
 # --------------------------------------------------------------------------
 
-def escape_via_local(pad: Pad) -> tuple[float, float]:
+def escape_via_local(pad: Pad, pitch: float) -> tuple[float, float]:
+    """Escape via of a link ball: outer column straight out past the package
+    edge, inner column a dogbone half a pitch diagonally, so the lanes of the
+    two columns interleave at half the ball pitch."""
     edge, depth = pad.escape
+    dog = pitch / 2
     if edge == "E":
-        return (pad.x + ESCAPE_OUT, pad.y) if depth == 0 else (pad.x + ESCAPE_IN, pad.y + ESCAPE_IN)
+        return (pad.x + ESCAPE_OUT, pad.y) if depth == 0 else (pad.x + dog, pad.y + dog)
     if edge == "W":
-        return (pad.x - ESCAPE_OUT, pad.y) if depth == 0 else (pad.x - ESCAPE_IN, pad.y + ESCAPE_IN)
+        return (pad.x - ESCAPE_OUT, pad.y) if depth == 0 else (pad.x - dog, pad.y + dog)
     if edge == "S":
         # Mirrored dogbone: the south edge receives lanes from a rotated chip,
         # whose inner-column lanes sit half a pitch the other way.
-        return (pad.x, pad.y - ESCAPE_OUT) if depth == 0 else (pad.x - ESCAPE_IN, pad.y - ESCAPE_IN)
-    return (pad.x, pad.y + ESCAPE_OUT) if depth == 0 else (pad.x + ESCAPE_IN, pad.y + ESCAPE_IN)
+        return (pad.x, pad.y - ESCAPE_OUT) if depth == 0 else (pad.x - dog, pad.y - dog)
+    return (pad.x, pad.y + ESCAPE_OUT) if depth == 0 else (pad.x + dog, pad.y + dog)
+
+
+def escape_via(part: Part, pad: Pad) -> tuple[float, float]:
+    return part.local_to_board(*escape_via_local(pad, part.package.pitch))
 
 
 def escape_pads(part: Part, edge_local: str) -> list[Pad]:
     return [pad for pad in part.pads if pad.escape and pad.escape[0] == edge_local]
 
 
-LANE_COMPRESSION = 0.25  # lane pitch in a bent ribbon relative to the escape pitch: a bent hop is split
-                         # by escape depth onto two layers, so each half has 1.0 mm lanes at the vias
-                         # and 0.25 mm lanes in its body
+def lane_centre(part: Part, edge_local: str) -> tuple[float, float]:
+    """Board-frame centre of a link port's escape vias; a ribbon path ends here."""
+    vias = [escape_via(part, pad) for pad in escape_pads(part, edge_local)]
+    return sum(v[0] for v in vias) / len(vias), sum(v[1] for v in vias) / len(vias)
+
+
+BODY_LANE_PITCH = 0.25   # lane pitch in the body of a bent ribbon: a bent hop is split by escape depth
+                         # onto two layers, so each half has one-ball-pitch lanes at the vias and
+                         # converges to this in its body (0.1 mm tracks, 0.15 mm gaps)
 TAPER_MM = 10.0          # along-path length over which the lanes converge or spread (keeps the
                          # outermost lane's diagonal shallow enough for 0.1 mm clearance)
 
@@ -639,14 +649,17 @@ def corner_at(b0: tuple[float, float], ua: tuple[float, float], ub: tuple[float,
 
 
 def ribbon(path: list[tuple[float, float]], starts: dict[str, tuple[float, float]],
-           end_vias: list[tuple[str | None, tuple[float, float]]]) -> tuple[dict[str, list[tuple[float, float]]], dict[str, str]]:
+           end_vias: list[tuple[str | None, tuple[float, float]]], body_compression: float = 1.0,
+           end_scale: float = 1.0) -> tuple[dict[str, list[tuple[float, float]]], dict[str, str]]:
     """Route each start via along the orthogonal centreline ``path`` at its own
     lateral offset and finish on the end via lying on the same lane.
 
     Between the first and last waypoints of a multi-segment path the lanes
-    converge to ``LANE_COMPRESSION`` of their escape pitch, so a bend costs the
-    outer lane half as much length.  Returns the polylines per net and the
-    mapping end-via-pad -> net.
+    converge to ``body_compression`` of their offset (when the first and last
+    segments are long enough for a shallow taper), so a bend costs the outer
+    lane little.  ``end_scale`` is the ratio of the end part's lane pitch to
+    the start part's, for hops between packages of different ball pitch.
+    Returns the polylines per net and the mapping end-via-pad -> net.
     """
     def unit(a, b):
         dx, dy = b[0] - a[0], b[1] - a[1]
@@ -655,12 +668,10 @@ def ribbon(path: list[tuple[float, float]], starts: dict[str, tuple[float, float
 
     segments = list(zip(path, path[1:]))
     lengths = [math.dist(a, b) for a, b in segments]
-    # Converge over the first segment and spread back over the last one, so
-    # every corner is taken at the compressed pitch; only when both segments
-    # are long enough for a shallow taper.
     compress = 1.0
     if len(segments) >= 2 and lengths[0] >= TAPER_MM and lengths[-1] >= TAPER_MM:
-        compress = LANE_COMPRESSION
+        compress = body_compression
+    taper = compress < 1.0 or end_scale != 1.0
     tracks: dict[str, list[tuple[float, float]]] = {}
     assignment: dict[str, str] = {}
     used: set[int] = set()
@@ -669,24 +680,27 @@ def ribbon(path: list[tuple[float, float]], starts: dict[str, tuple[float, float
         n0 = (-u0[1], u0[0])                              # left normal
         d = (start[0] - path[0][0]) * n0[0] + (start[1] - path[0][1]) * n0[1]
         dc = d * compress
+        d_end = d * end_scale
         points = [start]
-        if compress < 1.0:
+        if taper:
             points.append((path[0][0] + d * n0[0], path[0][1] + d * n0[1]))
-            points.append((path[0][0] + u0[0] * TAPER_MM + dc * n0[0], path[0][1] + u0[1] * TAPER_MM + dc * n0[1]))
+            if compress < 1.0:
+                points.append((path[0][0] + u0[0] * TAPER_MM + dc * n0[0], path[0][1] + u0[1] * TAPER_MM + dc * n0[1]))
         for (a0, b0), (a1, b1) in zip(segments, segments[1:]):
             points.append(corner_at(b0, unit(a0, b0), unit(a1, b1), dc, dc))
         ul = unit(*segments[-1])
         nl = (-ul[1], ul[0])
-        if compress < 1.0:
-            points.append((path[-1][0] - ul[0] * TAPER_MM + dc * nl[0], path[-1][1] - ul[1] * TAPER_MM + dc * nl[1]))
-            points.append((path[-1][0] + d * nl[0], path[-1][1] + d * nl[1]))
+        if taper:
+            if compress < 1.0:
+                points.append((path[-1][0] - ul[0] * TAPER_MM + dc * nl[0], path[-1][1] - ul[1] * TAPER_MM + dc * nl[1]))
+            points.append((path[-1][0] + d_end * nl[0], path[-1][1] + d_end * nl[1]))
         # End via: the one on this lane (same lateral offset on the last segment).
         best, best_err = None, 1e9
         for index, (pad_name, via) in enumerate(end_vias):
             if index in used:
                 continue
             lateral = (via[0] - path[-1][0]) * nl[0] + (via[1] - path[-1][1]) * nl[1]
-            err = abs(lateral - d)
+            err = abs(lateral - d_end)
             if err < best_err:
                 best, best_err = index, err
         if best is None or best_err > 1e-3:
@@ -705,32 +719,35 @@ def hop_path(design: Design, source: Part, sink: Part) -> tuple[list[tuple[float
     # TAPER_MM plus half the compressed ribbon width before the first corner.
     out_x = escape_reach(source.package)
     in_x = escape_reach(sink.package)
-    # The ASIC link lanes sit one ball pitch off the package centre (rows 3-20
-    # of 20); the FPGA lanes are centred on its east edge and at the west end
-    # of its south edge, so the FPGA end of a path is offset to line the lane
-    # sets up.
+    # Paths run through the centre of each port's escape vias, so the lane
+    # offsets are symmetric at both ends whatever rows the ball map uses.
     if source.part_class == "fpga":
         # FPGA east edge to A0 west edge with a jog to A0's row.
         x0 = source.x + out_x
         x1 = sink.x - in_x
         mid = (x0 + x1) / 2
-        y0 = source.y + 1.0
-        return [(x0, y0), (mid, y0), (mid, sink.y), (x1, sink.y)], "E", "W"
+        y0 = lane_centre(source, "E")[1]
+        y1 = lane_centre(sink, "W")[1]
+        return [(x0, y0), (mid, y0), (mid, y1), (x1, y1)], "E", "W"
     if sink.part_class == "fpga":
         # H1 (rotated: link_out on its physical west) to the FPGA south edge.
         x0 = source.x - out_x
+        y0 = lane_centre(source, "E")[1]
         channel_x = x0 - BEND_RUN
         y1 = sink.y - in_x
-        x1 = sink.x - 5.0
+        x1 = lane_centre(sink, "S")[0]
         y_mid = y1 - BEND_RUN
-        return [(x0, source.y), (channel_x, source.y), (channel_x, y_mid), (x1, y_mid), (x1, y1)], "E", "S"
-    if source.rotation == 0 and sink.rotation == 0:
-        return [(source.x + out_x, source.y), (sink.x - out_x, sink.y)], "E", "W"
-    if source.rotation == 180 and sink.rotation == 180:
-        return [(source.x - out_x, source.y), (sink.x + out_x, sink.y)], "E", "W"
+        return [(x0, y0), (channel_x, y0), (channel_x, y_mid), (x1, y_mid), (x1, y1)], "E", "S"
+    y0, y1 = lane_centre(source, "E")[1], lane_centre(sink, "W")[1]
+    if source.rotation == sink.rotation:
+        if abs(y0 - y1) > 1e-6:
+            raise ValueError(f"{source.ref} -> {sink.ref}: ports are not aligned ({y0:.2f} vs {y1:.2f})")
+        if source.rotation == 0:
+            return [(source.x + out_x, y0), (sink.x - in_x, y1)], "E", "W"
+        return [(source.x - out_x, y0), (sink.x + in_x, y1)], "E", "W"
     # Row change: east out of the last row-A chip, south, west into the rotated chip below.
-    channel_x = ROW_CHANGE_CHANNEL_X
-    return [(source.x + out_x, source.y), (channel_x, source.y), (channel_x, sink.y), (sink.x + out_x, sink.y)], "E", "W"
+    channel_x = source.x + out_x + BEND_RUN
+    return [(source.x + out_x, y0), (channel_x, y0), (channel_x, y1), (sink.x + in_x, y1)], "E", "W"
 
 
 def route_ring(design: Design) -> None:
@@ -743,7 +760,7 @@ def route_ring(design: Design) -> None:
         # Escape stubs and vias on both ends.
         for part, pads in ((source, src_pads), (sink, dst_pads)):
             for pad in pads:
-                vx, vy = part.local_to_board(*escape_via_local(pad))
+                vx, vy = escape_via(part, pad)
                 px, py = part.local_to_board(pad.x, pad.y)
                 net = pad.net or f"__{part.ref}_{pad.name}"
                 design.vias.append(Via(vx, vy, net))
@@ -756,13 +773,16 @@ def route_ring(design: Design) -> None:
         # A straight hop is one ribbon on the first link layer.  A bent hop is
         # split by escape depth (outer-column lanes, dogbone lanes) onto the
         # two link layers so each half is narrow enough to bend within the
-        # length limit.
+        # length limit.  Lanes of one depth are one ball pitch apart, and the
+        # end part may have a different pitch.
         groups = [(LINK_LAYERS[0], (0, 1))] if len(path) == 2 else [(LINK_LAYERS[0], (0,)), (LINK_LAYERS[1], (1,))]
+        body_compression = BODY_LANE_PITCH / source.package.pitch
+        end_scale = sink.package.pitch / source.package.pitch
         lengths = []
         for layer, depths in groups:
-            starts = {pad.net: source.local_to_board(*escape_via_local(pad)) for pad in src_pads if pad.escape[1] in depths}
-            ends = [(pad.name, sink.local_to_board(*escape_via_local(pad))) for pad in dst_pads if pad.escape[1] in depths]
-            tracks, assignment = ribbon(path, starts, ends)
+            starts = {pad.net: escape_via(source, pad) for pad in src_pads if pad.escape[1] in depths}
+            ends = [(pad.name, escape_via(sink, pad)) for pad in dst_pads if pad.escape[1] in depths]
+            tracks, assignment = ribbon(path, starts, ends, body_compression, end_scale)
             for pad_name, net in assignment.items():
                 pad = sink.pad(pad_name)
                 if pad.net is None:
@@ -840,20 +860,30 @@ def report_markdown(design: Design) -> str:
              f"{len(design.vias)} vias, {len(design.zones)} zones.", "",
              "## Stackup", "", "| Layer | Role |", "| --- | --- |"]
     lines += [f"| {layer} | {role} |" for layer, role in LAYER_ROLES.items()]
+    pin = design.pinout
+    pitch = pin.package.pitch
     lines += ["", "## Activation ring", "", f"36 lanes per hop, {TRACK_WIDTH} mm tracks. A straight hop is one "
-              f"ribbon on {LINK_LAYERS[0]} at {LANE_PITCH} mm lane pitch. A bent hop is split by escape depth "
-              f"into two 18-lane ribbons on {LINK_LAYERS[0]} and {LINK_LAYERS[1]}, each tapering from "
-              f"{2 * LANE_PITCH} mm at the vias to {2 * LANE_PITCH * LANE_COMPRESSION} mm in its body so the "
-              f"corners cost the outer lane little. Limit {MAX_LINK_MM:.0f} mm per `board.yaml`.", "",
+              f"ribbon on {LINK_LAYERS[0]} at {pitch / 2} mm lane pitch (outer-column and dogbone vias interleaved). "
+              f"A bent hop is split by escape depth into two 18-lane ribbons on {LINK_LAYERS[0]} and {LINK_LAYERS[1]}, "
+              f"each tapering from {pitch} mm at the vias to {BODY_LANE_PITCH} mm in its body so the corners cost "
+              f"the outer lane little; the FPGA end rescales to its own {PACKAGES['fpga'].pitch} mm pitch. "
+              f"Limit {MAX_LINK_MM:.0f} mm per `board.yaml`.", "",
               "| Hop | Shortest lane (mm) | Longest lane (mm) | Within limit |", "| --- | ---: | ---: | --- |"]
     for hop, (lo, hi) in design.hop_lengths.items():
         lines.append(f"| {hop} | {lo:.1f} | {hi:.1f} | {'yes' if hi <= MAX_LINK_MM else 'NO'} |")
-    pkg = PACKAGES["asic"]
-    lines += ["", "## Escape density", "",
-              f"ASIC package {pkg.body_w:.0f} mm, {pkg.cols}x{pkg.rows} balls at {pkg.pitch} mm. "
-              f"Per edge: 36 link signals on two columns of 18 rows ({36 / 18:.1f} signals per mm of edge); "
-              f"130 LPDDR signals on the north region (rows 1-8), which is {130 / pkg.body_w:.1f} per mm and "
-              "needs microvias or a build-up layer pair to escape, and is not routed here.", "",
+    pkg = pin.package
+    need = pin.requirements
+    deep = sum(1 for b in pin.balls if b.kind == "signal" and
+               min(b.row, b.col, pkg.rows - 1 - b.row, pkg.cols - 1 - b.col) >= int(design.board.data["package_selection"]["signal_rows"]))
+    memory_rows = 1 + max(b.row for b in pin.balls if b.kind == "signal" and b.interface.startswith("lpddr"))
+    lines += ["", "## ASIC package and escape density", "",
+              f"{pkg.name}: {pkg.cols}x{pkg.rows} balls at {pkg.pitch} mm, {pkg.body:.0f} mm body, selected by "
+              f"`hw/pinout.py` for {need.core_amps:.0f} A of core current at {need.rated_tokens_per_second:.0f} tokens/s "
+              f"({need.total} balls needed; see `hw/pinout/report.md`). "
+              f"Per edge: 36 link signals on two columns of 18 rows ({36 / (18 * pkg.pitch):.1f} signals per mm of edge); "
+              f"130 LPDDR signals on the north {memory_rows} rows, {130 / pkg.body:.1f} per mm of edge, of which {deep} "
+              f"sit deeper than the outer {design.board.data['package_selection']['signal_rows']} rows and need "
+              "microvias or a build-up layer pair to escape. The memory nets are not routed here.", "",
               "## Core rail current", "",
               "One 2 oz (70 um) plane across the package width, at 50K tokens/s from the board power model:", "",
               "| ASIC | Current (A) | Section per plane (mm2) | A/mm2 on one plane | Planes for 30 A/mm2 |",

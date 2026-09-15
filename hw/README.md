@@ -99,6 +99,41 @@ FPGA transceivers are there anyway, so a later firmware can serve a UDP or
 gRPC-style token protocol over 10GbE with no board change. A standalone box
 would then need its own 12 V supply rather than a host slot.
 
+## ASIC package and ball map
+
+`python -m hw.pinout` derives the ASIC package and its ball map from the
+board description and writes `hw/pinout/asic_ballmap.csv`, `asic_ballmap.json`
+and `report.md`. The pinout is co-designed with the die floorplan and the
+substrate, and the substrate is the packaging house's work; what we owe them
+is the ball count the power model demands, the package that carries it, and
+a ball map with the constraints a substrate and a PCB can both route. The
+rules live in the `package_selection` block of `board.yaml`:
+
+* the core rail needs one ball per 0.5 A at the rated throughput, and ground
+  matches it plus one return per four signal balls;
+* signals sit in the outer three rows, where a through via escapes them;
+* each interface owns a package edge, which is also the die-edge assignment
+  for the I/O ring: link in west, link out east as two columns of 18 rows,
+  both LPDDR5X channels on the north rows in byte lanes with a ground after
+  each lane, management, JTAG, reference clock and mode strap on the south
+  row, ground and the core rail in a checkerboard elsewhere;
+* the smallest candidate package that satisfies all of that is selected.
+
+At the design point of 14.5K tokens/s the core rail draws 54 A, which is 108
+core balls, 108 ground balls, 54 signal returns, 216 signals and 34 rail
+balls: 520 in all. The 400-ball package in the first draft cannot carry that,
+so the selection is a 784-ball 28 × 28 array at 0.8 mm in the same 23 mm
+body. At 50K tokens/s the core needs 354 balls each for power and ground and
+the selection grows to a 35 × 35 array in a 29 mm body, which the current
+floorplan does not fit (the generator says so rather than placing it). The
+package is therefore a rating decision before it is a mechanical one.
+
+The KiCad generator builds every ASIC footprint from this map, so the ball
+pitch, the escape geometry, the via-in-pad counts and the ring's lane pitch
+follow it. `hw/pinout/report.md` lists the candidates with the reason each
+was rejected or chosen, the ball counts by use, and the 41 memory signals
+that sit deeper than the outer three rows and need a build-up escape.
+
 ## KiCad project
 
 `python -m hw.kicad_gen` turns `board.yaml` into a KiCad 7 project under
@@ -122,11 +157,9 @@ What the project contains:
   runs left to right and row B is rotated 180 degrees so the ring snakes
   back; the memories sit outside the rows, the regulators between them,
   and the two head ASICs under the FPGA so the closing hop stays short;
-* a placeholder ball map shared by all ten ASICs: link in on the west edge,
-  link out on the east (two columns of 18 rows each), both LPDDR channels on
-  the north region, management on the south row, ground and rails elsewhere.
-  The FPGA's link pins are assigned by the ribbon router; its other pins are
-  placeholders too;
+* the ASIC ball map derived by `hw/pinout.py` (see above), shared by all ten
+  ASICs, with the head ASICs' memory balls unconnected. The FPGA's link pins
+  are assigned by the ribbon router; its other pins are placeholders;
 * every net at the signal level (1,744 nets), so schematic and board agree:
   ring links, sixteen LPDDR5X channels, the DDR4 x64, PCIe, management SPI,
   JTAG chain, reference clocks, mode straps and rails;
@@ -161,7 +194,9 @@ would relax them.
 
 ## Open items before schematic entry in an EDA tool
 
-1. ASIC package and ball map (blocked on the physical-design gate).
+1. ASIC package and ball map: the derived map in `hw/pinout/` goes to the
+   packaging house with the bump map once the die floorplan exists; the
+   substrate design and the final map come back from them.
 2. Measured energy per MAC on the target process, which sets the core
    regulator sizing and the auxiliary connector; the 3 pJ in `board.yaml` is
    a projection from the ASAP7 signoff run.
