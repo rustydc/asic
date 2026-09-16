@@ -453,7 +453,19 @@ care, and each item is a flag or an experiment in `fabric/pnr.py`:
   a copy of the cell LEF, and the resizer is told not to use the probe
   cells it had been picking as hold buffers.
 
-sky130 signoff: pending (see the results file when it lands).
+sky130 signoff: not closed. The full slice at 35 percent utilisation and a
+3 ns clock global-routes cleanly (`results/pnr_sky130hd.json`), but the
+detailed router did not converge: from 59K violations after the first
+iteration it reached floors of 826, 611 and 547 (iterations 23, 32 and 40),
+each followed by a rip-up phase every eight or nine iterations that reopened
+the same regions (spikes to 3.4K, 1.7K, 1.3K and 2.1K), and it sat at 1,219
+from iteration 50 to 53 when the run was stopped after 28 hours. The
+residual violations are concentrated, not spread, which points at pin
+access on a few sky130 cells with the merged-port LEF rather than
+congestion; the next attempts are a lower utilisation (25 percent), the
+unmerged LEF with those cells on the dont-use list, or a smaller slice.
+The ASAP7 signoff is the clean reference for the column datapath; sky130
+is the MPW target and this is the open item for it.
 
 ## RTL
 
