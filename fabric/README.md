@@ -467,6 +467,52 @@ unmerged LEF with those cells on the dont-use list, or a smaller slice.
 The ASAP7 signoff is the clean reference for the column datapath; sky130
 is the MPW target and this is the open item for it.
 
+## IHP test chip with HPI PSRAM
+
+The first silicon target is IHP SG13G2 through its open-source MPW
+(2,800 EUR per mm², about six months, 40 bare dies, QFN packaging up to
+64 pins), with one AP Memory HPI x16 PSRAM per chip as the off-chip
+memory. The open SG13G2 pad ring is 3.3 V only, so the PSRAM runs in its
+3 V mode: 133 MHz DDR on a 16-bit bus, about 530 MB/s, 64 MB.
+
+That bandwidth, not the capacity, sets the context. Retrieval traffic per
+token in one global layer is an index scan that grows with context plus a
+selected-KV transfer that does not (32 blocks of 16 positions, 4 KV heads of
+256), so cutting context alone gains little; the levers in order are int4
+KV at 16:1 compression, fewer retrieved blocks, then context:
+
+| Context | KV, compression | Blocks | Per token | Tokens/s on one device | Contexts per device |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 128K | int8, 4:1 | 32 | 3.1 MB | 135 | 1 |
+| 128K | int4, 16:1 | 32 | 1.0 MB | 400 | 8 |
+| 128K | int4, 16:1 | 8 | 0.66 MB | 650 | 8 |
+| 32K | int4, 16:1 | 8 | 0.26 MB | 1,600 | 30 |
+| 16K | int4, 16:1 | 8 | 0.20 MB | 2,150 | 60 |
+| 4K | int4, 16:1 | 8 | 0.15 MB | 2,900 | 240 |
+
+(80 percent sustained bandwidth; the 128K rows are the design point of the
+appliance for comparison.) A 16K to 32K context with int4 KV at 16:1 and 8
+retrieved blocks gives one to two thousand tokens per second per global
+layer on one device, which is enough to exercise the retrieval path end to
+end; the local window must shrink with it, because 512 positions of KV is
+512 KB and the die cannot hold that in IHP SRAM (about 1 mm² per 16 KB),
+so a 64-position window in on-chip SRAM or the window in the PSRAM too.
+
+Pin budget for a QFN64 with about 52 signal pins: HPI x16 20 (DQ0-15, two
+DQS, CLK, CE), the ring link narrowed to 8 data bits (12 signals each way,
+24), management SPI 5, reference clock 2, a strap: 52. JTAG goes; the SPI
+carries test access. The narrow link at 133 MHz DDR moves 266 MB/s, which
+at a 4 KB int8 activation is 65K tokens/s, far above the memory-bound rate.
+
+Die: at 130 nm the ROM bit is roughly 0.65 µm² and a tile's 64 columns
+about 0.6 mm², so a full-depth 4096 by 64 tile is about 1.5 mm² and the
+chip with two tiles, the HPI controller, a small retrieval engine, SRAM
+and the pad ring is 6 to 8 mm², 17 to 22 k EUR of silicon at the open
+rate. A reduced tile (256 rows by 16 columns) fits a Tiny Tapeout slot on
+IHP for a few hundred dollars and proves the via ROM, the column datapath
+and the requantiser, but not the memory path; the full chip is the one that
+tests HPI retrieval.
+
 ## RTL
 
 `rtl/fabric_tile.sv` is the synthesizable tile with the ROM as a constant
