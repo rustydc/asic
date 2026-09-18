@@ -2,7 +2,7 @@
 //
 // Memory port, one per requester:
 //   req_valid / req_ready, req_write, req_addr[31:0] (byte address aligned
-//   to a beat), req_beats[7:0]; write beats follow the request on
+//   to a beat), req_beats[11:0] (up to 4095); write beats follow the request on
 //   wdata_valid / wdata_ready / wdata; read beats return in order on
 //   rdata_valid / rdata.  One request in flight per requester.
 //
@@ -27,7 +27,7 @@ module fabric_mem_model #(
     output wire          req_ready,
     input  wire          req_write,
     input  wire [31:0]   req_addr,
-    input  wire [7:0]    req_beats,
+    input  wire [11:0]   req_beats,
     input  wire          wdata_valid,
     output wire          wdata_ready,
     input  wire [DW-1:0] wdata,
@@ -41,7 +41,7 @@ module fabric_mem_model #(
     end
     reg        busy, is_write;
     reg [AW-1:0] addr;
-    reg [7:0]  left;
+    reg [11:0] left;
     reg [3:0]  wait_r;
     assign req_ready   = !busy;
     assign wdata_ready = busy && is_write;
@@ -90,7 +90,7 @@ module fabric_mem_arbiter #(
     output wire [N-1:0]    r_req_ready,
     input  wire [N-1:0]    r_req_write,
     input  wire [N*32-1:0] r_req_addr,
-    input  wire [N*8-1:0]  r_req_beats,
+    input  wire [N*12-1:0] r_req_beats,
     input  wire [N-1:0]    r_wdata_valid,
     output wire [N-1:0]    r_wdata_ready,
     input  wire [N*DW-1:0] r_wdata,
@@ -101,7 +101,7 @@ module fabric_mem_arbiter #(
     input  wire            m_req_ready,
     output wire            m_req_write,
     output wire [31:0]     m_req_addr,
-    output wire [7:0]      m_req_beats,
+    output wire [11:0]     m_req_beats,
     output wire            m_wdata_valid,
     input  wire            m_wdata_ready,
     output wire [DW-1:0]   m_wdata,
@@ -112,7 +112,7 @@ module fabric_mem_arbiter #(
     reg          locked;
     reg [IW-1:0] owner, last;
     reg          own_write;
-    reg [7:0]    left;
+    reg [11:0]   left;
     // Pick the next requester after `last` with a request.
     integer i;
     reg [IW-1:0] pick;
@@ -126,7 +126,7 @@ module fabric_mem_arbiter #(
     assign m_req_valid = grant;
     assign m_req_write = r_req_write[pick];
     assign m_req_addr  = r_req_addr[pick*32 +: 32];
-    assign m_req_beats = r_req_beats[pick*8 +: 8];
+    assign m_req_beats = r_req_beats[pick*12 +: 12];
     genvar g;
     generate
         for (g = 0; g < N; g = g + 1) begin : g_r
@@ -143,7 +143,7 @@ module fabric_mem_arbiter #(
             locked <= 1'b0; owner <= 0; last <= N - 1; own_write <= 1'b0; left <= 0;
         end else begin
             if (grant) begin
-                locked <= 1'b1; owner <= pick; last <= pick; own_write <= r_req_write[pick]; left <= r_req_beats[pick*8 +: 8];
+                locked <= 1'b1; owner <= pick; last <= pick; own_write <= r_req_write[pick]; left <= r_req_beats[pick*12 +: 12];
             end else if (locked) begin
                 if ((own_write && m_wdata_valid && m_wdata_ready) || (!own_write && m_rdata_valid)) begin
                     left <= left - 1'b1;
@@ -178,7 +178,7 @@ module fabric_row_dma #(
     output reg                 rd_req_valid,
     input  wire                rd_req_ready,
     output wire [31:0]         rd_req_addr,
-    output wire [7:0]          rd_req_beats,
+    output wire [11:0]         rd_req_beats,
     input  wire                rd_rdata_valid,
     input  wire [DW-1:0]       rd_rdata,
     // write side
@@ -190,7 +190,7 @@ module fabric_row_dma #(
     output reg                 wr_req_valid,
     input  wire                wr_req_ready,
     output wire [31:0]         wr_req_addr,
-    output wire [7:0]          wr_req_beats,
+    output wire [11:0]         wr_req_beats,
     output wire                wr_wdata_valid,
     input  wire                wr_wdata_ready,
     output wire [DW-1:0]       wr_wdata
@@ -368,7 +368,7 @@ module fabric_index_scan #(
     output reg               req_valid,
     input  wire              req_ready,
     output wire [31:0]       req_addr,
-    output wire [7:0]        req_beats,
+    output wire [11:0]       req_beats,
     input  wire              rdata_valid,
     input  wire [DW-1:0]     rdata
 );
@@ -443,7 +443,7 @@ module fabric_record_reader #(
     output reg            req_valid,
     input  wire           req_ready,
     output reg  [31:0]    req_addr,
-    output wire [7:0]     req_beats,
+    output wire [11:0]    req_beats,
     input  wire           rdata_valid,
     input  wire [DW-1:0]  rdata,
     output reg            out_valid,
@@ -542,7 +542,7 @@ module fabric_kv_append #(
     output reg                 req_valid,
     input  wire                req_ready,
     output reg  [31:0]         req_addr,
-    output wire [7:0]          req_beats,
+    output wire [11:0]         req_beats,
     output wire                wdata_valid,
     input  wire                wdata_ready,
     output wire [DW-1:0]       wdata
@@ -572,7 +572,7 @@ module fabric_kv_append #(
     // The record being written: packed key and value halves of one head.
     reg [REC_BEATS*DW-1:0] rec;
     reg [IREC_BEATS*DW-1:0] irec;
-    reg [7:0]  beats_r;
+    reg [11:0] beats_r;
     assign req_beats = beats_r;
 
     // Packing of an int8 vector into a half: element e at bit KV_BITS*e.

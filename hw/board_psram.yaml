@@ -14,7 +14,7 @@
 # `module` on each card-resident component; `python -m hw.board --source
 # hw/board_psram.yaml` checks it, `hw.pinout` derives the package and
 # `hw.kicad_gen` writes both PCBs.  Every electrical number is a budget to
-# validate, and the connector and PSRAM package numbers are placeholders.
+# validate, and the connector geometry is a placeholder.
 
 board:
   name: asic-llm-appliance-psram-a0
@@ -120,6 +120,7 @@ part_classes:
       psram_13: {kind: psram_x16}
       psram_14: {kind: psram_x16}
       psram_15: {kind: psram_x16}
+      psram_clk: {kind: psram_clk}
       mgmt: {kind: mgmt_spi}
       jtag: {kind: jtag}
       refclk: {kind: refclk}
@@ -138,8 +139,8 @@ part_classes:
       refclk: {kind: refclk}
       mode: {kind: strap, value: HEAD}
   psram:
-    description: HPI x16 PSRAM, 64 MB, 1.8 V, 250 MHz DDR (1 GB/s); 49-ball FBGA 8 x 8 mm placeholder
-    package: 49-ball FBGA (placeholder)
+    description: AP Memory APS512XXN-OB9-BG, 512 Mb x16 HPI (Xccela) PSRAM, 1.8 V, 250 MHz DDR (1 GB/s); 24-ball BGA 6 x 8 mm at 1.0 mm pitch
+    package: BGA24 6 x 8 mm P1.0
     rails: [VDD_IO_1V8]
     tdp_w: 0.4
     interfaces:
@@ -532,8 +533,13 @@ interface_kinds:
     io_standard: 1.8 V LVCMOS series-terminated (placeholder)
     max_length_mm: 200
   psram_x16:
-    description: one HPI x16 PSRAM port; the clock pair is shared by four devices and is not counted per port
-    signals: {dq: 16, rwds: 2, cs: 1}
+    description: one HPI x16 PSRAM port (APS512XXN in x16 mode; DQ, DQS/DM per byte lane, CE#); the single-ended CLK is shared by four devices and counted under psram_clk
+    signals: {dq: 16, dqs: 2, ce: 1}
+  psram_clk:
+    description: the four single-ended 250 MHz PSRAM clocks, one per group of four devices, placed with the small interfaces
+    signals: {clk: 4}
+    misc: true               # placed with the small interfaces on the die
+    on_card: true            # wired to the card's devices, never over the connector
   pcie_x16_edge:
     description: PCIe x16 card-edge connector used mechanically, through-hole, 82 positions per side at 1.0 mm with our own pinout (placeholder geometry)
     signals: {side_a: 82, side_b: 82}

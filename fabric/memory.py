@@ -28,7 +28,7 @@ per-vector absolute-maximum scale; a token's index query is its normalised
 blocks by dot product join the window's rows in the softmax.
 
 Memory port (``fabric_memory.sv``): ``DW``-bit beats (128), byte addresses
-aligned to a beat, a request of up to 255 beats, write beats following the
+aligned to a beat, a request of up to 4095 beats, write beats following the
 request, read beats returning in order, one request in flight per requester.
 """
 
@@ -47,7 +47,7 @@ from fabric.tile import write_hex
 DW = 128                       # memory beat width in bits
 BEAT = DW // 8                 # bytes per beat
 INDEX_BITS = 4
-ALIGN = 64                     # region alignment in bytes
+ALIGN = 2048                   # region alignment: one device page, so records do not straddle bursts
 
 
 def _beats(nbytes: int) -> int:
@@ -69,7 +69,7 @@ class MemoryMap:
     (``local_window`` positions of a key and a value per KV head at
     ``kv_bits``), the block store (``context_tokens / block`` such records)
     and the index (one record of ``index_dim`` 4-bit codes and a scale per
-    block).  Regions are laid out in that order, each aligned to 64 bytes,
+    block).  Regions are laid out in that order, each aligned to a 2 KB page,
     and contexts are strided by the per-context total.
     """
 

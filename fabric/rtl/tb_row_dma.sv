@@ -25,7 +25,7 @@ module tb_row_dma #(
     // Memory and arbiter.
     wire          m_req_valid, m_req_ready, m_req_write, m_wdata_valid, m_wdata_ready, m_rdata_valid;
     wire [31:0]   m_req_addr;
-    wire [7:0]    m_req_beats;
+    wire [11:0]   m_req_beats;
     wire [DW-1:0] m_wdata, m_rdata;
     fabric_mem_model #(.DW(DW), .WORDS(WORDS), .LAT(3), .FILE("mem.hex")) mem (
         .clk(clk), .rst_n(rst_n), .req_valid(m_req_valid), .req_ready(m_req_ready), .req_write(m_req_write),
@@ -33,7 +33,7 @@ module tb_row_dma #(
         .wdata(m_wdata), .rdata_valid(m_rdata_valid), .rdata(m_rdata));
     wire [1:0]    r_req_valid, r_req_ready, r_req_write, r_wdata_valid, r_wdata_ready, r_rdata_valid;
     wire [63:0]   r_req_addr;
-    wire [15:0]   r_req_beats;
+    wire [23:0]   r_req_beats;
     wire [2*DW-1:0] r_wdata;
     wire [DW-1:0] r_rdata;
     fabric_mem_arbiter #(.N(2), .DW(DW)) arb (
@@ -56,10 +56,10 @@ module tb_row_dma #(
         .clk(clk), .rst_n(rst_n),
         .rd_start(rd_start), .rd_base(BASE[31:0]), .rd_done(rd_done), .row_out_valid(row_out_valid), .row_out(row_out),
         .rd_req_valid(r_req_valid[0]), .rd_req_ready(r_req_ready[0]), .rd_req_addr(r_req_addr[31:0]),
-        .rd_req_beats(r_req_beats[7:0]), .rd_rdata_valid(r_rdata_valid[0]), .rd_rdata(r_rdata),
+        .rd_req_beats(r_req_beats[11:0]), .rd_rdata_valid(r_rdata_valid[0]), .rd_rdata(r_rdata),
         .wr_start(wr_start), .wr_base(BASE[31:0]), .wr_done(wr_done), .row_in_valid(row_in_valid), .row_in(row_in),
         .wr_req_valid(r_req_valid[1]), .wr_req_ready(r_req_ready[1]), .wr_req_addr(r_req_addr[63:32]),
-        .wr_req_beats(r_req_beats[15:8]), .wr_wdata_valid(r_wdata_valid[1]), .wr_wdata_ready(r_wdata_ready[1]),
+        .wr_req_beats(r_req_beats[23:12]), .wr_wdata_valid(r_wdata_valid[1]), .wr_wdata_ready(r_wdata_ready[1]),
         .wr_wdata(r_wdata[2*DW-1:DW]));
 
     // The engine.

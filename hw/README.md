@@ -390,8 +390,11 @@ up on its own against the FPGA before the other nine exist, which the
 single board cannot offer.
 
 Placeholders, beyond the usual ones: the finger and slot geometry stand
-in for a real connector drawing, and the PSRAM is an 8 × 8 mm 49-ball body
-until a part is chosen.
+in for a real connector drawing. The PSRAM is chosen: the AP Memory
+APS512XXN-OB9-BG, 512 Mb x16 HPI at 250 MHz in a 24-ball 6 × 8 mm BGA at
+1.0 mm pitch, twenty signals per device with the single-ended clock
+shared by four devices (`psram_clk` on the die, four balls placed with
+the small interfaces), and its controller is in `fabric/rtl/fabric_hpi.sv`.
 
 ## Open items before schematic entry in an EDA tool
 

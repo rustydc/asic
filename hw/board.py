@@ -117,13 +117,14 @@ class Board:
     def connector_interfaces(self, module: str) -> list[tuple[str, str, str]]:
         """(component, interface, kind) of every interface on the card that a net
         connects to something off the card: everything on the ring chips except
-        their memory channels, which stay on the card with their devices."""
+        their memory channels and the kinds marked ``on_card`` (the shared
+        memory clocks), which stay on the card with their devices."""
         crossing = []
         for ref in self.module_members(module):
             if self.class_of(ref) not in ("layer_asic", "head_asic"):
                 continue
             for name, spec in self.classes[self.class_of(ref)].get("interfaces", {}).items():
-                if spec["kind"] != self.memory_kind:
+                if spec["kind"] != self.memory_kind and not self.kinds.get(spec["kind"], {}).get("on_card"):
                     crossing.append((ref, name, spec["kind"]))
         return crossing
 

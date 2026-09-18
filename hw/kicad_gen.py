@@ -283,7 +283,7 @@ PACKAGES = {
     "fpga": Package("FFVB676_26x26_P1.0", 26, 26, 1.0, 27.0, 27.0, 0.5),
     "lpddr5x": Package("FBGA315_15x21_P0.8", 15, 21, 0.8, 12.0, 16.8, 0.35),
     "ddr4": Package("FBGA96_8x12_P0.8", 8, 12, 0.8, 7.5, 10.6, 0.35),
-    "psram": Package("FBGA49_7x7_P1.0", 7, 7, 1.0, 8.0, 8.0, 0.4),      # x16 HPI PSRAM, placeholder body
+    "psram": Package("BGA24_5x5_P1.0", 5, 5, 1.0, 6.0, 8.0, 0.4),       # APS512XXN-OB9-BG: 24 balls on a 5 x 5 grid, 6 x 8 mm
 }
 
 
@@ -328,6 +328,8 @@ def misc_net(ref: str, interface: str, signal: str) -> str:
         return f"JTAG_{signal}_{me}" if signal in ("TDI", "TDO") else f"JTAG_{signal}"
     if interface == "refclk":
         return f"REFCLK_{me}_{signal[-1]}"
+    if interface == "psram_clk":
+        return f"PSRAM_{signal}"                   # PSRAM_CLK0..3, one per four devices on the card
     return f"{signal}_{me}"
 
 
@@ -1055,7 +1057,7 @@ def build_module_design(board: Board) -> Design:
         dx = (col - (per_row - 1) / 2) * (pkg.body_w + 2.0)
         dy = asic_pkg.body_h / 2 + ESCAPE_OUT + 1.5 + pkg.body_h / 2 + row * (pkg.body_h + 2.0)
         channel = pinout.memory_channels(board)[k]
-        nets = [f"{channels[channel]}_{s}" for s in memory_signals]
+        nets = [f"{channels[channel]}_{s}" for s in memory_signals] + [f"PSRAM_CLK{k // 4}"]   # the shared clock
         mem_pads = memory_ball_map(pkg, nets, board.classes[board.class_of(device)]["rails"])
         design.parts.append(Part(device, board.class_of(device), pkg.name, chip_x + dx, chip_y + dy, 0.0,
                                  pkg.body_w, pkg.body_h, mem_pads, value="PSRAM x16", package=pkg))

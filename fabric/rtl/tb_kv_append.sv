@@ -26,7 +26,7 @@ module tb_kv_append #(
 
     wire          req_valid, req_ready, wdata_valid, wdata_ready;
     wire [31:0]   req_addr;
-    wire [7:0]    req_beats;
+    wire [11:0]   req_beats;
     wire [DW-1:0] wdata;
     fabric_mem_model #(.DW(DW), .WORDS(WORDS), .LAT(2)) mem (
         .clk(clk), .rst_n(rst_n), .req_valid(req_valid), .req_ready(req_ready), .req_write(1'b1), .req_addr(req_addr),

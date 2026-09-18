@@ -687,6 +687,81 @@ the attention waits), the memory controller and PHY for the chosen
 device, error detection on the stored state, and context allocation and
 eviction, which the FPGA owns.
 
+## The memory device and its controller
+
+The PSRAM board's device is chosen: the **AP Memory APS512XXN-OB9-BG**,
+512 Mb, the Xccela DDR interface in its 16-bit HPI mode, 250 MHz, 1.62 to
+1.98 V, a 24-ball 6 × 8 mm BGA at 1.0 mm pitch, per its datasheet (rev
+1.0, November 2025). Sixteen of them give a layer die 1 GB at 16 GB/s over
+twenty signals per device (DQ0-15, DQS/DM0, DQS/DM1, CE#, CLK), the clock
+shared by four devices, on 1.8 V LVCMOS with no DRAM PHY. `hpi.py` holds
+the geometry, the mode-register encodings, the command frame and the
+striping; `rtl/fabric_hpi.sv` is the controller.
+
+The protocol, as the controller drives it: CE# low, the instruction byte
+on A/DQ[7:0] at the first rising edge, the address bytes A3..A0 on the
+second and third clocks' rising and falling edges (row 15 bits, column
+10), then for a read the device holds DQS low and starts the data
+`latency` clocks after the third clock plus up to `latency` more of
+refresh push-out under variable latency, two words per clock with DQS
+toggling; for a write the controller presents the first word `WLC`
+clocks after the third clock with DM low. Linear bursts (20h, A0h) wrap
+inside the 1024-word page; CE# stays low at most 4 µs and rises at least
+28 ns between bursts. Initialisation is the 150 µs power-up wait with the
+clock stopped, a global reset, MR0 = 18h (variable latency 10), MR4 = 60h
+(write latency 9), MR8 = 43h (x16, 1K-word wrap), then MR1 and MR2 read
+back and checked for the vendor, the density and the good-die mark.
+
+```text
+port (128-bit beats, bursts to 4095)        fabric_hpi_stripe
+   |  2 KB stripes on consecutive devices, a burst split into chunks that
+   |  run concurrently, read data returned in order from the page buffers
+   v
+fabric_hpi_channel x 16   init, frame, write latency, DQS capture, page buffer
+   |  CLK (a quarter period late), CE#, DQ[15:0], DQS/DM[1:0]
+   v
+APS512XXN-OB9-BG x 16
+```
+
+Three design choices. Reads are captured by the device's strobe, not
+counted: DQS delayed a quarter period clocks a small ring in the strobe
+domain, gray pointers cross to the controller clock, and the controller
+takes pairs as they appear, so the refresh push-out costs nothing and
+variable latency is the right mode. The stripe is one page, so a chunk is
+one burst and a head's 32 KB state is one burst across all sixteen
+devices; the stripe unit tracks issued chunks in a queue and drains their
+page buffers in order, and a write is done when every chunk's channel has
+finished, not when the data has left the port. The device clock is the
+controller clock delayed a quarter period and the capture strobe is DQS
+delayed the same, which are the PHY's two delay lines; in the testbench
+they are `#` delays.
+
+Burst efficiency at 250 MHz, three command clocks plus the minimum
+latency, two words per clock, and tCPH:
+
+| Burst | Data clocks | Total | Efficiency |
+| --- | ---: | ---: | ---: |
+| a full page, 2 KB | 512 | 532 | 96% |
+| a 512 B key-value record | 128 | 148 | 86% |
+| a 256 B state row or int4 record | 64 | 84 | 76% |
+| an 80 B index record | 20 | 40 | 50% |
+
+The index scan is the one that suffers: at 80 B per record it runs at
+half rate, so packing index records into pages and scanning a page per
+burst is the first thing to do when the scan's traffic matters.
+
+`tb_hpi` puts the stripe unit, the channels and a behavioural model of the
+device (`fabric_hpi_device`: the frame, the latencies with a pseudo-random
+push-out, a different tDQSCK per device, the page wrap, the registers,
+and `$error` on a violated tCEM, tCPH, an odd address or an array access
+in x8 mode) under random bursts of up to 300 beats, and checks the read
+data beat by beat and the device images at the end, over one, two, four
+and sixteen devices. Two protocol details come from the datasheet's
+figures rather than its text and are recorded as the assumption the
+controller and the model share: the first data word sits `latency` clocks
+after the third command clock, and the 512 Mb part's RA[14] rides in bit
+1 of A3. Both are one-line changes if the vendor's figure says otherwise.
+
 ## RTL
 
 `rtl/fabric_tile.sv` is the synthesizable tile with the ROM as a constant
@@ -722,6 +797,9 @@ units are written for function, not for the tile's no-carry-chain
 discipline: the norm's sum of squares and the state engine's accumulators
 are plain adders.
 
+`rtl/fabric_hpi.sv` holds the device model, the channel controller and the
+stripe unit, with `tb_hpi` checking them against `fabric.hpi`.
+
 `rtl/fabric_memory.sv` holds the memory side: the behavioural
 `fabric_mem_model` for the testbenches, `fabric_mem_arbiter`,
 `fabric_row_dma`, `fabric_topk`, `fabric_index_scan`,
@@ -748,9 +826,11 @@ bit for bit, at int8 and int4 KV and with the 128-wide index and the
    equal, and the FFN-down pass reads the wider FFN vector.
 5. A multi-token variant of the column datapath for chunked prefill, which
    amortizes the ROM read across a chunk of tokens from one context.
-6. Done: the vector datapath between the passes and the memory side,
-   above. Open behind them: the token sequencer that runs the tiles, the
-   units and the DMAs in order, the memory controller for the chosen
-   device, stochastic rounding for the state if int8 storage has to come
-   back, the simulator's traffic terms brought in line with the map, and
-   synthesis of the units for area.
+6. Done: the vector datapath between the passes, the memory side and the
+   HPI controller for the chosen PSRAM, above. Open behind them: the
+   token sequencer that runs the tiles, the units and the DMAs in order,
+   the asynchronous FIFO between the 800 MHz core and the 250 MHz
+   controller, the two delay lines of the PHY, stochastic rounding for
+   the state if int8 storage has to come back, the simulator's traffic
+   terms brought in line with the map, and synthesis of the units for
+   area.

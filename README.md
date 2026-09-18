@@ -26,7 +26,9 @@ LLM inference appliance built around the Qwen3.5 dense hybrid geometry.
   the per-context address map, the state DMA, the window and block
   append with the 4-bit index, the index scan and top-K, and the record
   reader into the attention core, with a float twin that reproduces the
-  reference retrieval token by token.
+  reference retrieval token by token. `fabric/hpi.py` and its RTL are the
+  controller for the PSRAM board's chosen device, the AP Memory
+  APS512XXN in x16 HPI mode, with a stripe unit over sixteen of them.
 * [`clash/`](clash/) contains a synthesizable four-stage ASIC-shard seed with a
   deliberately small fixed-coefficient datapath for early RTL and P&R work.
 * [`sim/`](sim/) contains the cycle-stepped 32-stage appliance simulator for

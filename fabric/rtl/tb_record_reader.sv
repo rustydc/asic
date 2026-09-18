@@ -29,7 +29,7 @@ module tb_record_reader #(
 
     wire          req_valid, req_ready, rdata_valid;
     wire [31:0]   req_addr;
-    wire [7:0]    req_beats;
+    wire [11:0]   req_beats;
     wire [DW-1:0] rdata;
     fabric_mem_model #(.DW(DW), .WORDS(WORDS), .LAT(3), .FILE("mem.hex")) mem (
         .clk(clk), .rst_n(rst_n), .req_valid(req_valid), .req_ready(req_ready), .req_write(1'b0), .req_addr(req_addr),

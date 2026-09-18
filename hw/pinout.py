@@ -181,6 +181,17 @@ MISC_SIGNALS = [("mgmt", "SCLK"), ("mgmt", "MOSI"), ("mgmt", "MISO"), ("mgmt", "
 LINK_ROWS = 18          # a 36-signal link port is two columns of this many rows
 
 
+def misc_signals(board: Board) -> list[tuple[str, str]]:
+    """The management signals plus any layer-die interface whose kind is
+    marked ``misc`` (the shared PSRAM clocks of the modular board)."""
+    extra = []
+    for name, spec in board.classes["layer_asic"]["interfaces"].items():
+        kind = board.kinds.get(spec["kind"], {})
+        if kind.get("misc"):
+            extra += [(name, signal) for signal in expand_signals(kind["signals"])]
+    return MISC_SIGNALS + extra
+
+
 def link_rows(board: Board) -> int:
     """A link port is a two-deep block of this many positions along its edge."""
     return math.ceil(len(expand_signals(board.kinds["link"]["signals"])) / 2)
@@ -195,7 +206,7 @@ def requirements(board: Board, rated_tokens_per_second: float | None = None) -> 
     tps = float(rules["rated_tokens_per_second"] if rated_tokens_per_second is None else rated_tokens_per_second)
     amps = board.core_current_a("layer_asic", tps)
     link = len(expand_signals(board.kinds["link"]["signals"]))
-    signal_balls = 2 * link + memory_signal_count(board) + len(MISC_SIGNALS)
+    signal_balls = 2 * link + memory_signal_count(board) + len(misc_signals(board))
     signal_grounds = math.ceil(signal_balls / rules["signals_per_ground"])
     core_balls = math.ceil(amps / rules["amps_per_ball"])
     rails = dict(rules.get("rail_balls", {"VDD_IO_1V8": 8, "VDD_PLL_0V9": 2, "VDD2H_1V05": 12, "VDDQ_0V3": 12}))
@@ -365,7 +376,7 @@ def assign(board: Board, package: PackageSpec, need: Requirements) -> list[Ball]
         misc = ((i, j) for i in (package.rows - 1, package.rows - 2) for j in range(2, package.cols - 2)
                 if (i, j) not in taken)
     try:
-        for n, (interface, signal) in enumerate(MISC_SIGNALS):
+        for n, (interface, signal) in enumerate(misc_signals(board)):
             i, j = next(misc)
             place(i, j, "signal", interface, signal)
             if n % 4 == 3:
@@ -447,7 +458,7 @@ def report_markdown(pinout: Pinout, board: Board) -> str:
              f"({board.data['power_model']['mac_energy_pj']} pJ per MAC, {board.data['power_tree']['rails']['VDD_CORE']['volts']} V), "
              f"one ball per {rules['amps_per_ball']} A.", "",
              "| Need | Balls |", "| --- | ---: |",
-             f"| Signals ({4 * link_rows(board)} link, {memory_signal_count(board)} memory, {len(MISC_SIGNALS)} management) | {need.signal_balls} |",
+             f"| Signals ({4 * link_rows(board)} link, {memory_signal_count(board)} memory, {len(misc_signals(board))} management) | {need.signal_balls} |",
              f"| Signal ground returns (1 per {rules['signals_per_ground']}) | {need.signal_grounds} |",
              f"| Core rail | {need.core_balls} |", f"| Ground for the core | {need.ground_balls} |"]
     for rail, count in need.rail_balls.items():
