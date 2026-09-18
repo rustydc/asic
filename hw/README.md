@@ -348,28 +348,33 @@ folded row**: the outbound cards in the even positions running away from
 the FPGA, the returning cards in the odd positions between them, so the
 ring order 0 to 9 sits at positions 0, 2, 4, 6, 8 and 9, 7, 5, 3, 1. Every
 hop skips one slot, the turn at the far end is a square U round the last
-slot, and the ring closes on the FPGA's east edge, which carries both link
-ports side by side exactly as the die does.
+slot, and the ring closes on the FPGA, which faces the row: its link_out
+leaves the north edge into the outbound set's band and the returning
+set's band enters its south edge, so neither FPGA hop has to wrap round
+the package. Its core regulator stands on its west edge, between it and
+the end slots, and the DDR4 with its regulators on the east, against the
+PSU bay.
 
 The slots are through-hole, the commodity part, and the skipped slot's
 pins are cleared by a **stagger**, not by weaving: the two sets of slots
-sit 38 mm apart along the cards, so each set's ribbon band, which runs at
+sit 29 mm apart along the cards, so each set's ribbon band, which runs at
 its link end, passes beyond the far end of the other set's pins. The
-stagger is derived from the geometry (half a slot, the ribbon's half width
-with its escapes, the link group's distance from the slot centre and a
-clearance), and the report states it; putting in and out on the same
-positions narrowed the band from 27 mm to 12 and the stagger from 52 mm to
-38. `slot_kind: smt` puts both sets on one line instead, a surface-mount
-slot letting inner-layer ribbons pass beneath it, and saves the 38 mm at
-the price of a less ordinary part. The cards stand parallel to the
+stagger is derived from the geometry (half a slot body, the clearance
+from the band's near track to the pins, and the band's distance from the
+slot centre), and the report states it; putting in and out on the same
+positions narrowed the band from 27 mm to 12, and dropping an escape
+allowance the band never used took the stagger from 38 mm to 29.
+`slot_kind: smt` puts both sets on one line instead, a surface-mount slot
+letting inner-layer ribbons pass beneath it, and saves the 29 mm at the
+price of a less ordinary part. The cards stand parallel to the
 front-to-back airflow. Hop lengths in `report.md` are end to end, the
 card's out drop plus the motherboard ribbon plus the next card's in drop:
-87 mm slot to slot with **no bend**, 190 mm at the turn, 76 and 92 mm for
+87 mm slot to slot with **no bend**, 181 mm at the turn, 89 and 111 mm for
 the FPGA hops, against a 200 mm limit the slower link allows. The turn is
 the hop to watch: it is the one that pays for the stagger twice.
 
 The fold is what sets the board's depth. The slot field is the card's
-89 mm plus the stagger, so the board is **420 × 170 mm** (`2u_short`): the
+89 mm plus the stagger, so the board is **420 × 160 mm** (`2u_short`): the
 rear I/O strip, the slot row, the fans, the FPGA and its DDR4 beside the
 end slots, and the PSU bay, whose CRPS modules are longer than the board
 and overhang its front edge inside the chassis. `layout: two_rows` in the
@@ -380,7 +385,7 @@ Three consequences are worth stating. The motherboard turned cheap and the
 card became the only hard board, and the card is small and built ten
 times, so a mistake in the memory escape scraps 77 cm², not 1,500. The
 chassis is a short-depth 2U, the card needing about 50 mm of height with
-its connector and the board 170 mm of depth. And a module can be brought
+its connector and the board 160 mm of depth. And a module can be brought
 up on its own against the FPGA before the other nine exist, which the
 single board cannot offer.
 

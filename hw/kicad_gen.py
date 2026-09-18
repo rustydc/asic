@@ -164,10 +164,10 @@ FORM_FACTORS = {
 # the fans and nothing else.  The CRPS modules are longer than the board and
 # overhang its front edge inside the bay.
 FORM_FACTORS["2u_short"] = FormFactor("2u_short", "short-depth 2U rack chassis, motherboard with a folded row of module slots, host-attached",
-                                      420.0, 170.0, (140.0, 85.0),
-                                      (("PSU bay (two CRPS, stacked, overhanging)", (346.0, 0.0, 420.0, 170.0)),
+                                      420.0, 160.0, (140.0, 80.0),
+                                      (("PSU bay (two CRPS, stacked, overhanging)", (346.0, 0.0, 420.0, 160.0)),
                                        ("rear I/O", (0.0, 0.0, 346.0, 12.0)),
-                                       ("front fans", (0.0, 162.0, 420.0, 170.0))))
+                                       ("front fans", (0.0, 152.0, 420.0, 160.0))))
 
 # Rear-panel parts that move on the short board: the SFP cage tucks in beside
 # the BMC Ethernet and the BMC goes above them, so the slot row can start
@@ -369,47 +369,59 @@ def asic_ball_map(board: Board, pin: pinout.Pinout, part_class: str, ref: str, h
     return pads
 
 
-def fpga_ball_map(board: Board, link_in_edge: str = "W", pcie_edge: str = "S") -> list[Pad]:
-    """FPGA: link_out on the east edge, link_in on the west edge (both assigned
-    by the ribbon router), PCIe on the south edge towards the host connector,
-    DDR4 x64 on the north rows, management and small interfaces on the south-west.
-    On a modular board the link comes back to the FPGA from the side it left,
-    so link_in moves to the south edge, PCIe to the north edge (the chip is
-    then placed rotated, PCIe still towards the rear) and DDR4 to the west
-    columns."""
+def fpga_ball_map(board: Board, link_in: str = "W", link_out: str = "E", pcie: str = "S", ddr: str | None = None) -> list[Pad]:
+    """FPGA ball map by edge.  The single board: link_out east, link_in west
+    (both assigned by the ribbon router), PCIe south towards the host
+    connector, DDR4 x64 on the north rows, management and small interfaces on
+    the south-west.  A modular board moves the ports to face its slot rows:
+    both link ports on one edge, or link_out north and link_in south sharing
+    the south edge with PCIe, with DDR4 on whichever side is free."""
     pkg = PACKAGES["fpga"]
+    last = pkg.rows - 1
     assigned: dict[tuple[int, int], tuple[str | None, tuple[str, int] | None, str | None]] = {}
     n = len(link_signals(board))
     half = math.ceil(n / 2)
     r0 = (pkg.rows - half) // 2
-    if link_in_edge == "E":
-        # Both ports on the east edge, as on a module card's die: link_in above, link_out below.
+    if link_in == link_out:
+        # Both ports on one edge, as on a module card's die: link_in first along it, link_out after.
         sep = math.ceil(((n + 1) / pkg.pitch - half) / 2)
-        r_in, r_out = pkg.rows // 2 - half - sep, pkg.rows // 2 + 1 + sep
+        starts = {"in": pkg.rows // 2 - half - sep, "out": pkg.rows // 2 + 1 + sep}
     else:
-        r_in = r_out = r0
+        starts = {"in": r0, "out": r0}
+
+    def block(edge: str, along: int, depth: int) -> tuple[int, int]:
+        if edge == "E":
+            return along, last - depth
+        if edge == "W":
+            return along, depth
+        if edge == "N":
+            return depth, along
+        return last - depth, along
+
     for k in range(n):
-        assigned[(r_out + k // 2, 25 if k % 2 == 0 else 24)] = (None, ("E", k % 2), "out")
-        if link_in_edge == "W":
-            assigned[(r_in + k // 2, 0 if k % 2 == 0 else 1)] = (None, ("W", k % 2), "in")
-        elif link_in_edge == "N":
-            assigned[(0 if k % 2 == 0 else 1, r_in + k // 2)] = (None, ("N", k % 2), "in")
-        elif link_in_edge == "E":
-            assigned[(r_in + k // 2, 25 if k % 2 == 0 else 24)] = (None, ("E", k % 2), "in")
-        else:
-            assigned[(25 if k % 2 == 0 else 24, r_in + k // 2)] = (None, ("S", k % 2), "in")
-    pcie = expand_signals(board.kinds["pcie_gen4_x8"]["signals"])
-    pcie_rows = (25, 24) if pcie_edge == "S" else (0, 1)
-    pcie_edge_positions = iter((i, j) for i in pcie_rows for j in range(2, 24))
-    for signal in pcie:
-        assigned[next(pcie_edge_positions)] = (f"PCIE_{signal}", None, None)
-    ddr = expand_signals(board.kinds["ddr4_x64"]["signals"])
-    if link_in_edge == "W":
-        north = iter([(i, j) for i in range(4) for j in range(26)] + [(4, j) for j in range(2, 24)])   # clear of the link columns
+        assigned[block(link_out, starts["out"] + k // 2, k % 2)] = (None, (link_out, k % 2), "out")
+        assigned[block(link_in, starts["in"] + k // 2, k % 2)] = (None, (link_in, k % 2), "in")
+    pcie_signals = expand_signals(board.kinds["pcie_gen4_x8"]["signals"])
+    if pcie in ("S", "N"):
+        rows = (last, last - 1) if pcie == "S" else (0, 1)
+        shared = pcie in (link_in, link_out)
+        cols = [j for j in range(26) if not (shared and starts["in"] <= j < starts["in"] + half)] if shared else list(range(2, 24))
+        pcie_positions = iter((i, j) for i in rows for j in cols)
     else:
-        north = iter([(i, j) for j in range(7) for i in range(2, 22)])                                # the west columns, clear of the link rows
-    for signal in ddr:
-        assigned[next(north)] = (f"DDR4_{signal}", None, None)
+        cols = (last, last - 1) if pcie == "E" else (0, 1)
+        pcie_positions = iter((i, j) for j in cols for i in range(2, 24))
+    for signal in pcie_signals:
+        assigned[next(pcie_positions)] = (f"PCIE_{signal}", None, None)
+    ddr_signals = expand_signals(board.kinds["ddr4_x64"]["signals"])
+    ddr = ddr or ("N" if link_in == "W" else "W")
+    if ddr == "N":
+        ddr_positions = iter([(i, j) for i in range(4) for j in range(26)] + [(4, j) for j in range(2, 24)])   # clear of the link columns
+    elif ddr == "W":
+        ddr_positions = iter([(i, j) for j in range(7) for i in range(2, 22)])                                # the west columns, clear of the link rows
+    else:
+        ddr_positions = iter([(i, j) for j in range(19, 26) for i in range(2, 22)])                           # the east columns
+    for signal in ddr_signals:
+        assigned[next(ddr_positions)] = (f"DDR4_{signal}", None, None)
     misc = ["MGMT_SCLK", "MGMT_MOSI", "MGMT_MISO"]
     for ref in board.nets["mgmt"]["slaves"]:
         misc += [f"MGMT_CS_{short_ref(ref)}", f"MGMT_IRQ_{short_ref(ref)}"]
@@ -1136,42 +1148,12 @@ def build_motherboard_design(board: Board, card: Design) -> Design:
     first_in = lane_centre(slot_of[chips[0]], "in")
     fx = x0 + (half - 1) * SLOT_PITCH + SLOT_BODY_W / 2 + 40.0 + pkg.body_w / 2
     fpga = Part(fpga_ref, "fpga", pkg.name, fx, first_in[1], 180.0, pkg.body_w, pkg.body_h,
-                fpga_ball_map(board, "S", "N"), value="FPGA", package=pkg)
+                fpga_ball_map(board, link_in="S", link_out="E", pcie="N"), value="FPGA", package=pkg)
     design.parts.append(fpga)
-    ddr_signals = expand_signals(board.kinds["ddr4_x16"]["signals"])
-    for n, device in enumerate(board.instances("ddr4")):
-        dpkg = PACKAGES["ddr4"]
-        nets = []
-        for s in ddr_signals:
-            if s.startswith("DQS"):
-                idx = int(s[3:].split("_")[0])
-                nets.append(f"DDR4_DQS{2 * n + idx}_{s[-1]}")
-            elif s.startswith("DQ"):
-                nets.append(f"DDR4_DQ{16 * n + int(s[2:])}")
-            elif s.startswith("DM"):
-                nets.append(f"DDR4_DM{2 * n + int(s[2:])}")
-            else:
-                nets.append(f"DDR4_{s}")
-        pads = memory_ball_map(dpkg, nets, board.classes["ddr4"]["rails"])
-        x, y, rotation = place_relative(fpga, -(fpga.body_w / 2 + 2.0 + dpkg.body_h / 2), -12.75 + 8.5 * n, 90.0)
-        design.parts.append(Part(device, "ddr4", dpkg.name, x, y, rotation, dpkg.body_w, dpkg.body_h, pads,
-                                 value="DDR4 x16", package=dpkg))
-    tree = board.data["power_tree"]["rails"]
-    fpga_rails = [r for r, spec in tree.items() if spec.get("per") == ["fpga"]]
-    ddr_rails = [r for r in board.classes["ddr4"]["rails"]]
-    blocks = [("REG_FPGA", fpga_rails, place_relative(fpga, 0.0, fpga.body_h / 2 + 2.5 + REG_H / 2)),
-              ("REG_DDR", ddr_rails, place_relative(fpga, -(fpga.body_w / 2 + 2.0 + PACKAGES["ddr4"].body_h + 2.0 + REG_H / 2), 11.0, 90.0)),
-              ("REG_3V3", ["VDD_3V3"], place_relative(fpga, -(fpga.body_w / 2 + 2.0 + PACKAGES["ddr4"].body_h + 2.0 + REG_H / 2), -11.0, 90.0))]
-    clk_nets = ["VDD_IO_1V8", "GND"] + [f"REFCLK_{short_ref(r)}_{p}" for r in board.nets["refclk"]["sinks"] for p in "PN"]
+    # DDR4 on the west edge with its regulators beyond it, the FPGA's own
+    # regulator to the south, the clock generator between the rows.
     cx, cy = x0 + (half - 1) * SLOT_PITCH / 2 + 8.0, y_b + edge_length() / 2 + 14.0
-    design.parts.append(Part("U_CLK", "clock_gen", "QFN64_9x9", cx, cy, 0.0, 9.0, 9.0,
-                             block_pads(9.0, 9.0, clk_nets[:24], pitch=0.7, pad_size=(0.3, 0.9)), value="Si5345"))
-    blocks.append(("REG_IO", ["VDD_IO_1V8"], (cx + 20.0, cy, 0.0)))
-    for ref, rails, (x, y, rotation) in blocks:
-        nets = ["+12V"] * 3 + [rails[0]] * 3 + rails[1:] + ["GND"] * 3
-        design.parts.append(Part(ref, "regulator", f"REG_MODULE_{REG_W:.0f}x{REG_H:.0f}", x, y, rotation, REG_W, REG_H,
-                                 block_pads(REG_W, REG_H, nets, pitch=1.8, pad_size=(1.2, 1.2)),
-                                 value=f"{', '.join(rails)} regulator"))
+    place_fpga_neighbours(design, fpga, cx, cy)
     add_chassis_parts(design)
     chain = board.nets["jtag"]["chain"]
     for a, b in zip(chain, chain[1:]):
@@ -1209,9 +1191,10 @@ def slot_stagger(board: Board, layout: EdgeLayout, sample: Part) -> float:
     pads stop at the surface."""
     if board.data["board"].get("slot_kind", "through_hole") == "smt":
         return 0.0
-    near = min(-pad.y for pad in sample.pads if pad.port)                  # the link groups' near edge, from the centre
-    band = layout.lanes * EDGE_PITCH / 2 + ESCAPE_OUT + PATH_MARGIN + 1.0    # half the ribbon plus its escapes
-    return sample.body_h / 2 + SLOT_STAGGER_CLEARANCE + band - near
+    near = min(-pad.y for pad in sample.pads if pad.port)     # the nearest link pin to the slot centre
+    # The ribbon starts on the pins themselves, so the band's near edge is that
+    # pin's track, and the far end of the other set's pins must clear it.
+    return sample.body_h / 2 + SLOT_STAGGER_CLEARANCE + TRACK_WIDTH / 2 + 1.0 - near
 
 
 def build_folded_motherboard(board: Board, card: Design) -> Design:
@@ -1259,11 +1242,15 @@ def build_folded_motherboard(board: Board, card: Design) -> Design:
     last_out = lane_centre(slot_of[chips[-1]], "out")
     fx = x0 + last * SLOT_PITCH + SLOT_BODY_W / 2 + FPGA_GAP + pkg.body_w / 2
     fy = (first_in[1] + last_out[1]) / 2
-    fpga = Part(fpga_ref, "fpga", pkg.name, fx, fy, 180.0, pkg.body_w, pkg.body_h,
-                fpga_ball_map(board, "E", "N"), value="FPGA", package=pkg)
+    # Midway between the two bands: link_out leaves its north edge towards the
+    # outbound band, link_in enters its south edge from the returning band and
+    # shares that edge with PCIe (towards the rear), DDR4 sits on the east
+    # towards the PSU bay and its regulator on the west, where nothing runs.
+    fpga = Part(fpga_ref, "fpga", pkg.name, fx, fy, 0.0, pkg.body_w, pkg.body_h,
+                fpga_ball_map(board, link_in="S", link_out="N", pcie="S", ddr="E"), value="FPGA", package=pkg)
     design.parts.append(fpga)
     # The clock generator and the I/O regulator sit left of the row, clear of the turn.
-    place_fpga_neighbours(design, fpga, 30.0, 130.0)
+    place_fpga_neighbours(design, fpga, 30.0, 130.0, ddr_side=1.0, regulator_side="W")
     add_chassis_parts(design)
     chain = board.nets["jtag"]["chain"]
     for a, b in zip(chain, chain[1:]):
@@ -1295,9 +1282,12 @@ def build_folded_motherboard(board: Board, card: Design) -> Design:
     return design
 
 
-def place_fpga_neighbours(design: Design, fpga: Part, clock_x: float, clock_y: float) -> None:
-    """DDR4 on the FPGA's west edge, its regulators, the clock generator and
-    the I/O regulator: the parts every modular motherboard has beside the FPGA."""
+def place_fpga_neighbours(design: Design, fpga: Part, clock_x: float, clock_y: float,
+                          ddr_side: float = -1.0, regulator_side: str = "S") -> None:
+    """DDR4 on the FPGA's west (or, ``ddr_side`` +1, east) edge with its
+    regulators beyond it, the FPGA's own regulator on its south or west edge,
+    the clock generator and the I/O regulator: the parts every modular
+    motherboard has beside the FPGA."""
     board = design.board
     ddr_signals = expand_signals(board.kinds["ddr4_x16"]["signals"])
     for n, device in enumerate(board.instances("ddr4")):
@@ -1314,15 +1304,22 @@ def place_fpga_neighbours(design: Design, fpga: Part, clock_x: float, clock_y: f
             else:
                 nets.append(f"DDR4_{s}")
         pads = memory_ball_map(dpkg, nets, board.classes["ddr4"]["rails"])
-        x, y, rotation = place_relative(fpga, -(fpga.body_w / 2 + 2.0 + dpkg.body_h / 2), -12.75 + 8.5 * n, 90.0)
+        x, y, rotation = place_relative(fpga, ddr_side * (fpga.body_w / 2 + 2.0 + dpkg.body_h / 2), -12.75 + 8.5 * n, 90.0)
         design.parts.append(Part(device, "ddr4", dpkg.name, x, y, rotation, dpkg.body_w, dpkg.body_h, pads,
                                  value="DDR4 x16", package=dpkg))
     tree = board.data["power_tree"]["rails"]
     fpga_rails = [r for r, spec in tree.items() if spec.get("per") == ["fpga"]]
     ddr_rails = [r for r in board.classes["ddr4"]["rails"]]
-    blocks = [("REG_FPGA", fpga_rails, place_relative(fpga, 0.0, fpga.body_h / 2 + 2.5 + REG_H / 2)),
-              ("REG_DDR", ddr_rails, place_relative(fpga, -(fpga.body_w / 2 + 2.0 + PACKAGES["ddr4"].body_h + 2.0 + REG_H / 2), 11.0, 90.0)),
-              ("REG_3V3", ["VDD_3V3"], place_relative(fpga, -(fpga.body_w / 2 + 2.0 + PACKAGES["ddr4"].body_h + 2.0 + REG_H / 2), -11.0, 90.0))]
+    if regulator_side == "W":
+        reg_fpga = place_relative(fpga, -(fpga.body_w / 2 + 2.5 + REG_H / 2), 0.0, 90.0)
+    elif regulator_side == "S":
+        reg_fpga = place_relative(fpga, 0.0, fpga.body_h / 2 + 2.5 + REG_H / 2)
+    else:
+        raise ValueError(f"FPGA regulator side {regulator_side!r} is not W or S")
+    beyond_ddr = ddr_side * (fpga.body_w / 2 + 2.0 + PACKAGES["ddr4"].body_h + 2.0 + REG_H / 2)
+    blocks = [("REG_FPGA", fpga_rails, reg_fpga),
+              ("REG_DDR", ddr_rails, place_relative(fpga, beyond_ddr, 11.0, 90.0)),
+              ("REG_3V3", ["VDD_3V3"], place_relative(fpga, beyond_ddr, -11.0, 90.0))]
     clk_nets = ["VDD_IO_1V8", "GND"] + [f"REFCLK_{short_ref(r)}_{p}" for r in board.nets["refclk"]["sinks"] for p in "PN"]
     design.parts.append(Part("U_CLK", "clock_gen", "QFN64_9x9", clock_x, clock_y, 0.0, 9.0, 9.0,
                              block_pads(9.0, 9.0, clk_nets[:24], pitch=0.7, pad_size=(0.3, 0.9)), value="Si5345"))
@@ -1341,8 +1338,12 @@ def add_motherboard_zones(design: Design) -> None:
         design.zones.append(Zone(layer, "GND", outline))
     design.zones.append(Zone(st.top_rail_layer, "+12V", outline, priority=0))
     fpga = design.part(design.board.instances("fpga")[0])
+    reg = design.part("REG_FPGA")
+    lx, ly = ((reg.x - fpga.x) * math.cos(math.radians(-fpga.rotation)) - (reg.y - fpga.y) * math.sin(math.radians(-fpga.rotation)),
+              (reg.x - fpga.x) * math.sin(math.radians(-fpga.rotation)) + (reg.y - fpga.y) * math.cos(math.radians(-fpga.rotation)))
     design.zones.append(Zone(st.core_rail_layer, "VCCINT_0V85",
-                             local_rect(fpga, -15.0, -15.0, 15.0, fpga.body_h / 2 + 2.5 + REG_H + 1.0), 1))
+                             local_rect(fpga, min(-15.0, lx - REG_H / 2 - 1.0), min(-15.0, ly - REG_H / 2 - 1.0),
+                                        max(15.0, lx + REG_H / 2 + 1.0), max(15.0, ly + REG_H / 2 + 1.0)), 1))
 
 
 def modular_report_lines(design: Design) -> list[str]:
@@ -1373,7 +1374,7 @@ def modular_report_lines(design: Design) -> list[str]:
         slots = [p for p in design.parts if p.part_class == "module_slot"]
         folded = board.data["board"].get("layout", "two_rows") == "folded"
         if folded:
-            ys = sorted({round(p.y, 1) for p in slots})
+            ys = sorted({p.y for p in slots})
             smt = board.data["board"].get("slot_kind", "through_hole") == "smt"
             crossing = (f"passes beneath it on {st.link_layer} (a surface-mount slot has no pins through the board)" if smt else
                         f"passes beyond its pins: the two sets of through-hole slots are staggered {ys[-1] - ys[0]:.0f} mm along "
@@ -1382,8 +1383,8 @@ def modular_report_lines(design: Design) -> list[str]:
                       f"{len(slots)} {'surface-mount' if smt else 'through-hole'} slots at {SLOT_PITCH:.0f} mm pitch in one folded "
                       f"row: the outbound cards in the even positions running away from the FPGA, the returning cards in the odd "
                       f"positions between them, so every hop skips one slot and {crossing}, the turn at the far end is a square U "
-                      f"round the last slot, and the ring closes on the FPGA's east edge, which carries both its link ports like a "
-                      f"card's die. Each hop is one "
+                      f"round the last slot, and the ring closes on the FPGA, whose link_out leaves its north edge towards the "
+                      f"outbound band and whose link_in takes the returning band on its south edge beside PCIe. Each hop is one "
                       f"{len(link_signals(board))}-lane ribbon at {EDGE_PITCH} mm lane pitch. Lengths below are end to end: the "
                       f"card's out drop, the motherboard ribbon and the next card's in drop. Limit {design.max_link_mm:.0f} mm "
                       f"per the link kind.", "",

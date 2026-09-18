@@ -186,7 +186,7 @@ class KicadGeneratorTest(unittest.TestCase):
         slot0 = design.part("J_SLOT0")
         self.assertTrue(all(pad.net.startswith("LINK") for pad in slot0.pads if pad.port))
         fpga = design.part("U_FPGA")
-        self.assertEqual(fpga.rotation, 180.0)
+        self.assertEqual(fpga.rotation, 0.0)
         self.assertEqual(len([pad for pad in fpga.pads if pad.escape]), 24)
         self.assertTrue(all(pad.net and pad.net.startswith("LINK") for pad in fpga.pads if pad.escape))
         boxed = [p for p in design.parts if p.body_w > 0]
@@ -210,7 +210,7 @@ class KicadGeneratorTest(unittest.TestCase):
         self.assertEqual(board.data["board"]["layout"], "folded")
         design = kg.build_design(board)
         self.assertEqual(design.form_factor.key, "2u_short")
-        self.assertEqual(design.form_factor.depth, 170.0)
+        self.assertEqual(design.form_factor.depth, 160.0)
         slots = sorted((p for p in design.parts if p.part_class == "module_slot"), key=lambda p: p.x)
         self.assertEqual(len(slots), 10)
         self.assertEqual([round(b.x - a.x, 3) for a, b in zip(slots, slots[1:])], [kg.SLOT_PITCH] * 9)
@@ -224,9 +224,11 @@ class KicadGeneratorTest(unittest.TestCase):
         returning = [p for p in slots if p.rotation == 0.0]
         self.assertEqual(len({round(p.y, 3) for p in outbound}), 1)
         self.assertEqual(len({round(p.y, 3) for p in returning}), 1)
+        # Just the slot's half body, the ribbon's clearance to its pins and a track's half width
+        # beyond the band's near edge: about 29 mm, not the 38 mm an escape allowance once added.
         stagger = outbound[0].y - returning[0].y
-        self.assertGreater(stagger, 30.0)
-        self.assertLess(stagger, 45.0)
+        self.assertGreater(stagger, 25.0)
+        self.assertLess(stagger, 32.0)
         # In-row and out-row pins sit at the same positions, so a skip-one hop is straight.
         straight = [hop for hop, bend in design.hop_bends.items() if bend < 1e-6]
         self.assertEqual(len(straight), 8)
@@ -234,9 +236,17 @@ class KicadGeneratorTest(unittest.TestCase):
         self.assertGreater(out_band_low, returning[0].y + returning[0].body_h / 2)
         ret_band_high = max(t.points[i][1] for t in design.tracks if t.net.startswith("LINK6_") and t.layer == design.stackup.link_layer for i in range(len(t.points)))
         self.assertLess(ret_band_high, outbound[0].y - outbound[0].body_h / 2)
-        self.assertEqual(design.part("U_FPGA").rotation, 180.0)
-        fpga_ports = {pad.escape[0] for pad in design.part("U_FPGA").pads if pad.escape}
-        self.assertEqual(fpga_ports, {"E"})
+        # The FPGA faces the row: link_out leaves its north edge for the outbound set, the returning
+        # set's ribbon enters its south edge; its regulator sits to its west and the DDR4 to its east.
+        fpga = design.part("U_FPGA")
+        self.assertEqual(fpga.rotation, 0.0)
+        fpga_ports = {pad.escape[0] for pad in fpga.pads if pad.escape}
+        self.assertEqual(fpga_ports, {"N", "S"})
+        self.assertEqual({pad.escape[0] for pad in fpga.pads if pad.escape and pad.port == "out"}, {"N"})
+        self.assertLess(design.part("REG_FPGA").x, fpga.x - fpga.body_w / 2)
+        self.assertTrue(all(design.part(d).x > fpga.x + fpga.body_w / 2 for d in ("U_D0", "U_D3", "REG_DDR")))
+        psu_bay = next(box for name, box in design.form_factor.keepouts if name.startswith("PSU bay"))
+        self.assertLess(design.part("REG_DDR").x + kg.REG_H / 2, psu_bay[0])
         for hop, (lo, hi) in design.hop_lengths.items():
             self.assertLessEqual(hi, design.max_link_mm, hop)
             self.assertLessEqual(design.hop_bends[hop], 90.0 + 1e-6, hop)
