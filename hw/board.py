@@ -533,8 +533,11 @@ class Board:
         parts.append(f'<text x="{fpga_x + 48}" y="{fpga_y + 38}" text-anchor="middle">PCIe (cable)</text>')
         parts.append(f'<text x="{fpga_x + 48}" y="{fpga_y + 56}" text-anchor="middle" font-size="10">DDR4 x64, clock, BMC</text>')
         load, input_w = self.power_budget_w()
+        folded = self.data["board"].get("layout", "two_rows") == "folded"
+        route = ("out through the even slots of one row and back through the odd ones between them (drawn here as two rows)"
+                 if folded else "out along one row of slots and back along the facing row (a U-fold)")
         parts.append(f'<text x="20" y="{H - 40}" fill="#333">Blue: activation ring, {self.signal_count("link")}-signal link per hop, '
-                     f'out along one row of slots and back along the facing row (a U-fold). Each module is one card: a ring chip, '
+                     f'{route}. Each module is one card: a ring chip, '
                      f'its memory and its core regulator. Power budget {load:.0f} W load / {input_w:.0f} W input.</text>')
         parts.append(f'<text x="20" y="{H - 20}" fill="#333">Management SPI, JTAG chain and reference clock reach every module '
                      f'through its slot (not drawn); the BMC, PSUs and fans are off the ring.</text>')

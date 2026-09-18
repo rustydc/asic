@@ -6,10 +6,11 @@
 # signals, which no sensible package escapes onto a motherboard beside nine
 # other chips, so this variant is modular: each ring chip sits on its own
 # card with its memory and its core regulator, and only the ring, the
-# management buses and 12 V cross the card-edge connector (108 contacts
-# instead of 488 balls).  Ten cards stand in slots on a 2U motherboard, in
-# two facing rows so the ring runs out along one row and back along the
-# other.  Same schema as board.yaml plus `module_kinds`, `modules` and a
+# management buses and 12 V cross the card-edge connector (48 contacts
+# instead of 488 balls).  Ten cards stand in one row of surface-mount slots
+# on a short-depth 2U motherboard, the ring running out through the even
+# slots and back through the odd ones, every hop passing beneath the slot it
+# skips.  Same schema as board.yaml plus `module_kinds`, `modules` and a
 # `module` on each card-resident component; `python -m hw.board --source
 # hw/board_psram.yaml` checks it, `hw.pinout` derives the package and
 # `hw.kicad_gen` writes both PCBs.  Every electrical number is a budget to
@@ -17,8 +18,9 @@
 
 board:
   name: asic-llm-appliance-psram-a0
-  form_factor: 2U rack chassis, one 420 x 360 mm motherboard with ten module slots in two facing rows, host-attached over a PCIe cable, front-to-back fans between the cards, redundant CRPS
-  form_factor_key: 2u
+  form_factor: short-depth 2U rack chassis, one 420 x 160 mm motherboard with ten surface-mount module slots in one folded row, host-attached over a PCIe cable, front-to-back fans between the cards, redundant CRPS
+  form_factor_key: 2u_short
+  layout: folded               # outbound cards in the even slots, returning cards in the odd ones; two_rows is the other layout
   host_interface: PCIe Gen4 x8 over a SlimSAS 8i cable to a host adapter card
   cooling: air; each card carries a small heatsink on its ASIC (about 10 W) and the PSRAMs run bare, the cards standing parallel to the front-to-back airflow at 22 mm pitch
   power_input:
@@ -531,7 +533,7 @@ interface_kinds:
     description: one HPI x16 PSRAM port; the clock pair is shared by four devices and is not counted per port
     signals: {dq: 16, rwds: 2, cs: 1}
   pcie_x16_edge:
-    description: PCIe x16 card-edge connector used mechanically, 82 positions per side at 1.0 mm with our own pinout (placeholder geometry)
+    description: PCIe x16 card-edge connector used mechanically, surface-mount so the ring ribbons pass beneath it, 82 positions per side at 1.0 mm with our own pinout (placeholder geometry)
     signals: {side_a: 82, side_b: 82}
   ddr4_x16:
     signals: {dq: 16, dqs_pairs: 2, dm: 2, addr_cmd: 28, ck_pairs: 1, ctrl: 6}

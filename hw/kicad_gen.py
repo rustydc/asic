@@ -158,6 +158,24 @@ FORM_FACTORS = {
                       ("front fans", (0.0, 352.0, 420.0, 360.0)))),
 }
 
+# A short-depth 2U for the folded slot row: the cards are 89 mm long and
+# stand in one row, so the board needs the rear I/O strip, the slot row and
+# the fans and nothing else.  The CRPS modules are longer than the board and
+# overhang its front edge inside the bay.
+FORM_FACTORS["2u_short"] = FormFactor("2u_short", "short-depth 2U rack chassis, motherboard with a folded row of module slots, host-attached",
+                                      420.0, 160.0, (140.0, 80.0),
+                                      (("PSU bay (two CRPS, stacked, overhanging)", (346.0, 0.0, 420.0, 160.0)),
+                                       ("rear I/O", (0.0, 0.0, 346.0, 12.0)),
+                                       ("front fans", (0.0, 152.0, 420.0, 160.0))))
+
+# Rear-panel parts that move on the short board: the SFP cage tucks in beside
+# the BMC Ethernet and the BMC goes above them, so the slot row can start
+# further left.
+CHASSIS_LAYOUT = {
+    "default": {"sfp_x": 60.0, "bmc_net_x": 30.0, "bmc": (30.0, 60.0)},
+    "2u_short": {"sfp_x": 36.0, "bmc_net_x": 18.0, "bmc": (30.0, 92.0)},
+}
+
 EDGE_ZONE_MM = 8.0          # the card-edge connector swallows this much of the card above the fingers
 
 
@@ -360,15 +378,24 @@ def fpga_ball_map(board: Board, link_in_edge: str = "W", pcie_edge: str = "S") -
     pkg = PACKAGES["fpga"]
     assigned: dict[tuple[int, int], tuple[str | None, tuple[str, int] | None, str | None]] = {}
     n = len(link_signals(board))
-    r0 = (pkg.rows - math.ceil(n / 2)) // 2
+    half = math.ceil(n / 2)
+    r0 = (pkg.rows - half) // 2
+    if link_in_edge == "E":
+        # Both ports on the east edge, as on a module card's die: link_in above, link_out below.
+        sep = math.ceil(((n + 1) / pkg.pitch - half) / 2)
+        r_in, r_out = pkg.rows // 2 - half - sep, pkg.rows // 2 + 1 + sep
+    else:
+        r_in = r_out = r0
     for k in range(n):
-        assigned[(r0 + k // 2, 25 if k % 2 == 0 else 24)] = (None, ("E", k % 2), "out")
+        assigned[(r_out + k // 2, 25 if k % 2 == 0 else 24)] = (None, ("E", k % 2), "out")
         if link_in_edge == "W":
-            assigned[(r0 + k // 2, 0 if k % 2 == 0 else 1)] = (None, ("W", k % 2), "in")
+            assigned[(r_in + k // 2, 0 if k % 2 == 0 else 1)] = (None, ("W", k % 2), "in")
         elif link_in_edge == "N":
-            assigned[(0 if k % 2 == 0 else 1, r0 + k // 2)] = (None, ("N", k % 2), "in")
+            assigned[(0 if k % 2 == 0 else 1, r_in + k // 2)] = (None, ("N", k % 2), "in")
+        elif link_in_edge == "E":
+            assigned[(r_in + k // 2, 25 if k % 2 == 0 else 24)] = (None, ("E", k % 2), "in")
         else:
-            assigned[(25 if k % 2 == 0 else 24, r0 + k // 2)] = (None, ("S", k % 2), "in")
+            assigned[(25 if k % 2 == 0 else 24, r_in + k // 2)] = (None, ("S", k % 2), "in")
     pcie = expand_signals(board.kinds["pcie_gen4_x8"]["signals"])
     pcie_rows = (25, 24) if pcie_edge == "S" else (0, 1)
     pcie_edge_positions = iter((i, j) for i in pcie_rows for j in range(2, 24))
@@ -736,15 +763,16 @@ def add_chassis_parts(design: Design) -> None:
     design.parts.append(Part("J_HOST", "host_cable", "SLIMSAS_8I", fpga.x - 34.0, 6.0, 0.0, 26.0, 9.0,
                              block_pads(26.0, 9.0, host_cable_nets(board), pitch=1.0, pad_size=(0.6, 1.5)),
                              value="SlimSAS 8i host cable"))
-    design.parts.append(Part("J_SFP", "sfp_cage", "SFP_CAGE", 60.0, 27.0, 0.0, 14.0, 50.0,
+    chassis = CHASSIS_LAYOUT.get(design.form_factor.key, CHASSIS_LAYOUT["default"])
+    design.parts.append(Part("J_SFP", "sfp_cage", "SFP_CAGE", chassis["sfp_x"], 27.0, 0.0, 14.0, 50.0,
                              block_pads(50.0, 14.0, sfp_nets, pitch=2.0), value="SFP+ cage"))
     eth = [f"BMC_ETH{k}_{p}" for k in range(4) for p in "PN"]
-    design.parts.append(Part("J_BMC_NET", "rj45", "RJ45_MAGJACK", 30.0, 13.0, 0.0, 16.0, 21.0,
+    design.parts.append(Part("J_BMC_NET", "rj45", "RJ45_MAGJACK", chassis["bmc_net_x"], 13.0, 0.0, 16.0, 21.0,
                              block_pads(16.0, 21.0, eth + ["VDD_3V3", "GND", "GND", "GND"], pitch=1.6),
                              value="BMC Ethernet"))
     fans = [f"FAN_{k}_{s}" for k in range(6) for s in ("PWM", "TACH")]
     bmc_nets = eth + fans + ["UART_TX", "UART_RX", "PMB_SCL", "PMB_SDA", "PSU_ON", "VDD_3V3", "VDD_3V3", "GND", "GND"]
-    design.parts.append(Part("U_BMC", "bmc", "BGA_BMC_21x21", 30.0, 60.0, 0.0, 21.0, 21.0,
+    design.parts.append(Part("U_BMC", "bmc", "BGA_BMC_21x21", chassis["bmc"][0], chassis["bmc"][1], 0.0, 21.0, 21.0,
                              block_pads(21.0, 21.0, bmc_nets, pitch=1.2, pad_size=(0.6, 1.2)), value="BMC SoC"))
     psu_nets = ["+12V"] * 6 + ["GND"] * 6 + ["PMB_SCL", "PMB_SDA", "PSU_ON", "GND"]
     bay = next(box for name, box in design.form_factor.keepouts if name.startswith("PSU bay"))
@@ -752,14 +780,14 @@ def add_chassis_parts(design: Design) -> None:
     if bx1 - bx0 >= 100.0:
         positions = [(bx0 + 27.0, by1 - 10.0), (bx1 - 45.0, by1 - 10.0)]      # side by side
     else:
-        positions = [((bx0 + bx1) / 2, by1 - 10.0), ((bx0 + bx1) / 2, by1 - 100.0)]   # stacked modules
+        positions = [((bx0 + bx1) / 2, by1 - 30.0), ((bx0 + bx1) / 2, by1 - 120.0)]   # stacked modules
     for k, (x, y) in enumerate(positions):
         design.parts.append(Part(f"J_PSU{k}", "psu_input", "CRPS_BLADES", x, y, 0.0, 40.0, 10.0,
                                  block_pads(40.0, 10.0, psu_nets, pitch=2.8, pad_size=(1.6, 2.0)),
                                  value="CRPS 12 V output"))
     for k in range(6):
         nets = ["+12V", "GND", f"FAN_{k}_PWM", f"FAN_{k}_TACH"]
-        design.parts.append(Part(f"J_FAN{k}", "fan_header", "FAN_4PIN", 35.0 + 70.0 * k, 348.0, 0.0, 10.0, 6.0,
+        design.parts.append(Part(f"J_FAN{k}", "fan_header", "FAN_4PIN", 35.0 + 70.0 * k, design.form_factor.depth - 12.0, 0.0, 10.0, 6.0,
                                  block_pads(10.0, 6.0, nets, pitch=2.54, pad_size=(1.2, 1.5)), value="fan header"))
 
 
@@ -803,9 +831,12 @@ EDGE_KEY_GAP = 2.0
 EDGE_FINGER = (0.7, 4.0)
 EDGE_LINK_IN_FROM = 12          # the link_in group starts here on side A; link_out follows on side B
 EDGE_MISC_FROM = 50             # side A: management, JTAG, refclk, straps; side B: PMBus, presence
-SLOT_ROW_GAP = 2.0              # the slot's two pin rows, mm apart
+SLOT_ROW_GAP = 2.0              # a through-hole slot's two pin rows, mm apart
 SLOT_BODY_W = 7.5               # connector body across the card
 SLOT_PIN_DRILL = 0.7
+SLOT_SMT_ROW = 4.5              # a surface-mount slot's two pad rows, either side of the body
+SLOT_SMT_PAD = (0.6, 2.2)       # its pads, across x along
+FPGA_GAP = 26.0                 # between the end slot's body and the FPGA package
 SLOT_PITCH = 22.0               # slot to slot: card, heatsink, airflow
 SLOT_ROW_GAP_MM = 12.0          # between the two facing rows of slots (the U's bottom)
 SLOT_RUN = 3.0                  # a ribbon leaves or enters a slot's pin row straight for this long
@@ -916,23 +947,29 @@ def card_edge_part(board: Board, layout: EdgeLayout, x_left: float) -> Part:
 
 
 def slot_part(board: Board, layout: EdgeLayout, ref: str, chip_ref: str, x: float, y: float, rotation: float,
-              finger_map: dict[str, str], hop_in: int, hop_out: int) -> Part:
-    """A module slot on the motherboard: two rows of through-hole pins along
-    local y, row A (link_in) on the local west side and row B (link_out) on
-    the east, so a ribbon leaves towards local +x.  The link pins carry the
-    ring nets by the card's finger map."""
+              finger_map: dict[str, str], hop_in: int, hop_out: int, smt: bool = False) -> Part:
+    """A module slot on the motherboard: two rows of pins along local y, row A
+    (link_in) on the local west side and row B (link_out) on the east, so a
+    ribbon leaves towards local +x.  The link pins carry the ring nets by the
+    card's finger map.  Through-hole by default; a surface-mount slot has its
+    pad rows outside the body and lets inner-layer ribbons pass beneath it."""
     pads = []
     for name, (net, port) in edge_assignments(board, layout, chip_ref).items():
         side, position = name[0], int(name[1:])
         along = edge_position_x(position) + EDGE_PITCH / 2 - edge_length() / 2
-        across = -SLOT_ROW_GAP / 2 if side == "A" else SLOT_ROW_GAP / 2
+        row = SLOT_SMT_ROW if smt else SLOT_ROW_GAP / 2
+        across = -row if side == "A" else row
         if port:
             signal = finger_map[name]
             net = ring_net(hop_in if port == "in" else hop_out, signal)
-        pads.append(Pad(name, across, along, net, shape="circle", size=(1.2, 1.2), drill=SLOT_PIN_DRILL,
-                        escape=("W" if port == "in" else "E", 0) if port else None, port=port))
-    return Part(ref, "module_slot", "PCIE_X16_SLOT", x, y, rotation, SLOT_BODY_W, edge_length() + 2.0, pads,
-                value=f"slot for {chip_ref}", lane_pitch_mm=EDGE_PITCH)
+        escape = ("W" if port == "in" else "E", 0) if port else None
+        if smt:
+            pads.append(Pad(name, across, along, net, shape="rect", size=SLOT_SMT_PAD, escape=escape, port=port))
+        else:
+            pads.append(Pad(name, across, along, net, shape="circle", size=(1.2, 1.2), drill=SLOT_PIN_DRILL,
+                            escape=escape, port=port))
+    return Part(ref, "module_slot", "PCIE_X16_SLOT_SMT" if smt else "PCIE_X16_SLOT", x, y, rotation,
+                SLOT_BODY_W, edge_length() + 2.0, pads, value=f"slot for {chip_ref}", lane_pitch_mm=EDGE_PITCH)
 
 
 def build_module_design(board: Board) -> Design:
@@ -1036,11 +1073,16 @@ def add_card_zones(design: Design) -> None:
 
 
 def build_motherboard_design(board: Board, card: Design) -> Design:
-    """The motherboard: a slot per module in two facing rows, the ring out
-    along row A (local +x hops), across the U's bottom, and back along row B
-    (slots rotated 180 degrees), the FPGA at the open end with its out-port
-    facing row A's first slot and its in-port on its north edge receiving row
-    B's last."""
+    """The motherboard, in one of two layouts.  ``two_rows``: a slot per module
+    in two facing rows, the ring out along row A, across the U's bottom and
+    back along row B, the FPGA at the open end with its in-port on the edge
+    facing the returning row.  ``folded``: one row, the outbound cards in the
+    even slots and the returning cards in the odd ones, every hop skipping a
+    slot, the FPGA beside the two end slots with both its link ports on the
+    edge facing them; the slots are surface-mount so the ribbons pass beneath
+    the slot they skip."""
+    if board.data["board"].get("layout", "two_rows") == "folded":
+        return build_folded_motherboard(board, card)
     ff = select_form_factor(board)
     link = board.kinds["link"]
     design = Design(board, ff, pinout=card.pinout, stackup=STACKUPS["motherboard"], max_bend_deg=90.0,
@@ -1139,6 +1181,116 @@ def build_motherboard_design(board: Board, card: Design) -> Design:
     return design
 
 
+def build_folded_motherboard(board: Board, card: Design) -> Design:
+    ff = select_form_factor(board)
+    link = board.kinds["link"]
+    design = Design(board, ff, pinout=card.pinout, stackup=STACKUPS["motherboard"], max_bend_deg=90.0,
+                    max_link_mm=float(link.get("max_length_mm", MAX_LINK_MM)), kind="motherboard",
+                    finger_map=dict(card.finger_map))
+    layout = edge_layout(board, card.pinout)
+    hops = ring_hops(board)
+    hop_in = {sink: h for h, (_, sink) in enumerate(hops)}
+    hop_out = {source: h for h, (source, _) in enumerate(hops)}
+    chips = [sink for _, sink in hops[:-1]]
+    half = math.ceil(len(chips) / 2)
+    last = len(chips) - 1
+    # Physical position along the row: outbound chips at the even positions
+    # running away from the FPGA, returning chips at the odd positions coming
+    # back, so ring order 0..9 sits at positions 0,2,4,6,8 and 9,7,5,3,1.  The
+    # FPGA is at the +x end, so position p is at x0 + (last - p) * pitch, the
+    # outbound slots turned round to travel -x and the returning ones upright.
+    x0 = 66.0
+    y_row = 12.0 + 3.0 + edge_length() / 2 + 1.0
+    slot_of: dict[str, Part] = {}
+    position_of: dict[str, int] = {}
+    for k, ref in enumerate(chips):
+        p = 2 * k if k < half else 2 * (len(chips) - 1 - k) + 1
+        x = x0 + (last - p) * SLOT_PITCH
+        rotation = 180.0 if k < half else 0.0
+        slot = int(board.modules[board.module_of(ref)]["slot"])
+        part = slot_part(board, layout, f"J_SLOT{slot}", ref, x, y_row, rotation, design.finger_map,
+                         hop_in[ref], hop_out[ref], smt=True)
+        design.parts.append(part)
+        slot_of[ref] = part
+        position_of[ref] = p
+    fpga_ref = board.instances("fpga")[0]
+    pkg = PACKAGES["fpga"]
+    first_in = lane_centre(slot_of[chips[0]], "in")
+    last_out = lane_centre(slot_of[chips[-1]], "out")
+    fx = x0 + last * SLOT_PITCH + SLOT_BODY_W / 2 + FPGA_GAP + pkg.body_w / 2
+    fy = (first_in[1] + last_out[1]) / 2
+    fpga = Part(fpga_ref, "fpga", pkg.name, fx, fy, 180.0, pkg.body_w, pkg.body_h,
+                fpga_ball_map(board, "E", "N"), value="FPGA", package=pkg)
+    design.parts.append(fpga)
+    place_fpga_neighbours(design, fpga, x0 + (last // 2) * SLOT_PITCH, y_row + edge_length() / 2 + 14.0)
+    add_chassis_parts(design)
+    chain = board.nets["jtag"]["chain"]
+    for a, b in zip(chain, chain[1:]):
+        target = slot_of.get(b) or design.part(b)
+        for pad in target.pads:
+            if pad.net == f"JTAG_TDI_{short_ref(b)}":
+                pad.net = f"JTAG_TDO_{short_ref(a)}"
+    for hop, (src_ref, dst_ref) in enumerate(hops):
+        source = slot_of.get(src_ref) or design.part(src_ref)
+        sink = slot_of.get(dst_ref) or design.part(dst_ref)
+        run_out = run_in = SLOT_RUN
+        if src_ref in slot_of and dst_ref in slot_of and source.rotation != sink.rotation:
+            # The turn at the far end: on past the last slot, up, and back into
+            # it, a U with square corners whose outbound leg is one pitch longer.
+            run_out, run_in = SLOT_TURN_RUN + SLOT_PITCH, SLOT_TURN_RUN
+        route_hop(design, hop, f"{src_ref} -> {dst_ref}", source, sink, run_out=run_out, run_in=run_in)
+    card_in = card.hop_lengths["fingers -> U_CHIP"][1]
+    card_out = card.hop_lengths["U_CHIP -> fingers"][1]
+    for label, (lo, hi) in list(design.hop_lengths.items()):
+        src, dst = label.split(" -> ")
+        extra = (card_out if src in slot_of else 0.0) + (card_in if dst in slot_of else 0.0)
+        design.hop_lengths[label] = (lo + extra, hi + extra)
+    design.notes.append(f"folded row: positions " + ", ".join(f"{short_ref(r)}@{position_of[r]}" for r in chips))
+    add_motherboard_zones(design)
+    add_power_vias(design)
+    check_fit(design)
+    return design
+
+
+def place_fpga_neighbours(design: Design, fpga: Part, clock_x: float, clock_y: float) -> None:
+    """DDR4 on the FPGA's west edge, its regulators, the clock generator and
+    the I/O regulator: the parts every modular motherboard has beside the FPGA."""
+    board = design.board
+    ddr_signals = expand_signals(board.kinds["ddr4_x16"]["signals"])
+    for n, device in enumerate(board.instances("ddr4")):
+        dpkg = PACKAGES["ddr4"]
+        nets = []
+        for s in ddr_signals:
+            if s.startswith("DQS"):
+                idx = int(s[3:].split("_")[0])
+                nets.append(f"DDR4_DQS{2 * n + idx}_{s[-1]}")
+            elif s.startswith("DQ"):
+                nets.append(f"DDR4_DQ{16 * n + int(s[2:])}")
+            elif s.startswith("DM"):
+                nets.append(f"DDR4_DM{2 * n + int(s[2:])}")
+            else:
+                nets.append(f"DDR4_{s}")
+        pads = memory_ball_map(dpkg, nets, board.classes["ddr4"]["rails"])
+        x, y, rotation = place_relative(fpga, -(fpga.body_w / 2 + 2.0 + dpkg.body_h / 2), -12.75 + 8.5 * n, 90.0)
+        design.parts.append(Part(device, "ddr4", dpkg.name, x, y, rotation, dpkg.body_w, dpkg.body_h, pads,
+                                 value="DDR4 x16", package=dpkg))
+    tree = board.data["power_tree"]["rails"]
+    fpga_rails = [r for r, spec in tree.items() if spec.get("per") == ["fpga"]]
+    ddr_rails = [r for r in board.classes["ddr4"]["rails"]]
+    blocks = [("REG_FPGA", fpga_rails, place_relative(fpga, 0.0, fpga.body_h / 2 + 2.5 + REG_H / 2)),
+              ("REG_DDR", ddr_rails, place_relative(fpga, -(fpga.body_w / 2 + 2.0 + PACKAGES["ddr4"].body_h + 2.0 + REG_H / 2), 11.0, 90.0)),
+              ("REG_3V3", ["VDD_3V3"], place_relative(fpga, -(fpga.body_w / 2 + 2.0 + PACKAGES["ddr4"].body_h + 2.0 + REG_H / 2), -11.0, 90.0))]
+    clk_nets = ["VDD_IO_1V8", "GND"] + [f"REFCLK_{short_ref(r)}_{p}" for r in board.nets["refclk"]["sinks"] for p in "PN"]
+    design.parts.append(Part("U_CLK", "clock_gen", "QFN64_9x9", clock_x, clock_y, 0.0, 9.0, 9.0,
+                             block_pads(9.0, 9.0, clk_nets[:24], pitch=0.7, pad_size=(0.3, 0.9)), value="Si5345"))
+    blocks.append(("REG_IO", ["VDD_IO_1V8"], (clock_x + 20.0, clock_y, 0.0)))
+    for ref, rails, (x, y, rotation) in blocks:
+        nets = ["+12V"] * 3 + [rails[0]] * 3 + rails[1:] + ["GND"] * 3
+        design.parts.append(Part(ref, "regulator", f"REG_MODULE_{REG_W:.0f}x{REG_H:.0f}", x, y, rotation, REG_W, REG_H,
+                                 block_pads(REG_W, REG_H, nets, pitch=1.8, pad_size=(1.2, 1.2)),
+                                 value=f"{', '.join(rails)} regulator"))
+
+
 def add_motherboard_zones(design: Design) -> None:
     ff, st = design.form_factor, design.stackup
     outline = rect(1.0, 1.0, ff.width - 1.0, ff.depth - 1.0)
@@ -1171,6 +1323,30 @@ def modular_report_lines(design: Design) -> list[str]:
                   "so the motherboard's slot-to-slot ribbons are straight. The memory nets are present and unrouted."]
     else:
         slots = [p for p in design.parts if p.part_class == "module_slot"]
+        folded = board.data["board"].get("layout", "two_rows") == "folded"
+        if folded:
+            lines += ["## Slots and the ring", "",
+                      f"{len(slots)} surface-mount slots at {SLOT_PITCH:.0f} mm pitch in one folded row: the outbound cards in "
+                      f"the even positions running away from the FPGA, the returning cards in the odd positions between them, "
+                      f"so every hop skips one slot and passes beneath it on {st.link_layer} (a surface-mount slot has no pins "
+                      f"through the board), the turn at the far end is a square U round the last slot, and the ring closes on "
+                      f"the FPGA's east edge, which carries both its link ports like a card's die. Each hop is one "
+                      f"{len(link_signals(board))}-lane ribbon at {EDGE_PITCH} mm lane pitch. Lengths below are end to end: the "
+                      f"card's out drop, the motherboard ribbon and the next card's in drop. Limit {design.max_link_mm:.0f} mm "
+                      f"per the link kind.", "",
+                      "| Hop | Shortest (mm) | Longest (mm) | Sharpest bend | Within limit |", "| --- | ---: | ---: | ---: | --- |"]
+            for hop, (lo, hi) in design.hop_lengths.items():
+                lines.append(f"| {hop} | {lo:.1f} | {hi:.1f} | {design.hop_bends[hop]:.0f} deg | {'yes' if hi <= design.max_link_mm else 'NO'} |")
+            module = next(iter(board.modules))
+            lines += ["", f"Each slot carries {board.connector_signal_count(module)} signals plus power and returns over "
+                      f"{2 * EDGE_POSITIONS} contacts; the memory never leaves the card. The slots' ground and 12 V pads reach "
+                      "the planes by stubs to vias placed clear of the ribbon corridor, so no via-in-pad is generated for them.", ""]
+            lines += ["## Not done here", "",
+                      "* Memory, DDR4 and PCIe are present as nets and unrouted.",
+                      "* No decoupling capacitors, no VRM internals, no thermal vias, no mounting holes, no card retention.",
+                      "* The card-edge and slot geometry is a placeholder for a real connector drawing.",
+                      "* The ASIC ball map is the rule-derived one from hw/pinout.py."]
+            return lines
         lines += ["## Slots and the ring", "",
                   f"{len(slots)} slots at {SLOT_PITCH:.0f} mm pitch in two facing rows {SLOT_ROW_GAP_MM:.0f} mm apart: the ring "
                   f"leaves the FPGA into the first slot of row A, runs slot to slot along the row, crosses to row B at the far "
@@ -1208,6 +1384,8 @@ def add_power_vias(design: Design) -> None:
     """Via-in-pad on every ground and rail pad (as an FCBGA on an HDI board would
     have) so the planes connect to the packages, regulators and connectors."""
     for part in design.parts:
+        if part.part_class == "module_slot":
+            continue
         for pad in part.pads:
             if not is_rail(pad.net, design.board):
                 continue
@@ -1912,7 +2090,8 @@ def main() -> None:
     design = generate(board, args.output)
     lay = design.layout
     ring = (f"ring {len(lay.nodes)}-gon of {lay.side:.0f} mm side" if lay
-            else f"{sum(1 for p in design.parts if p.part_class == 'module_slot')} module slots in two rows")
+            else f"{sum(1 for p in design.parts if p.part_class == 'module_slot')} module slots, "
+                 f"{board.data['board'].get('layout', 'two_rows').replace('_', ' ')}")
     print(f"wrote {args.output}/{PROJECT}.kicad_pcb ({design.form_factor.description}): {len(design.parts)} footprints, "
           f"{len(design.nets())} nets, {len(design.tracks)} tracks, {len(design.vias)} vias, "
           f"ASIC package {design.pinout.package.name}, {ring}")

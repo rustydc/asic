@@ -1,3 +1,4 @@
+import copy
 import math
 import re
 import tempfile
@@ -157,7 +158,7 @@ class KicadGeneratorTest(unittest.TestCase):
         self.assertEqual(len(slots), 10)
         self.assertEqual({p.rotation for p in slots}, {0.0, 180.0})
         self.assertEqual(sorted({round(p.y, 3) for p in slots}), sorted({round(v, 3) for v in (slots[0].y, slots[-1].y)}))
-        self.assertTrue(all(pad.drill for pad in slots[0].pads))
+        self.assertTrue(all(pad.drill is None and pad.shape == "rect" for pad in slots[0].pads))   # surface-mount slots
         self.assertEqual([p.ref for p in design.parts if p.part_class in ("layer_asic", "head_asic", "psram")], [])
         hops = kg.ring_hops(board)
         self.assertEqual(len(design.hop_lengths), len(hops))
@@ -188,10 +189,47 @@ class KicadGeneratorTest(unittest.TestCase):
                          "asics.kicad_sch", "fpga.kicad_sch"):
                 self.assertTrue(balanced((out / name).read_text(encoding="utf-8")), name)
             pcb = (out / "appliance.kicad_pcb").read_text(encoding="utf-8")
-            self.assertIn("thru_hole", pcb)
+            self.assertIn('(footprint "appliance:PCIE_X16_SLOT_SMT"', pcb)
             self.assertIn('(layers "B.Cu" "B.Mask")', (out / "module.kicad_pcb").read_text(encoding="utf-8"))
             self.assertIn("Slots and the ring", (out / "report.md").read_text(encoding="utf-8"))
             self.assertIn("The card", (out / "module_report.md").read_text(encoding="utf-8"))
+
+    def test_folded_row_skips_a_slot_per_hop_on_surface_mount_slots(self) -> None:
+        board = Board.load(Path(__file__).resolve().parents[1] / "board_psram.yaml")
+        self.assertEqual(board.data["board"]["layout"], "folded")
+        design = kg.build_design(board)
+        self.assertEqual(design.form_factor.key, "2u_short")
+        self.assertEqual(design.form_factor.depth, 160.0)
+        slots = sorted((p for p in design.parts if p.part_class == "module_slot"), key=lambda p: p.x)
+        self.assertEqual(len(slots), 10)
+        self.assertEqual(len({round(p.y, 3) for p in slots}), 1)                      # one row
+        self.assertEqual([round(b.x - a.x, 3) for a, b in zip(slots, slots[1:])], [kg.SLOT_PITCH] * 9)
+        # Nearest the FPGA (highest x): slot 0, then slot 9, 1, 8, ... 5 at the far end.
+        self.assertEqual([p.ref for p in reversed(slots)], [f"J_SLOT{n}" for n in (0, 9, 1, 8, 2, 7, 3, 6, 4, 5)])
+        self.assertEqual([p.rotation for p in reversed(slots)], [180.0, 0.0] * 5)
+        self.assertTrue(all(pad.drill is None for p in slots for pad in p.pads))       # surface-mount
+        self.assertEqual(design.part("U_FPGA").rotation, 180.0)
+        fpga_ports = {pad.escape[0] for pad in design.part("U_FPGA").pads if pad.escape}
+        self.assertEqual(fpga_ports, {"E"})
+        for hop, (lo, hi) in design.hop_lengths.items():
+            self.assertLessEqual(hi, design.max_link_mm, hop)
+            self.assertLessEqual(design.hop_bends[hop], 90.0 + 1e-6, hop)
+        self.assertLess(max(hi for _, hi in design.hop_lengths.values()), 140.0)
+        # No via-in-pad on the slots: their power pads reach the planes clear of the ribbon corridor.
+        slot_pads = {(round(p.local_to_board(pad.x, pad.y)[0], 3), round(p.local_to_board(pad.x, pad.y)[1], 3))
+                     for p in slots for pad in p.pads if pad.net in ("GND", "+12V")}
+        self.assertFalse(any((round(v.x, 3), round(v.y, 3)) in slot_pads for v in design.vias))
+        boxed = [p for p in design.parts if p.body_w > 0]
+        for i, a in enumerate(boxed):
+            for b in boxed[i + 1:]:
+                self.assertFalse(kg.polygons_overlap(a.corners(), b.corners()), f"{a.ref} overlaps {b.ref}")
+        # The two-row layout is still available for the same description.
+        data = copy.deepcopy(board.data)
+        data["board"]["layout"] = "two_rows"
+        data["board"]["form_factor_key"] = "2u"
+        two = kg.build_design(Board(data))
+        self.assertEqual(len({round(p.y, 3) for p in two.parts if p.part_class == "module_slot"}), 2)
+        self.assertTrue(all(pad.drill for p in two.parts if p.part_class == "module_slot" for pad in p.pads))
 
     def test_hops_bend_gently_and_the_ribbon_stays_on_one_layer(self) -> None:
         for hop, bend in self.design.hop_bends.items():

@@ -1,7 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1180 620" font-family="sans-serif" font-size="12">
 <rect width="1180" height="620" fill="#fafafa"/>
 <text x="20" y="28" font-size="16" font-weight="bold">asic-llm-appliance-psram-a0: block diagram</text>
-<text x="20" y="46" fill="#555">2U rack chassis, one 420 x 360 mm motherboard with ten module slots in two facing rows, host-attached over a PCIe cable, front-to-back fans between the cards, redundant CRPS</text>
+<text x="20" y="46" fill="#555">short-depth 2U rack chassis, one 420 x 160 mm motherboard with ten surface-mount module slots in one folded row, host-attached over a PCIe cable, front-to-back fans between the cards, redundant CRPS</text>
 <defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#1f5fbf"/></marker></defs>
 <path d="M136,295.0 L250,189.0" stroke="#1f5fbf" stroke-width="2.5" marker-end="url(#arrow)" fill="none"/>
 <line x1="400" y1="189.0" x2="425" y2="189.0" stroke="#1f5fbf" stroke-width="2.5" marker-end="url(#arrow)" fill="none"/>
@@ -68,6 +68,6 @@
 <text x="88" y="285.0" text-anchor="middle" font-weight="bold">U_FPGA</text>
 <text x="88" y="303.0" text-anchor="middle">PCIe (cable)</text>
 <text x="88" y="321.0" text-anchor="middle" font-size="10">DDR4 x64, clock, BMC</text>
-<text x="20" y="580" fill="#333">Blue: activation ring, 12-signal link per hop, out along one row of slots and back along the facing row (a U-fold). Each module is one card: a ring chip, its memory and its core regulator. Power budget 251 W load / 295 W input.</text>
+<text x="20" y="580" fill="#333">Blue: activation ring, 12-signal link per hop, out through the even slots of one row and back through the odd ones between them (drawn here as two rows). Each module is one card: a ring chip, its memory and its core regulator. Power budget 251 W load / 295 W input.</text>
 <text x="20" y="600" fill="#333">Management SPI, JTAG chain and reference clock reach every module through its slot (not drawn); the BMC, PSUs and fans are off the ring.</text>
 </svg>
