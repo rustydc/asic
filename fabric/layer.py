@@ -200,7 +200,7 @@ def recip_fixed(l: int, lw: int) -> tuple[int, int]:
     if not 1 <= l < (1 << lw):
         raise ValueError("reciprocal operand out of range")
     lz = lw - bit_length(l)
-    m = (l << lz) >> (lw - 16)                     # [2^15, 2^16)
+    m = ((l << lz) >> (lw - 16)) if lw >= 16 else ((l << lz) << (16 - lw))    # [2^15, 2^16)
     r0 = int(LUTS["recip"].table[(m >> 6) - 512])
     t = (m * r0) >> 16                             # M r0 in Q1.15
     u = (2 << 15) - t
@@ -487,6 +487,8 @@ def global_layer_float(w: dict, cfg, x: np.ndarray, pos: int, k_rows: np.ndarray
     r["q_raw"], r["gate"] = qg[:, :hd], qg[:, hd:]
     r["k_raw"] = (r["h"] @ w["self_attn.k_proj.weight"].T).reshape(nkv, hd)
     r["v"] = (r["h"] @ w["self_attn.v_proj.weight"].T).reshape(nkv, hd)
+    r["index_q"] = r["h"] @ w["self_attn.index_q.weight"].T
+    r["index_k"] = r["h"] @ w["self_attn.index_k.weight"].T
     r["q"] = rope_float(_rmsnorm(r["q_raw"], w["self_attn.q_norm.weight"], eps), pos, cfg)
     r["k"] = rope_float(_rmsnorm(r["k_raw"], w["self_attn.k_norm.weight"], eps), pos, cfg)
     out = np.zeros((nh, hd))
@@ -605,6 +607,9 @@ class GlobalConsts:
     res_mult: int
     res_shift: int
     ffn: FfnConsts
+    index_q: QuantizedMatrix | None = None
+    index_k: QuantizedMatrix | None = None
+    unit_norm: Norm | None = None       # the index query to an int8 unit vector
 
 
 def _matrix(w: np.ndarray, spec: TileSpec, act_scale: float, out_scale: float, row_gain: np.ndarray | None = None
@@ -647,7 +652,8 @@ def _compile_ffn(w: dict, cfg, spec: TileSpec, cal: dict, s_h: float) -> FfnCons
 
 
 RECURRENT_CAL_KEYS = ["x2", "h", "qkv", "z", "conv", "v", "y_norm", "mixer", "h2", "gate", "up", "act", "ffn"]
-GLOBAL_CAL_KEYS = ["x2", "h", "q_raw", "k_raw", "v", "q", "k", "att", "mixer", "h2", "gate", "up", "act", "ffn"]
+GLOBAL_CAL_KEYS = ["x2", "h", "q_raw", "k_raw", "v", "q", "k", "att", "mixer", "h2", "gate", "up", "act", "ffn",
+                   "index_q", "index_k"]
 
 
 def compile_recurrent_layer(w: dict, cfg, spec: TileSpec, cal: dict[str, float]) -> RecurrentConsts:
@@ -725,9 +731,12 @@ def compile_global_layer(w: dict, cfg, spec: TileSpec, cal: dict[str, float]) ->
     mult_o, sh_o = _fp(s_v / 256 / (1 << UB) / s_att)      # w is v / 2^8, the gate U16
     o_proj = _matrix(w["self_attn.o_proj.weight"], spec, s_att, _scale(cal["mixer"], 8))
     res_mult, res_shift = _fp(_scale(cal["mixer"], 8) / s_h)
+    index_q = _matrix(w["self_attn.index_q.weight"], spec, s_n, _scale(cal["index_q"], 8), gain)
+    index_k = _matrix(w["self_attn.index_k.weight"], spec, s_n, _scale(cal["index_k"], 8), gain)
     return GlobalConsts(s_h, norm, q_proj, k_proj, v_proj, q_norm, k_norm, inv_freq_q32, rot_mult_q, rot_sh_q,
                         rot_mult_k, rot_sh_k, s_q, s_k, s_v, mult_s, sh_s, mult_gate, sh_gate, mult_o, sh_o, o_proj,
-                        res_mult, res_shift, _compile_ffn(w, cfg, spec, cal, s_h))
+                        res_mult, res_shift, _compile_ffn(w, cfg, spec, cal, s_h), index_q, index_k,
+                        Norm(1, 1, NF - 7, 8, 8))
 
 
 def dequantized_weights(w: dict, consts, cfg) -> dict:
@@ -756,6 +765,8 @@ def dequantized_weights(w: dict, consts, cfg) -> dict:
         out["self_attn.k_proj.weight"] = deq(consts.k_proj)
         out["self_attn.v_proj.weight"] = deq(consts.v_proj)
         out["self_attn.o_proj.weight"] = deq(consts.o_proj)
+        out["self_attn.index_q.weight"] = deq(consts.index_q)
+        out["self_attn.index_k.weight"] = deq(consts.index_k)
     out["post_attention_layernorm.weight"] = np.zeros_like(w["post_attention_layernorm.weight"])
     out["mlp.gate_proj.weight"] = deq(consts.ffn.gate_proj)
     out["mlp.up_proj.weight"] = deq(consts.ffn.up_proj)
@@ -839,6 +850,9 @@ def global_layer_int(c: GlobalConsts, cfg, spec: TileSpec, x: np.ndarray, pos: i
     _, k_raw = _fabric(c.k_proj, r["h"], spec)
     _, v = _fabric(c.v_proj, r["h"], spec)
     r["k_raw"], r["v"] = k_raw.reshape(nkv, hd), v.reshape(nkv, hd)
+    _, r["index_q"] = _fabric(c.index_q, r["h"], spec)
+    _, r["index_k"] = _fabric(c.index_k, r["h"], spec)
+    r["index_q_unit"] = _norm(r["index_q"], c.unit_norm)
     sin, cos = rotary_table_int(pos, c.inv_freq)
     r["q"] = np.stack([rotary_int(_norm(r["q_raw"][h], c.q_norm), sin, cos, rd, c.rot_mult_q, c.rot_sh_q) for h in range(nh)])
     r["k"] = np.stack([rotary_int(_norm(r["k_raw"][n], c.k_norm), sin, cos, rd, c.rot_mult_k, c.rot_sh_k) for n in range(nkv)])

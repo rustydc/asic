@@ -22,7 +22,11 @@ LLM inference appliance built around the Qwen3.5 dense hybrid geometry.
   update and gates, SwiGLU, the residual adds, the rotary embedding and
   the attention core, as a bit-exact fixed-point model with the compiler
   for their constants, checked against the PyTorch reference and against
-  the RTL in Icarus.
+  the RTL in Icarus. `fabric/memory.py` and its RTL are the memory side:
+  the per-context address map, the state DMA, the window and block
+  append with the 4-bit index, the index scan and top-K, and the record
+  reader into the attention core, with a float twin that reproduces the
+  reference retrieval token by token.
 * [`clash/`](clash/) contains a synthesizable four-stage ASIC-shard seed with a
   deliberately small fixed-coefficient datapath for early RTL and P&R work.
 * [`sim/`](sim/) contains the cycle-stepped 32-stage appliance simulator for

@@ -242,13 +242,21 @@ module fabric_recip #(
             if (l[i]) lz = LW - 1 - i;
     end
     wire [LW-1:0] sh = l << lz;
+    wire [15:0]   m_w;
+    generate
+        if (LW >= 16) begin : g_wide
+            assign m_w = sh[LW-1:LW-16];
+        end else begin : g_narrow
+            assign m_w = {sh, {(16-LW){1'b0}}};
+        end
+    endgenerate
     reg  [15:0]   m1, m2;
     reg  [5:0]    z1, z2, z3;
     reg           v1, v2, v3;
     reg  [16:0]   r0_2, r0_3;
     reg  signed [63:0] u3;
     always @(posedge clk) begin
-        v1 <= start; m1 <= sh[LW-1:LW-16]; z1 <= lz;
+        v1 <= start; m1 <= m_w; z1 <= lz;
         v2 <= v1; m2 <= m1; z2 <= z1;
         r0_2 <= seed[(m1 >> 6) - 512];
         v3 <= v2; z3 <= z2; r0_3 <= r0_2;

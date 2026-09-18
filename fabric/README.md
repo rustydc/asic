@@ -600,6 +600,93 @@ do not include is the memory side: the recurrent state and conv history
 per context, the KV rows of the window and the retrieved blocks and the
 index scan that chooses them, and the head die's top-k and log-sum-exp.
 
+## The memory side
+
+A layer die keeps, for every resident context, the Gated DeltaNet state and
+convolution history of its three recurrent layers and, for its global
+layer, the local window of recent keys and values, the compressed blocks of
+older ones and the index that chooses among them, all in the die's local
+memory behind one port. `memory.py` and `rtl/fabric_memory.sv` are that
+side: the address map, the record layouts, the block and index arithmetic,
+integer and float twins of a context's stores, and the units on the port.
+
+```text
+per context                              per token, global layer
+  state0..2   32 x 128 x 128 int16         append   this token's K,V -> window slot pos mod 512
+  hist0..2    8192 x 3 int8                         block sums; every 16th token the block record
+  window      512 x 4 heads x [K|V]                 and its index record (4-bit codes + scale)
+  blocks      8192 x 4 heads x [K|V]       scan     index records 0..n-1, score, top-32
+  index       8192 x (64 B codes, scale)   read     512 window + 32 block records -> attention core
+```
+
+| Record | Layout | Bytes (9B, int8 KV) |
+| --- | --- | ---: |
+| state row | 128 int16, one row of one head's `S` | 256 |
+| KV record | key then value of one KV head at `kv_bits`, each half padded to beats | 512 (256 at int4) |
+| index record | `index_dim` 4-bit codes, then a beat with the scale in its first byte | 80 |
+
+The memory port is 128-bit beats, a request of up to 255 beats, write
+beats after the request, read beats in order, one request in flight per
+requester; `fabric_mem_arbiter` puts several requesters on the one port a
+transaction at a time. The units:
+
+* `fabric_row_dma` streams a head's state rows from memory into the delta
+  engine and its output rows back, a burst per row, with a FIFO of a
+  head's rows on the write side; the test runs a 128 x 128 head through
+  the DMA, the engine and the arbiter and checks the memory image after.
+* `fabric_kv_append` writes the token's KV records into the window slot,
+  keeps the block sums on chip, and at a block's end writes the block
+  records and its index record: the block mean, L2-normalised by the norm
+  unit, its absolute maximum as the scale, and
+  `code = round((u / scale + 1) * 15 / 2)` by the reciprocal unit.
+* `fabric_index_scan` reads the eligible index records, scores each as
+  `scale * sum (2q - 15)(2k - 15)` against the query's codes (32 codes per
+  beat), and hands the candidates to `fabric_topk`, a sorted list of K
+  entries that a candidate enters above the first it strictly beats.
+* `fabric_record_reader` takes record addresses, reads each record whole,
+  unpacks int4 to int8 where needed, and streams it to the attention core
+  as key beats then value beats; the test drives a retrieval's addresses
+  through it into `fabric_attention` and checks the heads' outputs.
+
+Retrieval semantics are the reference model's, and `GlobalContextMemoryFloat`
+reproduces `SparseGlobalMixer` token by token to 1e-6 over a sequence
+with blocks and retrieval (`test_memory.py`). The integer store differs
+from it in three places, each defined here: keys and values are stored as
+the int8 (or int4, by a shift of four) values the layer produced, block
+means are rounded to int8, and the index codes come from the reciprocal
+unit, which differs from the float quantiser in about four percent of the
+codes by one level, at rounding ties. On the tiny model the integer store
+selects the same blocks as the float store seven times in ten and the
+attention output tracks it at 0.95, with the residual stream at 0.995.
+
+Capacity and traffic for the 9B geometry at 128K context
+(`MemoryMap.report_markdown`):
+
+| Store | int16 state, int8 KV | int16 state, int4 KV | int8 state, int4 KV |
+| --- | ---: | ---: | ---: |
+| per context | 21.7 MB | 12.8 MB | 11.2 MB |
+| contexts in 1 GB (PSRAM board) | 49 | 83 | 95 |
+| contexts in 4 GB (LPDDR5X) | 197 | 335 | 382 |
+| traffic per token, three state layers | 6.3 MB | 6.3 MB | 3.1 MB |
+| traffic per token, global layer | 1.8 MB | 1.2 MB | 1.2 MB |
+
+Two things the map says about the simulator. The int16 state doubles the
+recurrent-state traffic the simulator's `recurrent_state_bytes` carries
+and makes it three quarters of the die's memory traffic. And the
+simulator's retrieval term fetches `top_blocks x retrieval_block_size`
+positions, 512 records per token, where the model attends over one mean
+record per block, 32: the simulator's global-layer traffic is about 2.5
+times what this memory side moves, so the memory-bound sweeps in
+`sim/README.md` are pessimistic on the global side and optimistic on the
+recurrent side until `recurrent_state_bytes` and the selected-position
+count follow this map.
+
+Not here: the sequencer that orders the units across a token (state DMA
+per head interleaved with the fabric passes, the append and scan while
+the attention waits), the memory controller and PHY for the chosen
+device, error detection on the stored state, and context allocation and
+eviction, which the FPGA owns.
+
 ## RTL
 
 `rtl/fabric_tile.sv` is the synthesizable tile with the ROM as a constant
@@ -635,6 +722,15 @@ units are written for function, not for the tile's no-carry-chain
 discipline: the norm's sum of squares and the state engine's accumulators
 are plain adders.
 
+`rtl/fabric_memory.sv` holds the memory side: the behavioural
+`fabric_mem_model` for the testbenches, `fabric_mem_arbiter`,
+`fabric_row_dma`, `fabric_topk`, `fabric_index_scan`,
+`fabric_record_reader` and `fabric_kv_append`, with the testbenches
+`tb_topk`, `tb_index_scan`, `tb_kv_append`, `tb_record_reader` and
+`tb_row_dma` checking memory images and outputs against `fabric.memory`
+bit for bit, at int8 and int4 KV and with the 128-wide index and the
+128 x 128 state.
+
 ## What is next
 
 1. Detailed routing and a multi-corner pass of the OpenROAD flow above, a
@@ -652,8 +748,9 @@ are plain adders.
    equal, and the FFN-down pass reads the wider FFN vector.
 5. A multi-token variant of the column datapath for chunked prefill, which
    amortizes the ROM read across a chunk of tokens from one context.
-6. Done: the vector datapath between the passes, above. Open behind it:
-   the memory side of a layer (state and conv history per context, the
-   window and block store, the index scan), the pass sequencer that runs
-   the tiles and the units in order, stochastic rounding for the state if
-   int8 storage has to come back, and synthesis of the units for area.
+6. Done: the vector datapath between the passes and the memory side,
+   above. Open behind them: the token sequencer that runs the tiles, the
+   units and the DMAs in order, the memory controller for the chosen
+   device, stochastic rounding for the state if int8 storage has to come
+   back, the simulator's traffic terms brought in line with the map, and
+   synthesis of the units for area.
