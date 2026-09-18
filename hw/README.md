@@ -83,15 +83,16 @@ is the energy of a fixed-weight multiply-accumulate in the column datapath,
 (`fabric/results/pnr_asap7_signoff.json`), which derates to about 1 pJ for
 real activity and projects to 2 to 4 pJ on a 28 nm-class node; the model
 carries 3 pJ. Each layer ASIC does 866M MACs per token (9B geometry), each
-head ASIC 508M, and the layer ASICs also move about 4.2 MB per token of
-index and KV traffic at roughly 40 pJ per byte. The other parts keep fixed
+head ASIC 508M, and the layer ASICs also move about 7.35 MB per token
+through their memory at roughly 40 pJ per byte: three 1 MB recurrent-state
+read-and-write pairs and the global layer's index scan and selected KV. The other parts keep fixed
 budgets (1 W per LPDDR5X, 25 W FPGA, 5 W BMC, 12 W per fan).
 
-At the simulator's 14.5K tokens/s ceiling that is 43 W per layer ASIC and
-517 W of load, 608 W of 12 V input at 85 percent regulator efficiency.
-`board.md` tabulates the same at 5K, 25K and 50K tokens/s: the board runs
-from about 330 W to 1.66 kW of input across the throughput range, and a
-layer ASIC's core rail goes from 21 A to 177 A at 0.8 V. The supply is
+At the simulator's corrected 8.2K tokens/s design point that is 27 W per
+layer ASIC and 366 W of load, 431 W of 12 V input at 85 percent regulator
+efficiency. `board.md` tabulates the same at 5K, 25K and 50K tokens/s: the
+board runs from about 330 W to 1.72 kW of input across the throughput range,
+and a layer ASIC's core rail goes from 22 A to 184 A at 0.8 V. The supply is
 therefore two 2000 W CRPS modules in a 1+1 redundant pair, one of which
 carries the whole load, and each ASIC needs a multiphase core regulator.
 A 7 nm-class die at about 1 pJ per MAC would put the whole range back under
@@ -153,11 +154,10 @@ rules live in the `package_selection` block of `board.yaml`:
 The package is rated at the 50K tokens/s target, where the core rail draws
 177 A: 354 core balls, 354 ground balls, 54 signal returns, 216 signals and
 34 rail balls, 1012 in all. That selects a 1225-ball 35 × 35 array at
-0.8 mm in a 29 mm body. The 784-ball 23 mm package of the card draft is
-enough at the 14.5K design point (520 balls) and is what the card form
-factor still uses; 400 balls never are. The rating is a decision: it fixes
-the package before the die exists, and the 1U was retargeted partly so the
-larger package fits.
+0.8 mm in a 29 mm body. The rating is what matters here, not the design
+point: at the corrected 8.2K the same rules ask only for a 784-ball
+package. The rating is a decision, and it fixes the package before the die
+exists; the 1U was retargeted partly so the larger package fits.
 
 The KiCad generator builds every ASIC footprint from this map, so the ball
 pitch, the escape geometry, the via-in-pad counts and the ring's lane pitch
@@ -243,54 +243,54 @@ Why a polygon and not the two-row snake of the earlier drafts:
   of the board is free apart from the PSU bay, so a shorter chassis is
   possible.
 
-## The high-end variant: four layer ASICs and one head, HBM in the package
+## The high-end variant: eight layer ASICs and two heads, HBM in the package
 
 `board_27b.yaml` describes the 27B-class appliance on a 2 nm-class die
-(`sim/config/qwen35_27b_2nm_hbm.json`): four layer ASICs of sixteen layers
-each (5.71B coefficients, about 152 mm² of fabric), one head ASIC holding
-the whole LM head at 42 percent of the same die, and an HBM4 stack on each
-layer ASIC's interposer, so there is no memory on the board. The same
-tools take it as a source (`--source hw/board_27b.yaml`) and write
+(`sim/config/qwen35_27b_2nm_hbm.json`): eight layer ASICs of eight layers
+each (2.86B coefficients, about 76 mm² of fabric), two head ASICs splitting
+the LM head by vocabulary at 22 percent of the same die, and an HBM4 stack
+on each layer ASIC's interposer, so there is no memory on the board. The
+same tools take it as a source (`--source hw/board_27b.yaml`) and write
 `board_27b.md`, `board_27b.svg`, `pinout_27b/` and `kicad_27b/`:
 
-* five via personalisations per model instead of ten, and one product
-  family with the 9B if that moves to the same eight-layer die;
-* at the rating of 234K tokens/s (the fabric ceiling) the board draws
-  2.3 kW of load, 2.7 kW of input from a 1+1 pair of 3000 W CRPS modules,
-  and 525 W per layer die; at the 50K target it is a quarter of that;
-* the package is a 55 × 55 array at 1.0 mm (3,025 balls, 2,778 needed):
-  656 A on the core rail at the rating, 1,312 core balls, no memory balls,
+* ten via personalisations per model, the same as the 9B board, and one
+  product family with the 9B if that moves from four layers per die to the
+  same eight;
+* at the rating of 153K tokens/s the board draws 1.8 kW of load, 2.1 kW of
+  input from a 1+1 pair of 3000 W CRPS modules, and about 200 W per layer
+  package (153 W of die, 10 W static, 36 W of HBM4 traffic); at the 50K
+  target it is 714 W of load, 840 W of input and 72 W per package;
+* the package is a 35 × 35 array at 0.8 mm (1,225 balls, 1,150 needed):
+  249 A on the core rail at the rating, 498 core balls, no memory balls,
   the north edge free for the HBM PHY towards the stack;
-* the ring is a regular hexagon of 85 mm side with 10 mm between the
-  packages for the cold plates; every hop is under 65 mm with bends of
-  30 to 42 degrees, and pcbnew DRC reports only the unrouted nets;
+* the ring is a regular 11-gon of 51 mm side, 91 mm circumradius, with
+  22 mm between the packages for the cold plates; every hop is 16 to 32 mm
+  with bends of 16 to 20 degrees, and pcbnew DRC reports only the unrouted
+  nets;
 * the regulators follow the power tree: one block per shared rail (I/O,
-  HBM core, HBM I/O) in the middle of the hexagon, the FPGA's rails on one
+  HBM core, HBM I/O) in the middle of the polygon, the FPGA's rails on one
   block, DDR4 rails and 3.3 V beside the DDR4 row.
 
-Cooling is direct-to-chip liquid. 525 W over a 55 mm package is about
-175 W/cm² at the lid and 250 to 300 W/cm² at the die, which a lidless
-microchannel cold plate handles with about 25 K of rise at 1 to 2 l/min
-per plate; through a lid and a conventional cold plate the junction lands
-near 95 °C, which is marginal. The board therefore assumes bare-die cold
-plates, a rear quick-disconnect pair, coolant flow and leak sensing on the
-BMC, and fans only for the regulators, DDR4 and FPGA. The 12 V input at
-2.7 kW is 225 A across the board, and the per-die core rail at 656 A wants
-the multiphase regulator on the package substrate or backside power
-delivery on the die; the 26 mm regulator block on the board is a
-placeholder for that decision, not a design.
+Cooling is direct-to-chip liquid, but eight layer dies rather than four
+make it an ordinary problem: 200 W over a 29 mm package is about 24 W/cm²
+at the lid and roughly 150 W/cm² at the die, which a microchannel cold
+plate handles with a few kelvin of rise at 1 l/min per plate. The board
+still assumes bare-die cold plates, a rear quick-disconnect pair, coolant
+flow and leak sensing on the BMC, and fans only for the regulators, DDR4
+and FPGA, because the 12 V input at 2.1 kW is 175 A across the board and
+the dies sit shoulder to shoulder on the polygon. The per-die core rail at
+249 A is what an ordinary multiphase point-of-load delivers to a plane; it
+was the four-die arrangement, at 650 A, that wanted the regulator on the
+package substrate or backside power delivery on the die.
 
-## Open item: the 27B board's rating needs revisiting
-
-`board_27b.yaml` is rated at 234,000 tokens/s, which came from the simulator
-before its memory model counted recurrent-state traffic and before the stages
-of a die shared one memory interface. The corrected figure for that board,
-four layer dies of sixteen layers with one HBM4 stack each, is 78,000
-tokens/s: the twelve recurrent states per die saturate the stack. Eight dies
-of eight layers reach 158,000 for the same silicon and twice the masks. Until
-that choice is made the package selection, the power table and the cooling
-budget in this file all follow a rating that is too high by about three
-times, so read them as an upper bound.
+This is a re-rating. The board was four layer dies of sixteen layers and
+one head die at 234K tokens/s, which came from the simulator before its
+memory model counted recurrent-state traffic and before the stages of a die
+shared one memory interface. Corrected, that arrangement runs at 77K: the
+twelve recurrent states per die saturate the stack, and dies, not tiles,
+are what buys throughput. Eight dies of eight layers reach 153K for the
+same silicon and twice the via personalisations, ten rather than five, and
+take the package down two sizes with them.
 
 ## Open items before schematic entry in an EDA tool
 

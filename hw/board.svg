@@ -106,6 +106,6 @@
 <rect x="542" y="390" width="96" height="60" rx="6" fill="#eee" stroke="#333"/>
 <text x="590" y="414" text-anchor="middle" font-weight="bold">U_CLK</text>
 <text x="590" y="432" text-anchor="middle" font-size="10">shared regulators</text>
-<text x="20" y="860" fill="#333">Blue: activation ring, 36-signal source-synchronous link per hop, clockwise on a regular 11-gon from the FPGA at the rear. Green: LPDDR5X x32 channels. Power budget 517 W load / 608 W input.</text>
+<text x="20" y="860" fill="#333">Blue: activation ring, 36-signal source-synchronous link per hop, clockwise on a regular 11-gon from the FPGA at the rear. Green: LPDDR5X x32 channels. Power budget 366 W load / 431 W input.</text>
 <text x="20" y="880" fill="#333">Management SPI, JTAG chain, and reference clock fan out from U_FPGA / U_CLK to all ten ASICs (not drawn); the BMC, PSUs and fans are off the ring.</text>
 </svg>

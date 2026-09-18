@@ -101,15 +101,17 @@ class KicadGeneratorTest(unittest.TestCase):
         mx, my = mem.extent()
         self.assertTrue(abs(asic.x - mem.x) < (ax + mx) / 2 and abs(asic.y - mem.y) < (ay + my) / 2)
 
-    def test_27b_variant_is_a_hexagon_of_hbm_packages_without_board_memory(self) -> None:
+    def test_27b_variant_is_an_11_gon_of_hbm_packages_without_board_memory(self) -> None:
         board = Board.load(Path(__file__).resolve().parents[1] / "board_27b.yaml")
         self.assertEqual(board.check(), [])
         design = kg.build_design(board)
         lay = design.layout
-        self.assertEqual(len(lay.nodes), 6)
-        self.assertEqual(design.pinout.package.name, "FCBGA3025_55x55_P1.0")
+        # Eight layer dies and two head dies put the high-end variant on the same
+        # 11-gon as the 9B board, in a package two sizes smaller than four dies needed.
+        self.assertEqual(len(lay.nodes), 11)
+        self.assertEqual(design.pinout.package.name, "FCBGA1225_35x35_P0.8")
         self.assertEqual([p.ref for p in design.parts if p.part_class == "lpddr5x"], [])
-        self.assertEqual(len([p for p in design.parts if p.part_class == "head_asic"]), 1)
+        self.assertEqual(len([p for p in design.parts if p.part_class == "head_asic"]), 2)
         self.assertTrue(all(hi <= kg.MAX_LINK_MM for _, hi in design.hop_lengths.values()), design.hop_lengths)
         self.assertLessEqual(max(design.hop_bends.values()), kg.MAX_BEND_DEG)
         # Every shared rail of the power tree has a regulator and no ASIC rail is left without a source.

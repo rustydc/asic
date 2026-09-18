@@ -16,7 +16,7 @@ board:
     # tokens/s row of the power table with margin for the fans and the BMC.
     - {name: CRPS 12 V, 1+1 redundant pair (two 2000 W modules), watts: 2000}
   # The chassis follows from the energy model below: at 3 pJ per MAC the
-  # board draws 0.5 to 1.6 kW of input across the throughput range, which is
+  # board draws 0.33 to 1.7 kW of input across the throughput range, which is
   # a rack power supply, not a slot.  A 7 nm-class die at ~1 pJ/MAC would
   # bring the whole range under 600 W and make a PCIe card viable again.
 
@@ -24,13 +24,15 @@ board:
 # token; the per-MAC energy is the one number measured so far (0.39 pJ on
 # ASAP7 at default activity, fabric/results/pnr_asap7_signoff.json), derated
 # for real activity and projected to a 28 nm-class node.  The design point
-# is the simulator's global-stage ceiling (sim/README.md).
+# is what the simulator measures for this board (sim/README.md), which is
+# bound by the one memory interface per die: three recurrent states plus the
+# global layer's retrieval, 7.35 MB per die per token.
 power_model:
   mac_energy_pj: 3.0
-  design_tokens_per_second: 14500
+  design_tokens_per_second: 8200
   memory_energy_pj_per_byte: 40.0
-  memory_bytes_per_token_per_asic: 4200000   # index scan + selected KV at 128K, int8, 4:1
-  report_tokens_per_second: [5000, 14500, 25000, 50000]
+  memory_bytes_per_token_per_asic: 7350000   # three recurrent states (1 MB each) plus the global layer's index scan and selected KV at 128K, int8, 4:1
+  report_tokens_per_second: [5000, 8200, 25000, 50000]
 
 # ASIC package and ball map.  `python -m hw.pinout` derives them from the
 # interface list, the power model and these rules: the core rail needs one
@@ -287,7 +289,7 @@ power_tree:
   input_bus: 12 V from two CRPS modules, 1+1 redundant, PMBus to the BMC
   regulator_efficiency: 0.85
   rails:
-    VDD_CORE:    {volts: 0.80, per: [layer_asic, head_asic], note: one multiphase PoL buck per ASIC, PMBus; ~50 A each at the design point, ~170 A at 50K tokens/s (from power_model)}
+    VDD_CORE:    {volts: 0.80, per: [layer_asic, head_asic], note: one multiphase PoL buck per ASIC, PMBus; ~33 A each at the design point, ~184 A at 50K tokens/s (from power_model)}
     VDD_PLL_0V9: {volts: 0.90, per: [layer_asic, head_asic], note: LDO from 1.8 V, one per ASIC}
     VDD_IO_1V8:  {volts: 1.80, shared: true, note: ASIC IO, link IO, clock gen}
     VDD2H_1V05:  {volts: 1.05, shared: true, note: LPDDR5X VDD2H and ASIC PHY}

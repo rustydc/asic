@@ -28,6 +28,15 @@ class ApplianceConfig:
     warmup_tokens_per_context: int = 1
     recurrent_cycles: int = 3_500
     recurrent_weight_scale: float = 1.0
+    # Longest single fabric pass of a layer's cascade, in cycles.  A layer is a
+    # chain of passes (projections, mixer, output, FFN) and each pass has its own
+    # via-programmed tiles: nothing is reused between them, so a pass is free the
+    # moment its token leaves it and the layer admits the next token one pass
+    # later, not one layer later.  Zero keeps the old behaviour, where a layer
+    # admitted a token only once per layer latency.  Passes are taken as equal
+    # here; an unbalanced cascade (the FFN-down pass reads the wider FFN vector)
+    # raises this number without changing the latency.
+    layer_pass_cycles: int = 0
     global_index_compute_cycles: int = 10_000
     global_topk_cycles: int = 500
     global_attention_cycles: int = 2_500
@@ -130,6 +139,8 @@ class ApplianceConfig:
             raise ValueError(f"configuration fields must be positive: {', '.join(invalid)}")
         if self.recurrent_state_bytes < 0:
             raise ValueError("recurrent_state_bytes cannot be negative")
+        if self.layer_pass_cycles < 0:
+            raise ValueError("layer_pass_cycles cannot be negative")
         if (self.sampling_cycles < 0 or self.packet_overhead_bytes < 0
                 or self.warmup_tokens_per_context < 0 or self.num_head_asics < 0
                 or self.head_result_bytes < 0):
@@ -314,14 +325,19 @@ class Simulation:
         if not stage.is_global:
             cfg = self.config
             compute = math.ceil(cfg.recurrent_cycles * cfg.recurrent_weight_scale)
+            # One pass of the cascade, not the whole layer: consecutive tokens
+            # occupy different passes, so the pass sets the initiation interval.
+            pass_cycles = min(compute, math.ceil(cfg.layer_pass_cycles * cfg.recurrent_weight_scale)) \
+                if cfg.layer_pass_cycles else compute
             if not cfg.recurrent_state_bytes:
-                return compute, compute, 0
-            # Read the state, run the delta rule, write it back.  The memory is
-            # the shared resource, so it sets the initiation interval.
+                return compute, pass_cycles, 0
+            # Read the state, run the delta rule, write it back.  The state is
+            # read by the first pass and written by the last, so two transfers
+            # must fit in the interval as well.
             bandwidth = cfg.memory_bytes_per_cycle * cfg.memory_efficiency
             transfer = math.ceil(cfg.recurrent_state_bytes / bandwidth)
             latency = transfer + compute + transfer
-            return latency, max(compute, 2 * transfer), 2 * cfg.recurrent_state_bytes
+            return latency, max(pass_cycles, 2 * transfer), 2 * cfg.recurrent_state_bytes
         cfg = self.config
         index_bytes, kv_bytes, append_bytes = self._global_memory_components(item)
         bandwidth = cfg.memory_bytes_per_cycle * cfg.memory_efficiency
@@ -425,20 +441,22 @@ class Simulation:
             if not stage.queue:
                 stage.counters.input_starved_cycles += 1
                 continue
-            max_inflight = self.config.global_max_inflight if stage.is_global else 1
+            item = stage.queue[0]
+            service_cycles, initiation_interval, memory_bytes = self._timing(stage, item)
+            # A stage holds as many tokens as fit between its latency and its
+            # initiation interval: one per pass of a pipelined layer cascade.
+            max_inflight = (self.config.global_max_inflight if stage.is_global
+                            else math.ceil(service_cycles / initiation_interval))
             if len(stage.active) + len(stage.finished) >= max_inflight:
                 continue
-            item = stage.queue.popleft()
-            service_cycles, initiation_interval, memory_bytes = self._timing(stage, item)
             if stage.last_start_cycle >= 0 and self.cycle - stage.last_start_cycle < initiation_interval:
-                stage.queue.appendleft(item)
                 continue
             asic = None
             if memory_bytes and not stage.is_head:
                 asic = stage.stage_id // self.config.layers_per_asic
                 if self.memory_busy_until[asic] > self.cycle:
-                    stage.queue.appendleft(item)
                     continue
+            stage.queue.popleft()
             stage.active.append(InFlight(item, service_cycles))
             stage.last_start_cycle = self.cycle
             stage.counters.accepted += 1

@@ -1,8 +1,11 @@
 # Appliance board, high-end variant: block-level schematic capture.
 #
-# The 27B-class geometry on a 2 nm-class die: four layer ASICs of sixteen
-# layers each and one head ASIC holding the whole LM head, each layer ASIC
-# with an HBM4 stack in its package, direct-to-chip liquid cooling.  Same
+# The 27B-class geometry on a 2 nm-class die: eight layer ASICs of eight
+# layers each and two head ASICs splitting the LM head by vocabulary, each
+# layer ASIC with an HBM4 stack in its package, direct-to-chip liquid
+# cooling.  Eight layer dies rather than four because the corrected memory
+# model (sim/README.md) makes throughput scale with memory ports: the same
+# silicon on half the dies runs at half the speed.  Same
 # schema as board.yaml; `python -m hw.board --source hw/board_27b.yaml`
 # checks it, `python -m hw.pinout --source ...` and `python -m hw.kicad_gen
 # --source ...` derive the package and the KiCad project.  Every electrical
@@ -10,28 +13,29 @@
 
 board:
   name: asic-llm-appliance-27b-a0
-  form_factor: 1U rack chassis, one 420 x 360 mm board, host-attached over a PCIe cable, direct-to-chip liquid cooling with a rear manifold, redundant CRPS; the activation ring is a regular 6-gon
+  form_factor: 1U rack chassis, one 420 x 360 mm board, host-attached over a PCIe cable, direct-to-chip liquid cooling with a rear manifold, redundant CRPS; the activation ring is a regular 11-gon
   form_factor_key: 1u
-  ring_gap_mm: 30            # neighbour spacing beyond the 55 mm package: 10 mm between bodies for the cold plates (17 mm on the 11-gon of 29 mm packages)
+  ring_gap_mm: 22            # neighbour spacing beyond the package: room between bodies for the cold plates (17 mm on the 9B board's 11-gon of 29 mm packages)
   host_interface: PCIe Gen4 x8 over a SlimSAS 8i cable to a host adapter card
-  cooling: one cold plate per layer ASIC and the head ASIC (about 525 W each at the rating, 235 W/cm2 over the package), facility water through a rear quick-disconnect pair; fans only for the regulators, DDR4 and the FPGA
+  cooling: one cold plate per layer ASIC and per head ASIC (about 200 W per layer package at the rating, die plus HBM4 stack, 24 W/cm2 over the 29 mm package and roughly 150 W/cm2 at the die), facility water through a rear quick-disconnect pair; fans only for the regulators, DDR4 and the FPGA
   power_input:
     - {name: CRPS 12 V, 1+1 redundant pair (two 3000 W modules), watts: 3000}
 
 # Energy model: the 2 nm-class die at 0.35 pJ per MAC (0.39 pJ measured on
 # ASAP7 at default activity, derated and scaled two nodes), HBM4 at 25 pJ
-# per byte.  The design point is the simulator's fabric ceiling for this
-# geometry (sim/config/qwen35_27b_2nm_hbm.json); the 50K row is the product
-# target, where the same board draws a quarter of the power.
+# per byte.  The design point is what the simulator measures for this
+# geometry (sim/config/qwen35_27b_2nm_hbm.json), which is memory-bound at
+# 1.44 of the stack's 2 TB/s rather than fabric-bound; the 50K row is the
+# product target, where the same board draws 40 percent of the power.
 power_model:
   mac_energy_pj: 0.35
-  design_tokens_per_second: 234000
+  design_tokens_per_second: 153000
   memory_energy_pj_per_byte: 25.0
-  memory_bytes_per_token_per_asic: 8000000    # four global layers per die: index scan + selected KV at 128K, int4, 16:1
-  report_tokens_per_second: [50000, 117000, 234000]
+  memory_bytes_per_token_per_asic: 9440000    # six recurrent states (1 MB each) plus two global layers (index scan + selected KV at 128K, int4, 16:1)
+  report_tokens_per_second: [50000, 100000, 153000]
 
 package_selection:
-  rated_tokens_per_second: 234000
+  rated_tokens_per_second: 153000
   amps_per_ball: 0.5
   signals_per_ground: 4
   signal_rows: 3
@@ -45,11 +49,11 @@ package_selection:
 
 part_classes:
   layer_asic:
-    description: fixed-weight 16-layer shard die (four R,R,R,G groups, 5.71B coefficients) with one HBM4 stack on a 2.5D interposer
-    package: FCBGA with HBM4 on the interposer, derived by hw/pinout.py from package_selection (55x55 at 1.0 mm at the rating)
+    description: fixed-weight 8-layer shard die (two R,R,R,G groups, 2.86B coefficients) with one HBM4 stack on a 2.5D interposer
+    package: FCBGA with HBM4 on the interposer, derived by hw/pinout.py from package_selection
     rails: [VDD_CORE, VDD_IO_1V8, VDD_PLL_0V9, VDD_HBM_1V1, VDDQ_HBM_0V4]
     static_w: 10
-    macs_per_token: 5712000000
+    macs_per_token: 2856000000
     memory_traffic: true
     interfaces:
       link_in: {kind: link}
@@ -59,11 +63,11 @@ part_classes:
       refclk: {kind: refclk}
       mode: {kind: strap, value: LAYER}
   head_asic:
-    description: same die, head-mode personalization holding the whole 248K-row LM head (1.27B coefficients, 42 percent of the tiles); no HBM
+    description: same die, head-mode personalization holding half the 248K-row LM head each (636M coefficients, 22 percent of the tiles); no HBM
     package: same package and ball map as layer_asic (HBM rails unconnected)
     rails: [VDD_CORE, VDD_IO_1V8, VDD_PLL_0V9]
     static_w: 5
-    macs_per_token: 1272000000
+    macs_per_token: 636000000
     interfaces:
       link_in: {kind: link}
       link_out: {kind: link}
@@ -125,11 +129,16 @@ part_classes:
 
 components:
   U_FPGA: {class: fpga, place: ring vertex 0, rear, beside the host connector}
-  U_A0: {class: layer_asic, layers: "0-15",  place: ring vertex 1}
-  U_A1: {class: layer_asic, layers: "16-31", place: ring vertex 2}
-  U_A2: {class: layer_asic, layers: "32-47", place: ring vertex 3}
-  U_A3: {class: layer_asic, layers: "48-63", place: ring vertex 4}
-  U_H0: {class: head_asic, vocab_rows: "0-248319", place: ring vertex 5}
+  U_A0: {class: layer_asic, layers: "0-7",   place: ring vertex 1}
+  U_A1: {class: layer_asic, layers: "8-15",  place: ring vertex 2}
+  U_A2: {class: layer_asic, layers: "16-23", place: ring vertex 3}
+  U_A3: {class: layer_asic, layers: "24-31", place: ring vertex 4}
+  U_A4: {class: layer_asic, layers: "32-39", place: ring vertex 5}
+  U_A5: {class: layer_asic, layers: "40-47", place: ring vertex 6}
+  U_A6: {class: layer_asic, layers: "48-55", place: ring vertex 7}
+  U_A7: {class: layer_asic, layers: "56-63", place: ring vertex 8}
+  U_H0: {class: head_asic, vocab_rows: "0-124159",      place: ring vertex 9}
+  U_H1: {class: head_asic, vocab_rows: "124160-248319", place: ring vertex 10}
   U_D0: {class: ddr4}
   U_D1: {class: ddr4}
   U_D2: {class: ddr4}
@@ -148,9 +157,9 @@ components:
   J_FAN4: {class: fan_header}
   J_FAN5: {class: fan_header}
 
-# The six ring nodes sit on the vertices of a regular hexagon in this order,
-# clockwise from the FPGA at the rear.  The HBM is in the package, so there
-# are no memory channels on the board.
+# The eleven ring nodes sit on the vertices of a regular 11-gon in this
+# order, clockwise from the FPGA at the rear.  The HBM is in the package, so
+# there are no memory channels on the board.
 nets:
   ring:
     kind: link
@@ -159,8 +168,13 @@ nets:
       - [U_A0.link_out, U_A1.link_in]
       - [U_A1.link_out, U_A2.link_in]
       - [U_A2.link_out, U_A3.link_in]
-      - [U_A3.link_out, U_H0.link_in]
-      - [U_H0.link_out, U_FPGA.link_in]
+      - [U_A3.link_out, U_A4.link_in]
+      - [U_A4.link_out, U_A5.link_in]
+      - [U_A5.link_out, U_A6.link_in]
+      - [U_A6.link_out, U_A7.link_in]
+      - [U_A7.link_out, U_H0.link_in]
+      - [U_H0.link_out, U_H1.link_in]
+      - [U_H1.link_out, U_FPGA.link_in]
   memory:
     kind: hbm4_in_package
     channels: []
@@ -174,18 +188,18 @@ nets:
   mgmt:
     kind: mgmt_spi
     master: U_FPGA.mgmt_master
-    slaves: [U_A0, U_A1, U_A2, U_A3, U_H0]
+    slaves: [U_A0, U_A1, U_A2, U_A3, U_A4, U_A5, U_A6, U_A7, U_H0, U_H1]
   jtag:
     kind: jtag
-    chain: [U_FPGA, U_A0, U_A1, U_A2, U_A3, U_H0]
+    chain: [U_FPGA, U_A0, U_A1, U_A2, U_A3, U_A4, U_A5, U_A6, U_A7, U_H0, U_H1]
   refclk:
     kind: refclk
     source: U_CLK
-    sinks: [U_FPGA, U_A0, U_A1, U_A2, U_A3, U_H0]
+    sinks: [U_FPGA, U_A0, U_A1, U_A2, U_A3, U_A4, U_A5, U_A6, U_A7, U_H0, U_H1]
 
 interface_kinds:
   link:
-    description: 32-bit source-synchronous DDR parallel link, 500 MHz clock (4 GB/s raw), ready/valid, CRC in packet; 1.3 GB/s used at 234K tokens/s with the 5 KB hidden vector
+    description: 32-bit source-synchronous DDR parallel link, 500 MHz clock (4 GB/s raw), ready/valid, CRC in packet; 0.8 GB/s used at 153K tokens/s with the 5 KB hidden vector
     signals: {data: 32, clock: 1, valid: 1, ready_back: 1, sof: 1}
     io_standard: 1.8 V LVCMOS series-terminated (placeholder; LVDS x8 at 4 Gb/s is the fallback)
     max_length_mm: 80
@@ -215,18 +229,19 @@ interface_kinds:
   uart:
     signals: {pins: 2}
 
-# Power tree: 12 V from the CRPS modules, then point-of-load regulators.  The
-# core rail is the problem: about 650 A per die at the rating, which wants
-# the multiphase regulator on the package substrate or backside power on
-# the die rather than a board plane.
+# Power tree: 12 V from the CRPS modules, then point-of-load regulators.
+# Eight layer dies rather than four halve the per-die core current to about
+# 200 A, which an ordinary multiphase point-of-load can still deliver to a
+# board plane; the 650 A of the four-die arrangement wanted the regulator on
+# the package substrate.
 power_tree:
   input_bus: 12 V from two CRPS modules, 1+1 redundant, PMBus to the BMC
   regulator_efficiency: 0.85
   rails:
-    VDD_CORE:     {volts: 0.80, per: [layer_asic, head_asic], note: multiphase PoL per ASIC, PMBus; ~650 A per layer die at the rating, ~140 A at 50K tokens/s}
+    VDD_CORE:     {volts: 0.80, per: [layer_asic, head_asic], note: multiphase PoL per ASIC, PMBus; ~200 A per layer die at the rating, ~65 A at 50K tokens/s}
     VDD_PLL_0V9:  {volts: 0.90, per: [layer_asic, head_asic], note: LDO from 1.8 V, one per ASIC}
     VDD_IO_1V8:   {volts: 1.80, shared: true, note: ASIC IO, link IO, clock gen}
-    VDD_HBM_1V1:  {volts: 1.10, shared: true, note: HBM4 core and PHY, one regulator feeding all four packages}
+    VDD_HBM_1V1:  {volts: 1.10, shared: true, note: HBM4 core and PHY, one regulator feeding all eight layer packages}
     VDDQ_HBM_0V4: {volts: 0.40, shared: true, note: HBM4 IO}
     VCCINT_0V85:  {volts: 0.85, per: [fpga]}
     VCCAUX_1V8:   {volts: 1.80, per: [fpga]}

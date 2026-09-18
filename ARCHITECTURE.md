@@ -249,22 +249,24 @@ must derive both figures from fixed-fabric, memory, link, and queue timing rathe
 than assume them.
 
 The transaction-level simulator with the Qwen3.5 head geometry, int8 KV, 4:1
-compression, 32 retrieved blocks, and 64 GB/s sustained bandwidth saturates the
-global stage at about 14.5K tokens/s for both presets at 128K context, with the
-recurrent stages under 10 percent busy. Half of the global memory interval is
-the index scan and half is the selected-KV transfer. Reaching the 25K-50K
-target needs some combination of int4 KV storage, 8:1 or 16:1 compression,
-fewer retrieved blocks, and 75-100 GB/s sustained bandwidth. Those are now the
-first parameters the software model must qualify.
+compression, 32 retrieved blocks, and 64 GB/s sustained bandwidth runs at about
+8.2K tokens/s for both presets at 128K context, and the limit is the one memory
+interface per die rather than any stage: the four stages on a die want 3 MB of
+recurrent Gated DeltaNet state plus 4.2 MB of retrieval every token, while the
+fabric passes stay under a quarter busy. Reaching the 25K-50K target needs some
+combination of int4 KV storage, 8:1 or 16:1 compression, fewer retrieved
+blocks, a cheaper recurrent state, more memory interfaces, and 75-100 GB/s
+sustained bandwidth. Those are now the first parameters the software model must
+qualify.
 
 Power follows throughput. The column datapath measures 0.39 pJ per
 multiply-accumulate on ASAP7 at default activity after detailed routing and
 extraction (`fabric/results/pnr_asap7_signoff.json`); derated for real
 activity and projected to a 28 nm-class node that is about 3 pJ, so a 9B
 token costs roughly 24 mJ of compute across the ten ASICs. The simulator and
-the board model both carry that figure: the 14.5K tokens/s baseline is about
-440 W of board load, 25K tokens/s about 700 W, and 50K tokens/s 1.3 kW, with a
-layer ASIC's core rail between 50 A and 180 A. A 7 nm-class process at about
+the board model both carry that figure: the 8.2K tokens/s design point is about
+370 W of board load, 25K tokens/s about 810 W, and 50K tokens/s 1.5 kW, with a
+layer ASIC's core rail between 33 A and 184 A. A 7 nm-class process at about
 1 pJ per MAC divides all of those by three. The choice of node is therefore
 as much a power-supply decision as an area one, and the on-die grid must be
 sized from measured current: the ASAP7 slice lost half its supply on the

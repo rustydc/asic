@@ -48,7 +48,9 @@ The sweep reports bytes/token, operation latency, initiation interval, and the
 global-stage throughput ceiling across index dimension, index precision,
 compression, KV element size, top-K, and bandwidth combinations. It is
 analytical and therefore much faster than running every point through the full
-pipeline.
+pipeline. It is also a global-stage analysis only: it does not count the
+recurrent-state traffic that shares the same memory interface, so its ceiling
+is an upper bound and the full simulation is the number to quote.
 
 ## Configurations
 
@@ -58,9 +60,11 @@ head-mode ASICs after the last layer chip. Fabric stage times come from the
 tile model in `fabric/` at two rows per cycle and 800 MHz: four passes of
 2048 cycles per 9B layer (`recurrent_cycles` 102 ticks) and one pass per head
 die (26 ticks); the 4B tile is 2560 deep, so 64 and 16 ticks. A layer is
-modeled as one stage whose initiation interval equals its latency; pass-level
-pipelining would cut the interval to one pass but the global stage is the
-bottleneck regardless. The 4B configuration
+modeled as one stage whose latency is the whole cascade but whose initiation
+interval is one pass (`layer_pass_cycles`, a quarter of the layer in every
+shipped geometry): the passes have separate via-programmed tiles, nothing is
+reused between them, so a pass is free as soon as its token leaves it and the
+layer holds one token per pass. The 4B configuration
 keeps every memory parameter identical and scales fabric cycles by the
 446M/865M per-shard parameter ratio. `activation_bytes` assumes int8 activations
 of the hidden width (4096 or 2560).
@@ -73,8 +77,7 @@ contexts), an 8 GB/s ring link, 1 pJ per MAC and 200 W of static power for
 the stacks and FPGA. `qwen35_9b_3nm_hbm.json` extrapolates to 2 GHz
 (41 ticks), 1.5 TB/s, 256 contexts, a 16 GB/s link and 0.5 pJ per MAC. The
 global index-scan compute placeholder scales with the clock and with the
-four times fewer compressed positions. Neither models pass-level
-pipelining, so a layer stage still admits one token per layer latency.
+four times fewer compressed positions.
 
 Each result also carries an energy model: `mac_energy_pj` times the MACs
 per token of every layer and head ASIC (`layer_macs_per_token`,
@@ -96,10 +99,11 @@ preserving the intended microsecond service times and bytes/second. This is a
 simulation time quantum rather than the proposed RTL clock and makes long
 pipeline sweeps fast.
 
-## Two corrections to every number below
+## Three corrections to every number below
 
-Until September 2026 the memory model was wrong in two ways that both
-flattered it, and the figures in this file are the corrected ones.
+Until September 2026 the stage model was wrong in three ways, two of which
+flattered it and one of which did not. The figures in this file are the
+corrected ones.
 
 * **Recurrent-state traffic was missing.** A Gated DeltaNet layer holds a
   512 KB state (32 value heads of 128 x 128, int8) and the delta rule is a
@@ -111,42 +115,66 @@ flattered it, and the figures in this file are the corrected ones.
 * **Every stage had its own memory port.** A die with four stages could pull
   four times its device bandwidth. There is one memory interface per ASIC, so
   a transfer now reserves it and the other stages of that die wait.
+* **A layer admitted one token per layer, not one per pass.** A layer is a
+  chain of passes and each pass has its own tiles: nothing is reused, so the
+  first pass is free the moment its token moves on. A stage now holds as many
+  tokens as fit between its latency and its interval, which also lets a
+  token's state write overlap the next token's state read. `layer_pass_cycles`
+  carries the pass.
 
-Together they cut the 9B design point from 14.5K to 8.3K tokens/s at int8 KV,
+The first two cut the 9B design point from 14.5K to 8.2K tokens/s at int8 KV,
 and they make the number of dies matter, which it did not before: memory ports
 scale with dies, so splitting the same model over more of them buys
-throughput. The 27B on 2 nm goes from 78K tokens/s on four layer dies to 158K
-on eight, for the same silicon and twice the masks.
+throughput. The 27B on 2 nm runs at 77K tokens/s on four layer dies and 153K
+on eight, for the same silicon and twice the masks — which is why the board in
+`hw/board_27b.yaml` is now eight layer dies and two head dies.
+
+The third correction was the one I expected to be worth four times, and it is
+worth almost nothing, because after the first two the memory is the wall and
+not the pass rate. It is exactly neutral on every LPDDR5X and PSRAM
+configuration, worth 4 to 8 percent on the 9B with HBM (the 3 nm 9B goes from
+234K to 244K), and slightly negative on the 27B, where holding more tokens per
+stage lengthens latency against a fixed pool of resident contexts. Take the
+memory away — the same 27B configuration with ten times the bandwidth — and it
+is worth 2.5 times, 240K to 597K tokens/s, with the global phases and the head
+dies as the next wall. That is the honest size of the pass-rate lever: it is
+real, and nothing in reach of this design is close enough to the fabric
+ceiling to collect it.
 
 ## Current finding
 
 With int8 KV at 4:1 compression, 32 retrieved blocks, and 64 GB/s sustained
-bandwidth, both geometries saturate the global stage at about 8.3K tokens/s
-with a 128K context, below the 25K to 50K target. The recurrent stages sit at
-15 percent (9B) or 10 percent (4B) utilization, the head stages under 5
-percent, and the ring links under 4 percent. The global memory interval is
-half index scan and half selected-KV transfer. The sweep shows int4 KV plus
-8:1 compression recovers 30K tokens/s at 75 GB/s and 40K at 100 GB/s; 16:1
-compression with int4 KV reaches the 50K ceiling at 100 GB/s.
+bandwidth, both geometries run at about 8.2K tokens/s with a 128K context,
+below the 25K to 50K target, and the limit is the one memory interface per
+die: the four stages on a die want 3 MB of recurrent state plus 4.34 MB of
+retrieval every token, and that 7.34 MB at 8.2K tokens/s is 60.3 GB/s of the
+63.75 the interface sustains — 95 percent. Nothing else is close. The
+recurrent stages are 23 percent busy, the head stages 2 percent and the ring
+links 2; the global stages read 62 percent, and that is mostly their own
+memory phases. Raising the resident contexts from 32 to 256 buys 5 percent.
+The sweep shows int4 KV plus 8:1 compression recovers 30K tokens/s at
+75 GB/s and 40K at 100 GB/s for the retrieval half of that traffic; the
+state half moves only with a cheaper state or more interfaces.
 
 Power scales with that throughput, not with the fabric clock. At 3 pJ per
-MAC the 9B token costs 24 mJ of compute and about 1.3 mJ of memory traffic,
-so the 14.5K tokens/s baseline is 346 W of compute, 20 W of memory and
-436 W for the board, 38 W of it in each layer ASIC; the sweep points that
-reach 40K tokens/s cost about 1.06 kW. The energy per MAC, which the
-process sets, is the lever: at 1 pJ the same points are 150 W and 400 W.
+MAC the 9B token costs 24 mJ of compute and about 2.3 mJ of memory traffic,
+so the 8.2K tokens/s design point is 196 W of compute, 19 W of memory and
+285 W for the board, 21 W of it in each layer ASIC. The energy per MAC,
+which the process sets, is the lever: at 1 pJ the same point is 65 W of
+compute and 154 W for the board.
 
-With HBM the wall moves to the fabric. The 7 nm-class configuration
-reaches 169K tokens/s at 230 µs mean latency with every layer stage at
-99 percent, the global memory phases short, the links at 12 percent and
-the head stages at 25 percent; the 3 nm-class one reaches 236K tokens/s
-at 165 µs. The limiter in both is the un-pipelined pass rate, one token
-per 8192 fabric cycles per stage, so pass-level pipelining (item 4 in the
-fabric README) is worth up to four times more, and the 128 or 256
-contexts are not yet binding. Power is the other wall: 1.6 kW for the
-board at 7 nm (147 W per layer ASIC, 7.9 mJ per token) and 1.2 kW at 3 nm
-(102 W per layer ASIC, 4.0 mJ per token), so both are liquid-cooled boxes
-rather than cards.
+With HBM the fabric and the memory arrive at the wall together. The
+7 nm-class configuration reaches 164K tokens/s at 424 µs mean latency, the
+3 nm-class one 244K at 277 µs and the 2 nm-class one 315K at 216 µs. In all
+three the layer and global stages are 96 to 98 percent busy *and* the stack
+is at 776, 1152 and 1486 GB/s, which is about 90 percent of what the
+0.85 efficiency allows; the head stages sit at 25 percent and the links
+under 10. So neither doubling the stack nor pipelining the passes moves
+these much on its own — 4.7 MB per die per token is the number to attack,
+and three quarters of it is recurrent state. Power is the other wall:
+1.7 kW for the board at 7 nm (142 W per layer ASIC, 7.9 mJ per token),
+1.4 kW at 3 nm (106 W, 4.0 mJ) and 1.4 kW at 2 nm (95 W, 2.8 mJ), so all
+three are liquid-cooled boxes rather than cards.
 
 ## Sixteen PSRAM devices instead of a DRAM PHY
 
@@ -160,24 +188,26 @@ or design.
 
 | Devices per ASIC | Bandwidth | Tokens/s | Latency | Board |
 | ---: | ---: | ---: | ---: | ---: |
-| 4 | 4 GB/s | 642 | 36 ms | 87 W |
-| 8 | 8 | 1,283 | 18 ms | 103 W |
-| 16 | 16 | 2,564 | 9.2 ms | 136 W |
-| 24 | 24 | 3,842 | 6.1 ms | 169 W |
-| 32 | 32 | 5,076 | 4.7 ms | 201 W |
+| 4 | 4 GB/s | 631 | 40 ms | 86 W |
+| 8 | 8 | 1,262 | 21 ms | 102 W |
+| 16 | 16 | 2,506 | 10.3 ms | 134 W |
+| 24 | 24 | 3,778 | 6.9 ms | 167 W |
+| 32 | 32 | 4,984 | 5.2 ms | 198 W |
 
 Throughput is linear in device count, because the memory interface is the
 only thing binding: at sixteen devices the recurrent stages sit at 24 percent
-and the global stages at 34 percent, so three quarters of the fabric is idle.
+and the global stages at 34 percent, so three quarters of the fabric is idle
+and pipelining its passes changes the throughput by nothing at all.
 Two LPDDR5X-9600 x32 give 77 GB/s, so sixteen PSRAMs are about a fifth of the
 LPDDR board and matching it would take seventy-odd devices, which is not a
 board. Cheaper state and shorter contexts recover some of it: int4 state and
-8 retrieved blocks at a 32K context reach 5.1K tokens/s on the same sixteen
-devices.
+8 retrieved blocks at a 32K context reach 5.0K tokens/s on the same sixteen
+devices, which is what thirty-two devices buy at int8.
 
 So the trade is real but it is not a wash. A PSRAM wall buys the removal of
 the single largest IP and analog risk in the design, and costs roughly five
-times the throughput per board. It also says a PSRAM-based die should hold
+times the throughput per board: the same 9B on two LPDDR5X-9600 per die, with
+the same int4 KV at 16:1, runs at 12.4K tokens/s against 2.5K. It also says a PSRAM-based die should hold
 more layers than an LPDDR one, since its fabric is mostly idle.
 
 ## The high end: a 27B-class model on a 2 nm-class die with HBM
@@ -186,41 +216,44 @@ more layers than an LPDDR one, since its fabric is mostly idle.
 hybrid geometry (`qwen3_5_27b` preset: hidden 5120, 64 layers, FFN 17408,
 22.9B body coefficients; the Qwen3.5-27B shapes stand in until a released
 27B checkpoint fixes them) on a 2 nm-class die with one HBM4 stack per
-layer ASIC: four layer ASICs of sixteen layers, four `R,R,R,G` groups
-each, so `global_every` is 4 (the default global layer per ASIC would
-quarter the retrieval traffic), and one head ASIC holding the whole LM
-head. The die is sized by the fabric mapping at a tenth of the 28 nm-class
-density placeholder: 5.71B coefficients in 18,664 tiles is about 152 mm²
-of fabric per layer die, and the head fills 42 percent of the same die
-(227 mm² at the 3 nm-class 0.15 scale). The fabric runs at 2.5 GHz, so a
-layer is four passes of 2560 cycles, 4.1 µs: the deeper tile costs exactly
-what the faster clock returns. `qwen35_9b_2nm_hbm.json` is the same die
-family with the 9B geometry on eight dies, and `qwen35_27b_3nm_hbm.json`
-the 27B on the 3 nm die, as controls. HBM4 is taken as 2 TB/s per die at
-25 pJ per byte, the MAC at 0.35 pJ, and the static floor at 250 W.
+layer ASIC: eight layer ASICs of eight layers, two `R,R,R,G` groups each,
+so `global_every` is 4 (the default global layer per ASIC would halve the
+retrieval traffic), and two head ASICs splitting the LM head by
+vocabulary. The die is sized by the fabric mapping at a tenth of the
+28 nm-class density placeholder: 2.86B coefficients in 9,332 tiles is
+about 76 mm² of fabric per layer die, and half the head is 22 percent of
+the same die. The fabric runs at 2.5 GHz, so a layer is four passes of
+2560 cycles, 4.1 µs: the deeper tile costs exactly what the faster clock
+returns. `qwen35_9b_2nm_hbm.json` is the same die family with the 9B
+geometry on eight dies, and `qwen35_27b_3nm_hbm.json` the 27B on the 3 nm
+die, as controls. HBM4 is taken as 2 TB/s per die at 25 pJ per byte, the
+MAC at 0.35 pJ, and the static floor at 50 W for the board plus 40 W per
+die and stack.
 
 | Configuration | Dies | Tokens/s | Latency (µs) | Board (W) | Memory per die |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| 9B, 3 nm-class | 8 + 2 | 190K | 212 | 1,170 | 1.12 TB/s |
-| 27B, 2 nm-class | 4 + 1 | 78K | 960 | 1,060 | 1.85 TB/s |
-| 27B, 2 nm-class | 8 + 2 | 158K | 529 | 1,880 | 1.86 TB/s |
-| 27B, 2 nm-class, int4 state | 8 + 2 | 214K | 340 | 2,320 | 1.68 TB/s |
+| 9B, 3 nm-class | 8 + 2 | 244K | 277 | 1,446 | 1.15 TB/s |
+| 27B, 2 nm-class | 4 + 1 | 77K | 1,580 | 1,042 | 1.45 TB/s |
+| 27B, 2 nm-class | 8 + 2 | 153K | 638 | 2,035 | 1.45 TB/s |
+| 27B, 2 nm-class, int4 state | 8 + 2 | 216K | 506 | 2,549 | 1.33 TB/s |
+| 27B, 3 nm-class | 8 + 2 | 119K | 971 | 2,055 | 1.12 TB/s |
 
 Four things follow. With the memory model corrected the 27B on 2 nm is
-memory-bound, not fabric-bound: sixteen layers on a die means twelve
-recurrent states crossing one HBM stack every token, 1.85 of its 2 TB/s. So
-the number of dies now matters a great deal, where it did not before.
-Splitting the same model over eight dies doubles throughput to 158K because
-it doubles the memory ports, and halving the state to int4 takes it to 214K.
-The 4 + 1 arrangement is therefore a real trade, half the masks for half the
-throughput, not the free win it looked like. Latency follows the same way.
-Power is the wall beyond that: 8.4 mJ per token is 2.0 kW of compute at that
-throughput, 468 W per layer die on the 4 + 1 board, which is liquid cooling
-and a bigger supply than the 9B's 1U; at the 50K tokens/s target the same
-appliance draws about 0.7 kW, 100 W per die, and fits the current chassis.
-The HBM is not what the model size needs: the sixteen global layers move
-8 MB per token per die, which is 1.8 TB/s per die at 234K tokens/s but
-400 GB/s at 50K, within reach of GDDR7 or four LPDDR5X channels, so HBM
-buys the throughput, not the 27B. And the package grows: 468 W at 0.8 V is
-about 650 A per die, which the pinout rules turn into a 55 × 55 array
-(`hw/board_27b.yaml`).
+memory-bound, not fabric-bound: eight layers on a die is six recurrent
+states plus two index scans crossing one HBM stack every token, 9.4 MB, and
+at 153K tokens/s that is 1.45 of the stack's 2 TB/s — 85 percent of what the
+0.85 sustained efficiency allows. So the number of dies matters a great
+deal, where it did not before: the same silicon on four dies of sixteen
+layers runs at 77K, half the masks for half the throughput, and halving the
+state to int4 takes the eight-die board to 216K. That is why the board in
+`hw/board_27b.yaml` is eight layer dies and two head dies. Latency follows
+the same way. Power is the wall beyond that: 8.4 mJ per token is 1.3 kW of
+compute at that throughput and 2.0 kW for the board, 153 W per layer die,
+which is liquid cooling and a bigger supply than the 9B's 1U; at the 50K
+tokens/s target the same appliance draws about 1.0 kW, 50 W per die. The
+HBM is what the *state* needs, not the model size: 9.4 MB per token per die
+is 1.45 TB/s at 153K but 470 GB/s at 50K, within reach of GDDR7 or four
+LPDDR5X channels, so HBM buys the throughput, not the 27B. And the package
+shrinks with the die count: 153 W at 0.8 V is about 250 A including the
+static floor, which the pinout rules turn into a 35 × 35 array rather than
+the 55 × 55 the four-die arrangement needed.

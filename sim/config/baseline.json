@@ -7,6 +7,7 @@
   "warmup_tokens_per_context": 4,
   "recurrent_cycles": 102,
   "recurrent_weight_scale": 1.0,
+  "layer_pass_cycles": 26,
   "global_index_compute_cycles": 200,
   "global_topk_cycles": 10,
   "global_attention_cycles": 50,

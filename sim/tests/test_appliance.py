@@ -1,4 +1,5 @@
 import json
+import math
 import tempfile
 import unittest
 from dataclasses import replace
@@ -85,6 +86,33 @@ class SimulationTest(unittest.TestCase):
         )
         self.assertGreater(latency, interval)
 
+    def test_layer_passes_shorten_the_interval_but_not_the_latency(self) -> None:
+        config = replace(SMALL, recurrent_cycles=8, layer_pass_cycles=2)
+        simulation = Simulation(config)
+        latency, interval, _ = simulation._timing(simulation.stages[0], WorkItem(0, 16, 0, 0))
+        self.assertEqual((latency, interval), (8, 2))
+        serial = Simulation(replace(config, layer_pass_cycles=0)).run()
+        pipelined = Simulation(config).run()
+        self.assertEqual(pipelined.completed_tokens, serial.completed_tokens)
+        self.assertGreater(pipelined.aggregate_tokens_per_second, serial.aggregate_tokens_per_second)
+        # Four passes, so tokens of four different contexts overlap inside the layer.
+        traced = Simulation(replace(config, trace=True))
+        traced.run()
+        first_stage = [event for event in traced.trace_events if event.resource == 0]
+        overlapping = [later for earlier, later in zip(first_stage, first_stage[1:])
+                       if later.start_cycle < earlier.start_cycle + earlier.duration_cycles]
+        self.assertTrue(overlapping)
+        self.assertNotEqual(overlapping[0].context_id, first_stage[0].context_id)
+
+    def test_a_pass_shorter_than_the_memory_transfer_does_not_shorten_the_interval(self) -> None:
+        # With the state larger than the pass, the shared memory sets the interval.
+        config = replace(SMALL, recurrent_cycles=8, layer_pass_cycles=2,
+                         recurrent_state_bytes=6_000_000, memory_bytes_per_cycle=1_000_000,
+                         memory_efficiency=1.0)
+        simulation = Simulation(config)
+        latency, interval, memory_bytes = simulation._timing(simulation.stages[0], WorkItem(0, 16, 0, 0))
+        self.assertEqual((latency, interval, memory_bytes), (6 + 8 + 6, 12, 12_000_000))
+
     def test_head_asics_extend_the_ring_without_memory(self) -> None:
         config = replace(SMALL, num_head_asics=2, head_cycles=3, head_result_bytes=4)
         simulation = Simulation(config)
@@ -141,10 +169,16 @@ class SimulationTest(unittest.TestCase):
             config = loaded[name]
             expected_globals = config.num_layers // (4 if "27b" in name else config.layers_per_asic)
             self.assertEqual(sum(1 for i in range(config.num_layers) if (i + 1) % config.global_period == 0), expected_globals, name)
-        self.assertEqual(loaded["qwen35_27b_2nm_hbm"].layers_per_asic, 16)
-        self.assertEqual(loaded["qwen35_27b_2nm_hbm"].num_asics, 4)
-        self.assertEqual(loaded["qwen35_27b_2nm_hbm"].num_head_asics, 1)
+        self.assertEqual(loaded["qwen35_27b_2nm_hbm"].layers_per_asic, 8)
+        self.assertEqual(loaded["qwen35_27b_2nm_hbm"].num_asics, 8)
+        self.assertEqual(loaded["qwen35_27b_2nm_hbm"].num_head_asics, 2)
         self.assertEqual(loaded["qwen35_27b_2nm_hbm"].global_period, 4)
+        # Every shipped geometry carries the pass its cascade is pipelined on, and a
+        # pass is a quarter of the layer: the same cycles the single-pass head die takes.
+        for name, config in loaded.items():
+            self.assertGreater(config.layer_pass_cycles, 0, name)
+            self.assertLess(config.layer_pass_cycles, config.recurrent_cycles, name)
+            self.assertEqual(config.layer_pass_cycles, math.ceil(config.recurrent_cycles / 4), name)
 
     def test_global_period_must_divide_the_layers_per_asic(self) -> None:
         with self.assertRaises(ValueError):

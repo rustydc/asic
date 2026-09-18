@@ -325,7 +325,7 @@ def report_markdown(pinout: Pinout, board: Board) -> str:
     p, need = pinout.package, pinout.requirements
     rules = board.data["package_selection"]
     lines = ["# ASIC package and ball map", "",
-             "Derived by `python -m hw.pinout` from `hw/board.yaml`. Do not edit.", "",
+             f"Derived by `python -m hw.pinout` from `{board.source.as_posix()}`. Do not edit.", "",
              "## Requirements", "",
              f"Rated at {need.rated_tokens_per_second:.0f} tokens/s the core rail draws {need.core_amps:.0f} A "
              f"({board.data['power_model']['mac_energy_pj']} pJ per MAC, {board.data['power_tree']['rails']['VDD_CORE']['volts']} V), "

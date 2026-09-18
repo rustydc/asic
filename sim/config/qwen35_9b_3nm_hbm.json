@@ -1,5 +1,5 @@
 {
-  "_comment": "Qwen3.5-9B geometry on a 3 nm-class die with one HBM stack per layer ASIC. Fabric at 2 GHz (extrapolated beyond the ASAP7 signoff): 4 passes x 2048 cycles = 4.1 us per layer, 1.0 us per head die; global compute phases scaled by the same clock ratio, and the index-scan compute by the 4x fewer compressed positions as well. int4 KV at 16:1 compression, 1.5 TB/s per die, 256 resident contexts, a 16 GB/s ring link, 0.5 pJ per MAC, and 30 pJ per byte for HBM. Pass-level pipelining is not modeled, so a layer stage still admits one token per layer latency. Each recurrent layer reads and writes its 512 KB Gated DeltaNet state through the local memory every token, and all stages of a die share one memory interface.",
+  "_comment": "Qwen3.5-9B geometry on a 3 nm-class die with one HBM stack per layer ASIC. Fabric at 2 GHz (extrapolated beyond the ASAP7 signoff): 4 passes x 2048 cycles = 4.1 us per layer, 1.0 us per head die; global compute phases scaled by the same clock ratio, and the index-scan compute by the 4x fewer compressed positions as well. int4 KV at 16:1 compression, 1.5 TB/s per die, 256 resident contexts, a 16 GB/s ring link, 0.5 pJ per MAC, and 30 pJ per byte for HBM. A layer admits a token every pass rather than every layer (layer_pass_cycles). Each recurrent layer reads and writes its 512 KB Gated DeltaNet state through the local memory every token, and all stages of a die share one memory interface.",
   "clock_mhz": 10.0,
   "resident_contexts": 256,
   "tokens_per_context": 16,
@@ -7,6 +7,7 @@
   "warmup_tokens_per_context": 4,
   "recurrent_cycles": 41,
   "recurrent_weight_scale": 1.0,
+  "layer_pass_cycles": 11,
   "global_index_compute_cycles": 20,
   "global_topk_cycles": 4,
   "global_attention_cycles": 20,

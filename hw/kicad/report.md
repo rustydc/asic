@@ -41,7 +41,7 @@ The ring is a regular 11-gon of 46 mm side (82 mm circumradius) centred at (140,
 
 ## ASIC package and escape density
 
-FCBGA1225_35x35_P0.8: 35x35 balls at 0.8 mm, 29 mm body, selected by `hw/pinout.py` for 177 A of core current at 50000 tokens/s (1012 balls needed; see `hw/pinout/report.md`). Per edge: 36 link signals on two columns of 18 rows (2.5 signals per mm of edge); 130 LPDDR signals on the north 4 rows, 4.5 per mm of edge, of which 28 sit deeper than the outer 3 rows and need microvias or a build-up layer pair to escape. The memory nets are not routed here.
+FCBGA1225_35x35_P0.8: 35x35 balls at 0.8 mm, 29 mm body, selected by `hw/pinout.py` for 177 A of core current at 50000 tokens/s (1012 balls needed; see the pinout report). Per edge: 36 link signals on two columns of 18 rows (2.5 signals per mm of edge); 130 LPDDR signals on the north 4 rows, 4.5 per mm of edge, of which 28 sit deeper than the outer 3 rows and need microvias or a build-up layer pair to escape. The memory nets are not routed here.
 
 ## Core rail current
 

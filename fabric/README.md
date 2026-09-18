@@ -536,7 +536,12 @@ at four rows per cycle, and 4096×16 at full depth.
 2. A via-ROM compiler cell from the foundry, or a hand-drawn cell for the MPW,
    to replace the ROM area and read energy placeholders.
 3. The GDS writer: `via_coordinates` into the ROM macro's bit-cell grid.
-4. Pass-level pipelining in the simulator so a layer stage's initiation
-   interval is one pass rather than four.
+4. Done: the simulator now admits a token per pass rather than per layer
+   (`layer_pass_cycles`). It is worth almost nothing at real memory
+   bandwidths and 2.5x with the memory removed, so the RTL question it
+   raises — whether consecutive tokens of different contexts may occupy
+   consecutive passes without a shared resource between them — is not
+   urgent. What the passes do need is balance: the model takes them as
+   equal, and the FFN-down pass reads the wider FFN vector.
 5. A multi-token variant of the column datapath for chunked prefill, which
    amortizes the ROM read across a chunk of tokens from one context.

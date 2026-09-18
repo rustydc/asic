@@ -92,7 +92,9 @@ class PinoutTest(unittest.TestCase):
     def test_in_package_memory_leaves_the_north_rows_to_power(self) -> None:
         board = Board.load(Path(__file__).resolve().parents[1] / "board_27b.yaml")
         p = pinout.derive(board)
-        self.assertEqual(p.package.name, "FCBGA3025_55x55_P1.0")
+        # Eight layer dies rather than four halve the per-die current, and the
+        # package falls two sizes with it.
+        self.assertEqual(p.package.name, "FCBGA1225_35x35_P0.8")
         self.assertEqual(p.requirements.signal_balls, 2 * 36 + 14)
         self.assertEqual(sum(1 for b in p.balls if b.interface.startswith("lpddr")), 0)
         self.assertGreaterEqual(p.count("rail", "VDD_CORE"), p.requirements.core_balls)
