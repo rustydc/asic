@@ -513,6 +513,93 @@ IHP for a few hundred dollars and proves the via ROM, the column datapath
 and the requantiser, but not the memory path; the full chip is the one that
 tests HPI retrieval.
 
+## The rest of the layer
+
+The tile evaluates `y = Wx`. Everything else in a decoder layer is
+element-wise or per-head arithmetic on a few thousand values between the
+fabric passes, and `layer.py` with `rtl/fabric_vector.sv`, `fabric_norm.sv`,
+`fabric_recurrent.sv`, `fabric_ffn.sv` and `fabric_attention.sv` is that
+datapath: the bit-exact integer model, the compiler that turns a layer's
+float weights and a calibration into the units' constants, the float
+reference the integer layer is checked against, and the RTL of every unit.
+
+```text
+recurrent layer          fabric pass         vector unit
+  h (int16) ---------> rmsnorm ----------> int8 x
+  x ---------------> [qkv | z | b | a] ----> conv+silu (8192 ch, 4 taps, history per context)
+                                             q,k: L2 norm per head -> int8 unit vectors
+                                             b, a: head gates -> beta, decay (U16)
+                                             delta state (32 heads, 128x128 int16 S) -> y
+                                             gated norm: y * silu(z) -> int8
+  -------------------> [out_proj] ---------> residual add (int16)
+  h ---------------> rmsnorm -> [gate | up] -> swiglu -> int8 -> [down] -> residual add
+global layer
+  x ---------------> [q,gate | k | v] -----> q,k: head norm (gain), rotary -> int8
+                                             attention core: online softmax over K/V rows,
+                                             sigmoid(gate) -> int8
+  -------------------> [o_proj] -----------> residual add, then the FFN as above
+```
+
+| Format | Where | Definition |
+| --- | --- | --- |
+| residual `h` | between layers and across both residual adds | int16, one scale per layer |
+| fabric activations | every tile input and output | int8, one scale per matrix |
+| F16 | input of every nonlinearity, output of SiLU | int16, 10 fraction bits (Q5.10) |
+| U16 | sigmoid, exp, softmax weights, decay, beta | unsigned Q0.16, 1.0 clipped to 65535 |
+| normalised `n` | inside the norms | `x / sqrt(sum x^2) * 2^14`, int16 |
+| recurrent state `S` | per head, per context, in the local memory | int16 at `s_v / 256` |
+| requantizer | the end of every unit | `sat((v * mult + 2^(sh-1)) >> sh)`, 16-bit `mult`, 6-bit `sh` |
+
+The nonlinearities are tables with linear interpolation: sigmoid over
+[−8, 8) in 256 steps, exp(−t) over [0, 32) in 1024, softplus over [−16, 16)
+in 2048, a sine over a turn in 1024, each within 1e-4 of the function
+except softplus at 1e-3. The inverse square root and the reciprocal are a
+seed from a 768- or 512-entry table over the normalised operand and one
+Newton step, within 3e-5 and 6e-5. Nothing in the datapath divides.
+
+Where a per-element weight follows a matrix it is folded into the matrix
+before quantisation: the two RMS norm weights of every layer into the rows
+of the projections they feed, the gated norm's weight into `out_proj`. The
+head norms of the global layer sit between the projection and the rotary,
+so their weight rides as a Q3.13 gain through the norm unit instead. The
+per-head `exp(A_log)` is a Q6.10 constant and `dt_bias` an F16 one; the
+head gates take the fabric's raw 24-bit accumulators for the one-column
+`in_proj_a` and `in_proj_b`, so those 32-wide outputs never pass through
+the int8 requantizer.
+
+Two findings from building it:
+
+* **The recurrent state must be int16.** Round-to-nearest cannot apply a
+  slow decay to a narrow value: `S * d` rounds back to `S` whenever
+  `|S| < 1 / (1 - d)`, which at `d = 0.999` is every int8 value and the
+  bottom three percent of int16. The simulator's `recurrent_state_bytes`
+  (512 KB per layer) assumed int8; the state as designed here is 1 MB per
+  layer per token, read and written, which halves the recurrent-state
+  share of the memory budget in the PSRAM sweep unless the state uses
+  stochastic rounding or error feedback instead. The state engine keeps
+  one head's 32 KB on chip for the two passes of the update, so the memory
+  sees each row once each way.
+* **A cancellation head cannot survive int8.** On a random-init model a
+  head whose delta output is a 1e-3 residual of its state flips sign in
+  the integer layer, and the norm then amplifies the flip. Against a float
+  reference carrying the same int4 weights the integer datapath tracks
+  every intermediate (`test_layer.py`: 0.95 on the state output, 0.998 on
+  the residual stream); against the unquantised weights the residual
+  stream still holds at 0.99 while the mixer of such a head does not. That
+  is the int4 weights' business, and the quantisation-aware training's.
+
+Per token and layer the arithmetic outside the tiles is about 2M
+multiply-adds in the state engine (four operations over 32 × 128 × 128),
+16K in the convolution and 12K in SwiGLU, against 866M in the tiles. At
+128 lanes a head's state update is 262 cycles, so four engines cover the
+32 heads inside one 2048-cycle pass; the attention core at 64 lanes
+consumes a 256-wide key or value row in four cycles, 8192 cycles for the
+1024 rows of window and retrieved blocks per KV head, so it too wants one
+engine per KV head to hide inside the layer's four passes. What the units
+do not include is the memory side: the recurrent state and conv history
+per context, the KV rows of the window and the retrieved blocks and the
+index scan that chooses them, and the head die's top-k and log-sum-exp.
+
 ## RTL
 
 `rtl/fabric_tile.sv` is the synthesizable tile with the ROM as a constant
@@ -527,6 +614,26 @@ streams the activations with occasional bubbles, and compares the raw
 accumulators and requantized outputs against the model. The tests run three
 configurations through Icarus Verilog: 64×8 with chained partial sums, 256×64
 at four rows per cycle, and 4096×16 at full depth.
+
+The vector units are `rtl/fabric_vector.sv` (interpolated table, sigmoid,
+SiLU, exp, softplus, inverse square root, reciprocal), `fabric_norm.sv`
+(the RMS norm, also the L2 normaliser and the gated norm by its
+parameters), `fabric_recurrent.sv` (convolution with SiLU, head gates,
+delta state), `fabric_ffn.sv` (SwiGLU, residual add) and
+`fabric_attention.sv` (rotary table and rotation, the attention core), with
+the fixed-point helpers in `fabric_fx.svh`. Each is a streaming unit of
+`L` lanes per beat with a stated latency; the tables load from hex images
+written by `fabric.layer.write_luts`, the per-channel constants arrive with
+the beat from whatever memory the integration keeps them in. The
+testbenches `tb_vector_units`, `tb_rmsnorm`, `tb_conv_silu`,
+`tb_head_gates`, `tb_delta_state`, `tb_ffn`, `tb_rotary` and
+`tb_attention` compare every output bit for bit with vectors from the
+`emit_*` functions of `fabric.layer`, at small sizes in the test suite and
+at the layer's own sizes (a 4096-element norm, a 128 × 128 state, 8192
+conv channels, four 256-wide heads at 64 lanes) when run by hand. These
+units are written for function, not for the tile's no-carry-chain
+discipline: the norm's sum of squares and the state engine's accumulators
+are plain adders.
 
 ## What is next
 
@@ -545,3 +652,8 @@ at four rows per cycle, and 4096×16 at full depth.
    equal, and the FFN-down pass reads the wider FFN vector.
 5. A multi-token variant of the column datapath for chunked prefill, which
    amortizes the ROM read across a chunk of tokens from one context.
+6. Done: the vector datapath between the passes, above. Open behind it:
+   the memory side of a layer (state and conv history per context, the
+   window and block store, the index scan), the pass sequencer that runs
+   the tiles and the units in order, stochastic rounding for the state if
+   int8 storage has to come back, and synthesis of the units for area.

@@ -16,7 +16,13 @@ LLM inference appliance built around the Qwen3.5 dense hybrid geometry.
   against the model with Icarus Verilog, a yosys flow that measures the
   column datapath on open liberty files (sky130, IHP SG13G2, NanGate 45,
   ASAP7), an OpenSTA driver for pre-layout timing, and an OpenROAD
-  place-and-route driver with its sky130 and ASAP7 results.
+  place-and-route driver with its sky130 and ASAP7 results. `fabric/layer.py`
+  and the vector-unit RTL beside the tile are the rest of the layer
+  datapath: the norms, the causal convolution, the Gated DeltaNet state
+  update and gates, SwiGLU, the residual adds, the rotary embedding and
+  the attention core, as a bit-exact fixed-point model with the compiler
+  for their constants, checked against the PyTorch reference and against
+  the RTL in Icarus.
 * [`clash/`](clash/) contains a synthesizable four-stage ASIC-shard seed with a
   deliberately small fixed-coefficient datapath for early RTL and P&R work.
 * [`sim/`](sim/) contains the cycle-stepped 32-stage appliance simulator for
