@@ -1,5 +1,5 @@
 {
-  "_comment": "Qwen3.5-9B geometry on the 2 nm-class die of qwen35_27b_2nm_hbm (2.5 GHz: 4 passes x 2048 cycles = 3.3 us per layer, 0.8 us per head die; HBM4 at 2 TB/s, 0.35 pJ per MAC, 25 pJ per byte, 250 W static), as the control for the 27B run.",
+  "_comment": "Qwen3.5-9B geometry on the 2 nm-class die of qwen35_27b_2nm_hbm (2.5 GHz: 4 passes x 2048 cycles = 3.3 us per layer, 0.8 us per head die; HBM4 at 2 TB/s, 0.35 pJ per MAC, 25 pJ per byte, 250 W static), as the control for the 27B run. Each recurrent layer reads and writes its 512 KB Gated DeltaNet state through the local memory every token, and all stages of a die share one memory interface.",
   "clock_mhz": 10.0,
   "resident_contexts": 256,
   "tokens_per_context": 16,
@@ -37,5 +37,6 @@
   "head_macs_per_token": 508000000,
   "memory_energy_pj_per_byte": 25.0,
   "static_power_w": 250.0,
-  "max_cycles": 50000000
+  "max_cycles": 50000000,
+  "recurrent_state_bytes": 524288
 }

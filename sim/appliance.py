@@ -34,6 +34,12 @@ class ApplianceConfig:
     global_output_cycles: int = 1_000
     global_weight_scale: float = 1.0
     global_max_inflight: int = 4
+    # Bounded recurrent state of ONE recurrent layer, in bytes (Gated DeltaNet:
+    # value heads x key dim x value dim).  A token's next token for the same
+    # context is a whole ring behind it, so the state cannot stay on chip
+    # between tokens: every token reads it and writes it back.  Zero keeps the
+    # old behaviour, where recurrent stages moved no memory traffic at all.
+    recurrent_state_bytes: int = 0
     fifo_depth: int = 2
     sampling_cycles: int = 500
     activation_bytes: int = 4_096
@@ -122,6 +128,8 @@ class ApplianceConfig:
         invalid = [name for name, value in positive.items() if value <= 0]
         if invalid:
             raise ValueError(f"configuration fields must be positive: {', '.join(invalid)}")
+        if self.recurrent_state_bytes < 0:
+            raise ValueError("recurrent_state_bytes cannot be negative")
         if (self.sampling_cycles < 0 or self.packet_overhead_bytes < 0
                 or self.warmup_tokens_per_context < 0 or self.num_head_asics < 0
                 or self.head_result_bytes < 0):
@@ -275,6 +283,9 @@ class Simulation:
         self.link_busy_cycles = [0] * (config.num_chips - 1)
         self.fifo_high_watermarks = [0] * config.num_stages
         self.memory_bytes_per_asic = [0] * config.num_asics
+        # One memory interface per ASIC: every stage on a die shares it, so a
+        # transfer reserves it and the other stages of that die wait.
+        self.memory_busy_until = [0] * config.num_asics
         self.pending_sampling: list[tuple[int, WorkItem]] = []
         self.completed_latencies: list[int] = []
         self.measurement_start_cycle: int | None = None
@@ -301,8 +312,16 @@ class Simulation:
         if stage.is_head:
             return self.config.head_cycles, self.config.head_cycles, 0
         if not stage.is_global:
-            cycles = math.ceil(self.config.recurrent_cycles * self.config.recurrent_weight_scale)
-            return cycles, cycles, 0
+            cfg = self.config
+            compute = math.ceil(cfg.recurrent_cycles * cfg.recurrent_weight_scale)
+            if not cfg.recurrent_state_bytes:
+                return compute, compute, 0
+            # Read the state, run the delta rule, write it back.  The memory is
+            # the shared resource, so it sets the initiation interval.
+            bandwidth = cfg.memory_bytes_per_cycle * cfg.memory_efficiency
+            transfer = math.ceil(cfg.recurrent_state_bytes / bandwidth)
+            latency = transfer + compute + transfer
+            return latency, max(compute, 2 * transfer), 2 * cfg.recurrent_state_bytes
         cfg = self.config
         index_bytes, kv_bytes, append_bytes = self._global_memory_components(item)
         bandwidth = cfg.memory_bytes_per_cycle * cfg.memory_efficiency
@@ -414,13 +433,20 @@ class Simulation:
             if stage.last_start_cycle >= 0 and self.cycle - stage.last_start_cycle < initiation_interval:
                 stage.queue.appendleft(item)
                 continue
+            asic = None
+            if memory_bytes and not stage.is_head:
+                asic = stage.stage_id // self.config.layers_per_asic
+                if self.memory_busy_until[asic] > self.cycle:
+                    stage.queue.appendleft(item)
+                    continue
             stage.active.append(InFlight(item, service_cycles))
             stage.last_start_cycle = self.cycle
             stage.counters.accepted += 1
             stage.counters.memory_bytes += memory_bytes
-            if stage.is_global:
-                asic = stage.stage_id // self.config.layers_per_asic
+            if asic is not None:
                 self.memory_bytes_per_asic[asic] += memory_bytes
+                bandwidth = self.config.memory_bytes_per_cycle * self.config.memory_efficiency
+                self.memory_busy_until[asic] = self.cycle + math.ceil(memory_bytes / bandwidth)
             if self.config.trace:
                 self.trace_events.append(TraceEvent(
                     "head" if stage.is_head else "FULL global" if stage.is_global else "recurrent",

@@ -280,6 +280,18 @@ the multiphase regulator on the package substrate or backside power
 delivery on the die; the 26 mm regulator block on the board is a
 placeholder for that decision, not a design.
 
+## Open item: the 27B board's rating needs revisiting
+
+`board_27b.yaml` is rated at 234,000 tokens/s, which came from the simulator
+before its memory model counted recurrent-state traffic and before the stages
+of a die shared one memory interface. The corrected figure for that board,
+four layer dies of sixteen layers with one HBM4 stack each, is 78,000
+tokens/s: the twelve recurrent states per die saturate the stack. Eight dies
+of eight layers reach 158,000 for the same silicon and twice the masks. Until
+that choice is made the package selection, the power table and the cooling
+budget in this file all follow a rating that is too high by about three
+times, so read them as an upper bound.
+
 ## Open items before schematic entry in an EDA tool
 
 1. ASIC package and ball map: the derived map in `hw/pinout/` goes to the

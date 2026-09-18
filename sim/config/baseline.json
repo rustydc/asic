@@ -1,5 +1,5 @@
 {
-  "_comment": "Qwen3.5-9B geometry: hidden 4096, 8 x (3 Gated DeltaNet + 1 Gated Attention), 4 KV heads x 256, int8 activations and KV. Fabric: 4096x64 tiles, 2 rows/cycle at 800 MHz (fabric/tile.py): 4 passes x 2048 cycles = 10.2 us per layer, 2.6 us per head die.",
+  "_comment": "Qwen3.5-9B geometry: hidden 4096, 8 x (3 Gated DeltaNet + 1 Gated Attention), 4 KV heads x 256, int8 activations and KV. Fabric: 4096x64 tiles, 2 rows/cycle at 800 MHz (fabric/tile.py): 4 passes x 2048 cycles = 10.2 us per layer, 2.6 us per head die. Each recurrent layer reads and writes its 512 KB Gated DeltaNet state through the local memory every token, and all stages of a die share one memory interface.",
   "clock_mhz": 10.0,
   "resident_contexts": 32,
   "tokens_per_context": 16,
@@ -37,5 +37,6 @@
   "head_macs_per_token": 508000000,
   "memory_energy_pj_per_byte": 40.0,
   "static_power_w": 70.0,
-  "max_cycles": 50000000
+  "max_cycles": 50000000,
+  "recurrent_state_bytes": 524288
 }

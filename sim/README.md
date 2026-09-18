@@ -96,10 +96,32 @@ preserving the intended microsecond service times and bytes/second. This is a
 simulation time quantum rather than the proposed RTL clock and makes long
 pipeline sweeps fast.
 
+## Two corrections to every number below
+
+Until September 2026 the memory model was wrong in two ways that both
+flattered it, and the figures in this file are the corrected ones.
+
+* **Recurrent-state traffic was missing.** A Gated DeltaNet layer holds a
+  512 KB state (32 value heads of 128 x 128, int8) and the delta rule is a
+  rank-1 update to all of it. A context's next token is a whole ring behind
+  its last one, so the state cannot stay on chip between tokens: every token
+  reads it and writes it back. That is 1 MB per recurrent layer per token,
+  and for the 9B it is larger than the retrieval traffic the model did
+  count. `recurrent_state_bytes` now carries it.
+* **Every stage had its own memory port.** A die with four stages could pull
+  four times its device bandwidth. There is one memory interface per ASIC, so
+  a transfer now reserves it and the other stages of that die wait.
+
+Together they cut the 9B design point from 14.5K to 8.3K tokens/s at int8 KV,
+and they make the number of dies matter, which it did not before: memory ports
+scale with dies, so splitting the same model over more of them buys
+throughput. The 27B on 2 nm goes from 78K tokens/s on four layer dies to 158K
+on eight, for the same silicon and twice the masks.
+
 ## Current finding
 
 With int8 KV at 4:1 compression, 32 retrieved blocks, and 64 GB/s sustained
-bandwidth, both geometries saturate the global stage at about 14.5K tokens/s
+bandwidth, both geometries saturate the global stage at about 8.3K tokens/s
 with a 128K context, below the 25K to 50K target. The recurrent stages sit at
 15 percent (9B) or 10 percent (4B) utilization, the head stages under 5
 percent, and the ring links under 4 percent. The global memory interval is
@@ -126,6 +148,38 @@ board at 7 nm (147 W per layer ASIC, 7.9 mJ per token) and 1.2 kW at 3 nm
 (102 W per layer ASIC, 4.0 mJ per token), so both are liquid-cooled boxes
 rather than cards.
 
+## Sixteen PSRAM devices instead of a DRAM PHY
+
+`qwen35_9b_psram16.json` asks what the 9B does with no DRAM PHY anywhere in
+the design: sixteen HPI x16 PSRAM devices per layer ASIC at 1.8 V and
+250 MHz DDR, 1 GB/s and 64 MB each, so 16 GB/s and 1 GB per die across about
+320 signal balls. int4 KV at 16:1 keeps a 128K context inside the gigabyte.
+The point is that a PSRAM is plain CMOS at a fifth of an LPDDR5X bit rate:
+no PLL, no per-bit deskew, no training, no analog IP anyone has to license
+or design.
+
+| Devices per ASIC | Bandwidth | Tokens/s | Latency | Board |
+| ---: | ---: | ---: | ---: | ---: |
+| 4 | 4 GB/s | 642 | 36 ms | 87 W |
+| 8 | 8 | 1,283 | 18 ms | 103 W |
+| 16 | 16 | 2,564 | 9.2 ms | 136 W |
+| 24 | 24 | 3,842 | 6.1 ms | 169 W |
+| 32 | 32 | 5,076 | 4.7 ms | 201 W |
+
+Throughput is linear in device count, because the memory interface is the
+only thing binding: at sixteen devices the recurrent stages sit at 24 percent
+and the global stages at 34 percent, so three quarters of the fabric is idle.
+Two LPDDR5X-9600 x32 give 77 GB/s, so sixteen PSRAMs are about a fifth of the
+LPDDR board and matching it would take seventy-odd devices, which is not a
+board. Cheaper state and shorter contexts recover some of it: int4 state and
+8 retrieved blocks at a 32K context reach 5.1K tokens/s on the same sixteen
+devices.
+
+So the trade is real but it is not a wash. A PSRAM wall buys the removal of
+the single largest IP and analog risk in the design, and costs roughly five
+times the throughput per board. It also says a PSRAM-based die should hold
+more layers than an LPDDR one, since its fabric is mostly idle.
+
 ## The high end: a 27B-class model on a 2 nm-class die with HBM
 
 `qwen35_27b_2nm_hbm.json` retargets the appliance to the 27B-class dense
@@ -145,22 +199,22 @@ family with the 9B geometry on eight dies, and `qwen35_27b_3nm_hbm.json`
 the 27B on the 3 nm die, as controls. HBM4 is taken as 2 TB/s per die at
 25 pJ per byte, the MAC at 0.35 pJ, and the static floor at 250 W.
 
-| Configuration | Dies | Tokens/s | Latency (µs) | Compute (mJ/token) | Board (W) | Layer ASIC (W) |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 9B, 3 nm-class | 8 + 2 | 236K | 165 | 4.0 | 1,230 | 102 |
-| 9B, 2 nm-class | 8 + 2 | 291K | 133 | 2.8 | 1,150 | 88 |
-| 27B, 3 nm-class | 4 + 1 | 189K | 367 | 12.1 | 2,620 | 540 |
-| 27B, 2 nm-class | 4 + 1 | 234K | 292 | 8.4 | 2,370 | 468 |
+| Configuration | Dies | Tokens/s | Latency (µs) | Board (W) | Memory per die |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 9B, 3 nm-class | 8 + 2 | 190K | 212 | 1,170 | 1.12 TB/s |
+| 27B, 2 nm-class | 4 + 1 | 78K | 960 | 1,060 | 1.85 TB/s |
+| 27B, 2 nm-class | 8 + 2 | 158K | 529 | 1,880 | 1.86 TB/s |
+| 27B, 2 nm-class, int4 state | 8 + 2 | 214K | 340 | 2,320 | 1.68 TB/s |
 
-Four things follow. The 27B on 2 nm lands at the same throughput as the 9B
-on 3 nm, 234K tokens/s, because the ceiling is still the un-pipelined pass
-rate and a layer takes the same 4.1 µs; the extra layers add pipeline
-depth, not interval, so latency grows to 292 µs for 65 stages, still inside
-the 250 to 500 µs target but near its top. The number of dies does not
-enter: eight dies of eight layers or four of sixteen give the same tokens
-per second and the same board power, and only per-die power and bandwidth
-change (the 8 + 2 split of the 27B is 234 W and 920 GB/s per die). Power is
-the wall that moves: 8.4 mJ per token is 2.0 kW of compute at that
+Four things follow. With the memory model corrected the 27B on 2 nm is
+memory-bound, not fabric-bound: sixteen layers on a die means twelve
+recurrent states crossing one HBM stack every token, 1.85 of its 2 TB/s. So
+the number of dies now matters a great deal, where it did not before.
+Splitting the same model over eight dies doubles throughput to 158K because
+it doubles the memory ports, and halving the state to int4 takes it to 214K.
+The 4 + 1 arrangement is therefore a real trade, half the masks for half the
+throughput, not the free win it looked like. Latency follows the same way.
+Power is the wall beyond that: 8.4 mJ per token is 2.0 kW of compute at that
 throughput, 468 W per layer die on the 4 + 1 board, which is liquid cooling
 and a bigger supply than the 9B's 1U; at the 50K tokens/s target the same
 appliance draws about 0.7 kW, 100 W per die, and fits the current chassis.
