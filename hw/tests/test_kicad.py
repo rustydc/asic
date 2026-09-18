@@ -134,15 +134,26 @@ class KicadGeneratorTest(unittest.TestCase):
         self.assertEqual(sorted(p.part_class for p in card.parts if p.part_class in ("layer_asic", "psram")),
                          ["layer_asic"] + ["psram"] * 16)
         self.assertEqual(set(card.hop_lengths), {"fingers -> U_CHIP", "U_CHIP -> fingers"})
-        self.assertTrue(all(bend < 10.0 for bend in card.hop_bends.values()), card.hop_bends)
-        self.assertTrue(all(hi < 25.0 for _, hi in card.hop_lengths.values()), card.hop_lengths)
+        # The two drops lean towards one finger span from blocks either side of it, on two layers.
+        self.assertTrue(all(bend < 45.0 for bend in card.hop_bends.values()), card.hop_bends)
+        self.assertTrue(all(hi < 30.0 for _, hi in card.hop_lengths.values()), card.hop_lengths)
+        layers = {t.layer for t in card.tracks if t.net.startswith("LINK_OUT_") and t.layer not in ("F.Cu", "B.Cu")}
+        self.assertEqual(layers, {kg.CARD_OUT_LAYER})
+        self.assertEqual({t.layer for t in card.tracks if t.net.startswith("LINK_IN_") and t.layer not in ("F.Cu", "B.Cu")},
+                         {card.stackup.link_layer})
         self.assertEqual(len(card.finger_map), 24)
         layout = kg.edge_layout(board, card.pinout)
-        self.assertEqual((layout.lanes, layout.in_from), (12, 12))
-        self.assertGreaterEqual(layout.out_from - layout.in_from, 13)      # the groups never touch
+        self.assertEqual((layout.lanes, layout.in_from, layout.out_from), (12, 12, 12))   # parallel positions
         for k in range(12):
             self.assertEqual(card.finger_map[f"A{layout.in_from + k}"], card.finger_map[f"B{layout.out_from + k}"])
         self.assertEqual(card.finger_map["A12"], "DATA0")
+        # The two faces' vias interleave half a position apart above the fingers, none on a finger.
+        finger_vias = [v for v in card.vias if v.net.startswith("LINK_")]
+        self.assertEqual(len(finger_vias), 24 + 24)                       # fingers and chip balls
+        ys = {round(v.y, 3) for v in finger_vias if v.y < kg.EDGE_ZONE_MM}
+        self.assertEqual(len(ys), 1)
+        xs = sorted(v.x for v in finger_vias if v.y < kg.EDGE_ZONE_MM)
+        self.assertTrue(all(abs((b - a) - kg.EDGE_VIA_STAGGER) < 1e-6 for a, b in zip(xs, xs[1:])), xs[:4])
         fingers = card.part("J_EDGE")
         self.assertTrue(all(pad.escape == ("N", 0) for pad in fingers.pads if pad.port))
         self.assertEqual(sum(1 for pad in fingers.pads if pad.net == "+12V"), 12)
@@ -199,7 +210,7 @@ class KicadGeneratorTest(unittest.TestCase):
         self.assertEqual(board.data["board"]["layout"], "folded")
         design = kg.build_design(board)
         self.assertEqual(design.form_factor.key, "2u_short")
-        self.assertEqual(design.form_factor.depth, 180.0)
+        self.assertEqual(design.form_factor.depth, 170.0)
         slots = sorted((p for p in design.parts if p.part_class == "module_slot"), key=lambda p: p.x)
         self.assertEqual(len(slots), 10)
         self.assertEqual([round(b.x - a.x, 3) for a, b in zip(slots, slots[1:])], [kg.SLOT_PITCH] * 9)
@@ -214,8 +225,11 @@ class KicadGeneratorTest(unittest.TestCase):
         self.assertEqual(len({round(p.y, 3) for p in outbound}), 1)
         self.assertEqual(len({round(p.y, 3) for p in returning}), 1)
         stagger = outbound[0].y - returning[0].y
-        self.assertGreater(stagger, 45.0)
-        self.assertLess(stagger, 60.0)
+        self.assertGreater(stagger, 30.0)
+        self.assertLess(stagger, 45.0)
+        # In-row and out-row pins sit at the same positions, so a skip-one hop is straight.
+        straight = [hop for hop, bend in design.hop_bends.items() if bend < 1e-6]
+        self.assertEqual(len(straight), 8)
         out_band_low = min(t.points[i][1] for t in design.tracks if t.net.startswith("LINK1_") and t.layer == design.stackup.link_layer for i in range(len(t.points)))
         self.assertGreater(out_band_low, returning[0].y + returning[0].body_h / 2)
         ret_band_high = max(t.points[i][1] for t in design.tracks if t.net.startswith("LINK6_") and t.layer == design.stackup.link_layer for i in range(len(t.points)))
@@ -226,7 +240,7 @@ class KicadGeneratorTest(unittest.TestCase):
         for hop, (lo, hi) in design.hop_lengths.items():
             self.assertLessEqual(hi, design.max_link_mm, hop)
             self.assertLessEqual(design.hop_bends[hop], 90.0 + 1e-6, hop)
-        self.assertLess(max(hi for _, hi in design.hop_lengths.values()), 190.0)
+        self.assertLess(max(hi for _, hi in design.hop_lengths.values()), 195.0)
         # No via-in-pad on the slots: their power pads reach the planes clear of the ribbon corridor.
         slot_pads = {(round(p.local_to_board(pad.x, pad.y)[0], 3), round(p.local_to_board(pad.x, pad.y)[1], 3))
                      for p in slots for pad in p.pads if pad.net in ("GND", "+12V")}
@@ -242,7 +256,7 @@ class KicadGeneratorTest(unittest.TestCase):
         smt_slots = [p for p in smt.parts if p.part_class == "module_slot"]
         self.assertEqual(len({round(p.y, 3) for p in smt_slots}), 1)
         self.assertTrue(all(pad.drill is None for p in smt_slots for pad in p.pads))
-        self.assertLess(max(hi for _, hi in smt.hop_lengths.values()), 140.0)
+        self.assertLess(max(hi for _, hi in smt.hop_lengths.values()), 160.0)   # no stagger to pay for at the turn
         data = copy.deepcopy(board.data)
         data["board"]["layout"] = "two_rows"
         data["board"]["form_factor_key"] = "2u"

@@ -18,10 +18,11 @@
 
 board:
   name: asic-llm-appliance-psram-a0
-  form_factor: short-depth 2U rack chassis, one 420 x 180 mm motherboard with ten through-hole module slots in one folded row, host-attached over a PCIe cable, front-to-back fans between the cards, redundant CRPS
+  form_factor: short-depth 2U rack chassis, one 420 x 170 mm motherboard with ten through-hole module slots in one folded row, host-attached over a PCIe cable, front-to-back fans between the cards, redundant CRPS
   form_factor_key: 2u_short
   layout: folded               # outbound cards in the even slots, returning cards in the odd ones; two_rows is the other layout
   slot_kind: through_hole      # the two sets staggered along the cards so the ribbons clear the skipped slot's pins; smt puts them on one line
+  finger_layout: parallel      # link_in on side A and link_out on side B of the same twelve positions, so slot-to-slot hops are straight; offset gives each its own span
   host_interface: PCIe Gen4 x8 over a SlimSAS 8i cable to a host adapter card
   cooling: air; each card carries a small heatsink on its ASIC (about 10 W) and the PSRAMs run bare, the cards standing parallel to the front-to-back airflow at 22 mm pitch
   power_input:
@@ -67,9 +68,9 @@ package_selection:
 # The cards.  One design, populated two ways: a layer module carries the
 # sixteen PSRAMs, a head module leaves them off.  The connector is a PCIe
 # x16 card edge used mechanically only, with our own pinout: 12 V and
-# ground on the short section, the link ports on twelve positions each
-# (in on side A, out on side B, under their package blocks), the small
-# interfaces after them.
+# ground on the short section, the link ports on the same twelve positions
+# (in on side A, out on side B, so a slot's out pin faces the next slot's in
+# pin), the small interfaces after them.
 module_kinds:
   layer_module:
     description: one layer ASIC, sixteen x16 PSRAMs in two rows above it, a core VRM and an I/O regulator; 12 V in over the edge.

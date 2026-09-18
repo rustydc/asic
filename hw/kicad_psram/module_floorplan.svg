@@ -3,83 +3,83 @@
 <rect x="20.0" y="20.0" width="330.0" height="210.0" fill="#f4f7f4" stroke="#333" stroke-width="1.5"/>
 <rect x="20.0" y="206.0" width="330.0" height="24.0" fill="none" stroke="#999" stroke-dasharray="4,3"/>
 <text x="24.0" y="218.0" fill="#777">edge connector zone</text>
-<polygon points="138.5,165.2 262.1,165.2 262.1,90.2 138.5,90.2" fill="#f9e9e9" stroke="none"/>
-<polygon points="97.4,230.0 349.4,230.0 349.4,206.0 97.4,206.0" fill="#e9d9a8" stroke="#333" stroke-width="1"/>
-<text x="223.39999999999998" y="220.0" text-anchor="middle" font-size="6">J_EDGE</text>
-<polygon points="141.5,162.2 210.5,162.2 210.5,93.2 141.5,93.2" fill="#dbe8f7" stroke="#333" stroke-width="1"/>
-<text x="176.0" y="131.03333333333336" text-anchor="middle" font-size="10">U_CHIP</text>
-<polygon points="59.0,80.6 83.0,80.6 83.0,56.6 59.0,56.6" fill="#e8f3e8" stroke="#333" stroke-width="1"/>
-<text x="71.0" y="70.60000000000001" text-anchor="middle" font-size="6">U_M0_0</text>
-<polygon points="89.0,80.6 113.0,80.6 113.0,56.6 89.0,56.6" fill="#e8f3e8" stroke="#333" stroke-width="1"/>
-<text x="101.0" y="70.60000000000001" text-anchor="middle" font-size="6">U_M0_1</text>
-<polygon points="119.0,80.6 143.0,80.6 143.0,56.6 119.0,56.6" fill="#e8f3e8" stroke="#333" stroke-width="1"/>
-<text x="131.0" y="70.60000000000001" text-anchor="middle" font-size="6">U_M0_2</text>
-<polygon points="149.0,80.6 173.0,80.6 173.0,56.6 149.0,56.6" fill="#e8f3e8" stroke="#333" stroke-width="1"/>
-<text x="161.0" y="70.60000000000001" text-anchor="middle" font-size="6">U_M0_3</text>
-<polygon points="179.0,80.6 203.0,80.6 203.0,56.6 179.0,56.6" fill="#e8f3e8" stroke="#333" stroke-width="1"/>
-<text x="191.0" y="70.60000000000001" text-anchor="middle" font-size="6">U_M0_4</text>
-<polygon points="209.0,80.6 233.0,80.6 233.0,56.6 209.0,56.6" fill="#e8f3e8" stroke="#333" stroke-width="1"/>
-<text x="221.0" y="70.60000000000001" text-anchor="middle" font-size="6">U_M0_5</text>
-<polygon points="239.0,80.6 263.0,80.6 263.0,56.6 239.0,56.6" fill="#e8f3e8" stroke="#333" stroke-width="1"/>
-<text x="251.0" y="70.60000000000001" text-anchor="middle" font-size="6">U_M0_6</text>
-<polygon points="269.0,80.6 293.0,80.6 293.0,56.6 269.0,56.6" fill="#e8f3e8" stroke="#333" stroke-width="1"/>
-<text x="281.0" y="70.60000000000001" text-anchor="middle" font-size="6">U_M0_7</text>
-<polygon points="59.0,50.6 83.0,50.6 83.0,26.6 59.0,26.6" fill="#e8f3e8" stroke="#333" stroke-width="1"/>
-<text x="71.0" y="40.60000000000001" text-anchor="middle" font-size="6">U_M0_8</text>
-<polygon points="89.0,50.6 113.0,50.6 113.0,26.6 89.0,26.6" fill="#e8f3e8" stroke="#333" stroke-width="1"/>
-<text x="101.0" y="40.60000000000001" text-anchor="middle" font-size="6">U_M0_9</text>
-<polygon points="119.0,50.6 143.0,50.6 143.0,26.6 119.0,26.6" fill="#e8f3e8" stroke="#333" stroke-width="1"/>
-<text x="131.0" y="40.60000000000001" text-anchor="middle" font-size="6">U_M0_10</text>
-<polygon points="149.0,50.6 173.0,50.6 173.0,26.6 149.0,26.6" fill="#e8f3e8" stroke="#333" stroke-width="1"/>
-<text x="161.0" y="40.60000000000001" text-anchor="middle" font-size="6">U_M0_11</text>
-<polygon points="179.0,50.6 203.0,50.6 203.0,26.6 179.0,26.6" fill="#e8f3e8" stroke="#333" stroke-width="1"/>
-<text x="191.0" y="40.60000000000001" text-anchor="middle" font-size="6">U_M0_12</text>
-<polygon points="209.0,50.6 233.0,50.6 233.0,26.6 209.0,26.6" fill="#e8f3e8" stroke="#333" stroke-width="1"/>
-<text x="221.0" y="40.60000000000001" text-anchor="middle" font-size="6">U_M0_13</text>
-<polygon points="239.0,50.6 263.0,50.6 263.0,26.6 239.0,26.6" fill="#e8f3e8" stroke="#333" stroke-width="1"/>
-<text x="251.0" y="40.60000000000001" text-anchor="middle" font-size="6">U_M0_14</text>
-<polygon points="269.0,50.6 293.0,50.6 293.0,26.6 269.0,26.6" fill="#e8f3e8" stroke="#333" stroke-width="1"/>
-<text x="281.0" y="40.60000000000001" text-anchor="middle" font-size="6">U_M0_15</text>
-<polygon points="259.1,160.7 259.1,82.7 242.6,82.7 242.6,160.7" fill="#f3e6d0" stroke="#333" stroke-width="1"/>
-<text x="250.85000000000002" y="123.70000000000002" text-anchor="middle" font-size="6">VRM_CORE</text>
-<polygon points="296.6,151.7 296.6,91.7 277.1,91.7 277.1,151.7" fill="#eeeeee" stroke="#333" stroke-width="1"/>
-<text x="286.85" y="123.70000000000002" text-anchor="middle" font-size="6">REG_IO</text>
-<polyline points="137.9,221.0 137.9,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
-<polyline points="140.9,221.0 140.9,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
-<polyline points="143.9,221.0 143.9,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
-<polyline points="146.9,221.0 146.9,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
-<polyline points="149.9,221.0 149.9,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
-<polyline points="152.9,221.0 152.9,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
-<polyline points="155.9,221.0 155.9,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
-<polyline points="158.9,221.0 158.9,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
-<polyline points="161.9,221.0 161.9,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
-<polyline points="164.9,221.0 164.9,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
-<polyline points="167.9,221.0 167.9,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
-<polyline points="170.9,221.0 170.9,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
-<polyline points="149.6,158.9 149.6,184.9 149.0,196.0 140.9,211.1 140.9,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
-<polyline points="152.0,158.9 152.0,184.9 151.4,196.0 146.9,211.1 146.9,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
-<polyline points="154.4,158.9 154.4,185.0 153.8,196.1 152.9,211.1 152.9,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
-<polyline points="156.8,158.9 156.8,185.0 156.2,196.1 158.9,211.1 158.9,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
-<polyline points="159.2,158.9 159.2,185.1 158.6,196.2 164.9,211.1 164.9,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
-<polyline points="161.6,158.9 161.6,185.2 161.0,196.3 170.9,211.1 170.9,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
-<polyline points="148.4,168.2 148.4,184.8 147.8,195.9 137.9,211.1 137.9,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
-<polyline points="150.8,168.2 150.8,184.9 150.2,196.0 143.9,211.1 143.9,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
-<polyline points="153.2,168.2 153.2,185.0 152.6,196.1 149.9,211.1 149.9,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
-<polyline points="155.6,168.2 155.6,185.0 155.0,196.1 155.9,211.1 155.9,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
-<polyline points="158.0,168.2 158.0,185.1 157.4,196.2 161.9,211.1 161.9,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
-<polyline points="160.4,168.2 160.4,185.1 159.8,196.2 167.9,211.1 167.9,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
-<polyline points="195.2,158.9 195.2,184.7 194.0,195.8 185.9,211.1 185.9,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
-<polyline points="197.6,158.9 197.6,184.8 196.4,195.9 191.9,211.1 191.9,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
-<polyline points="200.0,158.9 200.0,185.0 198.8,196.1 197.9,211.1 197.9,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
-<polyline points="202.4,158.9 202.4,185.1 201.2,196.2 203.9,211.1 203.9,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
-<polyline points="204.8,158.9 204.8,185.2 203.6,196.3 209.9,211.1 209.9,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
-<polyline points="207.2,158.9 207.2,185.4 206.0,196.5 215.9,211.1 215.9,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
-<polyline points="194.0,168.2 194.0,184.6 192.8,195.7 182.9,211.1 182.9,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
-<polyline points="196.4,168.2 196.4,184.8 195.2,195.9 188.9,211.1 188.9,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
-<polyline points="198.8,168.2 198.8,184.9 197.6,196.0 194.9,211.1 194.9,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
-<polyline points="201.2,168.2 201.2,185.0 200.0,196.1 200.9,211.1 200.9,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
-<polyline points="203.6,168.2 203.6,185.2 202.4,196.3 206.9,211.1 206.9,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
-<polyline points="206.0,168.2 206.0,185.3 204.8,196.4 212.9,211.1 212.9,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
+<polygon points="111.5,165.2 235.1,165.2 235.1,90.2 111.5,90.2" fill="#f9e9e9" stroke="none"/>
+<polygon points="93.2,230.0 345.2,230.0 345.2,206.0 93.2,206.0" fill="#e9d9a8" stroke="#333" stroke-width="1"/>
+<text x="219.20000000000002" y="220.0" text-anchor="middle" font-size="6">J_EDGE</text>
+<polygon points="114.5,162.2 183.5,162.2 183.5,93.2 114.5,93.2" fill="#dbe8f7" stroke="#333" stroke-width="1"/>
+<text x="149.0" y="131.03333333333336" text-anchor="middle" font-size="10">U_CHIP</text>
+<polygon points="32.0,80.6 56.0,80.6 56.0,56.6 32.0,56.6" fill="#e8f3e8" stroke="#333" stroke-width="1"/>
+<text x="44.0" y="70.60000000000001" text-anchor="middle" font-size="6">U_M0_0</text>
+<polygon points="62.0,80.6 86.0,80.6 86.0,56.6 62.0,56.6" fill="#e8f3e8" stroke="#333" stroke-width="1"/>
+<text x="74.0" y="70.60000000000001" text-anchor="middle" font-size="6">U_M0_1</text>
+<polygon points="92.0,80.6 116.0,80.6 116.0,56.6 92.0,56.6" fill="#e8f3e8" stroke="#333" stroke-width="1"/>
+<text x="104.0" y="70.60000000000001" text-anchor="middle" font-size="6">U_M0_2</text>
+<polygon points="122.0,80.6 146.0,80.6 146.0,56.6 122.0,56.6" fill="#e8f3e8" stroke="#333" stroke-width="1"/>
+<text x="134.0" y="70.60000000000001" text-anchor="middle" font-size="6">U_M0_3</text>
+<polygon points="152.0,80.6 176.0,80.6 176.0,56.6 152.0,56.6" fill="#e8f3e8" stroke="#333" stroke-width="1"/>
+<text x="164.0" y="70.60000000000001" text-anchor="middle" font-size="6">U_M0_4</text>
+<polygon points="182.0,80.6 206.0,80.6 206.0,56.6 182.0,56.6" fill="#e8f3e8" stroke="#333" stroke-width="1"/>
+<text x="194.0" y="70.60000000000001" text-anchor="middle" font-size="6">U_M0_5</text>
+<polygon points="212.0,80.6 236.0,80.6 236.0,56.6 212.0,56.6" fill="#e8f3e8" stroke="#333" stroke-width="1"/>
+<text x="224.0" y="70.60000000000001" text-anchor="middle" font-size="6">U_M0_6</text>
+<polygon points="242.0,80.6 266.0,80.6 266.0,56.6 242.0,56.6" fill="#e8f3e8" stroke="#333" stroke-width="1"/>
+<text x="254.0" y="70.60000000000001" text-anchor="middle" font-size="6">U_M0_7</text>
+<polygon points="32.0,50.6 56.0,50.6 56.0,26.6 32.0,26.6" fill="#e8f3e8" stroke="#333" stroke-width="1"/>
+<text x="44.0" y="40.60000000000001" text-anchor="middle" font-size="6">U_M0_8</text>
+<polygon points="62.0,50.6 86.0,50.6 86.0,26.6 62.0,26.6" fill="#e8f3e8" stroke="#333" stroke-width="1"/>
+<text x="74.0" y="40.60000000000001" text-anchor="middle" font-size="6">U_M0_9</text>
+<polygon points="92.0,50.6 116.0,50.6 116.0,26.6 92.0,26.6" fill="#e8f3e8" stroke="#333" stroke-width="1"/>
+<text x="104.0" y="40.60000000000001" text-anchor="middle" font-size="6">U_M0_10</text>
+<polygon points="122.0,50.6 146.0,50.6 146.0,26.6 122.0,26.6" fill="#e8f3e8" stroke="#333" stroke-width="1"/>
+<text x="134.0" y="40.60000000000001" text-anchor="middle" font-size="6">U_M0_11</text>
+<polygon points="152.0,50.6 176.0,50.6 176.0,26.6 152.0,26.6" fill="#e8f3e8" stroke="#333" stroke-width="1"/>
+<text x="164.0" y="40.60000000000001" text-anchor="middle" font-size="6">U_M0_12</text>
+<polygon points="182.0,50.6 206.0,50.6 206.0,26.6 182.0,26.6" fill="#e8f3e8" stroke="#333" stroke-width="1"/>
+<text x="194.0" y="40.60000000000001" text-anchor="middle" font-size="6">U_M0_13</text>
+<polygon points="212.0,50.6 236.0,50.6 236.0,26.6 212.0,26.6" fill="#e8f3e8" stroke="#333" stroke-width="1"/>
+<text x="224.0" y="40.60000000000001" text-anchor="middle" font-size="6">U_M0_14</text>
+<polygon points="242.0,50.6 266.0,50.6 266.0,26.6 242.0,26.6" fill="#e8f3e8" stroke="#333" stroke-width="1"/>
+<text x="254.0" y="40.60000000000001" text-anchor="middle" font-size="6">U_M0_15</text>
+<polygon points="232.1,160.7 232.1,82.7 215.6,82.7 215.6,160.7" fill="#f3e6d0" stroke="#333" stroke-width="1"/>
+<text x="223.85000000000002" y="123.70000000000002" text-anchor="middle" font-size="6">VRM_CORE</text>
+<polygon points="269.6,151.7 269.6,91.7 250.1,91.7 250.1,151.7" fill="#eeeeee" stroke="#333" stroke-width="1"/>
+<text x="259.85" y="123.70000000000002" text-anchor="middle" font-size="6">REG_IO</text>
+<polyline points="133.7,221.0 133.7,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
+<polyline points="136.7,221.0 136.7,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
+<polyline points="139.7,221.0 139.7,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
+<polyline points="142.7,221.0 142.7,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
+<polyline points="145.7,221.0 145.7,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
+<polyline points="148.7,221.0 148.7,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
+<polyline points="151.7,221.0 151.7,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
+<polyline points="154.7,221.0 154.7,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
+<polyline points="157.7,221.0 157.7,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
+<polyline points="160.7,221.0 160.7,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
+<polyline points="163.7,221.0 163.7,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
+<polyline points="166.7,221.0 166.7,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
+<polyline points="122.6,158.9 122.6,177.8 144.8,206.9 136.7,211.1 136.7,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
+<polyline points="125.0,158.9 125.0,177.0 147.2,206.1 142.7,211.1 142.7,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
+<polyline points="127.4,158.9 127.4,176.2 149.6,205.3 148.7,211.1 148.7,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
+<polyline points="129.8,158.9 129.8,175.4 152.0,204.5 154.7,211.1 154.7,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
+<polyline points="132.2,158.9 132.2,174.6 154.4,203.7 160.7,211.1 160.7,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
+<polyline points="134.6,158.9 134.6,173.8 156.8,202.9 166.7,211.1 166.7,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
+<polyline points="121.4,168.2 121.4,178.2 143.6,207.3 133.7,211.1 133.7,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
+<polyline points="123.8,168.2 123.8,177.4 146.0,206.5 139.7,211.1 139.7,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
+<polyline points="126.2,168.2 126.2,176.6 148.4,205.7 145.7,211.1 145.7,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
+<polyline points="128.6,168.2 128.6,175.8 150.8,204.9 151.7,211.1 151.7,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
+<polyline points="131.0,168.2 131.0,175.0 153.2,204.1 157.7,211.1 157.7,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
+<polyline points="133.4,168.2 133.4,174.2 155.6,203.3 163.7,211.1 163.7,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
+<polyline points="168.2,158.9 168.2,174.2 146.3,203.3 138.2,211.1 138.2,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
+<polyline points="170.6,158.9 170.6,175.0 148.7,204.1 144.2,211.1 144.2,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
+<polyline points="173.0,158.9 173.0,175.8 151.1,204.9 150.2,211.1 150.2,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
+<polyline points="175.4,158.9 175.4,176.6 153.5,205.7 156.2,211.1 156.2,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
+<polyline points="177.8,158.9 177.8,177.4 155.9,206.5 162.2,211.1 162.2,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
+<polyline points="180.2,158.9 180.2,178.2 158.3,207.3 168.2,211.1 168.2,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
+<polyline points="167.0,168.2 167.0,173.8 145.1,202.9 135.2,211.1 135.2,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
+<polyline points="169.4,168.2 169.4,174.6 147.5,203.7 141.2,211.1 141.2,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
+<polyline points="171.8,168.2 171.8,175.4 149.9,204.5 147.2,211.1 147.2,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
+<polyline points="174.2,168.2 174.2,176.2 152.3,205.3 153.2,211.1 153.2,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
+<polyline points="176.6,168.2 176.6,177.0 154.7,206.1 159.2,211.1 159.2,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
+<polyline points="179.0,168.2 179.0,177.8 157.1,206.9 165.2,211.1 165.2,212.9" fill="none" stroke="#1f5fbf" stroke-width="0.6"/>
 <text x="26.0" y="240.0" fill="#333">layer_module card, 110 x 70 mm, fingers along the bottom edge. Generated from hw/board_psram.yaml by hw/kicad_gen.py. Blue: ring ribbons on In2.Cu; pink: core-rail islands on In6.Cu. Card edge at the bottom.</text>
-<text x="26.0" y="256.0" fill="#333">Memory, PCIe and management nets are unrouted. Longest lane per hop: fingers -> CHIP 19 mm; CHIP -> fingers 19 mm</text>
+<text x="26.0" y="256.0" fill="#333">Memory, PCIe and management nets are unrouted. Longest lane per hop: fingers -> CHIP 22 mm; CHIP -> fingers 23 mm</text>
 </svg>

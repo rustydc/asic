@@ -110,7 +110,8 @@ STACKUPS = {
                             "In3.Cu": "12 V and FPGA rails", "In4.Cu": "GND", "B.Cu": "signal"},
                            "In2.Cu", "In3.Cu", "In3.Cu"),
     "card": Stackup("eight-layer module card (HDI build-up pair for the memory escape)",
-                    {"F.Cu": "signal", "In1.Cu": "GND", "In2.Cu": "link signals", "In3.Cu": "memory signals",
+                    {"F.Cu": "signal", "In1.Cu": "GND", "In2.Cu": "link signals (in)",
+                     "In3.Cu": "link signals (out) below the chip, memory signals above it",
                      "In4.Cu": "memory signals", "In5.Cu": "GND", "In6.Cu": "core and I/O rails", "B.Cu": "signal"},
                     "In2.Cu", "In6.Cu", "In6.Cu"),
 }
@@ -163,10 +164,10 @@ FORM_FACTORS = {
 # the fans and nothing else.  The CRPS modules are longer than the board and
 # overhang its front edge inside the bay.
 FORM_FACTORS["2u_short"] = FormFactor("2u_short", "short-depth 2U rack chassis, motherboard with a folded row of module slots, host-attached",
-                                      420.0, 180.0, (140.0, 90.0),
-                                      (("PSU bay (two CRPS, stacked, overhanging)", (346.0, 0.0, 420.0, 180.0)),
+                                      420.0, 170.0, (140.0, 85.0),
+                                      (("PSU bay (two CRPS, stacked, overhanging)", (346.0, 0.0, 420.0, 170.0)),
                                        ("rear I/O", (0.0, 0.0, 346.0, 12.0)),
-                                       ("front fans", (0.0, 172.0, 420.0, 180.0))))
+                                       ("front fans", (0.0, 162.0, 420.0, 170.0))))
 
 # Rear-panel parts that move on the short board: the SFP cage tucks in beside
 # the BMC Ethernet and the BMC goes above them, so the slot row can start
@@ -227,6 +228,7 @@ class Pad:
     escape: tuple[str, int] | None = None   # (edge, depth) for ring-link balls
     port: str | None = None                 # "in" or "out" for ring-link balls and pins
     drill: float | None = None              # through-hole pins (slot connectors)
+    via_offset: tuple[float, float] | None = None   # a finger's own via, relative to the pad (both faces share the x span)
 
 
 @dataclass
@@ -842,7 +844,10 @@ SLOT_PITCH = 22.0               # slot to slot: card, heatsink, airflow
 SLOT_ROW_GAP_MM = 12.0          # between the two facing rows of slots (the U's bottom)
 SLOT_RUN = 3.0                  # a ribbon leaves or enters a slot's pin row straight for this long
 SLOT_TURN_RUN = 8.0             # and this long before a square corner (the turn between rows, the FPGA hops)
-EDGE_VIA_UP = 2.7               # a finger's via sits this far up from the finger centre, on the F.Cu side
+EDGE_VIA_UP = 2.7               # a finger's via sits this far up from the finger centre
+EDGE_VIA_STAGGER = 0.5          # side B's vias sit this far along from side A's, so the two faces' vias interleave
+CARD_OUT_LAYER = "In3.Cu"       # the card's out drop, so it may cross the in drop over the shared finger span
+CARD_RUN = 2.0                  # a drop leaves the port and enters the fingers straight for this long
 
 
 def edge_position_x(position: int) -> float:
@@ -877,9 +882,15 @@ class EdgeLayout:
 
 
 def edge_layout(board: Board, pin: pinout.Pinout) -> EdgeLayout:
-    """Link_in fingers from position 12; link_out fingers as far along as the
-    package's link_out block is from its link_in block, to the nearest position."""
+    """Link_in fingers from position 12 on side A.  ``finger_layout: parallel``
+    (the default) puts link_out on the same positions of side B, so a slot's
+    out-row pin faces the next slot's in-row pin straight across; ``offset``
+    puts link_out as far along as the package's link_out block is from its
+    link_in block, to the nearest position, so each drop on the card has its
+    own span."""
     lanes = len(link_signals(board))
+    if board.data["board"].get("finger_layout", "parallel") == "parallel":
+        return EdgeLayout(lanes, EDGE_LINK_IN_FROM, EDGE_LINK_IN_FROM)
     centre = {}
     for port in ("link_in", "link_out"):
         xs = [ball.x for ball in pin.balls if ball.kind == "signal" and ball.interface == port]
@@ -933,10 +944,13 @@ def card_edge_part(board: Board, layout: EdgeLayout, x_left: float) -> Part:
         layers = '"F.Cu" "F.Mask"' if side == "B" else '"B.Cu" "B.Mask"'
         escape = ("N", 0) if port else None
         # To the card's router the link_in fingers are where a ribbon leaves
-        # (towards the chip) and the link_out fingers where one arrives.
+        # (towards the chip) and the link_out fingers where one arrives.  Each
+        # face's link fingers have their own vias just above the fingers, side
+        # B's half a position along so the two rows interleave.
         role = {"in": "out", "out": "in"}.get(port)
+        via = (EDGE_VIA_STAGGER if side == "B" else 0.0, EDGE_VIA_UP) if port else None
         pads.append(Pad(name, x, EDGE_FINGER[1] / 2 + 1.0, net, shape="rect", size=EDGE_FINGER, layers=layers,
-                        escape=escape, port=role))
+                        escape=escape, port=role, via_offset=via))
     length = edge_length()
     part = Part("J_EDGE", "card_edge", "PCIE_X16_FINGERS", x_left + length / 2, EDGE_ZONE_MM / 2, 0.0, length, EDGE_ZONE_MM,
                 pads, value="card-edge fingers", lane_pitch_mm=EDGE_PITCH)
@@ -995,10 +1009,14 @@ def build_module_design(board: Board) -> Design:
     # north, east and west.  The chip sits near the card's middle and the
     # fingers slide along the edge to put the groups under their blocks.
     in_balls = [ball.x for ball in pin.balls if ball.kind == "signal" and ball.interface == "link_in"]
-    in_offset = sum(in_balls) / len(in_balls)
+    out_balls = [ball.x for ball in pin.balls if ball.kind == "signal" and ball.interface == "link_out"]
+    in_offset, out_offset = sum(in_balls) / len(in_balls), sum(out_balls) / len(out_balls)
+    # With both drops landing on one finger span, the span sits midway between
+    # the two blocks and each drop leans the same way; otherwise under link_in.
+    anchor = (in_offset + out_offset) / 2 if layout.in_from == layout.out_from else in_offset
     in_group = sum(edge_position_x(k) + EDGE_PITCH / 2 for k in range(layout.in_from, layout.in_from + layout.lanes)) / layout.lanes
-    chip_x = ff.width / 2 - 3.0
-    fingers = card_edge_part(board, layout, chip_x + in_offset - in_group)
+    chip_x = ff.width / 2 - 12.0
+    fingers = card_edge_part(board, layout, chip_x + anchor - in_group)
     design.parts.append(fingers)
     chip_y = EDGE_ZONE_MM + EDGE_VIA_UP + PATH_MARGIN + 8.0 + ESCAPE_OUT + PATH_MARGIN + asic_pkg.body_h / 2
     # A generic card: the memory nets and the small interfaces carry the card's own names.
@@ -1043,8 +1061,10 @@ def build_module_design(board: Board) -> Design:
     # fingers' link pins take their nets from the ribbons, which fixes the
     # finger map; the same signal must sit at the same offset in both groups
     # or the motherboard's slot-to-slot ribbons would cross.
-    route_hop(design, 0, "fingers -> U_CHIP", fingers, chip, run_out=PATH_RUN, run_in=PATH_RUN)
-    route_hop(design, 1, "U_CHIP -> fingers", chip, fingers, run_out=PATH_RUN, run_in=PATH_RUN)
+    # Short straight runs at both ends: with one finger span the drops lean.
+    route_hop(design, 0, "fingers -> U_CHIP", fingers, chip, run_out=CARD_RUN, run_in=CARD_RUN)
+    route_hop(design, 1, "U_CHIP -> fingers", chip, fingers, run_out=CARD_RUN, run_in=CARD_RUN,
+              layer=CARD_OUT_LAYER if layout.in_from == layout.out_from else None)
     for pad in fingers.pads:
         if pad.port:
             design.finger_map[pad.name] = pad.net.split("_", 2)[2]           # LINK_IN_DATA3 -> DATA3
@@ -1334,16 +1354,21 @@ def modular_report_lines(design: Design) -> list[str]:
         lines += ["## The card", "",
                   f"One ring chip ({design.pinout.package.name}, {chip.body_w:.0f} mm body) with both link ports on its south "
                   f"edge, each ribbon leaving the package straight and "
-                  f"dropping straight onto its finger group ({len(link_signals(board))} positions at {EDGE_PITCH} mm, link_in "
-                  f"on side A, link_out on side B), the lanes fanning from {chip.lane_pitch} mm to {EDGE_PITCH} mm on the way down. "
+                  f"dropping onto its finger group ({len(link_signals(board))} positions at {EDGE_PITCH} mm, link_in on side A, "
+                  f"link_out on side B"
+                  + (f" at the same positions, the out drop on {CARD_OUT_LAYER} crossing the in drop on {design.stackup.link_layer} "
+                     f"over the shared span, the two faces' vias interleaved {EDGE_VIA_STAGGER} mm apart above the fingers"
+                     if design.finger_map and next(iter(design.finger_map)) and board.data['board'].get('finger_layout', 'parallel') == 'parallel'
+                     else " at its own positions")
+                  + f"), the lanes fanning from {chip.lane_pitch} mm to {EDGE_PITCH} mm on the way down. "
                   f"The memory devices sit in rows above the chip on its north edge; the core regulator and the I/O regulator "
                   f"stand at the right end.", "",
                   "| Leg | Shortest lane (mm) | Longest lane (mm) | Bend |", "| --- | ---: | ---: | ---: |"]
         for hop, (lo, hi) in design.hop_lengths.items():
             lines.append(f"| {hop} | {lo:.1f} | {hi:.1f} | {design.hop_bends[hop]:.0f} deg |")
         pairs = sum(1 for name in design.finger_map if name.startswith("A"))
-        lines += ["", f"Finger map: {pairs} link positions, each carrying the same signal on side A (in) and side B (out), "
-                  "so the motherboard's slot-to-slot ribbons are straight. The memory nets are present and unrouted."]
+        lines += ["", f"Finger map: {pairs} link positions, each carrying the same signal at the same offset on side A (in) "
+                  "and side B (out), so a slot's out-row pin faces the next slot's in-row pin. The memory nets are present and unrouted."]
     else:
         slots = [p for p in design.parts if p.part_class == "module_slot"]
         folded = board.data["board"].get("layout", "two_rows") == "folded"
@@ -1377,6 +1402,8 @@ def modular_report_lines(design: Design) -> list[str]:
                       "* No decoupling capacitors, no VRM internals, no thermal vias, no mounting holes, no card retention.",
                       "* The card-edge and slot geometry is a placeholder for a real connector drawing.",
                       "* The ASIC ball map is the rule-derived one from hw/pinout.py."]
+            if design.notes:
+                lines += ["", "## Notes", ""] + [f"* {note}" for note in design.notes]
             return lines
         lines += ["## Slots and the ring", "",
                   f"{len(slots)} slots at {SLOT_PITCH:.0f} mm pitch in two facing rows {SLOT_ROW_GAP_MM:.0f} mm apart: the ring "
@@ -1398,6 +1425,8 @@ def modular_report_lines(design: Design) -> list[str]:
               "* No decoupling capacitors, no VRM internals, no thermal vias, no mounting holes, no card retention.",
               "* The card-edge and slot geometry is a placeholder for a real connector drawing.",
               "* The ASIC ball map is the rule-derived one from hw/pinout.py."]
+    if design.notes:
+        lines += ["", "## Notes", ""] + [f"* {note}" for note in design.notes]
     return lines
 
 
@@ -1462,7 +1491,9 @@ def escape_via_local(pad: Pad, pitch: float) -> Point:
 
 
 def escape_via(part: Part, pad: Pad) -> Point:
-    if part.package is None:            # a connector pin or a finger: the ribbon starts on the pin's own via
+    if pad.via_offset is not None:      # a finger: its via sits where the card says, so the two faces' vias interleave
+        return part.local_to_board(pad.x + pad.via_offset[0], pad.y + pad.via_offset[1])
+    if part.package is None:            # a connector pin: the ribbon starts on the pin's own via
         return part.local_to_board(pad.x, pad.y) if pad.drill else part.local_to_board(*escape_via_local(pad, 2 * part.lane_pitch))
     return part.local_to_board(*escape_via_local(pad, part.package.pitch))
 
@@ -1617,13 +1648,14 @@ def route_ring(design: Design) -> None:
 
 
 def route_hop(design: Design, hop: int, label: str, source: Part, sink: Part,
-              run_out: float = PATH_RUN, run_in: float = PATH_RUN) -> None:
+              run_out: float = PATH_RUN, run_in: float = PATH_RUN, layer: str | None = None) -> None:
     """Route one ribbon from ``source``'s out-port to ``sink``'s in-port: escape
-    vias and stubs at both ends, the lanes on the link layer between."""
+    vias and stubs at both ends, the lanes on the link layer (or ``layer``) between."""
     path, bend = hop_path(source, sink, design.max_bend_deg, run_out, run_in)
     src_pads = port_pads(source, "out")
     dst_pads = port_pads(sink, "in")
-    # Escape stubs and vias on both ends (a through-hole pin is its own via).
+    # Escape stubs and vias on both ends (a through-hole pin is its own via;
+    # a finger's via is the small kind, since the two faces' vias interleave).
     for part, pads in ((source, src_pads), (sink, dst_pads)):
         for pad in pads:
             if pad.drill:
@@ -1631,7 +1663,8 @@ def route_hop(design: Design, hop: int, label: str, source: Part, sink: Part,
             vx, vy = escape_via(part, pad)
             px, py = part.local_to_board(pad.x, pad.y)
             net = pad.net or f"__{part.ref}_{pad.name}"
-            design.vias.append(Via(vx, vy, net))
+            size = SMALL_VIA_SIZE if pad.via_offset is not None else VIA_SIZE
+            design.vias.append(Via(vx, vy, net, size=size, drill=size / 2))
             design.tracks.append(Track(pad_layer(pad), net, [(px, py), (vx, vy)]))
     # The FPGA's link pins (and a card's fingers) get their nets from the
     # ribbon, so a hop into or out of an unassigned port is routed from
@@ -1657,7 +1690,7 @@ def route_hop(design: Design, hop: int, label: str, source: Part, sink: Part,
             raise ValueError(f"hop {hop}: lane of {net} arrives at {sink.ref}.{pad_name} carrying {pad.net}")
     lengths = []
     for net, points in tracks.items():
-        track = Track(design.stackup.link_layer, net, points)
+        track = Track(layer or design.stackup.link_layer, net, points)
         design.tracks.append(track)
         lengths.append(track.length())
     design.hop_lengths[label] = (min(lengths), max(lengths))

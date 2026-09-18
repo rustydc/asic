@@ -328,14 +328,19 @@ memory-bound where the other boards' are current-bound.
 
 The card is 110 × 70 mm with PCIe x16 fingers used mechanically: 12 V and
 ground on the short section, link_in on twelve side-A positions and
-link_out on twelve side-B positions, the management pins after them. The
-chip sits with its south edge 8 mm above the connector zone so that each
-link block drops straight onto its finger group, 15 to 19 mm of ribbon
-with no bend, the lanes fanning from 0.4 mm to 1.0 mm on the way down. The
-sixteen PSRAMs stand in two rows of eight above the chip; the core VRM and
-the 1.8 V regulator stand at the right end, so the 0.8 V current never
-crosses a connector: a module takes about 20 W as 1.7 A at 12 V. The head
-module is the same card with the memory sites empty.
+link_out on the **same** twelve side-B positions, the management pins after
+them. Sharing the positions is what makes every slot-to-slot hop on the
+motherboard a straight ribbon: a slot's out-row pin faces the next slot's
+in-row pin. On the card it means the two drops from the die's two south-edge
+blocks lean towards one finger span from either side and cross, so the
+in drop runs on `In2.Cu` and the out drop on `In3.Cu`, and the two faces'
+vias sit interleaved half a position apart just above the fingers. Each
+drop is 17 to 23 mm at 37 degrees, the lanes fanning from 0.4 mm to 1.0 mm
+on the way down. The sixteen PSRAMs stand in two rows of eight above the
+chip; the core VRM and the 1.8 V regulator stand at the right end, so the
+0.8 V current never crosses a connector: a module takes about 20 W as
+1.7 A at 12 V. The head module is the same card with the memory sites
+empty.
 
 The motherboard is six layers (signal, ground, the link, 12 V and the
 FPGA's rails, ground, signal) with ten slots at 22 mm pitch in **one
@@ -348,21 +353,23 @@ ports side by side exactly as the die does.
 
 The slots are through-hole, the commodity part, and the skipped slot's
 pins are cleared by a **stagger**, not by weaving: the two sets of slots
-sit 52 mm apart along the cards, so each set's ribbon band, which runs at
+sit 38 mm apart along the cards, so each set's ribbon band, which runs at
 its link end, passes beyond the far end of the other set's pins. The
 stagger is derived from the geometry (half a slot, the ribbon's half width
-with its escapes, the link groups' distance from the slot centre and a
-clearance), and the report states it. `slot_kind: smt` puts both sets on
-one line instead, a surface-mount slot letting inner-layer ribbons pass
-beneath it, and saves the 52 mm at the price of a less ordinary part. The
-cards stand parallel to the front-to-back airflow. Hop lengths in
-`report.md` are end to end, the card's out drop plus the motherboard
-ribbon plus the next card's in drop: 83 mm slot to slot at a 23 degree
-bend, 183 mm at the turn, 73 and 89 mm for the FPGA hops, against a
-200 mm limit the slower link allows.
+with its escapes, the link group's distance from the slot centre and a
+clearance), and the report states it; putting in and out on the same
+positions narrowed the band from 27 mm to 12 and the stagger from 52 mm to
+38. `slot_kind: smt` puts both sets on one line instead, a surface-mount
+slot letting inner-layer ribbons pass beneath it, and saves the 38 mm at
+the price of a less ordinary part. The cards stand parallel to the
+front-to-back airflow. Hop lengths in `report.md` are end to end, the
+card's out drop plus the motherboard ribbon plus the next card's in drop:
+87 mm slot to slot with **no bend**, 190 mm at the turn, 76 and 92 mm for
+the FPGA hops, against a 200 mm limit the slower link allows. The turn is
+the hop to watch: it is the one that pays for the stagger twice.
 
 The fold is what sets the board's depth. The slot field is the card's
-89 mm plus the stagger, so the board is **420 × 180 mm** (`2u_short`): the
+89 mm plus the stagger, so the board is **420 × 170 mm** (`2u_short`): the
 rear I/O strip, the slot row, the fans, the FPGA and its DDR4 beside the
 end slots, and the PSU bay, whose CRPS modules are longer than the board
 and overhang its front edge inside the chassis. `layout: two_rows` in the
@@ -373,7 +380,7 @@ Three consequences are worth stating. The motherboard turned cheap and the
 card became the only hard board, and the card is small and built ten
 times, so a mistake in the memory escape scraps 77 cm², not 1,500. The
 chassis is a short-depth 2U, the card needing about 50 mm of height with
-its connector and the board 180 mm of depth. And a module can be brought
+its connector and the board 170 mm of depth. And a module can be brought
 up on its own against the FPGA before the other nine exist, which the
 single board cannot offer.
 

@@ -10,8 +10,8 @@ layer_module card, 110 x 70 mm, fingers along the bottom edge: 110 x 70 mm, 8 co
 | --- | --- |
 | F.Cu | signal |
 | In1.Cu | GND |
-| In2.Cu | link signals |
-| In3.Cu | memory signals |
+| In2.Cu | link signals (in) |
+| In3.Cu | link signals (out) below the chip, memory signals above it |
 | In4.Cu | memory signals |
 | In5.Cu | GND |
 | In6.Cu | core and I/O rails |
@@ -19,14 +19,14 @@ layer_module card, 110 x 70 mm, fingers along the bottom edge: 110 x 70 mm, 8 co
 
 ## The card
 
-One ring chip (FCBGA784_28x28_P0.8, 23 mm body) with both link ports on its south edge, each ribbon leaving the package straight and dropping straight onto its finger group (12 positions at 1.0 mm, link_in on side A, link_out on side B), the lanes fanning from 0.4 mm to 1.0 mm on the way down. The memory devices sit in rows above the chip on its north edge; the core regulator and the I/O regulator stand at the right end.
+One ring chip (FCBGA784_28x28_P0.8, 23 mm body) with both link ports on its south edge, each ribbon leaving the package straight and dropping onto its finger group (12 positions at 1.0 mm, link_in on side A, link_out on side B at the same positions, the out drop on In3.Cu crossing the in drop on In2.Cu over the shared span, the two faces' vias interleaved 0.5 mm apart above the fingers), the lanes fanning from 0.4 mm to 1.0 mm on the way down. The memory devices sit in rows above the chip on its north edge; the core regulator and the I/O regulator stand at the right end.
 
 | Leg | Shortest lane (mm) | Longest lane (mm) | Bend |
 | --- | ---: | ---: | ---: |
-| fingers -> U_CHIP | 14.9 | 19.0 | 3 deg |
-| U_CHIP -> fingers | 14.9 | 19.0 | 6 deg |
+| fingers -> U_CHIP | 17.4 | 22.1 | 37 deg |
+| U_CHIP -> fingers | 17.4 | 22.7 | 37 deg |
 
-Finger map: 12 link positions, each carrying the same signal on side A (in) and side B (out), so the motherboard's slot-to-slot ribbons are straight. The memory nets are present and unrouted.
+Finger map: 12 link positions, each carrying the same signal at the same offset on side A (in) and side B (out), so a slot's out-row pin faces the next slot's in-row pin. The memory nets are present and unrouted.
 ## Not done here
 
 * Memory, DDR4 and PCIe are present as nets and unrouted.
