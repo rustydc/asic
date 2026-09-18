@@ -158,7 +158,7 @@ class KicadGeneratorTest(unittest.TestCase):
         self.assertEqual(len(slots), 10)
         self.assertEqual({p.rotation for p in slots}, {0.0, 180.0})
         self.assertEqual(sorted({round(p.y, 3) for p in slots}), sorted({round(v, 3) for v in (slots[0].y, slots[-1].y)}))
-        self.assertTrue(all(pad.drill is None and pad.shape == "rect" for pad in slots[0].pads))   # surface-mount slots
+        self.assertTrue(all(pad.drill for pad in slots[0].pads))                     # through-hole slots
         self.assertEqual([p.ref for p in design.parts if p.part_class in ("layer_asic", "head_asic", "psram")], [])
         hops = kg.ring_hops(board)
         self.assertEqual(len(design.hop_lengths), len(hops))
@@ -189,32 +189,44 @@ class KicadGeneratorTest(unittest.TestCase):
                          "asics.kicad_sch", "fpga.kicad_sch"):
                 self.assertTrue(balanced((out / name).read_text(encoding="utf-8")), name)
             pcb = (out / "appliance.kicad_pcb").read_text(encoding="utf-8")
-            self.assertIn('(footprint "appliance:PCIE_X16_SLOT_SMT"', pcb)
+            self.assertIn("thru_hole", pcb)
             self.assertIn('(layers "B.Cu" "B.Mask")', (out / "module.kicad_pcb").read_text(encoding="utf-8"))
             self.assertIn("Slots and the ring", (out / "report.md").read_text(encoding="utf-8"))
             self.assertIn("The card", (out / "module_report.md").read_text(encoding="utf-8"))
 
-    def test_folded_row_skips_a_slot_per_hop_on_surface_mount_slots(self) -> None:
+    def test_folded_row_skips_a_slot_per_hop_with_staggered_slots(self) -> None:
         board = Board.load(Path(__file__).resolve().parents[1] / "board_psram.yaml")
         self.assertEqual(board.data["board"]["layout"], "folded")
         design = kg.build_design(board)
         self.assertEqual(design.form_factor.key, "2u_short")
-        self.assertEqual(design.form_factor.depth, 160.0)
+        self.assertEqual(design.form_factor.depth, 180.0)
         slots = sorted((p for p in design.parts if p.part_class == "module_slot"), key=lambda p: p.x)
         self.assertEqual(len(slots), 10)
-        self.assertEqual(len({round(p.y, 3) for p in slots}), 1)                      # one row
         self.assertEqual([round(b.x - a.x, 3) for a, b in zip(slots, slots[1:])], [kg.SLOT_PITCH] * 9)
         # Nearest the FPGA (highest x): slot 0, then slot 9, 1, 8, ... 5 at the far end.
         self.assertEqual([p.ref for p in reversed(slots)], [f"J_SLOT{n}" for n in (0, 9, 1, 8, 2, 7, 3, 6, 4, 5)])
         self.assertEqual([p.rotation for p in reversed(slots)], [180.0, 0.0] * 5)
-        self.assertTrue(all(pad.drill is None for p in slots for pad in p.pads))       # surface-mount
+        # Through-hole slots, the outbound set staggered forward of the returning set by enough that
+        # each set's ribbon band clears the other set's pins: the band's near edge lies past the far end.
+        self.assertTrue(all(pad.drill for p in slots for pad in p.pads))
+        outbound = [p for p in slots if p.rotation == 180.0]
+        returning = [p for p in slots if p.rotation == 0.0]
+        self.assertEqual(len({round(p.y, 3) for p in outbound}), 1)
+        self.assertEqual(len({round(p.y, 3) for p in returning}), 1)
+        stagger = outbound[0].y - returning[0].y
+        self.assertGreater(stagger, 45.0)
+        self.assertLess(stagger, 60.0)
+        out_band_low = min(t.points[i][1] for t in design.tracks if t.net.startswith("LINK1_") and t.layer == design.stackup.link_layer for i in range(len(t.points)))
+        self.assertGreater(out_band_low, returning[0].y + returning[0].body_h / 2)
+        ret_band_high = max(t.points[i][1] for t in design.tracks if t.net.startswith("LINK6_") and t.layer == design.stackup.link_layer for i in range(len(t.points)))
+        self.assertLess(ret_band_high, outbound[0].y - outbound[0].body_h / 2)
         self.assertEqual(design.part("U_FPGA").rotation, 180.0)
         fpga_ports = {pad.escape[0] for pad in design.part("U_FPGA").pads if pad.escape}
         self.assertEqual(fpga_ports, {"E"})
         for hop, (lo, hi) in design.hop_lengths.items():
             self.assertLessEqual(hi, design.max_link_mm, hop)
             self.assertLessEqual(design.hop_bends[hop], 90.0 + 1e-6, hop)
-        self.assertLess(max(hi for _, hi in design.hop_lengths.values()), 140.0)
+        self.assertLess(max(hi for _, hi in design.hop_lengths.values()), 190.0)
         # No via-in-pad on the slots: their power pads reach the planes clear of the ribbon corridor.
         slot_pads = {(round(p.local_to_board(pad.x, pad.y)[0], 3), round(p.local_to_board(pad.x, pad.y)[1], 3))
                      for p in slots for pad in p.pads if pad.net in ("GND", "+12V")}
@@ -223,7 +235,14 @@ class KicadGeneratorTest(unittest.TestCase):
         for i, a in enumerate(boxed):
             for b in boxed[i + 1:]:
                 self.assertFalse(kg.polygons_overlap(a.corners(), b.corners()), f"{a.ref} overlaps {b.ref}")
-        # The two-row layout is still available for the same description.
+        # Surface-mount slots put both sets on one line, and the two-row layout is still available.
+        data = copy.deepcopy(board.data)
+        data["board"]["slot_kind"] = "smt"
+        smt = kg.build_design(Board(data))
+        smt_slots = [p for p in smt.parts if p.part_class == "module_slot"]
+        self.assertEqual(len({round(p.y, 3) for p in smt_slots}), 1)
+        self.assertTrue(all(pad.drill is None for p in smt_slots for pad in p.pads))
+        self.assertLess(max(hi for _, hi in smt.hop_lengths.values()), 140.0)
         data = copy.deepcopy(board.data)
         data["board"]["layout"] = "two_rows"
         data["board"]["form_factor_key"] = "2u"

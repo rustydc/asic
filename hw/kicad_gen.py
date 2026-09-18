@@ -163,10 +163,10 @@ FORM_FACTORS = {
 # the fans and nothing else.  The CRPS modules are longer than the board and
 # overhang its front edge inside the bay.
 FORM_FACTORS["2u_short"] = FormFactor("2u_short", "short-depth 2U rack chassis, motherboard with a folded row of module slots, host-attached",
-                                      420.0, 160.0, (140.0, 80.0),
-                                      (("PSU bay (two CRPS, stacked, overhanging)", (346.0, 0.0, 420.0, 160.0)),
+                                      420.0, 180.0, (140.0, 90.0),
+                                      (("PSU bay (two CRPS, stacked, overhanging)", (346.0, 0.0, 420.0, 180.0)),
                                        ("rear I/O", (0.0, 0.0, 346.0, 12.0)),
-                                       ("front fans", (0.0, 152.0, 420.0, 160.0))))
+                                       ("front fans", (0.0, 172.0, 420.0, 180.0))))
 
 # Rear-panel parts that move on the short board: the SFP cage tucks in beside
 # the BMC Ethernet and the BMC goes above them, so the slot row can start
@@ -836,7 +836,8 @@ SLOT_BODY_W = 7.5               # connector body across the card
 SLOT_PIN_DRILL = 0.7
 SLOT_SMT_ROW = 4.5              # a surface-mount slot's two pad rows, either side of the body
 SLOT_SMT_PAD = (0.6, 2.2)       # its pads, across x along
-FPGA_GAP = 26.0                 # between the end slot's body and the FPGA package
+FPGA_GAP = 30.0                 # between the end slot's body and the FPGA package
+SLOT_STAGGER_CLEARANCE = 2.0    # between a ribbon band and the pins of the slot set it must clear
 SLOT_PITCH = 22.0               # slot to slot: card, heatsink, airflow
 SLOT_ROW_GAP_MM = 12.0          # between the two facing rows of slots (the U's bottom)
 SLOT_RUN = 3.0                  # a ribbon leaves or enters a slot's pin row straight for this long
@@ -1181,6 +1182,18 @@ def build_motherboard_design(board: Board, card: Design) -> Design:
     return design
 
 
+def slot_stagger(board: Board, layout: EdgeLayout, sample: Part) -> float:
+    """How far the returning slots sit behind the outbound ones so that each
+    set's ribbon band, at its link end, runs past the far end of the other
+    set's pins rather than through them.  Zero for surface-mount slots, whose
+    pads stop at the surface."""
+    if board.data["board"].get("slot_kind", "through_hole") == "smt":
+        return 0.0
+    near = min(-pad.y for pad in sample.pads if pad.port)                  # the link groups' near edge, from the centre
+    band = layout.lanes * EDGE_PITCH / 2 + ESCAPE_OUT + PATH_MARGIN + 1.0    # half the ribbon plus its escapes
+    return sample.body_h / 2 + SLOT_STAGGER_CLEARANCE + band - near
+
+
 def build_folded_motherboard(board: Board, card: Design) -> Design:
     ff = select_form_factor(board)
     link = board.kinds["link"]
@@ -1188,6 +1201,7 @@ def build_folded_motherboard(board: Board, card: Design) -> Design:
                     max_link_mm=float(link.get("max_length_mm", MAX_LINK_MM)), kind="motherboard",
                     finger_map=dict(card.finger_map))
     layout = edge_layout(board, card.pinout)
+    smt = board.data["board"].get("slot_kind", "through_hole") == "smt"
     hops = ring_hops(board)
     hop_in = {sink: h for h, (_, sink) in enumerate(hops)}
     hop_out = {source: h for h, (source, _) in enumerate(hops)}
@@ -1199,17 +1213,23 @@ def build_folded_motherboard(board: Board, card: Design) -> Design:
     # back, so ring order 0..9 sits at positions 0,2,4,6,8 and 9,7,5,3,1.  The
     # FPGA is at the +x end, so position p is at x0 + (last - p) * pitch, the
     # outbound slots turned round to travel -x and the returning ones upright.
+    # Through-hole slots stagger the two sets along the cards so the ribbons
+    # of one set pass beyond the pins of the other: the returning set sits at
+    # the rear, the outbound set that much further forward.
     x0 = 66.0
-    y_row = 12.0 + 3.0 + edge_length() / 2 + 1.0
+    y_rear = 12.0 + 3.0 + edge_length() / 2 + 1.0
+    sample = slot_part(board, layout, "J_SAMPLE", chips[0], 0.0, 0.0, 0.0, design.finger_map, 0, 1, smt=smt)
+    stagger = slot_stagger(board, layout, sample)
     slot_of: dict[str, Part] = {}
     position_of: dict[str, int] = {}
     for k, ref in enumerate(chips):
         p = 2 * k if k < half else 2 * (len(chips) - 1 - k) + 1
         x = x0 + (last - p) * SLOT_PITCH
-        rotation = 180.0 if k < half else 0.0
+        outbound = k < half
+        rotation = 180.0 if outbound else 0.0
         slot = int(board.modules[board.module_of(ref)]["slot"])
-        part = slot_part(board, layout, f"J_SLOT{slot}", ref, x, y_row, rotation, design.finger_map,
-                         hop_in[ref], hop_out[ref], smt=True)
+        part = slot_part(board, layout, f"J_SLOT{slot}", ref, x, y_rear + (stagger if outbound else 0.0), rotation,
+                         design.finger_map, hop_in[ref], hop_out[ref], smt=smt)
         design.parts.append(part)
         slot_of[ref] = part
         position_of[ref] = p
@@ -1222,7 +1242,8 @@ def build_folded_motherboard(board: Board, card: Design) -> Design:
     fpga = Part(fpga_ref, "fpga", pkg.name, fx, fy, 180.0, pkg.body_w, pkg.body_h,
                 fpga_ball_map(board, "E", "N"), value="FPGA", package=pkg)
     design.parts.append(fpga)
-    place_fpga_neighbours(design, fpga, x0 + (last // 2) * SLOT_PITCH, y_row + edge_length() / 2 + 14.0)
+    # The clock generator and the I/O regulator sit left of the row, clear of the turn.
+    place_fpga_neighbours(design, fpga, 30.0, 130.0)
     add_chassis_parts(design)
     chain = board.nets["jtag"]["chain"]
     for a, b in zip(chain, chain[1:]):
@@ -1245,7 +1266,9 @@ def build_folded_motherboard(board: Board, card: Design) -> Design:
         src, dst = label.split(" -> ")
         extra = (card_out if src in slot_of else 0.0) + (card_in if dst in slot_of else 0.0)
         design.hop_lengths[label] = (lo + extra, hi + extra)
-    design.notes.append(f"folded row: positions " + ", ".join(f"{short_ref(r)}@{position_of[r]}" for r in chips))
+    design.notes.append(f"folded row: positions " + ", ".join(f"{short_ref(r)}@{position_of[r]}" for r in chips)
+                        + (f"; through-hole slots, the outbound set {stagger:.0f} mm forward of the returning set" if stagger
+                           else "; surface-mount slots, one line"))
     add_motherboard_zones(design)
     add_power_vias(design)
     check_fit(design)
@@ -1325,12 +1348,17 @@ def modular_report_lines(design: Design) -> list[str]:
         slots = [p for p in design.parts if p.part_class == "module_slot"]
         folded = board.data["board"].get("layout", "two_rows") == "folded"
         if folded:
+            ys = sorted({round(p.y, 1) for p in slots})
+            smt = board.data["board"].get("slot_kind", "through_hole") == "smt"
+            crossing = (f"passes beneath it on {st.link_layer} (a surface-mount slot has no pins through the board)" if smt else
+                        f"passes beyond its pins: the two sets of through-hole slots are staggered {ys[-1] - ys[0]:.0f} mm along "
+                        f"the cards, so each set's ribbon band at its link end clears the far end of the other set")
             lines += ["## Slots and the ring", "",
-                      f"{len(slots)} surface-mount slots at {SLOT_PITCH:.0f} mm pitch in one folded row: the outbound cards in "
-                      f"the even positions running away from the FPGA, the returning cards in the odd positions between them, "
-                      f"so every hop skips one slot and passes beneath it on {st.link_layer} (a surface-mount slot has no pins "
-                      f"through the board), the turn at the far end is a square U round the last slot, and the ring closes on "
-                      f"the FPGA's east edge, which carries both its link ports like a card's die. Each hop is one "
+                      f"{len(slots)} {'surface-mount' if smt else 'through-hole'} slots at {SLOT_PITCH:.0f} mm pitch in one folded "
+                      f"row: the outbound cards in the even positions running away from the FPGA, the returning cards in the odd "
+                      f"positions between them, so every hop skips one slot and {crossing}, the turn at the far end is a square U "
+                      f"round the last slot, and the ring closes on the FPGA's east edge, which carries both its link ports like a "
+                      f"card's die. Each hop is one "
                       f"{len(link_signals(board))}-lane ribbon at {EDGE_PITCH} mm lane pitch. Lengths below are end to end: the "
                       f"card's out drop, the motherboard ribbon and the next card's in drop. Limit {design.max_link_mm:.0f} mm "
                       f"per the link kind.", "",
@@ -1341,6 +1369,9 @@ def modular_report_lines(design: Design) -> list[str]:
             lines += ["", f"Each slot carries {board.connector_signal_count(module)} signals plus power and returns over "
                       f"{2 * EDGE_POSITIONS} contacts; the memory never leaves the card. The slots' ground and 12 V pads reach "
                       "the planes by stubs to vias placed clear of the ribbon corridor, so no via-in-pad is generated for them.", ""]
+            if not smt:
+                lines += ["The stagger costs board depth: the slot field is the card length plus the stagger. A surface-mount "
+                          "slot (`slot_kind: smt`) puts both sets on one line and saves it, at the price of a less ordinary part.", ""]
             lines += ["## Not done here", "",
                       "* Memory, DDR4 and PCIe are present as nets and unrouted.",
                       "* No decoupling capacitors, no VRM internals, no thermal vias, no mounting holes, no card retention.",

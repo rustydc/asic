@@ -62,6 +62,6 @@ U_FPGA -> U_A0 -> U_A1 -> U_A2 -> U_A3 -> U_A4 -> U_A5 -> U_A6 -> U_A7 -> U_H0 -
 | M8 | head_module | 8 | head_asic | 38 |
 | M9 | head_module | 9 | head_asic | 38 |
 
-**layer_module**: one layer ASIC, sixteen x16 PSRAMs in two rows above it, a core VRM and an I/O regulator; 12 V in over the edge. Connector: PCIe x16 card-edge connector used mechanically, surface-mount so the ring ribbons pass beneath it, 82 positions per side at 1.0 mm with our own pinout (placeholder geometry) (164 contacts). Card 110 x 70 mm.
+**layer_module**: one layer ASIC, sixteen x16 PSRAMs in two rows above it, a core VRM and an I/O regulator; 12 V in over the edge. Connector: PCIe x16 card-edge connector used mechanically, through-hole, 82 positions per side at 1.0 mm with our own pinout (placeholder geometry) (164 contacts). Card 110 x 70 mm.
 
-**head_module**: the same card with a head-mode ASIC and the memory sites unpopulated. Connector: PCIe x16 card-edge connector used mechanically, surface-mount so the ring ribbons pass beneath it, 82 positions per side at 1.0 mm with our own pinout (placeholder geometry) (164 contacts). Card 110 x 70 mm.
+**head_module**: the same card with a head-mode ASIC and the memory sites unpopulated. Connector: PCIe x16 card-edge connector used mechanically, through-hole, 82 positions per side at 1.0 mm with our own pinout (placeholder geometry) (164 contacts). Card 110 x 70 mm.
