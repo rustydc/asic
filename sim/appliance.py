@@ -150,8 +150,8 @@ class ApplianceConfig:
             raise ValueError("energy model values cannot be negative")
         if self.memory_efficiency > 1:
             raise ValueError("memory_efficiency cannot exceed one")
-        if self.global_every < 0 or self.layers_per_asic % self.global_period:
-            raise ValueError("global_every must divide layers_per_asic")
+        if self.global_every < 0 or (self.layers_per_asic % self.global_period and self.global_period % self.layers_per_asic):
+            raise ValueError("global_every must divide layers_per_asic or be a multiple of it")
 
     @classmethod
     def from_json(cls, path: str | Path) -> "ApplianceConfig":
