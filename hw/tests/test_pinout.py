@@ -101,6 +101,45 @@ class PinoutTest(unittest.TestCase):
         self.assertEqual(p.count("rail", "VDD_HBM_1V1"), 24)
         self.assertIn("HBM", pinout.report_markdown(p, board))
 
+    def test_psram_die_puts_both_link_ports_on_the_south_edge_and_memory_on_three(self) -> None:
+        board = Board.load(Path(__file__).resolve().parents[1] / "board_psram.yaml")
+        p = pinout.derive(board)
+        self.assertEqual(pinout.link_rows(board), 6)
+        self.assertEqual(pinout.memory_edges(board), ["N", "E", "W"])
+        # 16 ports of 19 signals plus a ground each: 320 balls in the outer five rows of three edges.
+        self.assertEqual(pinout.memory_balls_needed(board), 320)
+        self.assertEqual(p.package.name, "FCBGA784_28x28_P0.8")
+        self.assertEqual(p.requirements.signal_balls, 24 + 304 + 14)
+        rows, cols = p.package.rows, p.package.cols
+        link = [b for b in p.balls if b.interface in ("link_in", "link_out")]
+        self.assertEqual(len(link), 24)
+        self.assertTrue(all(b.row >= rows - 2 and b.escape[0] == "S" for b in link))
+        # link_in sits west of link_out along the edge, the blocks a finger group apart.
+        in_cols = [b.col for b in link if b.interface == "link_in"]
+        out_cols = [b.col for b in link if b.interface == "link_out"]
+        self.assertLess(max(in_cols), min(out_cols))
+        self.assertGreaterEqual((min(out_cols) - min(in_cols)) * p.package.pitch, 12.0)
+        memory = [b for b in p.balls if b.kind == "signal" and b.interface.startswith("psram_")]
+        self.assertEqual(len(memory), 304)
+        depth = [min(b.row, b.col, rows - 1 - b.row, cols - 1 - b.col) for b in memory]
+        self.assertLessEqual(max(depth), 4)
+        self.assertTrue(all(b.row >= rows - 2 for b in p.balls if b.interface in ("mgmt", "jtag", "refclk", "strap")))
+        report = pinout.report_markdown(p, board)
+        self.assertIn("S edge, beside it", report)
+        # The single-board rule set is untouched: the 9B map still has 36-lane ports on W and E.
+        self.assertEqual(pinout.link_rows(self.board), 18)
+        self.assertEqual(pinout.memory_edges(self.board), ["N"])
+
+    def test_memory_capacity_rule_rejects_a_package_whose_edges_are_too_short(self) -> None:
+        board = Board.load(Path(__file__).resolve().parents[1] / "board_psram.yaml")
+        # Memory on two edges instead of three: the 28x28 holds 230 memory balls in its outer
+        # five rows there, the 35x35 300, both short of the 320 needed, so the 45x45 is taken.
+        data = copy.deepcopy(board.data)
+        data["package_selection"]["edges"]["memory"] = ["N", "E"]
+        p = pinout.derive(Board(data))
+        self.assertEqual(p.package.name, "FCBGA2025_45x45_P1.0")
+        self.assertEqual(sum(1 for _, reason in p.rejected if "memory balls needed" in reason), 3)
+
     def test_no_candidate_is_an_error(self) -> None:
         data = copy.deepcopy(self.board.data)
         data["package_selection"]["candidates"] = data["package_selection"]["candidates"][:1]

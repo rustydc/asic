@@ -1,0 +1,585 @@
+# Appliance board, open-IP variant: block-level schematic capture.
+#
+# The 9B geometry on a 28 nm-class die with sixteen HPI x16 PSRAM devices
+# per layer ASIC and no DRAM PHY anywhere in the design
+# (sim/config/qwen35_9b_psram16.json).  Sixteen devices are 304 memory
+# signals, which no sensible package escapes onto a motherboard beside nine
+# other chips, so this variant is modular: each ring chip sits on its own
+# card with its memory and its core regulator, and only the ring, the
+# management buses and 12 V cross the card-edge connector (108 contacts
+# instead of 488 balls).  Ten cards stand in slots on a 2U motherboard, in
+# two facing rows so the ring runs out along one row and back along the
+# other.  Same schema as board.yaml plus `module_kinds`, `modules` and a
+# `module` on each card-resident component; `python -m hw.board --source
+# hw/board_psram.yaml` checks it, `hw.pinout` derives the package and
+# `hw.kicad_gen` writes both PCBs.  Every electrical number is a budget to
+# validate, and the connector and PSRAM package numbers are placeholders.
+
+board:
+  name: asic-llm-appliance-psram-a0
+  form_factor: 2U rack chassis, one 420 x 360 mm motherboard with ten module slots in two facing rows, host-attached over a PCIe cable, front-to-back fans between the cards, redundant CRPS
+  form_factor_key: 2u
+  host_interface: PCIe Gen4 x8 over a SlimSAS 8i cable to a host adapter card
+  cooling: air; each card carries a small heatsink on its ASIC (about 10 W) and the PSRAMs run bare, the cards standing parallel to the front-to-back airflow at 22 mm pitch
+  power_input:
+    # 2000 W is far more than the board draws (about 200 W at the design
+    # point); it is the same CRPS pair as the other boards so the chassis
+    # power design is shared.
+    - {name: CRPS 12 V, 1+1 redundant pair (two 2000 W modules), watts: 2000}
+
+# Energy model.  The die is the 9B 28 nm-class one at 3 pJ per MAC; the
+# design point is what the simulator measures with sixteen devices per
+# ASIC, and it is bound by their 16 GB/s, not by the fabric.  The memory
+# traffic is 4.72 MB per token per ASIC: three 1 MB recurrent states plus
+# the global layer's index scan and selected KV at 128K, int4 at 16:1, at
+# about 50 pJ per byte for a 1.8 V PSRAM interface.
+power_model:
+  mac_energy_pj: 3.0
+  design_tokens_per_second: 2500
+  memory_energy_pj_per_byte: 50.0
+  memory_bytes_per_token_per_asic: 4720000
+  report_tokens_per_second: [1000, 2500, 5000]
+
+# ASIC package and ball map (hw/pinout.py).  Rated at 5000 tokens/s, the
+# int4-state short-context point of the same sixteen devices, so a card
+# that reaches it needs no new package.  Both link ports sit on the south
+# edge, side by side, so each drops straight onto its finger group with no
+# bend on the card; the small interfaces sit between them.  The memory
+# takes the north, east and west edges, sixteen channels of nineteen
+# signals with a ground after each in the outer five rows (the card is
+# HDI, so five rows escape).
+package_selection:
+  rated_tokens_per_second: 5000
+  amps_per_ball: 0.5
+  signals_per_ground: 4
+  signal_rows: 5
+  edges: {link_in: S, link_out: S, memory: [N, E, W], misc: S}
+  rail_balls: {VDD_IO_1V8: 24, VDD_PLL_0V9: 2}
+  candidates:
+    - {name: FCBGA784_28x28_P0.8, cols: 28, rows: 28, pitch: 0.8, body: 23.0, ball: 0.40}
+    - {name: FCBGA961_31x31_P1.0, cols: 31, rows: 31, pitch: 1.0, body: 33.0, ball: 0.45}
+    - {name: FCBGA1225_35x35_P0.8, cols: 35, rows: 35, pitch: 0.8, body: 29.0, ball: 0.40}
+    - {name: FCBGA2025_45x45_P1.0, cols: 45, rows: 45, pitch: 1.0, body: 47.5, ball: 0.45}
+
+# The cards.  One design, populated two ways: a layer module carries the
+# sixteen PSRAMs, a head module leaves them off.  The connector is a PCIe
+# x16 card edge used mechanically only, with our own pinout: 12 V and
+# ground on the short section, the link ports on twelve positions each
+# (in on side A, out on side B, under their package blocks), the small
+# interfaces after them.
+module_kinds:
+  layer_module:
+    description: one layer ASIC, sixteen x16 PSRAMs in two rows above it, a core VRM and an I/O regulator; 12 V in over the edge.
+    connector: pcie_x16_edge
+    card_mm: [110, 70]
+  head_module:
+    description: the same card with a head-mode ASIC and the memory sites unpopulated.
+    connector: pcie_x16_edge
+    card_mm: [110, 70]
+
+modules:
+  M0: {kind: layer_module, slot: 0}
+  M1: {kind: layer_module, slot: 1}
+  M2: {kind: layer_module, slot: 2}
+  M3: {kind: layer_module, slot: 3}
+  M4: {kind: layer_module, slot: 4}
+  M5: {kind: layer_module, slot: 5}
+  M6: {kind: layer_module, slot: 6}
+  M7: {kind: layer_module, slot: 7}
+  M8: {kind: head_module, slot: 8}
+  M9: {kind: head_module, slot: 9}
+
+part_classes:
+  layer_asic:
+    description: fixed-weight 4-layer shard die with sixteen HPI x16 PSRAM ports and no DRAM PHY
+    package: FCBGA, derived by hw/pinout.py from package_selection
+    rails: [VDD_CORE, VDD_IO_1V8, VDD_PLL_0V9]
+    static_w: 3
+    macs_per_token: 866000000
+    memory_traffic: true
+    interfaces:
+      link_in: {kind: link}
+      link_out: {kind: link}
+      psram_0: {kind: psram_x16}
+      psram_1: {kind: psram_x16}
+      psram_2: {kind: psram_x16}
+      psram_3: {kind: psram_x16}
+      psram_4: {kind: psram_x16}
+      psram_5: {kind: psram_x16}
+      psram_6: {kind: psram_x16}
+      psram_7: {kind: psram_x16}
+      psram_8: {kind: psram_x16}
+      psram_9: {kind: psram_x16}
+      psram_10: {kind: psram_x16}
+      psram_11: {kind: psram_x16}
+      psram_12: {kind: psram_x16}
+      psram_13: {kind: psram_x16}
+      psram_14: {kind: psram_x16}
+      psram_15: {kind: psram_x16}
+      mgmt: {kind: mgmt_spi}
+      jtag: {kind: jtag}
+      refclk: {kind: refclk}
+      mode: {kind: strap, value: LAYER}
+  head_asic:
+    description: same die, head-mode personalization (LM head half); memory balls unconnected
+    package: same package and ball map as layer_asic
+    rails: [VDD_CORE, VDD_IO_1V8, VDD_PLL_0V9]
+    static_w: 2
+    macs_per_token: 508000000
+    interfaces:
+      link_in: {kind: link}
+      link_out: {kind: link}
+      mgmt: {kind: mgmt_spi}
+      jtag: {kind: jtag}
+      refclk: {kind: refclk}
+      mode: {kind: strap, value: HEAD}
+  psram:
+    description: HPI x16 PSRAM, 64 MB, 1.8 V, 250 MHz DDR (1 GB/s); 49-ball FBGA 8 x 8 mm placeholder
+    package: 49-ball FBGA (placeholder)
+    rails: [VDD_IO_1V8]
+    tdp_w: 0.4
+    interfaces:
+      channel: {kind: psram_x16}
+  fpga:
+    description: controller FPGA with hard PCIe Gen4 block and DDR4 controller (AU25P/KU5P class)
+    package: FFVB676 or similar
+    rails: [VCCINT_0V85, VCCAUX_1V8, VCCO_1V8, VCCO_1V2, MGTAVCC, MGTAVTT]
+    tdp_w: 25
+    interfaces:
+      pcie: {kind: pcie_gen4_x8}
+      link_out: {kind: link}
+      link_in: {kind: link}
+      ddr4: {kind: ddr4_x64}
+      mgmt_master: {kind: mgmt_spi}
+      jtag: {kind: jtag}
+      refclk: {kind: refclk}
+      sfp: {kind: sfp_plus, optional: true}
+      qspi: {kind: qspi}
+      uart: {kind: uart}
+  ddr4:
+    description: DDR4 x16 for the embedding table and context metadata (4 x16 = x64, 4 GB)
+    package: 96-ball FBGA
+    rails: [VDD_1V2, VPP_2V5]
+    tdp_w: 0.75
+    interfaces:
+      channel: {kind: ddr4_x16}
+  clock_gen:
+    description: low-jitter clock generator, 12+ outputs (Si5345 class)
+    rails: [VDD_IO_1V8]
+    tdp_w: 0.5
+  sfp_cage:
+    description: SFP+ cage on the rear panel for standalone 10GbE operation (optional fit)
+    rails: [VDD_3V3]
+    tdp_w: 1.5
+  host_cable:
+    description: SlimSAS 8i (SFF-8654) receptacle, PCIe Gen4 x8 plus sideband, to a host adapter card
+    rails: []
+    tdp_w: 0
+  bmc:
+    description: baseboard management controller (AST2600 class) with its own Ethernet, fans, PSU PMBus, card presence, FPGA UART
+    rails: [VDD_3V3]
+    tdp_w: 5
+  rj45:
+    description: BMC management Ethernet, rear panel
+    rails: [VDD_3V3]
+    tdp_w: 0.5
+  psu_input:
+    description: CRPS 12 V output blade receptacle (one per module) with PMBus and enable
+    rails: []
+    tdp_w: 0
+  fan_header:
+    description: 4-pin PWM fan header, one per 40 mm front fan
+    rails: []
+    tdp_w: 12
+
+# Instances.  A component with `module` sits on that card; the rest are on
+# the motherboard.
+components:
+  U_FPGA: {class: fpga, place: open end of the U, beside the host connector}
+  U_A0: {class: layer_asic, layers: "0-3", module: M0}
+  U_A1: {class: layer_asic, layers: "4-7", module: M1}
+  U_A2: {class: layer_asic, layers: "8-11", module: M2}
+  U_A3: {class: layer_asic, layers: "12-15", module: M3}
+  U_A4: {class: layer_asic, layers: "16-19", module: M4}
+  U_A5: {class: layer_asic, layers: "20-23", module: M5}
+  U_A6: {class: layer_asic, layers: "24-27", module: M6}
+  U_A7: {class: layer_asic, layers: "28-31", module: M7}
+  U_H0: {class: head_asic, vocab_rows: "0-124159", module: M8}
+  U_H1: {class: head_asic, vocab_rows: "124160-248319", module: M9}
+  U_M0_0: {class: psram, module: M0}
+  U_M0_1: {class: psram, module: M0}
+  U_M0_2: {class: psram, module: M0}
+  U_M0_3: {class: psram, module: M0}
+  U_M0_4: {class: psram, module: M0}
+  U_M0_5: {class: psram, module: M0}
+  U_M0_6: {class: psram, module: M0}
+  U_M0_7: {class: psram, module: M0}
+  U_M0_8: {class: psram, module: M0}
+  U_M0_9: {class: psram, module: M0}
+  U_M0_10: {class: psram, module: M0}
+  U_M0_11: {class: psram, module: M0}
+  U_M0_12: {class: psram, module: M0}
+  U_M0_13: {class: psram, module: M0}
+  U_M0_14: {class: psram, module: M0}
+  U_M0_15: {class: psram, module: M0}
+  U_M1_0: {class: psram, module: M1}
+  U_M1_1: {class: psram, module: M1}
+  U_M1_2: {class: psram, module: M1}
+  U_M1_3: {class: psram, module: M1}
+  U_M1_4: {class: psram, module: M1}
+  U_M1_5: {class: psram, module: M1}
+  U_M1_6: {class: psram, module: M1}
+  U_M1_7: {class: psram, module: M1}
+  U_M1_8: {class: psram, module: M1}
+  U_M1_9: {class: psram, module: M1}
+  U_M1_10: {class: psram, module: M1}
+  U_M1_11: {class: psram, module: M1}
+  U_M1_12: {class: psram, module: M1}
+  U_M1_13: {class: psram, module: M1}
+  U_M1_14: {class: psram, module: M1}
+  U_M1_15: {class: psram, module: M1}
+  U_M2_0: {class: psram, module: M2}
+  U_M2_1: {class: psram, module: M2}
+  U_M2_2: {class: psram, module: M2}
+  U_M2_3: {class: psram, module: M2}
+  U_M2_4: {class: psram, module: M2}
+  U_M2_5: {class: psram, module: M2}
+  U_M2_6: {class: psram, module: M2}
+  U_M2_7: {class: psram, module: M2}
+  U_M2_8: {class: psram, module: M2}
+  U_M2_9: {class: psram, module: M2}
+  U_M2_10: {class: psram, module: M2}
+  U_M2_11: {class: psram, module: M2}
+  U_M2_12: {class: psram, module: M2}
+  U_M2_13: {class: psram, module: M2}
+  U_M2_14: {class: psram, module: M2}
+  U_M2_15: {class: psram, module: M2}
+  U_M3_0: {class: psram, module: M3}
+  U_M3_1: {class: psram, module: M3}
+  U_M3_2: {class: psram, module: M3}
+  U_M3_3: {class: psram, module: M3}
+  U_M3_4: {class: psram, module: M3}
+  U_M3_5: {class: psram, module: M3}
+  U_M3_6: {class: psram, module: M3}
+  U_M3_7: {class: psram, module: M3}
+  U_M3_8: {class: psram, module: M3}
+  U_M3_9: {class: psram, module: M3}
+  U_M3_10: {class: psram, module: M3}
+  U_M3_11: {class: psram, module: M3}
+  U_M3_12: {class: psram, module: M3}
+  U_M3_13: {class: psram, module: M3}
+  U_M3_14: {class: psram, module: M3}
+  U_M3_15: {class: psram, module: M3}
+  U_M4_0: {class: psram, module: M4}
+  U_M4_1: {class: psram, module: M4}
+  U_M4_2: {class: psram, module: M4}
+  U_M4_3: {class: psram, module: M4}
+  U_M4_4: {class: psram, module: M4}
+  U_M4_5: {class: psram, module: M4}
+  U_M4_6: {class: psram, module: M4}
+  U_M4_7: {class: psram, module: M4}
+  U_M4_8: {class: psram, module: M4}
+  U_M4_9: {class: psram, module: M4}
+  U_M4_10: {class: psram, module: M4}
+  U_M4_11: {class: psram, module: M4}
+  U_M4_12: {class: psram, module: M4}
+  U_M4_13: {class: psram, module: M4}
+  U_M4_14: {class: psram, module: M4}
+  U_M4_15: {class: psram, module: M4}
+  U_M5_0: {class: psram, module: M5}
+  U_M5_1: {class: psram, module: M5}
+  U_M5_2: {class: psram, module: M5}
+  U_M5_3: {class: psram, module: M5}
+  U_M5_4: {class: psram, module: M5}
+  U_M5_5: {class: psram, module: M5}
+  U_M5_6: {class: psram, module: M5}
+  U_M5_7: {class: psram, module: M5}
+  U_M5_8: {class: psram, module: M5}
+  U_M5_9: {class: psram, module: M5}
+  U_M5_10: {class: psram, module: M5}
+  U_M5_11: {class: psram, module: M5}
+  U_M5_12: {class: psram, module: M5}
+  U_M5_13: {class: psram, module: M5}
+  U_M5_14: {class: psram, module: M5}
+  U_M5_15: {class: psram, module: M5}
+  U_M6_0: {class: psram, module: M6}
+  U_M6_1: {class: psram, module: M6}
+  U_M6_2: {class: psram, module: M6}
+  U_M6_3: {class: psram, module: M6}
+  U_M6_4: {class: psram, module: M6}
+  U_M6_5: {class: psram, module: M6}
+  U_M6_6: {class: psram, module: M6}
+  U_M6_7: {class: psram, module: M6}
+  U_M6_8: {class: psram, module: M6}
+  U_M6_9: {class: psram, module: M6}
+  U_M6_10: {class: psram, module: M6}
+  U_M6_11: {class: psram, module: M6}
+  U_M6_12: {class: psram, module: M6}
+  U_M6_13: {class: psram, module: M6}
+  U_M6_14: {class: psram, module: M6}
+  U_M6_15: {class: psram, module: M6}
+  U_M7_0: {class: psram, module: M7}
+  U_M7_1: {class: psram, module: M7}
+  U_M7_2: {class: psram, module: M7}
+  U_M7_3: {class: psram, module: M7}
+  U_M7_4: {class: psram, module: M7}
+  U_M7_5: {class: psram, module: M7}
+  U_M7_6: {class: psram, module: M7}
+  U_M7_7: {class: psram, module: M7}
+  U_M7_8: {class: psram, module: M7}
+  U_M7_9: {class: psram, module: M7}
+  U_M7_10: {class: psram, module: M7}
+  U_M7_11: {class: psram, module: M7}
+  U_M7_12: {class: psram, module: M7}
+  U_M7_13: {class: psram, module: M7}
+  U_M7_14: {class: psram, module: M7}
+  U_M7_15: {class: psram, module: M7}
+  U_D0: {class: ddr4}
+  U_D1: {class: ddr4}
+  U_D2: {class: ddr4}
+  U_D3: {class: ddr4}
+  U_CLK: {class: clock_gen}
+  U_BMC: {class: bmc}
+  J_HOST: {class: host_cable}
+  J_SFP: {class: sfp_cage}
+  J_BMC_NET: {class: rj45}
+  J_PSU0: {class: psu_input}
+  J_PSU1: {class: psu_input}
+  J_FAN0: {class: fan_header}
+  J_FAN1: {class: fan_header}
+  J_FAN2: {class: fan_header}
+  J_FAN3: {class: fan_header}
+  J_FAN4: {class: fan_header}
+  J_FAN5: {class: fan_header}
+
+# The ring runs through the slots in slot order: 0 to 4 along row A, 5 to
+# 9 back along row B, and closes at the FPGA at the open end.  Each hop is
+# card leg, motherboard ribbon, card leg.  The memory channels never leave
+# their card.
+nets:
+  ring:
+    kind: link
+    hops:
+      - [U_FPGA.link_out, U_A0.link_in]
+      - [U_A0.link_out, U_A1.link_in]
+      - [U_A1.link_out, U_A2.link_in]
+      - [U_A2.link_out, U_A3.link_in]
+      - [U_A3.link_out, U_A4.link_in]
+      - [U_A4.link_out, U_A5.link_in]
+      - [U_A5.link_out, U_A6.link_in]
+      - [U_A6.link_out, U_A7.link_in]
+      - [U_A7.link_out, U_H0.link_in]
+      - [U_H0.link_out, U_H1.link_in]
+      - [U_H1.link_out, U_FPGA.link_in]
+  memory:
+    kind: psram_x16
+    channels:
+      - [U_A0.psram_0, U_M0_0.channel]
+      - [U_A0.psram_1, U_M0_1.channel]
+      - [U_A0.psram_2, U_M0_2.channel]
+      - [U_A0.psram_3, U_M0_3.channel]
+      - [U_A0.psram_4, U_M0_4.channel]
+      - [U_A0.psram_5, U_M0_5.channel]
+      - [U_A0.psram_6, U_M0_6.channel]
+      - [U_A0.psram_7, U_M0_7.channel]
+      - [U_A0.psram_8, U_M0_8.channel]
+      - [U_A0.psram_9, U_M0_9.channel]
+      - [U_A0.psram_10, U_M0_10.channel]
+      - [U_A0.psram_11, U_M0_11.channel]
+      - [U_A0.psram_12, U_M0_12.channel]
+      - [U_A0.psram_13, U_M0_13.channel]
+      - [U_A0.psram_14, U_M0_14.channel]
+      - [U_A0.psram_15, U_M0_15.channel]
+      - [U_A1.psram_0, U_M1_0.channel]
+      - [U_A1.psram_1, U_M1_1.channel]
+      - [U_A1.psram_2, U_M1_2.channel]
+      - [U_A1.psram_3, U_M1_3.channel]
+      - [U_A1.psram_4, U_M1_4.channel]
+      - [U_A1.psram_5, U_M1_5.channel]
+      - [U_A1.psram_6, U_M1_6.channel]
+      - [U_A1.psram_7, U_M1_7.channel]
+      - [U_A1.psram_8, U_M1_8.channel]
+      - [U_A1.psram_9, U_M1_9.channel]
+      - [U_A1.psram_10, U_M1_10.channel]
+      - [U_A1.psram_11, U_M1_11.channel]
+      - [U_A1.psram_12, U_M1_12.channel]
+      - [U_A1.psram_13, U_M1_13.channel]
+      - [U_A1.psram_14, U_M1_14.channel]
+      - [U_A1.psram_15, U_M1_15.channel]
+      - [U_A2.psram_0, U_M2_0.channel]
+      - [U_A2.psram_1, U_M2_1.channel]
+      - [U_A2.psram_2, U_M2_2.channel]
+      - [U_A2.psram_3, U_M2_3.channel]
+      - [U_A2.psram_4, U_M2_4.channel]
+      - [U_A2.psram_5, U_M2_5.channel]
+      - [U_A2.psram_6, U_M2_6.channel]
+      - [U_A2.psram_7, U_M2_7.channel]
+      - [U_A2.psram_8, U_M2_8.channel]
+      - [U_A2.psram_9, U_M2_9.channel]
+      - [U_A2.psram_10, U_M2_10.channel]
+      - [U_A2.psram_11, U_M2_11.channel]
+      - [U_A2.psram_12, U_M2_12.channel]
+      - [U_A2.psram_13, U_M2_13.channel]
+      - [U_A2.psram_14, U_M2_14.channel]
+      - [U_A2.psram_15, U_M2_15.channel]
+      - [U_A3.psram_0, U_M3_0.channel]
+      - [U_A3.psram_1, U_M3_1.channel]
+      - [U_A3.psram_2, U_M3_2.channel]
+      - [U_A3.psram_3, U_M3_3.channel]
+      - [U_A3.psram_4, U_M3_4.channel]
+      - [U_A3.psram_5, U_M3_5.channel]
+      - [U_A3.psram_6, U_M3_6.channel]
+      - [U_A3.psram_7, U_M3_7.channel]
+      - [U_A3.psram_8, U_M3_8.channel]
+      - [U_A3.psram_9, U_M3_9.channel]
+      - [U_A3.psram_10, U_M3_10.channel]
+      - [U_A3.psram_11, U_M3_11.channel]
+      - [U_A3.psram_12, U_M3_12.channel]
+      - [U_A3.psram_13, U_M3_13.channel]
+      - [U_A3.psram_14, U_M3_14.channel]
+      - [U_A3.psram_15, U_M3_15.channel]
+      - [U_A4.psram_0, U_M4_0.channel]
+      - [U_A4.psram_1, U_M4_1.channel]
+      - [U_A4.psram_2, U_M4_2.channel]
+      - [U_A4.psram_3, U_M4_3.channel]
+      - [U_A4.psram_4, U_M4_4.channel]
+      - [U_A4.psram_5, U_M4_5.channel]
+      - [U_A4.psram_6, U_M4_6.channel]
+      - [U_A4.psram_7, U_M4_7.channel]
+      - [U_A4.psram_8, U_M4_8.channel]
+      - [U_A4.psram_9, U_M4_9.channel]
+      - [U_A4.psram_10, U_M4_10.channel]
+      - [U_A4.psram_11, U_M4_11.channel]
+      - [U_A4.psram_12, U_M4_12.channel]
+      - [U_A4.psram_13, U_M4_13.channel]
+      - [U_A4.psram_14, U_M4_14.channel]
+      - [U_A4.psram_15, U_M4_15.channel]
+      - [U_A5.psram_0, U_M5_0.channel]
+      - [U_A5.psram_1, U_M5_1.channel]
+      - [U_A5.psram_2, U_M5_2.channel]
+      - [U_A5.psram_3, U_M5_3.channel]
+      - [U_A5.psram_4, U_M5_4.channel]
+      - [U_A5.psram_5, U_M5_5.channel]
+      - [U_A5.psram_6, U_M5_6.channel]
+      - [U_A5.psram_7, U_M5_7.channel]
+      - [U_A5.psram_8, U_M5_8.channel]
+      - [U_A5.psram_9, U_M5_9.channel]
+      - [U_A5.psram_10, U_M5_10.channel]
+      - [U_A5.psram_11, U_M5_11.channel]
+      - [U_A5.psram_12, U_M5_12.channel]
+      - [U_A5.psram_13, U_M5_13.channel]
+      - [U_A5.psram_14, U_M5_14.channel]
+      - [U_A5.psram_15, U_M5_15.channel]
+      - [U_A6.psram_0, U_M6_0.channel]
+      - [U_A6.psram_1, U_M6_1.channel]
+      - [U_A6.psram_2, U_M6_2.channel]
+      - [U_A6.psram_3, U_M6_3.channel]
+      - [U_A6.psram_4, U_M6_4.channel]
+      - [U_A6.psram_5, U_M6_5.channel]
+      - [U_A6.psram_6, U_M6_6.channel]
+      - [U_A6.psram_7, U_M6_7.channel]
+      - [U_A6.psram_8, U_M6_8.channel]
+      - [U_A6.psram_9, U_M6_9.channel]
+      - [U_A6.psram_10, U_M6_10.channel]
+      - [U_A6.psram_11, U_M6_11.channel]
+      - [U_A6.psram_12, U_M6_12.channel]
+      - [U_A6.psram_13, U_M6_13.channel]
+      - [U_A6.psram_14, U_M6_14.channel]
+      - [U_A6.psram_15, U_M6_15.channel]
+      - [U_A7.psram_0, U_M7_0.channel]
+      - [U_A7.psram_1, U_M7_1.channel]
+      - [U_A7.psram_2, U_M7_2.channel]
+      - [U_A7.psram_3, U_M7_3.channel]
+      - [U_A7.psram_4, U_M7_4.channel]
+      - [U_A7.psram_5, U_M7_5.channel]
+      - [U_A7.psram_6, U_M7_6.channel]
+      - [U_A7.psram_7, U_M7_7.channel]
+      - [U_A7.psram_8, U_M7_8.channel]
+      - [U_A7.psram_9, U_M7_9.channel]
+      - [U_A7.psram_10, U_M7_10.channel]
+      - [U_A7.psram_11, U_M7_11.channel]
+      - [U_A7.psram_12, U_M7_12.channel]
+      - [U_A7.psram_13, U_M7_13.channel]
+      - [U_A7.psram_14, U_M7_14.channel]
+      - [U_A7.psram_15, U_M7_15.channel]
+  fpga_ddr4:
+    kind: ddr4_x16
+    channels:
+      - [U_FPGA.ddr4, U_D0.channel]
+      - [U_FPGA.ddr4, U_D1.channel]
+      - [U_FPGA.ddr4, U_D2.channel]
+      - [U_FPGA.ddr4, U_D3.channel]
+  mgmt:
+    kind: mgmt_spi
+    master: U_FPGA.mgmt_master
+    slaves: [U_A0, U_A1, U_A2, U_A3, U_A4, U_A5, U_A6, U_A7, U_H0, U_H1]
+  jtag:
+    kind: jtag
+    chain: [U_FPGA, U_A0, U_A1, U_A2, U_A3, U_A4, U_A5, U_A6, U_A7, U_H0, U_H1]
+  refclk:
+    kind: refclk
+    source: U_CLK
+    sinks: [U_FPGA, U_A0, U_A1, U_A2, U_A3, U_A4, U_A5, U_A6, U_A7, U_H0, U_H1]
+
+interface_kinds:
+  link:
+    description: 8-bit source-synchronous DDR parallel link, 125 MHz clock (250 MB/s raw, 10 MB/s used at the design point), ready/valid, CRC in packet; a quarter the width and half the clock of the single board's link, because this board needs a hundredth of the bandwidth and every hop crosses two card-edge connectors
+    signals: {data: 8, clock: 1, valid: 1, ready_back: 1, sof: 1}
+    io_standard: 1.8 V LVCMOS series-terminated (placeholder)
+    max_length_mm: 200
+  psram_x16:
+    description: one HPI x16 PSRAM port; the clock pair is shared by four devices and is not counted per port
+    signals: {dq: 16, rwds: 2, cs: 1}
+  pcie_x16_edge:
+    description: PCIe x16 card-edge connector used mechanically, 82 positions per side at 1.0 mm with our own pinout (placeholder geometry)
+    signals: {side_a: 82, side_b: 82}
+  ddr4_x16:
+    signals: {dq: 16, dqs_pairs: 2, dm: 2, addr_cmd: 28, ck_pairs: 1, ctrl: 6}
+  ddr4_x64:
+    description: FPGA-side aggregate of four ddr4_x16 devices
+    signals: {dq: 64, dqs_pairs: 8, dm: 8, addr_cmd: 28, ck_pairs: 1, ctrl: 6}
+  pcie_gen4_x8:
+    signals: {tx_pairs: 8, rx_pairs: 8, refclk_pair: 1, perst: 1, wake: 1}
+  mgmt_spi:
+    description: SPI from FPGA, one chip select per ASIC; telemetry, config, thermal diode readout
+    signals: {sclk: 1, mosi: 1, miso: 1, cs: 1, irq: 1}
+  jtag:
+    signals: {tck: 1, tms: 1, tdi: 1, tdo: 1, trst: 1}
+  refclk:
+    signals: {clk_pair: 1}
+  strap:
+    signals: {pins: 2}
+  sfp_plus:
+    signals: {tx_pair: 1, rx_pair: 1, i2c: 2, ctrl: 4}
+  qspi:
+    signals: {pins: 6}
+  uart:
+    signals: {pins: 2}
+
+# Power tree: 12 V from the CRPS modules across the motherboard and over
+# every card edge; each card converts it to its own core and I/O rails
+# beside the die, so no low-voltage current crosses a connector or a plane.
+power_tree:
+  input_bus: 12 V from two CRPS modules, 1+1 redundant, PMBus to the BMC; 12 V over the card edge to every module
+  regulator_efficiency: 0.85
+  rails:
+    VDD_CORE:    {volts: 0.80, per: [layer_asic, head_asic], note: multiphase PoL buck on each card, PMBus; ~13 A at the design point, ~24 A at the 5K rating}
+    VDD_PLL_0V9: {volts: 0.90, per: [layer_asic, head_asic], note: LDO on each card}
+    VDD_IO_1V8:  {volts: 1.80, shared: true, note: ASIC IO, link IO, PSRAM; one regulator per card plus one on the motherboard for the clock generator}
+    VCCINT_0V85: {volts: 0.85, per: [fpga]}
+    VCCAUX_1V8:  {volts: 1.80, per: [fpga]}
+    VCCO_1V8:    {volts: 1.80, per: [fpga]}
+    VCCO_1V2:    {volts: 1.20, per: [fpga], note: DDR4 IO}
+    MGTAVCC:     {volts: 0.90, per: [fpga], note: PCIe/SFP transceivers}
+    MGTAVTT:     {volts: 1.20, per: [fpga]}
+    VDD_1V2:     {volts: 1.20, shared: true, note: DDR4}
+    VPP_2V5:     {volts: 2.50, shared: true, note: DDR4}
+    VDD_3V3:     {volts: 3.30, shared: true, note: SFP, BMC, EEPROM, LEDs, misc}
+
+misc:
+  - board ID EEPROM (I2C) on the motherboard and on every card
+  - card presence pin per slot to the BMC; per-ASIC thermal diode via mgmt SPI
+  - PMBus on every card's core VRM for per-ASIC current telemetry
+  - FPGA config QSPI flash, JTAG header, UART debug header
+  - six 40 mm fan headers, PWM and tach to the BMC
+  - status LEDs on the rear panel and one per card

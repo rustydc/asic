@@ -41,7 +41,7 @@ The ring is a regular 11-gon of 51 mm side (91 mm circumradius) centred at (140,
 
 ## ASIC package and escape density
 
-FCBGA1225_35x35_P0.8: 35x35 balls at 0.8 mm, 29 mm body, selected by `hw/pinout.py` for 249 A of core current at 153000 tokens/s (1150 balls needed; see the pinout report). Per edge: 36 link signals on two columns of 18 rows (2.5 signals per mm of edge); No memory balls: the HBM stack sits on the package interposer.
+FCBGA1225_35x35_P0.8: 35x35 balls at 0.8 mm, 29 mm body, selected by `hw/pinout.py` for 249 A of core current at 153000 tokens/s (1150 balls needed; see the pinout report). Per edge: 36 link signals on a two-deep block of 18 (2.5 signals per mm of edge); No memory balls: the HBM stack sits on the package interposer.
 
 ## Core rail current
 

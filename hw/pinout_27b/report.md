@@ -33,8 +33,8 @@ FCBGA1225_35x35_P0.8: 35 x 35 at 0.8 mm, 29 mm body.
 
 | Use | Balls | Where |
 | --- | ---: | --- |
-| link_in | 36 | W edge, columns 1-2, rows 9-26 |
-| link_out | 36 | E edge, same rows |
+| link_in | 36 | W edge, a two-deep block of 18 positions |
+| link_out | 36 | E edge, the same positions |
 | memory | 0 | in the package (HBM on the interposer), no balls |
 | mgmt, jtag, refclk, strap | 14 | S row |
 | VDD_CORE | 522 | interior checkerboard |
@@ -49,7 +49,7 @@ Signal balls deeper than the outer 3 rows: 0 (these need a microvia or build-up 
 ## What the packaging house gets
 
 * this map as `asic_ballmap.csv`, with the edge each interface must face;
-* the die-edge assignment it implies: link ports on the west and east die edges, the HBM PHY on the north edge towards the stack, management on the south;
+* the die-edge assignment it implies: link ports on the W and E die edges, the HBM PHY on the north edge towards the stack, management on the south;
 * the core current (249 A at the rating, 90 A at 50K tokens/s) for the bump map and the substrate power planes.
 
 The substrate design, the bump map and the final ball map come back from them; the loop usually runs two or three times and this file is regenerated from the agreed rules each round.

@@ -3,7 +3,9 @@
 Block-level schematic capture for the first appliance board. `board.yaml` is
 the source of truth; `python -m hw.board` checks it and regenerates
 `board.svg` (block diagram) and `board.md` (bill of materials, power, pin
-budget, ring order). Everything here is a budget to validate, not a vendor-
+budget, ring order). Two variants share the tools: `board_27b.yaml`, the
+high-end 27B on HBM, and `board_psram.yaml`, the open-IP 9B on PSRAM
+modules. Everything here is a budget to validate, not a vendor-
 confirmed number, until the ASIC pinout and power are characterized.
 
 ```bash
@@ -152,8 +154,8 @@ rules live in the `package_selection` block of `board.yaml`:
 * the smallest candidate package that satisfies all of that is selected.
 
 The package is rated at the 50K tokens/s target, where the core rail draws
-177 A: 354 core balls, 354 ground balls, 54 signal returns, 216 signals and
-34 rail balls, 1012 in all. That selects a 1225-ball 35 × 35 array at
+184 A: 369 core balls, 369 ground balls, 54 signal returns, 216 signals and
+34 rail balls, 1042 in all. That selects a 1225-ball 35 × 35 array at
 0.8 mm in a 29 mm body. The rating is what matters here, not the design
 point: at the corrected 8.2K the same rules ask only for a 784-ball
 package. The rating is a decision, and it fixes the package before the die
@@ -217,7 +219,7 @@ regulator internals, thermal vias, mounting holes, chassis mechanicals, or
 a real ASIC ball map. `report.md` carries the link lengths, the escape
 density (the 130 memory signals per ASIC north edge need a build-up layer
 pair to escape), and the core-rail current density: at 50K tokens/s a layer
-ASIC draws about 177 A, which is over 80 A/mm² on a single 2 oz plane across
+ASIC draws about 184 A, which is over 90 A/mm² on a single 2 oz plane across
 the package width, so the real board needs the regulator against the package
 with several plane layers between them.
 
@@ -291,6 +293,76 @@ twelve recurrent states per die saturate the stack, and dies, not tiles,
 are what buys throughput. Eight dies of eight layers reach 153K for the
 same silicon and twice the via personalisations, ten rather than five, and
 take the package down two sizes with them.
+
+## The open-IP variant: sixteen PSRAMs per chip, so the chips go on cards
+
+`board_psram.yaml` describes the 9B geometry on the 28 nm-class die with
+sixteen HPI x16 PSRAM devices per layer ASIC and no DRAM PHY anywhere in
+the design (`sim/config/qwen35_9b_psram16.json`, 2.5K tokens/s). Sixteen
+devices are 304 memory signals, and a die that escapes them onto a
+motherboard beside nine other chips needs a 45 × 45 package and a ring
+too big for the chassis. So this variant is modular: every ring chip sits
+on its own card with its memory and its core regulator, and only the
+ring, the management buses and 12 V cross the card edge. The same tools
+take it as a source and write `board_psram.md`, `board_psram.svg`,
+`pinout_psram/` and `kicad_psram/`, the last holding two PCBs:
+`appliance.kicad_pcb` is the motherboard and `module.kicad_pcb` the card.
+
+What crosses the connector decides everything else:
+
+| | Contacts |
+| --- | ---: |
+| Memory card, chip left on the motherboard | 488 |
+| Module: chip, memory and regulator on the card | 108, then **48** with the 8-bit link |
+
+The link is 8 bits wide here (12 signals per port, 125 MHz DDR, 250 MB/s
+raw against 10 MB/s used): this board needs a hundredth of the single
+board's link bandwidth, and twelve-position finger groups are what let
+the slot-to-slot ribbons jog between cards. With both link ports on the
+die's south edge the die itself shrinks to a **28 × 28 array at 0.8 mm,
+23 mm body**, 540 balls of 784: 304 memory signals in the outer five rows
+of the north, east and west edges (the card is HDI), the two link blocks
+side by side on the south edge with the management pins between them, and
+21 A of core current at the 5K rating, which is 43 balls. The pinout is
+memory-bound where the other boards' are current-bound.
+
+The card is 110 × 70 mm with PCIe x16 fingers used mechanically: 12 V and
+ground on the short section, link_in on twelve side-A positions and
+link_out on twelve side-B positions, the management pins after them. The
+chip sits with its south edge 8 mm above the connector zone so that each
+link block drops straight onto its finger group, 15 to 19 mm of ribbon
+with no bend, the lanes fanning from 0.4 mm to 1.0 mm on the way down. The
+sixteen PSRAMs stand in two rows of eight above the chip; the core VRM and
+the 1.8 V regulator stand at the right end, so the 0.8 V current never
+crosses a connector: a module takes about 20 W as 1.7 A at 12 V. The head
+module is the same card with the memory sites empty.
+
+The motherboard is six layers (signal, ground, the link, 12 V and the
+FPGA's rails, ground, signal) with ten slots at 22 mm pitch in two facing
+rows 12 mm apart, the cards standing parallel to the front-to-back
+airflow. The ring leaves the FPGA into slot 0, runs slot to slot along the
+rear row to slot 4, crosses the 12 mm gap to slot 5 and comes back along
+the front row to slot 9 and the FPGA, whose link-in port moves to the edge
+facing the returning row so both FPGA hops are gentle. Between slots a
+ribbon leaves the out-row pins, jogs 17 mm sideways to the next card's
+in-group and enters its in-row pins, a 50 degree bend; the turn between
+the rows and the FPGA's return bend square. Hop lengths in `report.md` are
+end to end, the card's out drop plus the motherboard ribbon plus the next
+card's in drop: 65 mm slot to slot, 142 mm at the turn and 110 mm back
+into the FPGA, against a 200 mm limit the slower link allows.
+
+Three consequences are worth stating. The motherboard turned cheap and the
+card became the only hard board, and the card is small and built ten
+times, so a mistake in the memory escape scraps 77 cm², not 1,500. The
+chassis is a 2U (the card needs about 50 mm of height with its connector),
+but the slot field is 110 × 190 mm and the board is mostly empty, so a
+short-depth 2U is the real form factor. And a module can be brought up on
+its own against the FPGA before the other nine exist, which the single
+board cannot offer.
+
+Placeholders, beyond the usual ones: the finger and slot geometry stand
+in for a real connector drawing, the PSRAM is an 8 × 8 mm 49-ball body
+until a part is chosen, and the two-row slot footprint is through-hole.
 
 ## Open items before schematic entry in an EDA tool
 

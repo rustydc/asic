@@ -13,6 +13,7 @@ that does not close at the FPGA, and a power budget that exceeds the input.
 from __future__ import annotations
 
 import argparse
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -48,6 +49,12 @@ class Board:
         self.components: dict[str, dict] = data["components"]
         self.nets: dict[str, dict] = data["nets"]
         self.kinds: dict[str, dict] = data["interface_kinds"]
+        # Modular boards: the ring chips and their memory sit on daughter cards
+        # that plug into slots on the motherboard.  ``module_kinds`` describes
+        # the cards, ``modules`` the instances and their slots, and a component
+        # names its card with ``module``.  Both are absent on a single-board design.
+        self.module_kinds: dict[str, dict] = data.get("module_kinds", {})
+        self.modules: dict[str, dict] = data.get("modules", {})
 
     @classmethod
     def load(cls, path: Path = DEFAULT_SOURCE) -> "Board":
@@ -76,10 +83,52 @@ class Board:
             total += count * (2 if name.endswith("pair") or name.endswith("pairs") else 1)
         return total
 
+    @property
+    def memory_kind(self) -> str:
+        """Interface kind of the on-board memory channels, from the ``memory`` net."""
+        return self.nets["memory"]["kind"]
+
     def memory_interfaces(self, part_class: str) -> list[str]:
         """Names of the class's on-board memory channel interfaces (none when the memory is in the package)."""
         return sorted(name for name, spec in self.classes[part_class].get("interfaces", {}).items()
-                      if spec["kind"].startswith("lpddr"))
+                      if spec["kind"] == self.memory_kind)
+
+    def memory_device_classes(self) -> list[str]:
+        """Part classes that are memory devices: they carry a channel of the memory kind and are not ring chips."""
+        return [part for part, spec in self.classes.items()
+                if part not in ("layer_asic", "head_asic")
+                and any(iface["kind"] == self.memory_kind for iface in spec.get("interfaces", {}).values())]
+
+    # Modules ------------------------------------------------------------------
+
+    @property
+    def is_modular(self) -> bool:
+        return bool(self.modules)
+
+    def module_of(self, refdes: str) -> str | None:
+        return self.components[refdes].get("module")
+
+    def module_members(self, module: str) -> list[str]:
+        return [ref for ref, comp in self.components.items() if comp.get("module") == module]
+
+    def module_kind_of(self, module: str) -> str:
+        return self.modules[module]["kind"]
+
+    def connector_interfaces(self, module: str) -> list[tuple[str, str, str]]:
+        """(component, interface, kind) of every interface on the card that a net
+        connects to something off the card: everything on the ring chips except
+        their memory channels, which stay on the card with their devices."""
+        crossing = []
+        for ref in self.module_members(module):
+            if self.class_of(ref) not in ("layer_asic", "head_asic"):
+                continue
+            for name, spec in self.classes[self.class_of(ref)].get("interfaces", {}).items():
+                if spec["kind"] != self.memory_kind:
+                    crossing.append((ref, name, spec["kind"]))
+        return crossing
+
+    def connector_signal_count(self, module: str) -> int:
+        return sum(self.signal_count(kind) for _, _, kind in self.connector_interfaces(module))
 
     def pin_budget(self, refdes: str) -> int:
         part = self.classes[self.class_of(refdes)]
@@ -137,6 +186,7 @@ class Board:
         problems += self._check_references()
         problems += self._check_ring()
         problems += self._check_memory()
+        problems += self._check_modules()
         problems += self._check_power()
         return problems
 
@@ -217,9 +267,41 @@ class Board:
         for ref in self.instances("head_asic"):
             if attached[ref]:
                 problems.append(f"{ref} is a head ASIC and must not have memory attached")
-        unused = set(self.instances("lpddr5x")) - used_devices
+        devices = {ref for part in self.memory_device_classes() for ref in self.instances(part)}
+        unused = devices - used_devices
         if unused:
             problems.append(f"unattached memory devices: {sorted(unused)}")
+        return problems
+
+    def _check_modules(self) -> list[str]:
+        problems = []
+        if not self.is_modular:
+            stray = [ref for ref, comp in self.components.items() if comp.get("module")]
+            return [f"{ref}: names a module but the board has none" for ref in stray]
+        slots: dict[int, str] = {}
+        for module, spec in self.modules.items():
+            if spec["kind"] not in self.module_kinds:
+                problems.append(f"module {module}: unknown module kind {spec['kind']!r}")
+            slot = int(spec["slot"])
+            if slot in slots:
+                problems.append(f"module {module} and {slots[slot]} both sit in slot {slot}")
+            slots[slot] = module
+            chips = [ref for ref in self.module_members(module) if self.class_of(ref) in ("layer_asic", "head_asic")]
+            if len(chips) != 1:
+                problems.append(f"module {module} must carry exactly one ring chip, has {chips}")
+        for ref, comp in self.components.items():
+            module = comp.get("module")
+            if module is not None and module not in self.modules:
+                problems.append(f"{ref}: unknown module {module!r}")
+            if self.class_of(ref) in ("layer_asic", "head_asic") and module is None:
+                problems.append(f"{ref}: every ring chip of a modular board sits on a module")
+        for a, b in self.nets["memory"]["channels"]:
+            asic, device = Endpoint.parse(a).component, Endpoint.parse(b).component
+            if asic in self.components and device in self.components and self.module_of(asic) != self.module_of(device):
+                problems.append(f"memory device {device} is not on the module of {asic}")
+        for kind, spec in self.module_kinds.items():
+            if spec["connector"] not in self.kinds:
+                problems.append(f"module kind {kind}: unknown connector kind {spec['connector']!r}")
         return problems
 
     def _check_power(self) -> list[str]:
@@ -265,12 +347,28 @@ class Board:
         link = self.kinds["link"]
         lines += ["", "## Link", "", f"{link['description']}; {self.signal_count('link')} signals per hop, "
                   f"{len(self.ring())} hops, max {link['max_length_mm']} mm."]
+        if self.is_modular:
+            lines += ["", "## Modules", "",
+                      "| Module | Kind | Slot | Carries | Connector signals |", "| --- | --- | ---: | --- | ---: |"]
+            for module, spec in self.modules.items():
+                members = self.module_members(module)
+                by_class: dict[str, int] = {}
+                for ref in members:
+                    by_class[self.class_of(ref)] = by_class.get(self.class_of(ref), 0) + 1
+                carries = ", ".join(f"{n} x {part}" if n > 1 else part for part, n in by_class.items())
+                lines.append(f"| {module} | {spec['kind']} | {spec['slot']} | {carries} | {self.connector_signal_count(module)} |")
+            for kind, spec in self.module_kinds.items():
+                connector = self.kinds[spec["connector"]]
+                lines += ["", f"**{kind}**: {spec['description']} Connector: {connector['description']} "
+                          f"({self.signal_count(spec['connector'])} contacts). Card {spec['card_mm'][0]} x {spec['card_mm'][1]} mm."]
         return "\n".join(lines) + "\n"
 
     def svg(self) -> str:
         """Block diagram: the eleven ring nodes on a regular polygon, clockwise
-        from the FPGA at the bottom (the chassis rear), memories outside."""
-        import math
+        from the FPGA at the bottom (the chassis rear), memories outside; or,
+        on a modular board, the modules in their two facing rows of slots."""
+        if self.is_modular:
+            return self._svg_modules()
         W, H = 1180, 900
         box_w, box_h = 96, 60
         mem_w, mem_h = 40, 22
@@ -376,6 +474,70 @@ class Board:
                      f'Green: LPDDR5X x32 channels. Power budget {load:.0f} W load / {input_w:.0f} W input.</text>')
         parts.append(f'<text x="20" y="{H - 20}" fill="#333">Management SPI, JTAG chain, and reference clock fan out '
                      f'from U_FPGA / U_CLK to all ten ASICs (not drawn); the BMC, PSUs and fans are off the ring.</text>')
+        parts.append("</svg>")
+        return "\n".join(parts) + "\n"
+
+    def _svg_modules(self) -> str:
+        """Modular board: the ring runs along one row of slots, turns, and comes
+        back along the facing row to the FPGA at the open end of the U."""
+        W, H = 1180, 620
+        box_w, box_h = 150, 78
+        refs = [hop[1].component for hop in self.ring()[:-1]]            # ring chips in ring order
+        modules = [self.module_of(ref) for ref in refs]
+        half = math.ceil(len(modules) / 2)
+        row_a, row_b = modules[:half], modules[half:]
+        x0, pitch = 250, 175
+        y_a, y_b = 150, 400
+        pos: dict[str, tuple[float, float]] = {}
+        for k, module in enumerate(row_a):
+            pos[module] = (x0 + k * pitch, y_a)
+        for k, module in enumerate(row_b):                                # returns right to left
+            pos[module] = (x0 + (half - 1 - k) * pitch, y_b)
+        fpga_x, fpga_y = 40, (y_a + y_b) / 2 - 10
+        parts = ['<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 %d %d" font-family="sans-serif" font-size="12">' % (W, H),
+                 f'<rect width="{W}" height="{H}" fill="#fafafa"/>',
+                 f'<text x="20" y="28" font-size="16" font-weight="bold">{self.data["board"]["name"]}: block diagram</text>',
+                 f'<text x="20" y="46" fill="#555">{self.data["board"]["form_factor"]}</text>',
+                 '<defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">'
+                 '<path d="M0,0 L8,4 L0,8 z" fill="#1f5fbf"/></marker></defs>']
+        line = 'stroke="#1f5fbf" stroke-width="2.5" marker-end="url(#arrow)" fill="none"'
+        centre = {m: (x + box_w / 2, y + box_h / 2) for m, (x, y) in pos.items()}
+        centre["U_FPGA"] = (fpga_x + 48, fpga_y + 40)
+        # Ring hops between module boxes: horizontal along a row, vertical at the turn, and the FPGA hops.
+        order = ["U_FPGA"] + modules + ["U_FPGA"]
+        for a, b in zip(order, order[1:]):
+            (ax, ay), (bx, by) = centre[a], centre[b]
+            if a == "U_FPGA":
+                parts.append(f'<path d="M{fpga_x + 96},{fpga_y + 30} L{pos[b][0]},{by}" {line}/>')
+            elif b == "U_FPGA":
+                parts.append(f'<path d="M{pos[a][0]},{ay} L{fpga_x + 96},{fpga_y + 50}" {line}/>')
+            elif abs(ay - by) < 1:                                       # along a row
+                sx, ex = (pos[a][0] + box_w, pos[b][0]) if bx > ax else (pos[a][0], pos[b][0] + box_w)
+                parts.append(f'<line x1="{sx}" y1="{ay}" x2="{ex}" y2="{by}" {line}/>')
+            else:                                                         # the turn
+                parts.append(f'<line x1="{ax}" y1="{pos[a][1] + box_h}" x2="{bx}" y2="{pos[b][1]}" {line}/>')
+        for module, (x, y) in pos.items():
+            chip = next(ref for ref in self.module_members(module) if self.class_of(ref) in ("layer_asic", "head_asic"))
+            devices = [ref for ref in self.module_members(module) if ref != chip]
+            fill = "#f7dbdb" if self.class_of(chip) == "head_asic" else "#dbe8f7"
+            parts.append(f'<rect x="{x}" y="{y}" width="{box_w}" height="{box_h}" rx="6" fill="{fill}" stroke="#333"/>')
+            parts.append(f'<text x="{x + box_w / 2}" y="{y + 18}" text-anchor="middle" font-weight="bold">{module}: slot {self.modules[module]["slot"]}</text>')
+            sub = f"{chip} L{self.components[chip]['layers']}" if "layers" in self.components[chip] else f"{chip} head mode"
+            parts.append(f'<text x="{x + box_w / 2}" y="{y + 36}" text-anchor="middle">{sub}</text>')
+            parts.append(f'<text x="{x + box_w / 2}" y="{y + 54}" text-anchor="middle" font-size="10">'
+                         f'{f"{len(devices)} x {self.class_of(devices[0])}" if devices else "no memory"} on the card</text>')
+            parts.append(f'<text x="{x + box_w / 2}" y="{y + 69}" text-anchor="middle" font-size="10">'
+                         f'{self.connector_signal_count(module)} signals over the edge</text>')
+        parts.append(f'<rect x="{fpga_x}" y="{fpga_y}" width="96" height="80" rx="6" fill="#fff2cc" stroke="#333"/>')
+        parts.append(f'<text x="{fpga_x + 48}" y="{fpga_y + 20}" text-anchor="middle" font-weight="bold">U_FPGA</text>')
+        parts.append(f'<text x="{fpga_x + 48}" y="{fpga_y + 38}" text-anchor="middle">PCIe (cable)</text>')
+        parts.append(f'<text x="{fpga_x + 48}" y="{fpga_y + 56}" text-anchor="middle" font-size="10">DDR4 x64, clock, BMC</text>')
+        load, input_w = self.power_budget_w()
+        parts.append(f'<text x="20" y="{H - 40}" fill="#333">Blue: activation ring, {self.signal_count("link")}-signal link per hop, '
+                     f'out along one row of slots and back along the facing row (a U-fold). Each module is one card: a ring chip, '
+                     f'its memory and its core regulator. Power budget {load:.0f} W load / {input_w:.0f} W input.</text>')
+        parts.append(f'<text x="20" y="{H - 20}" fill="#333">Management SPI, JTAG chain and reference clock reach every module '
+                     f'through its slot (not drawn); the BMC, PSUs and fans are off the ring.</text>')
         parts.append("</svg>")
         return "\n".join(parts) + "\n"
 

@@ -18,8 +18,14 @@ Rules, all from ``package_selection`` in the YAML:
   can escape it on the PCB;
 * each interface owns one package edge (``edges``), so the die floorplan puts
   its macro on that die edge: the links on the west and east edges as two
-  columns of rows, both memory channels on the north rows in byte lanes with
-  a ground between lanes, the small interfaces on the south row;
+  columns of rows, the memory channels on the north rows (or the north and
+  south rows, ``memory: [N, S]``) one channel after another with a ground
+  after each lane, the small interfaces on the south row or, when the south
+  rows hold memory, on the west columns outside the link port;
+* ``link_out_mirrored`` wires the link-out lanes in reverse ball order, which
+  a module card needs: its ribbon leaves the package on one edge, bends down
+  to the card-edge fingers, and the mirror puts each signal at the same
+  finger position on both ports so the motherboard hops are straight;
 * the remaining balls alternate ground and the core rail, with a few I/O and
   memory-PHY rail balls; the same map serves the head ASIC with the memory
   balls unconnected.
@@ -146,11 +152,38 @@ def lpddr_lanes(signals: list[str]) -> list[list[str]]:
     return lanes
 
 
+def memory_lanes(signals: list[str]) -> list[list[str]]:
+    """Lanes of one memory channel, each followed by a ground ball: the LPDDR
+    byte lanes above, or the whole port as one lane for a narrow device such
+    as an x16 PSRAM."""
+    if any(s.startswith("DQS") for s in signals) and any(s.startswith("CA") for s in signals):
+        return lpddr_lanes(signals)
+    return [list(signals)]
+
+
+def memory_edges(board: Board) -> list[str]:
+    """Package edges that hold the memory channels, ``N`` unless the rules say otherwise."""
+    edges = board.data["package_selection"]["edges"]
+    value = edges.get("memory", edges.get("lpddr", "N"))
+    return list(value) if isinstance(value, list) else [value]
+
+
+def memory_balls_needed(board: Board) -> int:
+    """Memory signal balls plus the ground after every lane."""
+    signals = memory_signals(board)
+    return len(memory_channels(board)) * (len(signals) + len(memory_lanes(signals))) if signals else 0
+
+
 MISC_SIGNALS = [("mgmt", "SCLK"), ("mgmt", "MOSI"), ("mgmt", "MISO"), ("mgmt", "CS"), ("mgmt", "IRQ"),
                 ("jtag", "TCK"), ("jtag", "TMS"), ("jtag", "TDI"), ("jtag", "TDO"), ("jtag", "TRST"),
                 ("refclk", "CLK_P"), ("refclk", "CLK_N"), ("strap", "MODE0"), ("strap", "MODE1")]
 
-LINK_ROWS = 18          # a link port is two columns of this many rows
+LINK_ROWS = 18          # a 36-signal link port is two columns of this many rows
+
+
+def link_rows(board: Board) -> int:
+    """A link port is a two-deep block of this many positions along its edge."""
+    return math.ceil(len(expand_signals(board.kinds["link"]["signals"])) / 2)
 
 
 # --------------------------------------------------------------------------
@@ -202,6 +235,52 @@ def reject_reason(package: PackageSpec, need: Requirements, signal_rows: int) ->
     return None
 
 
+def link_block_starts(board: Board, package: PackageSpec) -> dict[str, tuple[str, int]]:
+    """(edge, first position along it) of the link_in and link_out blocks.  A
+    block on its own edge is centred; two blocks on one edge sit either side
+    of the middle, far enough apart that their card-edge finger groups (one
+    position per signal at 1.0 mm) do not meet."""
+    edges = board.data["package_selection"]["edges"]
+    n = link_rows(board)
+    signals = 2 * n
+    starts = {}
+    for port in ("link_in", "link_out"):
+        edge = edges[port]
+        along = package.rows if edge in ("W", "E") else package.cols
+        if edges["link_in"] == edges["link_out"]:
+            sep = math.ceil(((signals + 1) / package.pitch - n) / 2)
+            mid = along // 2
+            starts[port] = (edge, mid - n - sep if port == "link_in" else mid + 1 + sep)
+        else:
+            starts[port] = (edge, (along - n) // 2)
+    return starts
+
+
+def link_position(package: PackageSpec, edge: str, along: int, depth: int) -> tuple[int, int]:
+    """Ball (row, column) of a link ball ``depth`` in from ``edge`` at ``along``."""
+    if edge == "W":
+        return along, depth
+    if edge == "E":
+        return along, package.cols - 1 - depth
+    if edge == "N":
+        return depth, along
+    return package.rows - 1 - depth, along
+
+
+def memory_capacity_reason(board: Board, package: PackageSpec, signal_rows: int) -> str | None:
+    """With the memory on the north and south edges every memory ball must sit
+    in those edges' outer rows; the single-edge map is allowed to spill."""
+    edges = memory_edges(board)
+    if edges == ["N"]:
+        return None
+    capacity = sum(signal_rows * package.cols if edge in ("N", "S") else signal_rows * (package.rows - 2 * signal_rows)
+                   for edge in edges)
+    needed = memory_balls_needed(board)
+    if capacity < needed:
+        return f"{len(edges)} memory edges of {signal_rows} rows hold {capacity} balls, {needed} memory balls needed"
+    return None
+
+
 # --------------------------------------------------------------------------
 # Ball assignment
 # --------------------------------------------------------------------------
@@ -209,8 +288,10 @@ def reject_reason(package: PackageSpec, need: Requirements, signal_rows: int) ->
 def assign(board: Board, package: PackageSpec, need: Requirements) -> list[Ball]:
     rules = board.data["package_selection"]
     edges = rules["edges"]
+    signal_rows = int(rules["signal_rows"])
     link = expand_signals(board.kinds["link"]["signals"])
-    lpddr = memory_signals(board)
+    memory = memory_signals(board)
+    mem_edges = memory_edges(board)
     taken: dict[tuple[int, int], Ball] = {}
 
     def place(i: int, j: int, kind: str, interface: str = "", signal: str = "", escape=None) -> None:
@@ -219,45 +300,80 @@ def assign(board: Board, package: PackageSpec, need: Requirements) -> list[Ball]
         x, y = package.ball_xy(i, j)
         taken[(i, j)] = Ball(package.ball_name(i, j), i, j, x, y, kind, interface, signal, escape)
 
-    # Link ports: two columns of LINK_ROWS rows, centred on the edge.  Signal
-    # 2k on the outer column, 2k+1 on the inner column of the same row, so
-    # the PCB ribbon's lanes (outer via, dogbone via) carry consecutive signals.
-    r0 = (package.rows - LINK_ROWS) // 2
+    # Link ports: two-deep blocks along their edges.  Signal 2k on the outer
+    # position, 2k+1 on the inner position of the same row or column, so the
+    # PCB ribbon's lanes (outer via, dogbone via) carry consecutive signals.
+    # A mirrored link-out port runs the same sequence from the other end.
+    n_rows = link_rows(board)
+    starts = link_block_starts(board, package)
+    r0 = starts["link_in"][1] if starts["link_in"][0] in ("W", "E") else (package.rows - n_rows) // 2
+    mirrored = bool(rules.get("link_out_mirrored", False))
     for k, signal in enumerate(link):
-        i = r0 + k // 2
-        depth = k % 2
-        if edges["link_in"] == "W":
-            place(i, depth, "signal", "link_in", signal, ("W", depth))
-            place(i, package.cols - 1 - depth, "signal", "link_out", signal, ("E", depth))
-        else:
-            place(i, package.cols - 1 - depth, "signal", "link_in", signal, ("E", depth))
-            place(i, depth, "signal", "link_out", signal, ("W", depth))
+        m = len(link) - 1 - k if mirrored else k
+        for port, index in (("link_in", k), ("link_out", m)):
+            edge, start = starts[port]
+            depth = index % 2
+            i, j = link_position(package, edge, start + index // 2, depth)
+            place(i, j, "signal", port, signal, (edge, depth))
+    link_rows_taken = set(range(r0, r0 + n_rows)) if starts["link_in"][0] in ("W", "E") else set()
 
-    # Memory channels on the north rows: full width above the link rows, then
-    # the columns between the link ports; byte lanes with a ground after each.
+    # Memory channels.  On the north edge alone: full width above the link
+    # rows, then the columns between the link ports, row by row.  On the north
+    # and south edges: the outer rows of each edge in five-column strips, north
+    # first, so every channel is a compact block and every ball is escapable.
     def north_positions():
         for i in range(package.rows):
             cols = range(package.cols) if i < r0 else range(2, package.cols - 2)
             for j in cols:
                 if (i, j) not in taken:
                     yield i, j
-    north = north_positions()
+
+    def strip_positions():
+        # Four-wide strips through the outer rows of each memory edge in turn.
+        for edge in mem_edges:
+            if edge in ("N", "S"):
+                rows = range(signal_rows) if edge == "N" else range(package.rows - signal_rows, package.rows)
+                for j0 in range(0, package.cols, 4):
+                    for j in range(j0, min(j0 + 4, package.cols)):
+                        for i in rows:
+                            if (i, j) not in taken:
+                                yield i, j
+            else:
+                cols = range(signal_rows) if edge == "W" else range(package.cols - signal_rows, package.cols)
+                for i0 in range(signal_rows, package.rows - signal_rows, 4):
+                    for i in range(i0, min(i0 + 4, package.rows - signal_rows)):
+                        for j in cols:
+                            if (i, j) not in taken:
+                                yield i, j
+    positions = north_positions() if mem_edges == ["N"] else strip_positions()
     for channel in memory_channels(board):
-        for lane in lpddr_lanes(lpddr):
+        for lane in memory_lanes(memory):
             for signal in lane:
-                i, j = next(north)
+                i, j = next(positions)
                 place(i, j, "signal", channel, signal)
-            i, j = next(north)
+            i, j = next(positions)
             place(i, j, "ground", "GND", "")
 
-    # Small interfaces on the south row, a ground after every four.
-    south = ((package.rows - 1, j) for j in range(2, package.cols - 2))
-    for n, (interface, signal) in enumerate(MISC_SIGNALS):
-        i, j = next(south)
-        place(i, j, "signal", interface, signal)
-        if n % 4 == 3:
-            i, j = next(south)
-            place(i, j, "ground", "GND", "")
+    # Small interfaces on the south row (between the link blocks when those
+    # are on the south edge too), a ground after every four; or, when the
+    # south rows hold memory, in the west columns outside the link port.
+    if edges.get("misc", "S") == "W":
+        memory_rows = set(range(signal_rows)) | set(range(package.rows - signal_rows, package.rows))
+        misc = ((i, j) for j0 in (0, 2) for i in range(package.rows) for j in (j0, j0 + 1)
+                if i not in memory_rows and i not in link_rows_taken and (i, j) not in taken)
+    else:
+        misc = ((i, j) for i in (package.rows - 1, package.rows - 2) for j in range(2, package.cols - 2)
+                if (i, j) not in taken)
+    try:
+        for n, (interface, signal) in enumerate(MISC_SIGNALS):
+            i, j = next(misc)
+            place(i, j, "signal", interface, signal)
+            if n % 4 == 3:
+                i, j = next(misc)
+                place(i, j, "ground", "GND", "")
+    except StopIteration:
+        raise ValueError(f"{package.name}: no room for the small interfaces on the {edges.get('misc', 'S')} edge "
+                         "beside the link and memory balls") from None
 
     # Everything else: ground and core in a checkerboard, rails sprinkled in.
     rails = list(need.rail_balls.items())
@@ -285,7 +401,7 @@ def derive(board: Board, rated_tokens_per_second: float | None = None) -> Pinout
     signal_rows = int(board.data["package_selection"]["signal_rows"])
     rejected = []
     for package in sorted(candidates(board), key=lambda p: (p.body, p.balls)):
-        reason = reject_reason(package, need, signal_rows)
+        reason = reject_reason(package, need, signal_rows) or memory_capacity_reason(board, package, signal_rows)
         if reason is None:
             balls = assign(board, package, need)
             core = sum(1 for b in balls if b.kind == "rail" and b.interface == "VDD_CORE")
@@ -331,7 +447,7 @@ def report_markdown(pinout: Pinout, board: Board) -> str:
              f"({board.data['power_model']['mac_energy_pj']} pJ per MAC, {board.data['power_tree']['rails']['VDD_CORE']['volts']} V), "
              f"one ball per {rules['amps_per_ball']} A.", "",
              "| Need | Balls |", "| --- | ---: |",
-             f"| Signals ({2 * 36} link, {memory_signal_count(board)} memory, {len(MISC_SIGNALS)} management) | {need.signal_balls} |",
+             f"| Signals ({4 * link_rows(board)} link, {memory_signal_count(board)} memory, {len(MISC_SIGNALS)} management) | {need.signal_balls} |",
              f"| Signal ground returns (1 per {rules['signals_per_ground']}) | {need.signal_grounds} |",
              f"| Core rail | {need.core_balls} |", f"| Ground for the core | {need.ground_balls} |"]
     for rail, count in need.rail_balls.items():
@@ -343,14 +459,15 @@ def report_markdown(pinout: Pinout, board: Board) -> str:
         lines.append(f"| {c.name} | {c.balls} | {c.outer_balls(int(rules['signal_rows']))} | {c.body:.0f} mm | {verdict} |")
     lines += ["", "## Ball map", "", f"{p.name}: {p.cols} x {p.rows} at {p.pitch} mm, {p.body:.0f} mm body.", "",
               "| Use | Balls | Where |", "| --- | ---: | --- |",
-              f"| link_in | {pinout.count('signal', 'link_in')} | {rules['edges']['link_in']} edge, columns 1-2, rows "
-              f"{(p.rows - LINK_ROWS) // 2 + 1}-{(p.rows - LINK_ROWS) // 2 + LINK_ROWS} |",
-              f"| link_out | {pinout.count('signal', 'link_out')} | {rules['edges']['link_out']} edge, same rows |",
-              *([f"| {', '.join(memory_channels(board))} | {sum(pinout.count('signal', c) for c in memory_channels(board))} | "
-                 f"{rules['edges']['lpddr']} rows, byte lanes with a ground after each |"] if memory_channels(board)
+              f"| link_in | {pinout.count('signal', 'link_in')} | {rules['edges']['link_in']} edge, a two-deep block of "
+              f"{link_rows(board)} positions |",
+              f"| link_out | {pinout.count('signal', 'link_out')} | {rules['edges']['link_out']} edge"
+              f"{', beside it' if rules['edges']['link_out'] == rules['edges']['link_in'] else ', the same positions'} |",
+              *([f"| {len(memory_channels(board))} memory channels | {sum(pinout.count('signal', c) for c in memory_channels(board))} | "
+                 f"{' and '.join(memory_edges(board))} rows, lanes with a ground after each |"] if memory_channels(board)
                 else ["| memory | 0 | in the package (HBM on the interposer), no balls |"]),
               f"| mgmt, jtag, refclk, strap | {sum(pinout.count('signal', i) for i in ('mgmt', 'jtag', 'refclk', 'strap'))} | "
-              f"{rules['edges']['misc']} row |",
+              f"{rules['edges']['misc']} {'columns outside the link port' if rules['edges']['misc'] == 'W' else 'row'} |",
               f"| VDD_CORE | {pinout.count('rail', 'VDD_CORE')} | interior checkerboard |",
               f"| GND | {pinout.count('ground')} | interior checkerboard and lane returns |"]
     for rail in need.rail_balls:
@@ -361,9 +478,10 @@ def report_markdown(pinout: Pinout, board: Board) -> str:
               "(these need a microvia or build-up escape on the PCB).", "",
               "## What the packaging house gets", "",
               "* this map as `asic_ballmap.csv`, with the edge each interface must face;",
-              "* the die-edge assignment it implies: link ports on the west and east die edges, "
-              + ("both LPDDR5X PHYs on the north edge, " if memory_channels(board) else "the HBM PHY on the north edge towards the stack, ")
-              + "management on the south;",
+              f"* the die-edge assignment it implies: link ports on the {rules['edges']['link_in']} and {rules['edges']['link_out']} die edges, "
+              + (f"the memory PHYs on the {' and '.join(memory_edges(board))} edge{'s' if len(memory_edges(board)) > 1 else ''}, "
+                 if memory_channels(board) else "the HBM PHY on the north edge towards the stack, ")
+              + ("management on the west outside the link port;" if rules["edges"].get("misc") == "W" else "management on the south;"),
               f"* the core current ({need.core_amps:.0f} A at the rating, {board.core_current_a('layer_asic', 50_000):.0f} A "
               "at 50K tokens/s) for the bump map and the substrate power planes.", "",
               "The substrate design, the bump map and the final ball map come back from them; the loop usually runs "

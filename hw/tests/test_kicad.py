@@ -124,6 +124,75 @@ class KicadGeneratorTest(unittest.TestCase):
             for b in boxed[i + 1:]:
                 self.assertFalse(kg.polygons_overlap(a.corners(), b.corners()), f"{a.ref} overlaps {b.ref}")
 
+    def test_modular_board_makes_a_card_and_a_motherboard(self) -> None:
+        board = Board.load(Path(__file__).resolve().parents[1] / "board_psram.yaml")
+        card = kg.build_module_design(board)
+        # The card: fingers, one chip, sixteen devices, two regulators, both link legs straight down.
+        self.assertEqual(card.kind, "card")
+        self.assertEqual(card.stackup, kg.STACKUPS["card"])
+        self.assertEqual(sorted(p.part_class for p in card.parts if p.part_class in ("layer_asic", "psram")),
+                         ["layer_asic"] + ["psram"] * 16)
+        self.assertEqual(set(card.hop_lengths), {"fingers -> U_CHIP", "U_CHIP -> fingers"})
+        self.assertTrue(all(bend < 10.0 for bend in card.hop_bends.values()), card.hop_bends)
+        self.assertTrue(all(hi < 25.0 for _, hi in card.hop_lengths.values()), card.hop_lengths)
+        self.assertEqual(len(card.finger_map), 24)
+        layout = kg.edge_layout(board, card.pinout)
+        self.assertEqual((layout.lanes, layout.in_from), (12, 12))
+        self.assertGreaterEqual(layout.out_from - layout.in_from, 13)      # the groups never touch
+        for k in range(12):
+            self.assertEqual(card.finger_map[f"A{layout.in_from + k}"], card.finger_map[f"B{layout.out_from + k}"])
+        self.assertEqual(card.finger_map["A12"], "DATA0")
+        fingers = card.part("J_EDGE")
+        self.assertTrue(all(pad.escape == ("N", 0) for pad in fingers.pads if pad.port))
+        self.assertEqual(sum(1 for pad in fingers.pads if pad.net == "+12V"), 12)
+        for part in card.parts:
+            for x, y in part.corners():
+                self.assertTrue(0 <= x <= card.form_factor.width and 0 <= y <= card.form_factor.depth, part.ref)
+        # The motherboard: ten slots in two rows, the FPGA, everything routed and within the limit.
+        design = kg.build_design(board)
+        self.assertEqual(design.kind, "motherboard")
+        self.assertIsNone(design.layout)
+        self.assertEqual(design.stackup, kg.STACKUPS["motherboard"])
+        slots = [p for p in design.parts if p.part_class == "module_slot"]
+        self.assertEqual(len(slots), 10)
+        self.assertEqual({p.rotation for p in slots}, {0.0, 180.0})
+        self.assertEqual(sorted({round(p.y, 3) for p in slots}), sorted({round(v, 3) for v in (slots[0].y, slots[-1].y)}))
+        self.assertTrue(all(pad.drill for pad in slots[0].pads))
+        self.assertEqual([p.ref for p in design.parts if p.part_class in ("layer_asic", "head_asic", "psram")], [])
+        hops = kg.ring_hops(board)
+        self.assertEqual(len(design.hop_lengths), len(hops))
+        for hop, (lo, hi) in design.hop_lengths.items():
+            self.assertLessEqual(hi, design.max_link_mm, hop)
+            self.assertLessEqual(design.hop_bends[hop], 90.0 + 1e-6, hop)
+        signals = kg.link_signals(board)
+        self.assertEqual(len(signals), 12)
+        for h in range(len(hops)):
+            routed = {t.net for t in design.tracks if t.net.startswith(f"LINK{h}_") and t.layer == design.stackup.link_layer}
+            self.assertEqual(routed, {kg.ring_net(h, s) for s in signals}, f"hop {h}")
+        # Slot pins carry the ring nets the card's finger map dictates, so a lane arriving at a slot
+        # is checked against a fixed net rather than assigned; only the FPGA's pins are assigned.
+        slot0 = design.part("J_SLOT0")
+        self.assertTrue(all(pad.net.startswith("LINK") for pad in slot0.pads if pad.port))
+        fpga = design.part("U_FPGA")
+        self.assertEqual(fpga.rotation, 180.0)
+        self.assertEqual(len([pad for pad in fpga.pads if pad.escape]), 24)
+        self.assertTrue(all(pad.net and pad.net.startswith("LINK") for pad in fpga.pads if pad.escape))
+        boxed = [p for p in design.parts if p.body_w > 0]
+        for i, a in enumerate(boxed):
+            for b in boxed[i + 1:]:
+                self.assertFalse(kg.polygons_overlap(a.corners(), b.corners()), f"{a.ref} overlaps {b.ref}")
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory)
+            kg.generate(board, out)
+            for name in ("appliance.kicad_pcb", "module.kicad_pcb", "module_asics.kicad_sch", "module_memory.kicad_sch",
+                         "asics.kicad_sch", "fpga.kicad_sch"):
+                self.assertTrue(balanced((out / name).read_text(encoding="utf-8")), name)
+            pcb = (out / "appliance.kicad_pcb").read_text(encoding="utf-8")
+            self.assertIn("thru_hole", pcb)
+            self.assertIn('(layers "B.Cu" "B.Mask")', (out / "module.kicad_pcb").read_text(encoding="utf-8"))
+            self.assertIn("Slots and the ring", (out / "report.md").read_text(encoding="utf-8"))
+            self.assertIn("The card", (out / "module_report.md").read_text(encoding="utf-8"))
+
     def test_hops_bend_gently_and_the_ribbon_stays_on_one_layer(self) -> None:
         for hop, bend in self.design.hop_bends.items():
             self.assertLessEqual(bend, 25.0, hop)

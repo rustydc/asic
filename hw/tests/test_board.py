@@ -1,7 +1,10 @@
 import copy
 import unittest
+from pathlib import Path
 
 from hw.board import Board
+
+HW = Path(__file__).resolve().parents[1]
 
 
 class BoardTest(unittest.TestCase):
@@ -68,6 +71,50 @@ class BoardTest(unittest.TestCase):
         data["nets"]["memory"]["channels"][0] = ["U_H0.link_in", "U_M0a.channel"]
         problems = Board(data).check()
         self.assertTrue(any("head ASIC" in p or "is link" in p for p in problems))
+
+    def test_memory_devices_follow_the_memory_net_kind(self) -> None:
+        self.assertEqual(self.board.memory_kind, "lpddr5x_x32")
+        self.assertEqual(self.board.memory_interfaces("layer_asic"), ["lpddr_ch0", "lpddr_ch1"])
+        self.assertEqual(self.board.memory_device_classes(), ["lpddr5x"])
+        self.assertFalse(self.board.is_modular)
+        hbm = Board.load(HW / "board_27b.yaml")
+        self.assertEqual(hbm.memory_interfaces("layer_asic"), [])
+        self.assertEqual(hbm.memory_device_classes(), [])
+
+    def test_modular_board_puts_every_ring_chip_and_its_memory_on_a_card(self) -> None:
+        board = Board.load(HW / "board_psram.yaml")
+        self.assertEqual(board.check(), [])
+        self.assertTrue(board.is_modular)
+        self.assertEqual(board.memory_kind, "psram_x16")
+        self.assertEqual(len(board.memory_interfaces("layer_asic")), 16)
+        self.assertEqual(board.memory_device_classes(), ["psram"])
+        self.assertEqual(len(board.instances("psram")), 128)
+        self.assertEqual(sorted(int(spec["slot"]) for spec in board.modules.values()), list(range(10)))
+        self.assertEqual(len(board.module_members("M0")), 17)          # one chip and sixteen devices
+        self.assertEqual(len(board.module_members("M8")), 1)           # a head module carries no memory
+        # Only the ring, the small interfaces and power cross the connector: the memory stays on the card.
+        self.assertEqual(board.connector_signal_count("M0"), 2 * 12 + 5 + 5 + 2 + 2)
+        self.assertEqual(board.connector_signal_count("M8"), board.connector_signal_count("M0"))
+        self.assertIn("Modules", board.summary_markdown())
+        svg = board.svg()
+        self.assertIn("slot 9", svg)
+        self.assertIn("38 signals over the edge", svg)
+
+    def test_modular_checks_catch_a_device_on_the_wrong_card_and_a_shared_slot(self) -> None:
+        board = Board.load(HW / "board_psram.yaml")
+        data = copy.deepcopy(board.data)
+        data["components"]["U_M0_3"]["module"] = "M1"
+        problems = Board(data).check()
+        self.assertTrue(any("not on the module of U_A0" in p for p in problems))
+        data = copy.deepcopy(board.data)
+        data["modules"]["M1"]["slot"] = 0
+        self.assertTrue(any("both sit in slot 0" in p for p in Board(data).check()))
+        data = copy.deepcopy(board.data)
+        del data["components"]["U_H1"]["module"]
+        self.assertTrue(any("every ring chip of a modular board" in p for p in Board(data).check()))
+        data = copy.deepcopy(self.board.data)
+        data["components"]["U_A0"]["module"] = "M0"
+        self.assertTrue(any("names a module but the board has none" in p for p in Board(data).check()))
 
     def test_svg_and_summary_render(self) -> None:
         svg = self.board.svg()

@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1180 620" font-family="sans-serif" font-size="12">
+<rect width="1180" height="620" fill="#fafafa"/>
+<text x="20" y="28" font-size="16" font-weight="bold">asic-llm-appliance-psram-a0: block diagram</text>
+<text x="20" y="46" fill="#555">2U rack chassis, one 420 x 360 mm motherboard with ten module slots in two facing rows, host-attached over a PCIe cable, front-to-back fans between the cards, redundant CRPS</text>
+<defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#1f5fbf"/></marker></defs>
+<path d="M136,295.0 L250,189.0" stroke="#1f5fbf" stroke-width="2.5" marker-end="url(#arrow)" fill="none"/>
+<line x1="400" y1="189.0" x2="425" y2="189.0" stroke="#1f5fbf" stroke-width="2.5" marker-end="url(#arrow)" fill="none"/>
+<line x1="575" y1="189.0" x2="600" y2="189.0" stroke="#1f5fbf" stroke-width="2.5" marker-end="url(#arrow)" fill="none"/>
+<line x1="750" y1="189.0" x2="775" y2="189.0" stroke="#1f5fbf" stroke-width="2.5" marker-end="url(#arrow)" fill="none"/>
+<line x1="925" y1="189.0" x2="950" y2="189.0" stroke="#1f5fbf" stroke-width="2.5" marker-end="url(#arrow)" fill="none"/>
+<line x1="1025.0" y1="228" x2="1025.0" y2="400" stroke="#1f5fbf" stroke-width="2.5" marker-end="url(#arrow)" fill="none"/>
+<line x1="950" y1="439.0" x2="925" y2="439.0" stroke="#1f5fbf" stroke-width="2.5" marker-end="url(#arrow)" fill="none"/>
+<line x1="775" y1="439.0" x2="750" y2="439.0" stroke="#1f5fbf" stroke-width="2.5" marker-end="url(#arrow)" fill="none"/>
+<line x1="600" y1="439.0" x2="575" y2="439.0" stroke="#1f5fbf" stroke-width="2.5" marker-end="url(#arrow)" fill="none"/>
+<line x1="425" y1="439.0" x2="400" y2="439.0" stroke="#1f5fbf" stroke-width="2.5" marker-end="url(#arrow)" fill="none"/>
+<path d="M250,439.0 L136,315.0" stroke="#1f5fbf" stroke-width="2.5" marker-end="url(#arrow)" fill="none"/>
+<rect x="250" y="150" width="150" height="78" rx="6" fill="#dbe8f7" stroke="#333"/>
+<text x="325.0" y="168" text-anchor="middle" font-weight="bold">M0: slot 0</text>
+<text x="325.0" y="186" text-anchor="middle">U_A0 L0-3</text>
+<text x="325.0" y="204" text-anchor="middle" font-size="10">16 x psram on the card</text>
+<text x="325.0" y="219" text-anchor="middle" font-size="10">38 signals over the edge</text>
+<rect x="425" y="150" width="150" height="78" rx="6" fill="#dbe8f7" stroke="#333"/>
+<text x="500.0" y="168" text-anchor="middle" font-weight="bold">M1: slot 1</text>
+<text x="500.0" y="186" text-anchor="middle">U_A1 L4-7</text>
+<text x="500.0" y="204" text-anchor="middle" font-size="10">16 x psram on the card</text>
+<text x="500.0" y="219" text-anchor="middle" font-size="10">38 signals over the edge</text>
+<rect x="600" y="150" width="150" height="78" rx="6" fill="#dbe8f7" stroke="#333"/>
+<text x="675.0" y="168" text-anchor="middle" font-weight="bold">M2: slot 2</text>
+<text x="675.0" y="186" text-anchor="middle">U_A2 L8-11</text>
+<text x="675.0" y="204" text-anchor="middle" font-size="10">16 x psram on the card</text>
+<text x="675.0" y="219" text-anchor="middle" font-size="10">38 signals over the edge</text>
+<rect x="775" y="150" width="150" height="78" rx="6" fill="#dbe8f7" stroke="#333"/>
+<text x="850.0" y="168" text-anchor="middle" font-weight="bold">M3: slot 3</text>
+<text x="850.0" y="186" text-anchor="middle">U_A3 L12-15</text>
+<text x="850.0" y="204" text-anchor="middle" font-size="10">16 x psram on the card</text>
+<text x="850.0" y="219" text-anchor="middle" font-size="10">38 signals over the edge</text>
+<rect x="950" y="150" width="150" height="78" rx="6" fill="#dbe8f7" stroke="#333"/>
+<text x="1025.0" y="168" text-anchor="middle" font-weight="bold">M4: slot 4</text>
+<text x="1025.0" y="186" text-anchor="middle">U_A4 L16-19</text>
+<text x="1025.0" y="204" text-anchor="middle" font-size="10">16 x psram on the card</text>
+<text x="1025.0" y="219" text-anchor="middle" font-size="10">38 signals over the edge</text>
+<rect x="950" y="400" width="150" height="78" rx="6" fill="#dbe8f7" stroke="#333"/>
+<text x="1025.0" y="418" text-anchor="middle" font-weight="bold">M5: slot 5</text>
+<text x="1025.0" y="436" text-anchor="middle">U_A5 L20-23</text>
+<text x="1025.0" y="454" text-anchor="middle" font-size="10">16 x psram on the card</text>
+<text x="1025.0" y="469" text-anchor="middle" font-size="10">38 signals over the edge</text>
+<rect x="775" y="400" width="150" height="78" rx="6" fill="#dbe8f7" stroke="#333"/>
+<text x="850.0" y="418" text-anchor="middle" font-weight="bold">M6: slot 6</text>
+<text x="850.0" y="436" text-anchor="middle">U_A6 L24-27</text>
+<text x="850.0" y="454" text-anchor="middle" font-size="10">16 x psram on the card</text>
+<text x="850.0" y="469" text-anchor="middle" font-size="10">38 signals over the edge</text>
+<rect x="600" y="400" width="150" height="78" rx="6" fill="#dbe8f7" stroke="#333"/>
+<text x="675.0" y="418" text-anchor="middle" font-weight="bold">M7: slot 7</text>
+<text x="675.0" y="436" text-anchor="middle">U_A7 L28-31</text>
+<text x="675.0" y="454" text-anchor="middle" font-size="10">16 x psram on the card</text>
+<text x="675.0" y="469" text-anchor="middle" font-size="10">38 signals over the edge</text>
+<rect x="425" y="400" width="150" height="78" rx="6" fill="#f7dbdb" stroke="#333"/>
+<text x="500.0" y="418" text-anchor="middle" font-weight="bold">M8: slot 8</text>
+<text x="500.0" y="436" text-anchor="middle">U_H0 head mode</text>
+<text x="500.0" y="454" text-anchor="middle" font-size="10">no memory on the card</text>
+<text x="500.0" y="469" text-anchor="middle" font-size="10">38 signals over the edge</text>
+<rect x="250" y="400" width="150" height="78" rx="6" fill="#f7dbdb" stroke="#333"/>
+<text x="325.0" y="418" text-anchor="middle" font-weight="bold">M9: slot 9</text>
+<text x="325.0" y="436" text-anchor="middle">U_H1 head mode</text>
+<text x="325.0" y="454" text-anchor="middle" font-size="10">no memory on the card</text>
+<text x="325.0" y="469" text-anchor="middle" font-size="10">38 signals over the edge</text>
+<rect x="40" y="265.0" width="96" height="80" rx="6" fill="#fff2cc" stroke="#333"/>
+<text x="88" y="285.0" text-anchor="middle" font-weight="bold">U_FPGA</text>
+<text x="88" y="303.0" text-anchor="middle">PCIe (cable)</text>
+<text x="88" y="321.0" text-anchor="middle" font-size="10">DDR4 x64, clock, BMC</text>
+<text x="20" y="580" fill="#333">Blue: activation ring, 12-signal link per hop, out along one row of slots and back along the facing row (a U-fold). Each module is one card: a ring chip, its memory and its core regulator. Power budget 251 W load / 295 W input.</text>
+<text x="20" y="600" fill="#333">Management SPI, JTAG chain and reference clock reach every module through its slot (not drawn); the BMC, PSUs and fans are off the ring.</text>
+</svg>

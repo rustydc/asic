@@ -41,7 +41,7 @@ The ring is a regular 11-gon of 46 mm side (82 mm circumradius) centred at (140,
 
 ## ASIC package and escape density
 
-FCBGA1225_35x35_P0.8: 35x35 balls at 0.8 mm, 29 mm body, selected by `hw/pinout.py` for 177 A of core current at 50000 tokens/s (1012 balls needed; see the pinout report). Per edge: 36 link signals on two columns of 18 rows (2.5 signals per mm of edge); 130 LPDDR signals on the north 4 rows, 4.5 per mm of edge, of which 28 sit deeper than the outer 3 rows and need microvias or a build-up layer pair to escape. The memory nets are not routed here.
+FCBGA1225_35x35_P0.8: 35x35 balls at 0.8 mm, 29 mm body, selected by `hw/pinout.py` for 184 A of core current at 50000 tokens/s (1042 balls needed; see the pinout report). Per edge: 36 link signals on a two-deep block of 18 (2.5 signals per mm of edge); 130 LPDDR signals on the north 4 rows, 4.5 per mm of edge, of which 28 sit deeper than the outer 3 rows and need microvias or a build-up layer pair to escape. The memory nets are not routed here.
 
 ## Core rail current
 
@@ -49,14 +49,14 @@ One 2 oz (70 um) plane across the package width, at 50K tokens/s from the board 
 
 | ASIC | Current (A) | Section per plane (mm2) | A/mm2 on one plane | Planes for 30 A/mm2 |
 | --- | ---: | ---: | ---: | ---: |
-| U_A0 | 177 | 2.03 | 87 | 3 |
-| U_A1 | 177 | 2.03 | 87 | 3 |
-| U_A2 | 177 | 2.03 | 87 | 3 |
-| U_A3 | 177 | 2.03 | 87 | 3 |
-| U_A4 | 177 | 2.03 | 87 | 3 |
-| U_A5 | 177 | 2.03 | 87 | 3 |
-| U_A6 | 177 | 2.03 | 87 | 3 |
-| U_A7 | 177 | 2.03 | 87 | 3 |
+| U_A0 | 184 | 2.03 | 91 | 4 |
+| U_A1 | 184 | 2.03 | 91 | 4 |
+| U_A2 | 184 | 2.03 | 91 | 4 |
+| U_A3 | 184 | 2.03 | 91 | 4 |
+| U_A4 | 184 | 2.03 | 91 | 4 |
+| U_A5 | 184 | 2.03 | 91 | 4 |
+| U_A6 | 184 | 2.03 | 91 | 4 |
+| U_A7 | 184 | 2.03 | 91 | 4 |
 
 The core rail therefore needs the regulator directly beside the package with several plane layers or thick copper in between; the single In8.Cu island here is a placeholder.
 

@@ -9,11 +9,11 @@
  },
  "requirements": {
   "rated_tokens_per_second": 50000.0,
-  "core_amps": 176.625,
+  "core_amps": 184.49999999999997,
   "signal_balls": 216,
   "signal_grounds": 54,
-  "core_balls": 354,
-  "ground_balls": 354,
+  "core_balls": 369,
+  "ground_balls": 369,
   "rail_balls": {
    "VDD_IO_1V8": 8,
    "VDD_PLL_0V9": 2,
@@ -24,11 +24,11 @@
  "rejected": [
   [
    "FCBGA400_20x20_P1.0",
-   "400 balls, 1012 needed"
+   "400 balls, 1042 needed"
   ],
   [
    "FCBGA784_28x28_P0.8",
-   "784 balls, 1012 needed"
+   "784 balls, 1042 needed"
   ]
  ],
  "balls": [

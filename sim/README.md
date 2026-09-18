@@ -207,7 +207,9 @@ devices, which is what thirty-two devices buy at int8.
 So the trade is real but it is not a wash. A PSRAM wall buys the removal of
 the single largest IP and analog risk in the design, and costs roughly five
 times the throughput per board: the same 9B on two LPDDR5X-9600 per die, with
-the same int4 KV at 16:1, runs at 12.4K tokens/s against 2.5K. It also says a PSRAM-based die should hold
+the same int4 KV at 16:1, runs at 12.4K tokens/s against 2.5K. The board that
+carries it is `hw/board_psram.yaml`: sixteen devices are 304 memory signals,
+which puts every chip on its own card. It also says a PSRAM-based die should hold
 more layers than an LPDDR one, since its fabric is mostly idle.
 
 ## The high end: a 27B-class model on a 2 nm-class die with HBM
