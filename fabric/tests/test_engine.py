@@ -1,6 +1,8 @@
+import os
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -18,15 +20,22 @@ SOURCES = [RTL / name for name in ("fabric_vector.sv", "fabric_norm.sv", "fabric
                                    "fabric_phy.sv", "fabric_cdc.sv", "fabric_hpi.sv", "tb_layer_engine.sv")]
 
 
-def run_engine(case: unittest.TestCase, cfg, c, spec, mm, steps: list[S.Step], inputs: dict, memory=None, ndev: int = 0) -> int:
-    """Emit, simulate and check one program; returns the engine's cycle count.  With ``ndev`` the memory is the HPI path."""
+def run_engine(case: unittest.TestCase, cfg, c, spec, mm, steps: list[S.Step], inputs: dict, memory=None, ndev: int = 0,
+               model_tiles: bool = False, log=None) -> int:
+    """Emit, simulate and check one program; returns the engine's cycle count.  With ``ndev`` the memory is the HPI path,
+    with ``model_tiles`` the tiles' behavioural columns (full-size runs)."""
     with tempfile.TemporaryDirectory() as directory:
         work = Path(directory)
-        run = E.EngineRun(work, cfg, c, spec, mm, steps, inputs, memory, ndev)
+        t0 = time.time()
+        run = E.EngineRun(work, cfg, c, spec, mm, steps, inputs, memory, ndev, model_tiles)
         args = [f"-Ptb_layer_engine.{name}={value}" for name, value in run.params.items()]
+        t1 = time.time()
         subprocess.run(["iverilog", "-g2012", "-I", str(RTL), "-s", "tb_layer_engine", "-o", "sim.vvp", *args, *map(str, SOURCES)],
                        cwd=work, check=True, capture_output=True, text=True)
+        t2 = time.time()
         out = subprocess.run(["vvp", "sim.vvp"], cwd=work, check=True, capture_output=True, text=True).stdout
+        if log is not None:
+            log(f"emit {t1 - t0:.0f} s, compile {t2 - t1:.0f} s, simulate {time.time() - t2:.0f} s: {out.strip().splitlines()[-2]}")
         case.assertIn("PASS", out, out)
         case.assertEqual(run.check(work), [])
         issue = [tuple(int(v) for v in line.split()) for line in (work / "issue.txt").read_text().splitlines()]
@@ -49,8 +58,8 @@ class LayoutTest(unittest.TestCase):
         self.assertEqual(len([n for n in lay.vb if n.startswith("s_slot")]), 4)    # the four heads' slots
         words = S.encode(prog, lay)
         conv = next(i for i, s in enumerate(prog) if s.name == "conv")
-        self.assertEqual((words[conv] >> 64) & 0xFFFF, lay.vb["P1"])            # src
-        self.assertEqual((words[conv] >> 170) & 0xFFFFFFFF, lay.vb["hist_next"])  # arg2
+        self.assertEqual((words[conv] >> 64) & ((1 << 30) - 1), lay.vb["P1"])            # src
+        self.assertEqual((words[conv] >> 154) & ((1 << 30) - 1), lay.vb["hist_next"])     # a3
         # A stream keeps the slots shared and gives each token its own copies of the rest.
         two = S.stream(prog, 2)
         lay2 = E.Layout(two, S.recurrent_layout(cfg, spec, mm)["sizes"])
@@ -235,6 +244,47 @@ class GlobalEngineRtlTest(unittest.TestCase):
             memory[f"m_ctx@{token}"] = images
             programs.append(S.retarget(S.global_program(self.cfg, self.c, self.spec, self.mm, pos), token))
         run_engine(self, self.cfg, self.c, self.spec, self.mm, S.interleave(programs), inputs, memory)
+
+
+@unittest.skipUnless(os.environ.get("FABRIC_FULL_SIZE") and shutil.which("iverilog"), "set FABRIC_FULL_SIZE=1 for the full-size run")
+class FullSizeEngineTest(unittest.TestCase):
+    """One token of the 9B recurrent layer through the engine at the design's
+    own geometry: 4096 wide, 834 tiles of 4096 x 64, 32 heads of 128 x 128
+    state, with the tiles' behavioural columns.  Minutes of Icarus, so it
+    runs only when asked for."""
+
+    def test_full_size_recurrent_token(self) -> None:
+        import torch
+        from fixed_llm_poc import ASICDecoderLayer, ASICLMConfig
+        cfg = ASICLMConfig.qwen3_5_9b()
+        torch.manual_seed(0)
+        t0 = time.time()
+        layer = ASICDecoderLayer(cfg, 0)
+        w = {k: v.detach().double().numpy() for k, v in layer.state_dict().items()}
+        spec, mm = TileSpec(), MemoryMap.from_config(cfg)
+        rng = np.random.default_rng(9)
+        nv, hk, hv = cfg.linear_num_value_heads, cfg.linear_key_head_dim, cfg.linear_value_head_dim
+        conv_dim = layer.linear_attn.conv_dim
+        xs = [rng.standard_normal(cfg.hidden_size) * 2.0 for _ in range(3)]
+        s, hist, runs = np.zeros((nv, hk, hv)), np.zeros((conv_dim, cfg.linear_conv_kernel - 1)), []
+        for x in xs:
+            r = L.recurrent_layer_float(w, cfg, x, s, hist)
+            s, hist = r["s_next"], r["hist_next"]
+            runs.append(r)
+        cal = L.calibrate(runs, L.RECURRENT_CAL_KEYS)
+        cal["x2"] = max(cal["x2"], max(float(np.abs(x).max()) for x in xs))
+        c = L.compile_recurrent_layer(w, cfg, spec, cal)
+        prog = S.recurrent_program(cfg, c, spec, mm)
+        # The context after one token, then the second on the engine.
+        s_i = np.zeros((nv, hk, hv), dtype=np.int64)
+        sc_i = np.tile([L.ONE_U, 0, 0, 0], (nv, 1)).astype(np.int64)
+        hist_i = np.zeros((conv_dim, cfg.linear_conv_kernel - 1), dtype=np.int64)
+        r = L.recurrent_layer_int(c, cfg, spec, np.rint(xs[0] / c.s_h).astype(np.int64), s_i, hist_i, scale=sc_i)
+        inputs = {"x": np.rint(xs[1] / c.s_h).astype(np.int64), "s_mem": r["s_next"], "scale_mem": r["scale_next"], "hist_mem": r["hist_next"]}
+        print(f"\nfull size: layer built and compiled in {time.time() - t0:.0f} s, {len(prog)} steps")
+        cycles = run_engine(self, cfg, c, spec, mm, prog, inputs, model_tiles=True, log=print)
+        print(f"full size: {cycles} engine cycles for one token (the timing model said {S.schedule(prog).cycles})")
+        self.assertGreater(cycles, S.schedule(prog).cycles // 2)
 
 
 if __name__ == "__main__":

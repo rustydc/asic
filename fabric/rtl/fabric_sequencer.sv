@@ -3,8 +3,8 @@
 // DMAs, several tokens of different contexts interleaved in one stream.
 //
 // The program is a list of steps.  Each step is a command to one unit
-// (unit id, engine, a length, a source and destination buffer and two
-// arguments), up to seven buffer ids it consumes, up to two it produces
+// (unit id, engine, a length, a 32-bit argument and four 30-bit address
+// operands), up to six buffer ids it consumes, up to two it produces
 // (each either a write or a contribution to a whole vector), and a last
 // flag.  The controller issues in program order.  Per buffer id it keeps
 // the number of outstanding writers and readers; the head step issues when
@@ -41,17 +41,18 @@ module fabric_sequencer #(
     output wire [NU-1:0]        cmd_valid,
     output wire [3:0]           cmd_engine,
     output wire [15:0]          cmd_len,
-    output wire [15:0]          cmd_src,
-    output wire [15:0]          cmd_dst,
+    output wire [29:0]          cmd_src,
+    output wire [29:0]          cmd_dst,
+    output wire [29:0]          cmd_a2,
+    output wire [29:0]          cmd_a3,
     output wire [31:0]          cmd_arg,
-    output wire [31:0]          cmd_arg2,
     output wire [7:0]           cmd_tag,
     input  wire [NU-1:0]        cmd_ready,      // the addressed engine of that unit is free
     // completions, one port per engine
     input  wire [NU*NE-1:0]     done_valid,
     input  wire [NU*NE*8-1:0]   done_tag
 );
-    localparam int NC = 7, NP = 2;
+    localparam int NC = 6, NP = 2, IDB = 64 + 4 * 30;   // the ids follow the four address operands
     reg [255:0] prog [0:DEPTH-1];
     initial if (PROG_FILE != "") $readmemh(PROG_FILE, prog);
 
@@ -62,17 +63,18 @@ module fabric_sequencer #(
     assign cmd_engine = cur[7:4];
     assign cmd_len    = cur[31:16];
     assign cmd_arg    = cur[63:32];
-    assign cmd_src    = cur[79:64];
-    assign cmd_dst    = cur[95:80];
-    assign cmd_arg2   = cur[201:170];
+    assign cmd_src    = cur[64 +: 30];
+    assign cmd_dst    = cur[94 +: 30];
+    assign cmd_a2     = cur[124 +: 30];
+    assign cmd_a3     = cur[154 +: 30];
     assign cmd_tag    = pc[7:0];
     wire [7:0]   cur_c [0:NC-1];
     wire [7:0]   cur_p [0:NP-1];
-    wire [NP-1:0] cur_contrib = cur[169:168];
+    wire [NP-1:0] cur_contrib = cur[IDB + 8*(NC+NP) +: NP];
     genvar gi;
     generate
-        for (gi = 0; gi < NC; gi = gi + 1) begin : g_c assign cur_c[gi] = cur[96 + 8*gi +: 8]; end
-        for (gi = 0; gi < NP; gi = gi + 1) begin : g_p assign cur_p[gi] = cur[152 + 8*gi +: 8]; end
+        for (gi = 0; gi < NC; gi = gi + 1) begin : g_c assign cur_c[gi] = cur[IDB + 8*gi +: 8]; end
+        for (gi = 0; gi < NP; gi = gi + 1) begin : g_p assign cur_p[gi] = cur[IDB + 8*NC + 8*gi +: 8]; end
     endgenerate
 
     // The ids of every issued step, by tag, for the release at completion.
@@ -155,8 +157,8 @@ module fabric_sequencer #(
                         if (cur_c[k] != 8'hFF) rd_cnt[cur_c[k]] = rd_cnt[cur_c[k]] + 1'b1;
                     for (k = 0; k < NP; k = k + 1)
                         if (cur_p[k] != 8'hFF) wr_cnt[cur_p[k]] = wr_cnt[cur_p[k]] + 1'b1;
-                    tab_c[pc[7:0]] <= cur[96 +: NC*8];
-                    tab_p[pc[7:0]] <= cur[152 +: NP*8];
+                    tab_c[pc[7:0]] <= cur[IDB +: NC*8];
+                    tab_p[pc[7:0]] <= cur[IDB + 8*NC +: NP*8];
                     tab_live[pc[7:0]] <= 1'b1;
                     pc <= pc + 1'b1;
                     if (cur_last || pc + 1 == n_steps) finishing <= 1'b1;

@@ -2,8 +2,8 @@
 // real units through one byte-addressed vector buffer.
 //
 // Every unit sits behind an adapter with the same face to the controller:
-// a command (length, source and destination byte addresses, two 32-bit
-// arguments, a tag) accepted when the engine is idle, and a done pulse
+// a command (length, four 30-bit address operands src, dst, a2 and a3, a
+// 32-bit argument, a tag) accepted when the engine is idle, and a done pulse
 // carrying the tag one cycle after the step's last result was written to
 // the vector buffer.  The adapters read the buffer 16 bytes per port per
 // cycle (one cycle of latency) and write 16 bytes with byte enables.
@@ -74,7 +74,7 @@ endmodule
 // ---------------------------------------------------------------------------
 // Norm engine.  arg[7:0] selects the constants (mult, shift, eps and the
 // gain's requantizer), arg[8] int16 input, arg[9] the gain is silu of the
-// int8 vector at byte address arg[31:16]; len is the beat count.
+// int8 vector at a2; len is the beat count.
 // ---------------------------------------------------------------------------
 module fabric_norm_adapter #(
     parameter int NL     = 8,
@@ -88,8 +88,10 @@ module fabric_norm_adapter #(
     input  wire          rst_n,
     input  wire          cmd_valid,
     input  wire [15:0]   cmd_len,
-    input  wire [15:0]   cmd_src,
-    input  wire [15:0]   cmd_dst,
+    input  wire [29:0]   cmd_src,
+    input  wire [29:0]   cmd_dst,
+    input  wire [29:0]   cmd_a2,
+    input  wire [29:0]   cmd_a3,
     input  wire [31:0]   cmd_arg,
     input  wire [7:0]    cmd_tag,
     output wire          cmd_ready,
@@ -154,8 +156,8 @@ module fabric_norm_adapter #(
         end else begin
             done_valid <= wrote; wrote <= 1'b0; wr_en <= 1'b0;
             if (cmd_valid && cmd_ready) begin
-                busy <= 1'b1; issuing <= 1'b1; n <= cmd_len[BW-1:0]; src <= cmd_src; dst <= cmd_dst;
-                gaddr <= cmd_arg[31:16]; int16 <= cmd_arg[8]; gated <= cmd_arg[9]; k <= consts[cmd_arg[7:0]];
+                busy <= 1'b1; issuing <= 1'b1; n <= cmd_len[BW-1:0]; src <= cmd_src[AW-1:0]; dst <= cmd_dst[AW-1:0];
+                gaddr <= cmd_a2[AW-1:0]; int16 <= cmd_arg[8]; gated <= cmd_arg[9]; k <= consts[cmd_arg[7:0]];
                 tag <= cmd_tag; i <= 0; o <= 0;
             end
             if (issuing) begin
@@ -173,16 +175,16 @@ endmodule
 
 // ---------------------------------------------------------------------------
 // The tile array as one pass engine.  passes.hex describes each tile:
-//   [3:0] pass  [7:4] row block  [15:8] the tile whose partial sums it
-//   continues (FF: none)  [16] last row block  [17] raw: write the
-//   accumulators as 32-bit words  [25:18] bytes to write  [41:26] byte
+//   [3:0] pass  [7:4] row block  [19:8] the tile whose partial sums it
+//   continues (FFF: none)  [20] last row block  [21] raw: write the
+//   accumulators as 32-bit words  [29:22] bytes to write  [53:30] byte
 //   offset of its output inside the destination.
 // A command runs pass arg[7:0] over arg[15:8] row blocks for the
 // arg[23:16] tokens of a chunk (one at least, TMAX at most): each row
 // block's tiles start together and consume ROWS activations of every
-// token, P per cycle, token t's from src + t * arg2[15:0] + rb * ROWS;
-// when the last block's requantizer walk ends every last-block tile's
-// output for token t goes to dst + t * arg2[31:16] + offset.
+// token, P per cycle, token t's from src + t * a2 + rb * ROWS; when the
+// last block's requantizer walk ends every last-block tile's output for
+// token t goes to dst + t * a3 + offset.
 // ---------------------------------------------------------------------------
 module fabric_pass_adapter #(
     parameter int NT   = 4,
@@ -195,16 +197,18 @@ module fabric_pass_adapter #(
     parameter int SB   = 16,
     parameter int SHB  = 5,
     parameter int TMAX = 1,
+    parameter int MODEL_TILES = 0,              // the behavioural columns, for full-size runs
     parameter int AW   = 16
 ) (
     input  wire          clk,
     input  wire          rst_n,
     input  wire          cmd_valid,
     input  wire [15:0]   cmd_len,
-    input  wire [15:0]   cmd_src,
-    input  wire [15:0]   cmd_dst,
+    input  wire [29:0]   cmd_src,
+    input  wire [29:0]   cmd_dst,
+    input  wire [29:0]   cmd_a2,
+    input  wire [29:0]   cmd_a3,
     input  wire [31:0]   cmd_arg,
-    input  wire [31:0]   cmd_arg2,
     input  wire [7:0]    cmd_tag,
     output wire          cmd_ready,
     output reg           done_valid,
@@ -220,7 +224,7 @@ module fabric_pass_adapter #(
     localparam int PW  = TMAX * COLS * ACC;  // a tile's accumulators, token-major
     localparam int QW  = TMAX * COLS * AB;
     localparam int VW  = COLS * 32;          // one token's output vector as raw words
-    reg [47:0]   tab [0:NT-1];
+    reg [55:0]   tab [0:NT-1];
     reg [SB-1:0] mult_all [0:NT*COLS-1];
     reg [SHB-1:0] shift_all [0:NT*COLS-1];
     initial begin
@@ -231,7 +235,8 @@ module fabric_pass_adapter #(
 
     localparam [2:0] S_IDLE = 0, S_START = 1, S_STREAM = 2, S_WAIT = 3, S_WRITE = 4, S_DONE = 5;
     reg [2:0]    state;
-    reg [7:0]    pass, nrb, rb, t, tag, ntok, tok;
+    reg [7:0]    pass, nrb, rb, tag, ntok, tok;
+    reg [11:0]   t;
     reg [AW-1:0] src, dst, in_stride, out_stride;
     reg [15:0]   i;
     reg [3:0]    j;
@@ -259,10 +264,10 @@ module fabric_pass_adapter #(
                 assign mult_w[gc*SB +: SB]   = mult_all[gt*COLS + gc];
                 assign shift_w[gc*SHB +: SHB] = shift_all[gt*COLS + gc];
             end
-            wire [7:0]    chain   = tab[gt][15:8];
-            wire [PW-1:0] psum_in = (chain == 8'hFF) ? {PW{1'b0}} : psum_out_flat[chain*PW +: PW];
+            wire [11:0]   chain   = tab[gt][19:8];
+            wire [PW-1:0] psum_in = (chain == 12'hFFF) ? {PW{1'b0}} : psum_out_flat[chain*PW +: PW];
             assign start_t[gt] = (state == S_START) && (tab[gt][3:0] == pass[3:0]) && (tab[gt][7:4] == rb[3:0]);
-            fabric_tile #(.ROWS(ROWS), .COLS(COLS), .WB(WB), .AB(AB), .P(P), .ACC(ACC), .SB(SB), .SHB(SHB), .T(TMAX), .ROM_FILE("")) u_tile (
+            fabric_tile #(.ROWS(ROWS), .COLS(COLS), .WB(WB), .AB(AB), .P(P), .ACC(ACC), .SB(SB), .SHB(SHB), .T(TMAX), .MODEL(MODEL_TILES), .ROM_FILE("")) u_tile (
                 .clk(clk), .rst_n(rst_n), .start(start_t[gt]), .psum_in(psum_in), .x_valid(xv), .x_data(x_data),
                 .mult(mult_w), .shift(shift_w), .x_ready(), .done(), .psum_out(psum_out_flat[gt*PW +: PW]),
                 .q_out(q_out_flat[gt*QW +: QW]), .q_valid(q_valid_t[gt]));
@@ -271,15 +276,15 @@ module fabric_pass_adapter #(
     endgenerate
 
     // The output vector of tile t for token tok: its requantized bytes, or its accumulators as words.
-    wire [47:0]   cur     = tab[t];
-    wire          cur_hit = (cur[3:0] == pass[3:0]) && cur[16];
-    wire [7:0]    nbytes  = cur[25:18];
+    wire [55:0]   cur     = tab[t];
+    wire          cur_hit = (cur[3:0] == pass[3:0]) && cur[20];
+    wire [7:0]    nbytes  = cur[29:22];
     wire [4:0]    beats   = (nbytes + 15) / 16;
     reg  [VW-1:0] vec;
     integer c;
     always @* begin
         vec = {VW{1'b0}};
-        if (cur[17]) begin
+        if (cur[21]) begin
             for (c = 0; c < COLS; c = c + 1)
                 vec[c*32 +: 32] = {{(32-ACC){psum_out_flat[t*PW + (tok*COLS + c)*ACC + ACC - 1]}}, psum_out_flat[t*PW + (tok*COLS + c)*ACC +: ACC]};
         end else vec[COLS*AB-1:0] = q_out_flat[t*QW + tok*COLS*AB +: COLS*AB];
@@ -295,7 +300,7 @@ module fabric_pass_adapter #(
             case (state)
                 S_IDLE: if (cmd_valid) begin
                     pass <= cmd_arg[7:0]; nrb <= cmd_arg[15:8]; ntok <= (cmd_arg[23:16] == 0) ? 8'd1 : cmd_arg[23:16];
-                    src <= cmd_src; dst <= cmd_dst; in_stride <= cmd_arg2[15:0]; out_stride <= cmd_arg2[31:16]; tag <= cmd_tag;
+                    src <= cmd_src[AW-1:0]; dst <= cmd_dst[AW-1:0]; in_stride <= cmd_a2[AW-1:0]; out_stride <= cmd_a3[AW-1:0]; tag <= cmd_tag;
                     rb <= 0; tok <= 0; state <= S_START;
                 end
                 S_START: begin
@@ -311,7 +316,7 @@ module fabric_pass_adapter #(
                 end
                 S_WRITE: begin
                     if (cur_hit) begin
-                        wr_en <= 1'b1; wr_addr <= dst + tok * out_stride + cur[41:26] + j * 16; wr_data <= vec[j*128 +: 128]; wr_be <= be_w;
+                        wr_en <= 1'b1; wr_addr <= dst + tok * out_stride + cur[53:30] + j * 16; wr_data <= vec[j*128 +: 128]; wr_be <= be_w;
                         if (j == beats - 1) begin
                             j <= 0;
                             if (tok == ntok - 1) begin tok <= 0; t <= t + 1'b1; if (t == NT - 1) state <= S_DONE; end
@@ -329,9 +334,9 @@ module fabric_pass_adapter #(
 endmodule
 
 // ---------------------------------------------------------------------------
-// The causal convolution.  src: the new int8 samples; arg[15:0]: the
-// history (4 bytes per channel, oldest first); dst: the int8 outputs;
-// arg2[15:0]: the shifted history; len: beats of CL channels.
+// The causal convolution.  src: the new int8 samples; a2: the history (4
+// bytes per channel, oldest first); dst: the int8 outputs; a3: the shifted
+// history; len: beats of CL channels.
 // ---------------------------------------------------------------------------
 module fabric_conv_adapter #(
     parameter int CL = 4,
@@ -344,10 +349,11 @@ module fabric_conv_adapter #(
     input  wire          rst_n,
     input  wire          cmd_valid,
     input  wire [15:0]   cmd_len,
-    input  wire [15:0]   cmd_src,
-    input  wire [15:0]   cmd_dst,
+    input  wire [29:0]   cmd_src,
+    input  wire [29:0]   cmd_dst,
+    input  wire [29:0]   cmd_a2,
+    input  wire [29:0]   cmd_a3,
     input  wire [31:0]   cmd_arg,
-    input  wire [31:0]   cmd_arg2,
     input  wire [7:0]    cmd_tag,
     output wire          cmd_ready,
     output reg           done_valid,
@@ -410,8 +416,8 @@ module fabric_conv_adapter #(
         end else begin
             done_valid <= wrote; wrote <= 1'b0; wr_en_y <= 1'b0; wr_en_h <= 1'b0;
             if (cmd_valid && cmd_ready) begin
-                busy <= 1'b1; issuing <= 1'b1; n <= cmd_len; src <= cmd_src; dst <= cmd_dst; hist <= cmd_arg[15:0];
-                hnext <= cmd_arg2[15:0]; tag <= cmd_tag; i <= 0; o <= 0;
+                busy <= 1'b1; issuing <= 1'b1; n <= cmd_len; src <= cmd_src[AW-1:0]; dst <= cmd_dst[AW-1:0]; hist <= cmd_a2[AW-1:0];
+                hnext <= cmd_a3[AW-1:0]; tag <= cmd_tag; i <= 0; o <= 0;
             end
             if (issuing) begin
                 i <= i + 1'b1;
@@ -428,8 +434,8 @@ module fabric_conv_adapter #(
 endmodule
 
 // ---------------------------------------------------------------------------
-// The head gates.  src: the b accumulators as 32-bit words, arg[15:0]: the
-// a accumulators, dst: 4 bytes per head (decay, beta), len: heads.
+// The head gates.  src: the b accumulators as 32-bit words, a2: the a
+// accumulators, dst: 4 bytes per head (decay, beta), len: heads.
 // ---------------------------------------------------------------------------
 module fabric_gates_adapter #(
     parameter int NVMAX = 64,
@@ -441,8 +447,10 @@ module fabric_gates_adapter #(
     input  wire          rst_n,
     input  wire          cmd_valid,
     input  wire [15:0]   cmd_len,
-    input  wire [15:0]   cmd_src,
-    input  wire [15:0]   cmd_dst,
+    input  wire [29:0]   cmd_src,
+    input  wire [29:0]   cmd_dst,
+    input  wire [29:0]   cmd_a2,
+    input  wire [29:0]   cmd_a3,
     input  wire [31:0]   cmd_arg,
     input  wire [7:0]    cmd_tag,
     output wire          cmd_ready,
@@ -479,7 +487,7 @@ module fabric_gates_adapter #(
         end else begin
             done_valid <= wrote; wrote <= 1'b0; wr_en <= 1'b0;
             if (cmd_valid && cmd_ready) begin
-                busy <= 1'b1; issuing <= 1'b1; n <= cmd_len; src <= cmd_src; dst <= cmd_dst; a_addr <= cmd_arg[15:0];
+                busy <= 1'b1; issuing <= 1'b1; n <= cmd_len; src <= cmd_src[AW-1:0]; dst <= cmd_dst[AW-1:0]; a_addr <= cmd_a2[AW-1:0];
                 tag <= cmd_tag; i <= 0; o <= 0;
             end
             if (issuing) begin
@@ -496,8 +504,8 @@ module fabric_gates_adapter #(
 endmodule
 
 // ---------------------------------------------------------------------------
-// One int8 state engine.  src: k (K bytes), arg[15:0]: q, arg[31:16]: v (V
-// bytes), arg2[15:0]: the head's gates word, arg2[31:16]: the state slot
+// One int8 state engine.  src: the head's unit q then unit k (K bytes
+// each), a2: v (V bytes), arg: the head's gates word, a3: the state slot
 // (a header beat of g, e, peak, nsat then K rows of V bytes), dst: y (V
 // int16).  The rows stream through fabric_delta_state8 and back into the
 // slot; y and the new header are written last.
@@ -515,10 +523,11 @@ module fabric_delta_adapter #(
     input  wire          clk,
     input  wire          rst_n,
     input  wire          cmd_valid,
-    input  wire [15:0]   cmd_src,
-    input  wire [15:0]   cmd_dst,
+    input  wire [29:0]   cmd_src,
+    input  wire [29:0]   cmd_dst,
+    input  wire [29:0]   cmd_a2,
+    input  wire [29:0]   cmd_a3,
     input  wire [31:0]   cmd_arg,
-    input  wire [31:0]   cmd_arg2,
     input  wire [7:0]    cmd_tag,
     output wire          cmd_ready,
     output reg           done_valid,
@@ -607,8 +616,8 @@ module fabric_delta_adapter #(
             if (y_valid) begin y_seen <= 1'b1; y_r <= y; end
             case (state)
                 S_IDLE: if (cmd_valid) begin
-                    k_addr <= cmd_src; y_addr <= cmd_dst; q_addr <= cmd_arg[15:0]; v_addr <= cmd_arg[31:16];
-                    g_addr <= cmd_arg2[15:0]; slot <= cmd_arg2[31:16]; tag <= cmd_tag;
+                    q_addr <= cmd_src[AW-1:0]; k_addr <= cmd_src[AW-1:0] + K; y_addr <= cmd_dst[AW-1:0]; v_addr <= cmd_a2[AW-1:0];
+                    g_addr <= cmd_arg[AW-1:0]; slot <= cmd_a3[AW-1:0]; tag <= cmd_tag;
                     ld <= 0; r <= 0; fw <= 0; fr <= 0; fj <= 0; y_seen <= 1'b0; rows_written <= 0; j <= 0;
                     state <= S_LOAD;
                 end
@@ -648,7 +657,7 @@ module fabric_delta_adapter #(
 endmodule
 
 // ---------------------------------------------------------------------------
-// SwiGLU.  src: gate (int8), arg[15:0]: up, arg[23:16]: constants, dst: act; len: beats of NL.
+// SwiGLU.  src: gate (int8), a2: up, arg[3:0]: constants, dst: act; len: beats of NL.
 // ---------------------------------------------------------------------------
 module fabric_swiglu_adapter #(
     parameter int NL = 8,
@@ -659,8 +668,10 @@ module fabric_swiglu_adapter #(
     input  wire          rst_n,
     input  wire          cmd_valid,
     input  wire [15:0]   cmd_len,
-    input  wire [15:0]   cmd_src,
-    input  wire [15:0]   cmd_dst,
+    input  wire [29:0]   cmd_src,
+    input  wire [29:0]   cmd_dst,
+    input  wire [29:0]   cmd_a2,
+    input  wire [29:0]   cmd_a3,
     input  wire [31:0]   cmd_arg,
     input  wire [7:0]    cmd_tag,
     output wire          cmd_ready,
@@ -697,8 +708,8 @@ module fabric_swiglu_adapter #(
         end else begin
             done_valid <= wrote; wrote <= 1'b0; wr_en <= 1'b0;
             if (cmd_valid && cmd_ready) begin
-                busy <= 1'b1; issuing <= 1'b1; n <= cmd_len; src <= cmd_src; dst <= cmd_dst; u_addr <= cmd_arg[15:0];
-                k <= consts[cmd_arg[19:16]]; tag <= cmd_tag; i <= 0; o <= 0;
+                busy <= 1'b1; issuing <= 1'b1; n <= cmd_len; src <= cmd_src[AW-1:0]; dst <= cmd_dst[AW-1:0]; u_addr <= cmd_a2[AW-1:0];
+                k <= consts[cmd_arg[3:0]]; tag <= cmd_tag; i <= 0; o <= 0;
             end
             if (issuing) begin
                 i <= i + 1'b1;
@@ -714,7 +725,7 @@ module fabric_swiglu_adapter #(
 endmodule
 
 // ---------------------------------------------------------------------------
-// The residual add.  src: h (int16), arg[15:0]: y (int8), arg[23:16]: constants, dst: h'; len: beats of NL.
+// The residual add.  src: h (int16), a2: y (int8), arg[3:0]: constants, dst: h'; len: beats of NL.
 // ---------------------------------------------------------------------------
 module fabric_residual_adapter #(
     parameter int NL = 8,
@@ -724,8 +735,10 @@ module fabric_residual_adapter #(
     input  wire          rst_n,
     input  wire          cmd_valid,
     input  wire [15:0]   cmd_len,
-    input  wire [15:0]   cmd_src,
-    input  wire [15:0]   cmd_dst,
+    input  wire [29:0]   cmd_src,
+    input  wire [29:0]   cmd_dst,
+    input  wire [29:0]   cmd_a2,
+    input  wire [29:0]   cmd_a3,
     input  wire [31:0]   cmd_arg,
     input  wire [7:0]    cmd_tag,
     output wire          cmd_ready,
@@ -762,8 +775,8 @@ module fabric_residual_adapter #(
         end else begin
             done_valid <= wrote; wrote <= 1'b0; wr_en <= 1'b0;
             if (cmd_valid && cmd_ready) begin
-                busy <= 1'b1; issuing <= 1'b1; n <= cmd_len; src <= cmd_src; dst <= cmd_dst; y_addr <= cmd_arg[15:0];
-                k <= consts[cmd_arg[19:16]]; tag <= cmd_tag; i <= 0; o <= 0;
+                busy <= 1'b1; issuing <= 1'b1; n <= cmd_len; src <= cmd_src[AW-1:0]; dst <= cmd_dst[AW-1:0]; y_addr <= cmd_a2[AW-1:0];
+                k <= consts[cmd_arg[3:0]]; tag <= cmd_tag; i <= 0; o <= 0;
             end
             if (issuing) begin
                 i <= i + 1'b1;
@@ -780,9 +793,9 @@ endmodule
 
 // ---------------------------------------------------------------------------
 // The rotary unit.  arg[3:0] = 0: the table of sines then cosines of the
-// R/2 rotary frequencies at position arg2, as int16, to dst.  1: one head:
+// R/2 rotary frequencies at position a3, as int16, to dst.  1: one head:
 // the int8 vector at src through the head norm with the kind's (arg[7:4],
-// 0 q and 1 k) gains and constants to int16, rotated by the table at arg2,
+// 0 q and 1 k) gains and constants to int16, rotated by the table at a2,
 // requantized to int8 at dst; len is the beat count.
 // ---------------------------------------------------------------------------
 module fabric_rotary_adapter #(
@@ -796,10 +809,11 @@ module fabric_rotary_adapter #(
     input  wire          clk,
     input  wire          rst_n,
     input  wire          cmd_valid,
-    input  wire [15:0]   cmd_src,
-    input  wire [15:0]   cmd_dst,
+    input  wire [29:0]   cmd_src,
+    input  wire [29:0]   cmd_dst,
+    input  wire [29:0]   cmd_a2,
+    input  wire [29:0]   cmd_a3,
     input  wire [31:0]   cmd_arg,
-    input  wire [31:0]   cmd_arg2,
     input  wire [7:0]    cmd_tag,
     output wire          cmd_ready,
     output reg           done_valid,
@@ -875,7 +889,7 @@ module fabric_rotary_adapter #(
             if (ldv) tab_r[j_d*128 +: 128] <= rd_data;
             case (state)
                 S_IDLE: if (cmd_valid) begin
-                    src <= cmd_src; dst <= cmd_dst; kind <= cmd_arg[7:4]; tab_addr <= cmd_arg2[AW-1:0]; pos <= cmd_arg2;
+                    src <= cmd_src[AW-1:0]; dst <= cmd_dst[AW-1:0]; kind <= cmd_arg[7:4]; tab_addr <= cmd_a2[AW-1:0]; pos <= {2'd0, cmd_a3};
                     consts_r <= consts[cmd_arg[4]]; tag <= cmd_tag; i <= 0; o <= 0; j <= 0;
                     if (cmd_arg[3:0] == 0) begin tstart <= 1'b1; state <= S_TABLE; end
                     else state <= S_LOADT;
@@ -909,10 +923,10 @@ module fabric_rotary_adapter #(
 endmodule
 
 // ---------------------------------------------------------------------------
-// One attention core.  src: the group's G query rows (int8, HD each);
-// arg[15:0]: the first head's gate row (the heads' gates are 2 HD apart);
-// arg[31:16]: the head's rows, len records of a key then a value row;
-// dst: the G output rows.  Beats are read then presented until the core
+// One attention core.  src: the group's G query rows (int8, HD each); a2:
+// the first head's gate row (the heads' gates are 2 HD apart); a3: the
+// head's rows, len records of a key then a value row; dst: the G output
+// rows.  Beats are read then presented until the core
 // takes them, so its exponential stalls cost nothing but time.
 // ---------------------------------------------------------------------------
 module fabric_attn_adapter #(
@@ -927,8 +941,10 @@ module fabric_attn_adapter #(
     input  wire          rst_n,
     input  wire          cmd_valid,
     input  wire [15:0]   cmd_len,
-    input  wire [15:0]   cmd_src,
-    input  wire [15:0]   cmd_dst,
+    input  wire [29:0]   cmd_src,
+    input  wire [29:0]   cmd_dst,
+    input  wire [29:0]   cmd_a2,
+    input  wire [29:0]   cmd_a3,
     input  wire [31:0]   cmd_arg,
     input  wire [7:0]    cmd_tag,
     output wire          cmd_ready,
@@ -974,7 +990,7 @@ module fabric_attn_adapter #(
             done_valid <= 1'b0; wr_en <= 1'b0; start <= 1'b0; finish <= 1'b0;
             case (state)
                 S_IDLE: if (cmd_valid) begin
-                    src <= cmd_src; dst <= cmd_dst; gate <= cmd_arg[15:0]; rows <= cmd_arg[31:16]; n <= cmd_len; tag <= cmd_tag;
+                    src <= cmd_src[AW-1:0]; dst <= cmd_dst[AW-1:0]; gate <= cmd_a2[AW-1:0]; rows <= cmd_a3[AW-1:0]; n <= cmd_len; tag <= cmd_tag;
                     k <= consts[0]; phase <= 0; g <= 0; b <= 0; r <= 0; o <= 0; start <= 1'b1; state <= S_START;
                 end
                 S_START: state <= S_ISSUE;
@@ -1005,19 +1021,19 @@ module fabric_attn_adapter #(
 endmodule
 
 // ---------------------------------------------------------------------------
-// The memory unit.  arg2[3:0] is the operation, arg2[31:4] the position and
-// arg[31:16] the context's memory page (2 KB units) where the global layer
-// needs them:
+// The memory unit.  arg[3:0] is the operation, arg[31:4] the position and
+// a3 the context's memory page (2 KB units) where the global layer needs
+// them:
 //   0  memory beats src (a beat address) to the buffer at dst, len beats
 //   1  buffer src to memory beats dst, len beats
-//   2  append: keys at src, values at arg[15:0], index projection at dst,
-//      with the context's running block sums read from and written back
-//      to its sums record
+//   2  append: keys at src, values at a2, index projection at dst, with
+//      the context's running block sums read from and written back to
+//      its sums record
 //   3  scan: the int8 unit index query at src coded and scored over the
 //      eligible index records; the top-K ids (a count then the ids, int16)
 //      to dst
-//   4  rows: the selection at src; KV head arg[15:0]'s window records then
-//      its selected block records, as int8 key and value rows, to dst
+//   4  rows: the selection at src; KV head a2's window records then its
+//      selected block records, as int8 key and value rows, to dst
 // The four requesters (a beat mover, the append, the scan, the record
 // reader) share the port through fabric_mem_arbiter.
 // ---------------------------------------------------------------------------
@@ -1044,10 +1060,11 @@ module fabric_mem_unit #(
     input  wire          rst_n,
     input  wire          cmd_valid,
     input  wire [15:0]   cmd_len,
-    input  wire [15:0]   cmd_src,
-    input  wire [15:0]   cmd_dst,
+    input  wire [29:0]   cmd_src,
+    input  wire [29:0]   cmd_dst,
+    input  wire [29:0]   cmd_a2,
+    input  wire [29:0]   cmd_a3,
     input  wire [31:0]   cmd_arg,
-    input  wire [31:0]   cmd_arg2,
     input  wire [7:0]    cmd_tag,
     output wire          cmd_ready,
     output reg           done_valid,
@@ -1079,7 +1096,8 @@ module fabric_mem_unit #(
     // The command.
     reg [3:0]    op;
     reg [31:0]   pos, ctx_base;
-    reg [15:0]   n, src, dst, arg_lo;
+    reg [15:0]   n;
+    reg [AW-1:0] src, dst, arg_lo;
     reg [7:0]    tag, head;
 
     // Requesters onto the port.
@@ -1266,14 +1284,14 @@ module fabric_mem_unit #(
             if (rr_rec_done) begin rw_rec <= rw_rec + 1'b1; rw_ob <= 0; end
             case (state)
                 S_IDLE: if (cmd_valid) begin
-                    op <= cmd_arg2[3:0]; pos <= {4'd0, cmd_arg2[31:4]}; ctx_base <= {5'd0, cmd_arg[31:16], 11'd0};
-                    n <= cmd_len; src <= cmd_src; dst <= cmd_dst; arg_lo <= cmd_arg[15:0]; head <= cmd_arg[7:0]; tag <= cmd_tag;
-                    case (cmd_arg2[3:0])
-                        4'd0: begin mv_go <= 1'b1; mv_mode <= MV_RD_VB; mv_maddr <= {12'd0, cmd_src, 4'd0}; mv_vaddr <= cmd_dst; mv_n <= cmd_len[11:0]; state <= S_MV; end
-                        4'd1: begin mv_go <= 1'b1; mv_mode <= MV_WR_VB; mv_maddr <= {12'd0, cmd_dst, 4'd0}; mv_vaddr <= cmd_src; mv_n <= cmd_len[11:0]; state <= S_MV; end
-                        4'd2: begin ld_on <= 1'b1; ld_tgt <= T_K; ld_base <= cmd_src; ld_i <= 0; ld_n <= KB; state <= S_AP_LOAD; end
-                        4'd3: begin ld_on <= 1'b1; ld_tgt <= T_U; ld_base <= cmd_src; ld_i <= 0; ld_n <= IB; state <= S_SC_LOAD; end
-                        default: begin ld_on <= 1'b1; ld_tgt <= T_SEL; ld_base <= cmd_src; ld_i <= 0; ld_n <= SEL_BEATS; state <= S_RW_LOAD; end
+                    op <= cmd_arg[3:0]; pos <= {4'd0, cmd_arg[31:4]}; ctx_base <= {cmd_a3[20:0], 11'd0};
+                    n <= cmd_len; src <= cmd_src[AW-1:0]; dst <= cmd_dst[AW-1:0]; arg_lo <= cmd_a2[AW-1:0]; head <= cmd_a2[7:0]; tag <= cmd_tag;
+                    case (cmd_arg[3:0])
+                        4'd0: begin mv_go <= 1'b1; mv_mode <= MV_RD_VB; mv_maddr <= {cmd_src[27:0], 4'd0}; mv_vaddr <= cmd_dst[AW-1:0]; mv_n <= cmd_len[11:0]; state <= S_MV; end
+                        4'd1: begin mv_go <= 1'b1; mv_mode <= MV_WR_VB; mv_maddr <= {cmd_dst[27:0], 4'd0}; mv_vaddr <= cmd_src[AW-1:0]; mv_n <= cmd_len[11:0]; state <= S_MV; end
+                        4'd2: begin ld_on <= 1'b1; ld_tgt <= T_K; ld_base <= cmd_src[AW-1:0]; ld_i <= 0; ld_n <= KB; state <= S_AP_LOAD; end
+                        4'd3: begin ld_on <= 1'b1; ld_tgt <= T_U; ld_base <= cmd_src[AW-1:0]; ld_i <= 0; ld_n <= IB; state <= S_SC_LOAD; end
+                        default: begin ld_on <= 1'b1; ld_tgt <= T_SEL; ld_base <= cmd_src[AW-1:0]; ld_i <= 0; ld_n <= SEL_BEATS; state <= S_RW_LOAD; end
                     endcase
                 end
                 S_MV: if (mv_done) state <= S_DONE;
@@ -1380,6 +1398,7 @@ module fabric_layer_engine #(
     parameter int P    = 2,
     parameter int NT   = 56,
     parameter int TMAX = 1,                     // tokens a pass may carry (chunked prefill)
+    parameter int MODEL_TILES = 0,              // behavioural columns in the tiles (full-size runs)
     parameter int WB   = 4,
     parameter int ACC  = 24,
     parameter int SB   = 16,
@@ -1387,6 +1406,7 @@ module fabric_layer_engine #(
     parameter int SW   = 38,
     parameter int YSH  = 9,
     parameter int VB_BYTES = 4096,
+    parameter int AW   = 24,                    // vector-buffer address bits
     parameter     VB_FILE   = "vb_init.hex",
     parameter     PROG_FILE = "program.hex",
     parameter     LUT_DIR   = "./"
@@ -1409,7 +1429,7 @@ module fabric_layer_engine #(
     input  wire         m_rdata_valid,
     input  wire [127:0] m_rdata
 );
-    localparam int NU = 10, NE = 4, AW = 16, NL = 8, CL = 4, GROUP = NH / NKV;
+    localparam int NU = 10, NE = 4, NL = 8, CL = 4, GROUP = NH / NKV;
     localparam int U_TILES = 0, U_NORM = 1, U_CONV = 2, U_GATES = 3, U_DELTA = 4, U_SWIGLU = 5, U_RESIDUAL = 6, U_ROTARY = 7, U_ATTN = 8, U_MEM = 9;
     // Vector-buffer ports.
     localparam int R_NORM = 0, R_TILES = 4, R_CONV = R_TILES + TMAX, R_GATES = R_CONV + 2, R_DELTA = R_GATES + 2, R_SWIGLU = R_DELTA + 4,
@@ -1419,15 +1439,16 @@ module fabric_layer_engine #(
 
     wire [NU-1:0]      cmd_valid, cmd_ready;
     wire [3:0]         cmd_engine;
-    wire [15:0]        cmd_len, cmd_src, cmd_dst;
-    wire [31:0]        cmd_arg, cmd_arg2;
+    wire [15:0]        cmd_len;
+    wire [29:0]        cmd_src, cmd_dst, cmd_a2, cmd_a3;
+    wire [31:0]        cmd_arg;
     wire [7:0]         cmd_tag;
     wire [NU*NE-1:0]   done_valid;
     wire [NU*NE*8-1:0] done_tag;
     fabric_sequencer #(.NU(NU), .NE(NE), .PROG_FILE(PROG_FILE)) u_seq (
         .clk(clk), .rst_n(rst_n), .start(start), .n_steps(n_steps), .running(running), .done(done),
         .cmd_valid(cmd_valid), .cmd_engine(cmd_engine), .cmd_len(cmd_len), .cmd_src(cmd_src), .cmd_dst(cmd_dst),
-        .cmd_arg(cmd_arg), .cmd_arg2(cmd_arg2), .cmd_tag(cmd_tag), .cmd_ready(cmd_ready), .done_valid(done_valid), .done_tag(done_tag));
+        .cmd_a2(cmd_a2), .cmd_a3(cmd_a3), .cmd_arg(cmd_arg), .cmd_tag(cmd_tag), .cmd_ready(cmd_ready), .done_valid(done_valid), .done_tag(done_tag));
 
     wire [NR*AW-1:0]  rd_addr;
     wire [NR*128-1:0] rd_data;
@@ -1466,7 +1487,7 @@ module fabric_layer_engine #(
         for (e = 0; e < 2; e = e + 1) begin : g_norm
             fabric_norm_adapter #(.NL(NL), .DMAX(D), .SW(SW), .NCONST(4), .AW(AW), .LUT_DIR(LUT_DIR)) u (
                 .clk(clk), .rst_n(rst_n), .cmd_valid(cmd_valid[U_NORM] && cmd_engine == e), .cmd_len(cmd_len), .cmd_src(cmd_src),
-                .cmd_dst(cmd_dst), .cmd_arg(cmd_arg), .cmd_tag(cmd_tag), .cmd_ready(ready_norm[e]),
+                .cmd_dst(cmd_dst), .cmd_a2(cmd_a2), .cmd_a3(cmd_a3), .cmd_arg(cmd_arg), .cmd_tag(cmd_tag), .cmd_ready(ready_norm[e]),
                 .done_valid(done_valid[U_NORM*NE + e]), .done_tag(done_tag[(U_NORM*NE + e)*8 +: 8]),
                 .rd_addr_x(rd_addr[(R_NORM + 2*e)*AW +: AW]), .rd_addr_g(rd_addr[(R_NORM + 2*e + 1)*AW +: AW]),
                 .rd_data_x(rd_data[(R_NORM + 2*e)*128 +: 128]), .rd_data_g(rd_data[(R_NORM + 2*e + 1)*128 +: 128]),
@@ -1476,7 +1497,7 @@ module fabric_layer_engine #(
         for (e = 0; e < NE; e = e + 1) begin : g_delta
             fabric_delta_adapter #(.K(HK), .V(HV), .YSH(YSH), .AW(AW)) u (
                 .clk(clk), .rst_n(rst_n), .cmd_valid(cmd_valid[U_DELTA] && cmd_engine == e), .cmd_src(cmd_src), .cmd_dst(cmd_dst),
-                .cmd_arg(cmd_arg), .cmd_arg2(cmd_arg2), .cmd_tag(cmd_tag), .cmd_ready(ready_delta[e]),
+                .cmd_a2(cmd_a2), .cmd_a3(cmd_a3), .cmd_arg(cmd_arg), .cmd_tag(cmd_tag), .cmd_ready(ready_delta[e]),
                 .done_valid(done_valid[U_DELTA*NE + e]), .done_tag(done_tag[(U_DELTA*NE + e)*8 +: 8]),
                 .rd_addr(rd_addr[(R_DELTA + e)*AW +: AW]), .rd_data(rd_data[(R_DELTA + e)*128 +: 128]),
                 .wr_en(wr_en[W_DELTA + e]), .wr_addr(wr_addr[(W_DELTA + e)*AW +: AW]), .wr_data(wr_data[(W_DELTA + e)*128 +: 128]),
@@ -1485,7 +1506,7 @@ module fabric_layer_engine #(
         for (e = 0; e < 2; e = e + 1) begin : g_rotary
             fabric_rotary_adapter #(.HD(HD), .R(RD), .NL(NL), .SW(SW), .AW(AW), .LUT_DIR(LUT_DIR)) u (
                 .clk(clk), .rst_n(rst_n), .cmd_valid(cmd_valid[U_ROTARY] && cmd_engine == e), .cmd_src(cmd_src), .cmd_dst(cmd_dst),
-                .cmd_arg(cmd_arg), .cmd_arg2(cmd_arg2), .cmd_tag(cmd_tag), .cmd_ready(ready_rotary[e]),
+                .cmd_a2(cmd_a2), .cmd_a3(cmd_a3), .cmd_arg(cmd_arg), .cmd_tag(cmd_tag), .cmd_ready(ready_rotary[e]),
                 .done_valid(done_valid[U_ROTARY*NE + e]), .done_tag(done_tag[(U_ROTARY*NE + e)*8 +: 8]),
                 .rd_addr(rd_addr[(R_ROTARY + e)*AW +: AW]), .rd_data(rd_data[(R_ROTARY + e)*128 +: 128]),
                 .wr_en(wr_en[W_ROTARY + e]), .wr_addr(wr_addr[(W_ROTARY + e)*AW +: AW]), .wr_data(wr_data[(W_ROTARY + e)*128 +: 128]),
@@ -1494,7 +1515,7 @@ module fabric_layer_engine #(
         for (e = 0; e < NE; e = e + 1) begin : g_attn
             fabric_attn_adapter #(.HD(HD), .G(GROUP), .L(ATT_L), .AW(AW), .LUT_DIR(LUT_DIR)) u (
                 .clk(clk), .rst_n(rst_n), .cmd_valid(cmd_valid[U_ATTN] && cmd_engine == e), .cmd_len(cmd_len), .cmd_src(cmd_src),
-                .cmd_dst(cmd_dst), .cmd_arg(cmd_arg), .cmd_tag(cmd_tag), .cmd_ready(ready_attn[e]),
+                .cmd_dst(cmd_dst), .cmd_a2(cmd_a2), .cmd_a3(cmd_a3), .cmd_arg(cmd_arg), .cmd_tag(cmd_tag), .cmd_ready(ready_attn[e]),
                 .done_valid(done_valid[U_ATTN*NE + e]), .done_tag(done_tag[(U_ATTN*NE + e)*8 +: 8]),
                 .rd_addr(rd_addr[(R_ATTN + e)*AW +: AW]), .rd_data(rd_data[(R_ATTN + e)*128 +: 128]),
                 .wr_en(wr_en[W_ATTN + e]), .wr_addr(wr_addr[(W_ATTN + e)*AW +: AW]), .wr_data(wr_data[(W_ATTN + e)*128 +: 128]),
@@ -1502,15 +1523,16 @@ module fabric_layer_engine #(
         end
     endgenerate
 
-    fabric_pass_adapter #(.NT(NT), .ROWS(ROWS), .COLS(COLS), .WB(WB), .AB(8), .P(P), .ACC(ACC), .SB(SB), .SHB(SHB), .TMAX(TMAX), .AW(AW)) u_tiles (
+    fabric_pass_adapter #(.NT(NT), .ROWS(ROWS), .COLS(COLS), .WB(WB), .AB(8), .P(P), .ACC(ACC), .SB(SB), .SHB(SHB), .TMAX(TMAX),
+                          .MODEL_TILES(MODEL_TILES), .AW(AW)) u_tiles (
         .clk(clk), .rst_n(rst_n), .cmd_valid(cmd_valid[U_TILES] && cmd_engine == 0), .cmd_len(cmd_len), .cmd_src(cmd_src), .cmd_dst(cmd_dst),
-        .cmd_arg(cmd_arg), .cmd_arg2(cmd_arg2), .cmd_tag(cmd_tag), .cmd_ready(ready_tiles), .done_valid(done_valid[U_TILES*NE]), .done_tag(done_tag[U_TILES*NE*8 +: 8]),
+        .cmd_a2(cmd_a2), .cmd_a3(cmd_a3), .cmd_arg(cmd_arg), .cmd_tag(cmd_tag), .cmd_ready(ready_tiles), .done_valid(done_valid[U_TILES*NE]), .done_tag(done_tag[U_TILES*NE*8 +: 8]),
         .rd_addr(rd_addr[R_TILES*AW +: TMAX*AW]), .rd_data(rd_data[R_TILES*128 +: TMAX*128]),
         .wr_en(wr_en[W_TILES]), .wr_addr(wr_addr[W_TILES*AW +: AW]), .wr_data(wr_data[W_TILES*128 +: 128]), .wr_be(wr_be[W_TILES*16 +: 16]));
 
     fabric_conv_adapter #(.CL(CL), .KK(KK), .C(CONV), .AW(AW), .LUT_DIR(LUT_DIR)) u_conv (
         .clk(clk), .rst_n(rst_n), .cmd_valid(cmd_valid[U_CONV] && cmd_engine == 0), .cmd_len(cmd_len), .cmd_src(cmd_src), .cmd_dst(cmd_dst),
-        .cmd_arg(cmd_arg), .cmd_arg2(cmd_arg2), .cmd_tag(cmd_tag), .cmd_ready(ready_conv), .done_valid(done_valid[U_CONV*NE]),
+        .cmd_a2(cmd_a2), .cmd_a3(cmd_a3), .cmd_arg(cmd_arg), .cmd_tag(cmd_tag), .cmd_ready(ready_conv), .done_valid(done_valid[U_CONV*NE]),
         .done_tag(done_tag[U_CONV*NE*8 +: 8]),
         .rd_addr_x(rd_addr[R_CONV*AW +: AW]), .rd_addr_h(rd_addr[(R_CONV+1)*AW +: AW]),
         .rd_data_x(rd_data[R_CONV*128 +: 128]), .rd_data_h(rd_data[(R_CONV+1)*128 +: 128]),
@@ -1519,21 +1541,21 @@ module fabric_layer_engine #(
 
     fabric_gates_adapter #(.NVMAX(NV), .ACC(ACC), .AW(AW), .LUT_DIR(LUT_DIR)) u_gates (
         .clk(clk), .rst_n(rst_n), .cmd_valid(cmd_valid[U_GATES] && cmd_engine == 0), .cmd_len(cmd_len), .cmd_src(cmd_src), .cmd_dst(cmd_dst),
-        .cmd_arg(cmd_arg), .cmd_tag(cmd_tag), .cmd_ready(ready_gates), .done_valid(done_valid[U_GATES*NE]), .done_tag(done_tag[U_GATES*NE*8 +: 8]),
+        .cmd_a2(cmd_a2), .cmd_a3(cmd_a3), .cmd_arg(cmd_arg), .cmd_tag(cmd_tag), .cmd_ready(ready_gates), .done_valid(done_valid[U_GATES*NE]), .done_tag(done_tag[U_GATES*NE*8 +: 8]),
         .rd_addr_b(rd_addr[R_GATES*AW +: AW]), .rd_addr_a(rd_addr[(R_GATES+1)*AW +: AW]),
         .rd_data_b(rd_data[R_GATES*128 +: 128]), .rd_data_a(rd_data[(R_GATES+1)*128 +: 128]),
         .wr_en(wr_en[W_GATES]), .wr_addr(wr_addr[W_GATES*AW +: AW]), .wr_data(wr_data[W_GATES*128 +: 128]), .wr_be(wr_be[W_GATES*16 +: 16]));
 
     fabric_swiglu_adapter #(.NL(NL), .AW(AW), .LUT_DIR(LUT_DIR)) u_swiglu (
         .clk(clk), .rst_n(rst_n), .cmd_valid(cmd_valid[U_SWIGLU] && cmd_engine == 0), .cmd_len(cmd_len), .cmd_src(cmd_src), .cmd_dst(cmd_dst),
-        .cmd_arg(cmd_arg), .cmd_tag(cmd_tag), .cmd_ready(ready_swiglu), .done_valid(done_valid[U_SWIGLU*NE]), .done_tag(done_tag[U_SWIGLU*NE*8 +: 8]),
+        .cmd_a2(cmd_a2), .cmd_a3(cmd_a3), .cmd_arg(cmd_arg), .cmd_tag(cmd_tag), .cmd_ready(ready_swiglu), .done_valid(done_valid[U_SWIGLU*NE]), .done_tag(done_tag[U_SWIGLU*NE*8 +: 8]),
         .rd_addr_g(rd_addr[R_SWIGLU*AW +: AW]), .rd_addr_u(rd_addr[(R_SWIGLU+1)*AW +: AW]),
         .rd_data_g(rd_data[R_SWIGLU*128 +: 128]), .rd_data_u(rd_data[(R_SWIGLU+1)*128 +: 128]),
         .wr_en(wr_en[W_SWIGLU]), .wr_addr(wr_addr[W_SWIGLU*AW +: AW]), .wr_data(wr_data[W_SWIGLU*128 +: 128]), .wr_be(wr_be[W_SWIGLU*16 +: 16]));
 
     fabric_residual_adapter #(.NL(NL), .AW(AW)) u_residual (
         .clk(clk), .rst_n(rst_n), .cmd_valid(cmd_valid[U_RESIDUAL] && cmd_engine == 0), .cmd_len(cmd_len), .cmd_src(cmd_src), .cmd_dst(cmd_dst),
-        .cmd_arg(cmd_arg), .cmd_tag(cmd_tag), .cmd_ready(ready_residual), .done_valid(done_valid[U_RESIDUAL*NE]), .done_tag(done_tag[U_RESIDUAL*NE*8 +: 8]),
+        .cmd_a2(cmd_a2), .cmd_a3(cmd_a3), .cmd_arg(cmd_arg), .cmd_tag(cmd_tag), .cmd_ready(ready_residual), .done_valid(done_valid[U_RESIDUAL*NE]), .done_tag(done_tag[U_RESIDUAL*NE*8 +: 8]),
         .rd_addr_h(rd_addr[R_RESIDUAL*AW +: AW]), .rd_addr_y(rd_addr[(R_RESIDUAL+1)*AW +: AW]),
         .rd_data_h(rd_data[R_RESIDUAL*128 +: 128]), .rd_data_y(rd_data[(R_RESIDUAL+1)*128 +: 128]),
         .wr_en(wr_en[W_RESIDUAL]), .wr_addr(wr_addr[W_RESIDUAL*AW +: AW]), .wr_data(wr_data[W_RESIDUAL*128 +: 128]), .wr_be(wr_be[W_RESIDUAL*16 +: 16]));
@@ -1542,7 +1564,7 @@ module fabric_layer_engine #(
                       .RPB(RPB), .MAXR(MAXR), .WINDOW_OFF(WINDOW_OFF), .BLOCK_OFF(BLOCK_OFF), .INDEX_OFF(INDEX_OFF), .SUMS_OFF(SUMS_OFF),
                       .AW(AW), .LUT_DIR(LUT_DIR)) u_mem (
         .clk(clk), .rst_n(rst_n), .cmd_valid(cmd_valid[U_MEM] && cmd_engine == 0), .cmd_len(cmd_len), .cmd_src(cmd_src), .cmd_dst(cmd_dst),
-        .cmd_arg(cmd_arg), .cmd_arg2(cmd_arg2), .cmd_tag(cmd_tag), .cmd_ready(ready_mem), .done_valid(done_valid[U_MEM*NE]), .done_tag(done_tag[U_MEM*NE*8 +: 8]),
+        .cmd_a2(cmd_a2), .cmd_a3(cmd_a3), .cmd_arg(cmd_arg), .cmd_tag(cmd_tag), .cmd_ready(ready_mem), .done_valid(done_valid[U_MEM*NE]), .done_tag(done_tag[U_MEM*NE*8 +: 8]),
         .rd_addr(rd_addr[R_MEM*AW +: AW]), .rd_data(rd_data[R_MEM*128 +: 128]),
         .wr_en(wr_en[W_MEM]), .wr_addr(wr_addr[W_MEM*AW +: AW]), .wr_data(wr_data[W_MEM*128 +: 128]), .wr_be(wr_be[W_MEM*16 +: 16]),
         .m_req_valid(m_req_valid), .m_req_ready(m_req_ready), .m_req_write(m_req_write), .m_req_addr(m_req_addr), .m_req_beats(m_req_beats),

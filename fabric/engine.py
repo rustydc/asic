@@ -32,7 +32,7 @@ from fabric.memory import BEAT, MemoryMap
 from fabric.tile import TileSpec, compile_matrix, write_hex
 
 NPASS = 4                    # the recurrent layer's passes: in_proj, out_proj, gate_up, down
-TAB_BITS = 48                # a pass-table entry
+TAB_BITS = 56                # a pass-table entry
 
 
 def _refs(value) -> list[str]:
@@ -156,6 +156,16 @@ def _layout_of(c) -> dict:
     return _LAYOUTS[id(c)]
 
 
+def _write_rom(path: Path, words: np.ndarray, spec: TileSpec) -> None:
+    """A tile's ROM image, one row per line, column 0 in the lowest nibble."""
+    if spec.weight_bits == 4 and spec.cols % 2 == 0:
+        packed = (words[:, 0::2] | (words[:, 1::2] << 4)).astype(np.uint8)        # byte c holds columns 2c and 2c + 1
+        path.write_text("".join(packed[r, ::-1].tobytes().hex() + "\n" for r in range(words.shape[0])))
+    else:
+        write_hex(path, [sum(int(words[r, col]) << (col * spec.weight_bits) for col in range(spec.cols)) for r in range(words.shape[0])],
+                  spec.cols * spec.weight_bits)
+
+
 def _tiles(directory: Path, c, spec: TileSpec) -> int:
     """The tile ROM images, the flat requantizer tables and the pass table; returns the tile count."""
     mult, shift, table = [], [], []
@@ -165,20 +175,18 @@ def _tiles(directory: Path, c, spec: TileSpec) -> int:
             cm = compile_matrix(q, spec)
             first = t
             for tile in cm.tiles:
-                words = tile.rom_words(spec)
-                rows = [sum(int(words[r, col]) << (col * spec.weight_bits) for col in range(spec.cols)) for r in range(spec.rows)]
-                write_hex(directory / f"tile_{t}.hex", rows, spec.cols * spec.weight_bits)
+                _write_rom(directory / f"tile_{t}.hex", tile.rom_words(spec), spec)
                 mult += list(tile.mult)
                 shift += list(tile.shift)
-                chain = 0xFF if tile.row_block == 0 else t - cm.col_blocks
-                assert chain == 0xFF or cm.tiles[chain - first].col_block == tile.col_block
+                chain = 0xFFF if tile.row_block == 0 else t - cm.col_blocks
+                assert chain == 0xFFF or cm.tiles[chain - first].col_block == tile.col_block
                 last = tile.row_block == cm.row_blocks - 1
                 nbytes = tile.valid_cols * (4 if raw else 1)
                 dst_off = base + tile.col_block * spec.cols * (4 if raw else 1)
-                assert nbytes < 256 and dst_off < (1 << 16) and cm.row_blocks < 16
-                table.append(p | (tile.row_block << 4) | (chain << 8) | (int(last) << 16) | (int(raw) << 17) | (nbytes << 18) | (dst_off << 26))
+                assert nbytes < 256 and dst_off < (1 << 24) and cm.row_blocks < 16
+                table.append(p | (tile.row_block << 4) | (chain << 8) | (int(last) << 20) | (int(raw) << 21) | (nbytes << 22) | (dst_off << 30))
                 t += 1
-    assert t < 255
+    assert t < 0xFFF
     write_hex(directory / "tiles_mult.hex", mult, spec.scale_bits)
     write_hex(directory / "tiles_shift.hex", shift, spec.shift_bits)
     write_hex(directory / "passes.hex", table, TAB_BITS)
@@ -235,7 +243,7 @@ class EngineRun:
     after the token's append)."""
 
     def __init__(self, directory: Path, cfg, c, spec: TileSpec, mm: MemoryMap, steps: list[S.Step], inputs: dict,
-                 memory: dict[str, tuple[bytes, bytes]] | None = None, ndev: int = 0) -> None:
+                 memory: dict[str, tuple[bytes, bytes]] | None = None, ndev: int = 0, model_tiles: bool = False) -> None:
         directory.mkdir(parents=True, exist_ok=True)
         self.cfg, self.steps, self.mm, self.ndev = cfg, steps, mm, ndev
         self.recurrent = isinstance(c, L.RecurrentConsts)
@@ -291,6 +299,7 @@ class EngineRun:
                        "WINDOW_OFF": regions["window0"][0], "BLOCK_OFF": regions["blocks0"][0], "INDEX_OFF": regions["index0"][0],
                        "SUMS_OFF": regions["sums0"][0], "ATT_L": 8,
                        "ROWS": spec.rows, "COLS": spec.cols, "P": spec.rows_per_cycle, "NT": nt, "TMAX": self.chunk,
+                       "MODEL_TILES": int(model_tiles), "AW": max(16, (max(self.layout.vb_bytes, 1) - 1).bit_length() + 1),
                        "WB": spec.weight_bits, "ACC": spec.acc_bits, "SB": spec.scale_bits, "SHB": spec.shift_bits, "SW": sw,
                        "YSH": L.ysh_for(self.hk), "VB_BYTES": self.layout.vb_bytes, "MEM_BEATS": self.layout.mem_beats,
                        "SCHEDULE_CYCLES": S.schedule(steps).cycles, **hpi_params}

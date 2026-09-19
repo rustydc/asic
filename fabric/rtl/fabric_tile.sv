@@ -479,8 +479,100 @@ module fabric_columns #(
 
 endmodule
 
+
 // ---------------------------------------------------------------------------
-// Tile: ROM plus columns.
+// Behavioural columns for full-size engine runs: the same ports and
+// cycle-level behaviour as fabric_columns (activations from the cycle
+// after start, done two cycles after the last rows, the outputs after a
+// walk of T*COLS cycles) with the accumulation as plain arithmetic, so a
+// die's eight hundred tiles simulate in minutes.  The columns proper are
+// checked bit for bit on their own; fabric_tile selects these with MODEL.
+// ---------------------------------------------------------------------------
+module fabric_columns_model #(
+    parameter int ROWS = 4096,
+    parameter int COLS = 64,
+    parameter int WB   = 4,
+    parameter int AB   = 8,
+    parameter int P    = 2,
+    parameter int ACC  = 24,
+    parameter int SB   = 16,
+    parameter int SHB  = 5,
+    parameter int T    = 1
+) (
+    input  wire                     clk,
+    input  wire                     rst_n,
+    input  wire                     start,
+    input  wire [T*COLS*ACC-1:0]    psum_in,
+    input  wire                     x_valid,
+    input  wire [T*P*AB-1:0]        x_data,
+    input  wire [P*COLS*WB-1:0]     rom_words,
+    input  wire [COLS*SB-1:0]       mult,
+    input  wire [COLS*SHB-1:0]      shift,
+    output wire [$clog2(ROWS/P)-1:0] cycle,
+    output wire                     x_ready,
+    output reg                      done,
+    output reg  [T*COLS*ACC-1:0]    psum_out,
+    output reg  [T*COLS*AB-1:0]     q_out,
+    output reg                      q_valid
+);
+    localparam int CYCLES = ROWS / P;
+    localparam int CW     = $clog2(CYCLES);
+    localparam int NA     = T * COLS;
+    localparam int ROWW   = COLS * WB;
+    reg          busy;
+    reg [CW-1:0] cycle_r;
+    reg          vA, vB;
+    reg [ACC-1:0] acc [0:NA-1];
+    reg [15:0]   walk;
+    reg          walking;
+    wire consume = busy && x_valid;
+    assign x_ready = busy;
+    assign cycle   = cycle_r;
+    integer t, b, c;
+    reg signed [63:0] a, prod;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            busy <= 1'b0; cycle_r <= 0; done <= 1'b0; vA <= 1'b0; vB <= 1'b0; q_valid <= 1'b0; walk <= 0; walking <= 1'b0;
+        end else begin
+            done <= vB; vB <= vA; vA <= consume && (cycle_r == CYCLES - 1);
+            q_valid <= 1'b0;
+            if (start) begin
+                busy <= 1'b1; cycle_r <= 0;
+                for (t = 0; t < NA; t = t + 1) acc[t] <= psum_in[t*ACC +: ACC];
+            end else if (consume) begin
+                cycle_r <= cycle_r + 1'b1;
+                if (cycle_r == CYCLES - 1) busy <= 1'b0;
+                for (t = 0; t < T; t = t + 1)
+                    for (c = 0; c < COLS; c = c + 1) begin
+                        a = $signed(acc[t*COLS + c]);
+                        for (b = 0; b < P; b = b + 1)
+                            a = a + $signed(x_data[(t*P + b)*AB +: AB]) * $signed(rom_words[b*ROWW + c*WB +: WB]);
+                        acc[t*COLS + c] <= a[ACC-1:0];
+                    end
+            end
+            // The requantizer walk: everything resolved at done, published NA + 7 cycles later.
+            if (done) begin
+                walking <= 1'b1; walk <= 0;
+                for (t = 0; t < NA; t = t + 1) begin
+                    psum_out[t*ACC +: ACC] <= acc[t];
+                    a = $signed(acc[t]);
+                    prod = a * $signed({48'b0, mult[(t % COLS)*SB +: SB]});
+                    if (shift[(t % COLS)*SHB +: SHB] != 0) prod = prod + (64'sd1 <<< (shift[(t % COLS)*SHB +: SHB] - 1));
+                    prod = prod >>> shift[(t % COLS)*SHB +: SHB];
+                    if (prod > (64'sd1 <<< (AB - 1)) - 1) prod = (64'sd1 <<< (AB - 1)) - 1;
+                    if (prod < -(64'sd1 <<< (AB - 1))) prod = -(64'sd1 <<< (AB - 1));
+                    q_out[t*AB +: AB] <= prod[AB-1:0];
+                end
+            end else if (walking) begin
+                walk <= walk + 1'b1;
+                if (walk == NA + 6) begin walking <= 1'b0; q_valid <= 1'b1; end
+            end
+        end
+    end
+endmodule
+
+// ---------------------------------------------------------------------------
+// Tile: ROM plus columns (or, with MODEL, the behavioural columns).
 // ---------------------------------------------------------------------------
 module fabric_tile #(
     parameter int ROWS = 4096,
@@ -492,6 +584,7 @@ module fabric_tile #(
     parameter int SB   = 16,
     parameter int SHB  = 5,
     parameter int T    = 1,
+    parameter int MODEL = 0,
     parameter     ROM_FILE = ""
 ) (
     input  wire                  clk,
@@ -514,10 +607,19 @@ module fabric_tile #(
     fabric_rom #(.ROWS(ROWS), .COLS(COLS), .WB(WB), .P(P), .ROM_FILE(ROM_FILE)) rom (
         .cycle(cycle), .words(rom_words));
 
-    fabric_columns #(.ROWS(ROWS), .COLS(COLS), .WB(WB), .AB(AB), .P(P), .ACC(ACC), .SB(SB), .SHB(SHB), .T(T)) columns (
-        .clk(clk), .rst_n(rst_n), .start(start), .psum_in(psum_in), .x_valid(x_valid), .x_data(x_data),
-        .rom_words(rom_words), .mult(mult), .shift(shift), .cycle(cycle), .x_ready(x_ready), .done(done),
-        .psum_out(psum_out), .q_out(q_out), .q_valid(q_valid));
+    generate
+        if (MODEL) begin : g_model
+            fabric_columns_model #(.ROWS(ROWS), .COLS(COLS), .WB(WB), .AB(AB), .P(P), .ACC(ACC), .SB(SB), .SHB(SHB), .T(T)) columns (
+                .clk(clk), .rst_n(rst_n), .start(start), .psum_in(psum_in), .x_valid(x_valid), .x_data(x_data),
+                .rom_words(rom_words), .mult(mult), .shift(shift), .cycle(cycle), .x_ready(x_ready), .done(done),
+                .psum_out(psum_out), .q_out(q_out), .q_valid(q_valid));
+        end else begin : g_real
+            fabric_columns #(.ROWS(ROWS), .COLS(COLS), .WB(WB), .AB(AB), .P(P), .ACC(ACC), .SB(SB), .SHB(SHB), .T(T)) columns (
+                .clk(clk), .rst_n(rst_n), .start(start), .psum_in(psum_in), .x_valid(x_valid), .x_data(x_data),
+                .rom_words(rom_words), .mult(mult), .shift(shift), .cycle(cycle), .x_ready(x_ready), .done(done),
+                .psum_out(psum_out), .q_out(q_out), .q_valid(q_valid));
+        end
+    endgenerate
 endmodule
 
 `default_nettype wire

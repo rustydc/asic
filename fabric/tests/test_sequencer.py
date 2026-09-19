@@ -43,11 +43,12 @@ class LinkTest(unittest.TestCase):
         S.link(steps)
         words = S.encode(steps)
         ids = S.buffer_ids(steps)
-        self.assertEqual((words[1] >> 96) & 0xFF, ids["a"])                # consumed
-        self.assertEqual((words[1] >> 104) & 0xFF, 0xFF)                   # no second consumed buffer
-        self.assertEqual((words[1] >> 152) & 0xFF, ids["y"])               # produced
-        self.assertEqual((words[1] >> 168) & 0b11, 0b01)                   # as a contribution
-        self.assertEqual((words[0] >> 168) & 0b11, 0)
+        base = 64 + 4 * S.ADDR_BITS                                          # the ids follow the four address operands
+        self.assertEqual((words[1] >> base) & 0xFF, ids["a"])                # consumed
+        self.assertEqual((words[1] >> (base + 8)) & 0xFF, 0xFF)              # no second consumed buffer
+        self.assertEqual((words[1] >> (base + 8 * S.MAX_CONSUME)) & 0xFF, ids["y"])            # produced
+        self.assertEqual((words[1] >> (base + 8 * (S.MAX_CONSUME + 2))) & 0b11, 0b01)         # as a contribution
+        self.assertEqual((words[0] >> (base + 8 * (S.MAX_CONSUME + 2))) & 0b11, 0)
         self.assertEqual((words[2] >> 8) & 1, 1)                           # the last step
 
 

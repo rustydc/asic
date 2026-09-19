@@ -114,7 +114,7 @@ class MappingTest(unittest.TestCase):
 
 @unittest.skipUnless(shutil.which("iverilog") and shutil.which("vvp"), "iverilog not installed")
 class RtlTest(unittest.TestCase):
-    def run_rtl(self, spec: TileSpec, seed: int, with_psum: bool, tokens: int = 1) -> str:
+    def run_rtl(self, spec: TileSpec, seed: int, with_psum: bool, tokens: int = 1, model: int = 0) -> str:
         rng = np.random.default_rng(seed)
         q = random_quantized(rng, spec.rows, spec.cols, spec)
         tile = compile_matrix(q, spec).tiles[0]
@@ -125,7 +125,8 @@ class RtlTest(unittest.TestCase):
             emit_vectors(work, tile, x, spec, psum_in)
             params = [f"-Ptb_fabric_tile.{name}={value}" for name, value in (
                 ("ROWS", spec.rows), ("COLS", spec.cols), ("WB", spec.weight_bits), ("AB", spec.act_bits),
-                ("P", spec.rows_per_cycle), ("ACC", spec.acc_bits), ("SB", spec.scale_bits), ("SHB", spec.shift_bits), ("T", tokens))]
+                ("P", spec.rows_per_cycle), ("ACC", spec.acc_bits), ("SB", spec.scale_bits), ("SHB", spec.shift_bits), ("T", tokens),
+                ("MODEL", model))]
             subprocess.run(["iverilog", "-g2012", "-o", "sim.vvp", *params,
                             str(RTL / "fabric_tile.sv"), str(RTL / "tb_fabric_tile.sv")],
                            cwd=work, check=True, capture_output=True, text=True)
@@ -147,6 +148,12 @@ class RtlTest(unittest.TestCase):
         self.assertIn("4 tokens", out)
         out = self.run_rtl(TileSpec(rows=256, cols=16, rows_per_cycle=4), seed=5, with_psum=False, tokens=3)
         self.assertIn("PASS", out, out)
+
+    def test_behavioural_columns_match(self) -> None:
+        # The stand-in the full-size engine runs use gives the same outputs on the same vectors.
+        for tokens in (1, 3):
+            out = self.run_rtl(SMALL, seed=6, with_psum=True, tokens=tokens, model=1)
+            self.assertIn("PASS", out, out)
 
     def test_full_depth_tile_bit_exact(self) -> None:
         out = self.run_rtl(TileSpec(rows=4096, cols=16, rows_per_cycle=2), seed=3, with_psum=True)

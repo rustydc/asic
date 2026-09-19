@@ -42,6 +42,7 @@ module tb_layer_engine #(
     parameter int P    = 2,
     parameter int NT   = 56,
     parameter int TMAX = 1,
+    parameter int MODEL_TILES = 0,
     parameter int WB   = 4,
     parameter int ACC  = 24,
     parameter int SB   = 16,
@@ -49,6 +50,7 @@ module tb_layer_engine #(
     parameter int SW   = 38,
     parameter int YSH  = 9,
     parameter int VB_BYTES  = 4096,
+    parameter int AW        = 24,
     parameter int MEM_BEATS = 128,
     parameter int SCHEDULE_CYCLES = 0,
     parameter int USE_HPI   = 0,
@@ -72,7 +74,7 @@ module tb_layer_engine #(
     fabric_layer_engine #(.D(D), .NK(NK), .NV(NV), .HK(HK), .HV(HV), .KK(KK), .CONV(CONV), .NH(NH), .NKV(NKV), .HD(HD), .RD(RD), .IDIM(IDIM),
                           .W(W), .BS(BS), .TOP(TOP), .KV_BITS(KV_BITS), .REC_BYTES(REC_BYTES), .RPB(RPB), .MAXR(MAXR),
                           .WINDOW_OFF(WINDOW_OFF), .BLOCK_OFF(BLOCK_OFF), .INDEX_OFF(INDEX_OFF), .SUMS_OFF(SUMS_OFF), .ATT_L(ATT_L),
-                          .ROWS(ROWS), .COLS(COLS), .P(P), .NT(NT), .TMAX(TMAX), .WB(WB), .ACC(ACC), .SB(SB), .SHB(SHB), .SW(SW), .YSH(YSH), .VB_BYTES(VB_BYTES)) dut (
+                          .ROWS(ROWS), .COLS(COLS), .P(P), .NT(NT), .TMAX(TMAX), .MODEL_TILES(MODEL_TILES), .WB(WB), .ACC(ACC), .SB(SB), .SHB(SHB), .SW(SW), .YSH(YSH), .VB_BYTES(VB_BYTES), .AW(AW)) dut (
         .clk(clk), .rst_n(rst_n), .start(start), .n_steps(N[15:0]), .running(running), .done(done),
         .m_req_valid(req_valid), .m_req_ready(req_ready), .m_req_write(req_write), .m_req_addr(req_addr), .m_req_beats(req_beats),
         .m_wdata_valid(wdata_valid), .m_wdata_ready(wdata_ready), .m_wdata(wdata), .m_rdata_valid(rdata_valid), .m_rdata(rdata));

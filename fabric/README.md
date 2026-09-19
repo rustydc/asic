@@ -1044,8 +1044,14 @@ and the slot; a memory command moves beats between the memory (beat
 addresses) and the buffer. A step's `ops` hold these as references to
 buffers by name, and `engine.Layout` places every buffer a program
 references (a stream's per-token copies included, the state slots once)
-and resolves them when `encode` writes the image; the second argument
-word took bits 201:170 of the program word.
+and resolves them when `encode` writes the image. The program word grew
+for the full-size buffers: four 30-bit address operands (source,
+destination and two more), a 32-bit argument and the length, then six
+consumed ids, two produced ids and their contribution bits, 250 of the
+256 bits; the vector buffer is addressed with 24 bits. A 9B token's
+buffers are 312 KB for the recurrent layer and 1.2 MB for the global
+(the four heads' window rows are most of it), against the 64 KB the first
+16-bit fields allowed.
 
 Two units changed to serve every shape from one instance: the norm takes
 its beat count at run time (its result does not depend on the width of

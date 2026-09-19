@@ -15,7 +15,8 @@ module tb_fabric_tile #(
     parameter int ACC  = 24,
     parameter int SB   = 16,
     parameter int SHB  = 5,
-    parameter int T    = 1
+    parameter int T    = 1,
+    parameter int MODEL = 0
 );
     localparam int CYCLES = ROWS / P;
     localparam int NA = T * COLS;
@@ -34,7 +35,7 @@ module tb_fabric_tile #(
     wire [NA*ACC-1:0]   psum_out;
     wire [NA*AB-1:0]    q_out;
 
-    fabric_tile #(.ROWS(ROWS), .COLS(COLS), .WB(WB), .AB(AB), .P(P), .ACC(ACC), .SB(SB), .SHB(SHB), .T(T),
+    fabric_tile #(.ROWS(ROWS), .COLS(COLS), .WB(WB), .AB(AB), .P(P), .ACC(ACC), .SB(SB), .SHB(SHB), .T(T), .MODEL(MODEL),
                   .ROM_FILE("rom.hex")) dut (
         .clk(clk), .rst_n(rst_n), .start(start), .psum_in(psum_in), .x_valid(x_valid), .x_data(x_data),
         .mult(mult), .shift(shift), .x_ready(x_ready), .done(done), .psum_out(psum_out), .q_out(q_out),
