@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Sequence
 
 RTL = Path(__file__).parent / "rtl" / "fabric_tile.sv"
+RTL_DIR = Path(__file__).parent / "rtl"
 
 
 @dataclass
@@ -205,17 +206,29 @@ def map_ties(netlist: Path, liberties: Sequence[Path], output: Path, *, tie_hi: 
     return log
 
 
-def synthesize(liberty: Path | Sequence[Path], *, rows: int, cols: int, rows_per_cycle: int, weight_bits: int = 4,
+def synthesize(liberty: Path | Sequence[Path], *, rows: int = 256, cols: int = 8, rows_per_cycle: int = 2, weight_bits: int = 4,
                act_bits: int = 8, acc_bits: int = 24, top: str = "fabric_columns",
-               target_ps: int | None = None, keep_netlist: Path | None = None) -> SynthResult:
-    """Synthesize ``top`` against one liberty file, or several (e.g. ASAP7 splits cells across files)."""
+               target_ps: int | None = None, keep_netlist: Path | None = None,
+               sources: Sequence[Path] | None = None, params: dict | None = None, data_files: Sequence[Path] = ()) -> SynthResult:
+    """Synthesize ``top`` against one liberty file, or several (e.g. ASAP7 splits cells across files).
+
+    By default the column datapath of ``fabric_tile.sv`` with the tile
+    parameters; any other unit by ``sources`` (its RTL files, the include
+    directory being ``rtl/``), ``params`` (its parameter overrides) and
+    ``data_files`` (the hex images its ROMs read)."""
     liberties = [Path(p).resolve() for p in ([liberty] if isinstance(liberty, (str, Path)) else liberty)]
-    params = {"ROWS": rows, "COLS": cols, "WB": weight_bits, "AB": act_bits, "P": rows_per_cycle, "ACC": acc_bits}
+    if params is None:
+        params = {"ROWS": rows, "COLS": cols, "WB": weight_bits, "AB": act_bits, "P": rows_per_cycle, "ACC": acc_bits}
     chparam = " ".join(f"-set {name} {value}" for name, value in params.items())
+    sources = [RTL] if sources is None else [Path(p) for p in sources]
     with tempfile.TemporaryDirectory() as directory:
         work = Path(directory)
         # yowasp runs in a sandbox rooted at the working directory; copy inputs next to the script.
-        shutil.copy(RTL, work / "fabric_tile.sv")
+        for path in sources:
+            shutil.copy(path, work / path.name)
+        for path in data_files:
+            shutil.copy(path, work / Path(path).name)
+        shutil.copy(RTL_DIR / "fabric_fx.svh", work / "fabric_fx.svh")
         names = []
         for index, path in enumerate(liberties):
             name = f"cells{index}.lib"
@@ -236,7 +249,7 @@ def synthesize(liberty: Path | Sequence[Path], *, rows: int, cols: int, rows_per
         else:
             abc_cmd = f"abc {lib_args} {dont_use}"
         script = "\n".join([
-            "read_verilog -sv fabric_tile.sv",
+            *[f"read_verilog -sv {path.name}" for path in sources],
             f"chparam {chparam} {top}",
             f"hierarchy -check -top {top}",
             f"synth -top {top} -flatten",
@@ -269,7 +282,8 @@ def synthesize(liberty: Path | Sequence[Path], *, rows: int, cols: int, rows_per
     critical = f"{path[-1][0]} -> {path[-1][1]}" if path else None
     tail = log[log.rfind("Printing statistics"):] if "Printing statistics" in log else log[-3000:]
     label = "+".join(p.name for p in liberties)
-    return SynthResult(label, rows, cols, rows_per_cycle, cells, area, area / cols, flops, delay, critical,
+    per = area / cols if params is None or "COLS" in params else area
+    return SynthResult(label, rows, cols, rows_per_cycle, cells, area, per, flops, delay, critical,
                        tail[-3000:])
 
 
