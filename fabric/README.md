@@ -750,6 +750,25 @@ The index scan is the one that suffers: at 80 B per record it runs at
 half rate, so packing index records into pages and scanning a page per
 burst is the first thing to do when the scan's traffic matters.
 
+The controller runs on the device clock and the arbiter and the units on
+the core's, 800 MHz against 250, so the memory port crosses a clock
+boundary in `rtl/fabric_cdc.sv`: `fabric_async_fifo` is a dual-clock FIFO
+with gray-coded pointers and two-flop synchronisers, full decided on the
+write clock from the synchronised read pointer and empty on the read
+clock from the synchronised write pointer, so neither flag is ever
+optimistic; `fabric_mem_bridge` carries the port's three streams through
+three of them, four requests, sixteen write beats and eight read beats
+deep. The read stream has no back-pressure at either end, so its FIFO
+relies on the core draining faster than the controller fills, one beat
+per 1.25 ns against one per 4 ns; a core that stops its clock would
+overflow it, and that is latched into `rd_overflow` rather than lost
+silently. `tb_async_fifo` runs the FIFO at three unrelated clock ratios
+with random bursts of pushes and pops and a scoreboard, and confirms it
+fills to the last entry; `tb_mem_bridge` drives the whole memory path from
+the core clock through the bridge, the stripe unit, the channels and the
+device models at core periods of 1.25, 1.3 and 3.0 ns against the 4 ns
+device clock.
+
 `tb_hpi` puts the stripe unit, the channels and a behavioural model of the
 device (`fabric_hpi_device`: the frame, the latencies with a pseudo-random
 push-out, a different tDQSCK per device, the page wrap, the registers,
@@ -798,7 +817,9 @@ discipline: the norm's sum of squares and the state engine's accumulators
 are plain adders.
 
 `rtl/fabric_hpi.sv` holds the device model, the channel controller and the
-stripe unit, with `tb_hpi` checking them against `fabric.hpi`.
+stripe unit, with `tb_hpi` checking them against `fabric.hpi`;
+`rtl/fabric_cdc.sv` the asynchronous FIFO and the bridge, with
+`tb_async_fifo` and `tb_mem_bridge`.
 
 `rtl/fabric_memory.sv` holds the memory side: the behavioural
 `fabric_mem_model` for the testbenches, `fabric_mem_arbiter`,
@@ -827,10 +848,9 @@ bit for bit, at int8 and int4 KV and with the 128-wide index and the
 5. A multi-token variant of the column datapath for chunked prefill, which
    amortizes the ROM read across a chunk of tokens from one context.
 6. Done: the vector datapath between the passes, the memory side and the
-   HPI controller for the chosen PSRAM, above. Open behind them: the
-   token sequencer that runs the tiles, the units and the DMAs in order,
-   the asynchronous FIFO between the 800 MHz core and the 250 MHz
-   controller, the two delay lines of the PHY, stochastic rounding for
+   HPI controller for the chosen PSRAM with its clock crossing, above.
+   Open behind them: the token sequencer that runs the tiles, the units
+   and the DMAs in order, the two delay lines of the PHY, stochastic rounding for
    the state if int8 storage has to come back, the simulator's traffic
    terms brought in line with the map, and synthesis of the units for
    area.

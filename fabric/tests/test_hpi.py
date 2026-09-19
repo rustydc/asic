@@ -101,5 +101,37 @@ class HpiRtlTest(unittest.TestCase):
             self.assertNotIn("ERROR", out, out)
 
 
+@unittest.skipUnless(shutil.which("iverilog") and shutil.which("vvp"), "iverilog not installed")
+class CdcRtlTest(unittest.TestCase):
+    """The asynchronous FIFO on its own, then the memory path across the bridge."""
+
+    def test_async_fifo_at_three_clock_ratios(self) -> None:
+        for aw, wclk, rclk, seed in ((3, 1.3, 4.0, 1), (2, 4.0, 1.3, 2), (4, 2.0, 2.1, 3)):
+            with tempfile.TemporaryDirectory() as directory:
+                args = [f"-Ptb_async_fifo.AW={aw}", f"-Ptb_async_fifo.WCLK={wclk}", f"-Ptb_async_fifo.RCLK={rclk}",
+                        f"-Ptb_async_fifo.SEED={seed}", "-Ptb_async_fifo.N=2000"]
+                subprocess.run(["iverilog", "-g2012", "-I", str(RTL), "-s", "tb_async_fifo", "-o", "sim.vvp", *args,
+                                str(RTL / "fabric_cdc.sv"), str(RTL / "tb_async_fifo.sv")],
+                               cwd=directory, check=True, capture_output=True, text=True)
+                out = subprocess.run(["vvp", "sim.vvp"], cwd=directory, check=True, capture_output=True, text=True).stdout
+            self.assertIn("PASS", out, out)
+            self.assertIn(f"peak occupancy {1 << aw}", out, out)      # the flags let it fill completely
+
+    def test_memory_path_across_the_bridge(self) -> None:
+        for ndev, core_ns in ((4, 1.3), (16, 1.25), (2, 3.0)):
+            with tempfile.TemporaryDirectory() as directory:
+                work = Path(directory)
+                params = H.emit_hpi_vectors(work, np.random.default_rng(40 + ndev), ndev=ndev, device_kb=16,
+                                            transactions=16, max_beats=300)
+                args = [f"-Ptb_mem_bridge.{name}={value}" for name, value in params.items()] + [f"-Ptb_mem_bridge.CORE_NS={core_ns}"]
+                subprocess.run(["iverilog", "-g2012", "-I", str(RTL), "-s", "tb_mem_bridge", "-o", "sim.vvp", *args,
+                                str(RTL / "fabric_cdc.sv"), str(RTL / "fabric_hpi.sv"), str(RTL / "tb_mem_bridge.sv")],
+                               cwd=work, check=True, capture_output=True, text=True)
+                result = subprocess.run(["vvp", "sim.vvp"], cwd=work, check=True, capture_output=True, text=True)
+            out = result.stdout + result.stderr
+            self.assertIn("PASS", out, out)
+            self.assertNotIn("ERROR", out, out)
+
+
 if __name__ == "__main__":
     unittest.main()
