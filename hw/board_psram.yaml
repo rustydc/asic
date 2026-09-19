@@ -146,10 +146,19 @@ part_classes:
     interfaces:
       channel: {kind: psram_x16}
   fpga:
-    description: controller FPGA with hard PCIe Gen4 block and DDR4 controller (AU25P/KU5P class)
-    package: FFVB676 or similar
+    description: controller FPGA, AMD Artix UltraScale+ XCAU15P-2FFVB676E (hard PCIe Gen4 x8, 12 GTH, 156 HP + 72 HD I/O)
+    part: XCAU15P-2FFVB676E
+    package: FFVB676, 27 x 27 mm, 1.0 mm pitch
     rails: [VCCINT_0V85, VCCAUX_1V8, VCCO_1V8, VCCO_1V2, MGTAVCC, MGTAVTT]
     tdp_w: 25
+    # What the part offers (AMD UltraScale+ product selection guide XMP103 v2.8,
+    # Artix table, FFVB676 column) against the io_plan below: DDR4 on the HP
+    # banks at 1.2 V, the transceiver pairs on the GTH quads, everything else
+    # on the HD banks at 1.8 V.  board.py checks the fit and reports it.
+    resources: {hp_io: 156, hd_io: 72, gth: 12, pcie: 1x Gen4 x8, ddr4_max_mbps: 2400}
+    io_plan:
+      hp: [ddr4]
+      gt: {pcie: [tx_pairs, rx_pairs, refclk_pair], sfp: [tx_pair, rx_pair]}
     interfaces:
       pcie: {kind: pcie_gen4_x8}
       link_out: {kind: link}

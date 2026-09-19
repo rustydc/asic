@@ -135,6 +135,32 @@ class Board:
         part = self.classes[self.class_of(refdes)]
         return sum(self.signal_count(spec["kind"]) for spec in part["interfaces"].values())
 
+    def fpga_fit(self) -> list[tuple[str, int, int]]:
+        """(resource, needed, available) for the FPGA's interfaces against its part's
+        ``resources``, sorted by its ``io_plan``: the interfaces under ``hp`` take
+        HP I/O, the pair signals under ``gt`` take transceiver lanes (a lane is a
+        transmit pair and a receive pair; a reference clock pair is neither),
+        and every other signal takes HD I/O.  Empty when no part is chosen."""
+        spec = self.classes.get("fpga", {})
+        if "resources" not in spec:
+            return []
+        plan = spec.get("io_plan", {})
+        hp = hd = gt_pairs = 0
+        for name, iface in spec["interfaces"].items():
+            for signal, count in self.kinds[iface["kind"]]["signals"].items():
+                pins = count * (2 if signal.endswith("pair") or signal.endswith("pairs") else 1)
+                if name in plan.get("hp", []):
+                    hp += pins
+                elif signal in plan.get("gt", {}).get(name, []):
+                    if "refclk" not in signal:
+                        gt_pairs += count
+                else:
+                    hd += pins
+        res = spec["resources"]
+        return [("HP I/O (1.2 V: DDR4)", hp, int(res["hp_io"])),
+                ("HD I/O (1.8 V: links, management, configuration)", hd, int(res["hd_io"])),
+                ("transceiver lanes (PCIe x8, SFP+)", gt_pairs // 2, int(res["gth"]))]
+
     # Power model -------------------------------------------------------------
 
     @property
@@ -189,7 +215,12 @@ class Board:
         problems += self._check_memory()
         problems += self._check_modules()
         problems += self._check_power()
+        problems += self._check_fpga()
         return problems
+
+    def _check_fpga(self) -> list[str]:
+        return [f"fpga: {resource} needs {needed}, the part has {available}"
+                for resource, needed, available in self.fpga_fit() if needed > available]
 
     def _check_references(self) -> list[str]:
         problems = []
@@ -345,6 +376,12 @@ class Board:
         for part in self.classes:
             if self.classes[part].get("interfaces") and self.instances(part):
                 lines.append(f"| {part} | {self.pin_budget(self.instances(part)[0])} |")
+        if self.fpga_fit():
+            fpga = self.classes["fpga"]
+            lines += ["", "## FPGA fit", "", f"{fpga['part']}, {fpga['package']}: {fpga['resources']['pcie']} hard block, "
+                      f"DDR4 to {fpga['resources']['ddr4_max_mbps']} Mb/s.", "",
+                      "| Resource | Needed | Available |", "| --- | ---: | ---: |"]
+            lines += [f"| {resource} | {needed} | {available} |" for resource, needed, available in self.fpga_fit()]
         link = self.kinds["link"]
         lines += ["", "## Link", "", f"{link['description']}; {self.signal_count('link')} signals per hop, "
                   f"{len(self.ring())} hops, max {link['max_length_mm']} mm."]

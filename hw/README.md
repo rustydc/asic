@@ -398,6 +398,37 @@ just inside the memory rows, `psram_clk: N` in `edges`, so each clock
 escapes with its memory and runs 15 to 55 mm to its device), and its
 controller is in `fabric/rtl/fabric_hpi.sv`.
 
+### The controller FPGA: an Artix UltraScale+ AU15P
+
+The board's FPGA is the **AMD XCAU15P-2FFVB676E**, chosen against the
+pin budget in `board_psram.md` from the UltraScale+ product selection
+guide (XMP103 v2.8): the FFVB676 package, 27 × 27 mm at 1.0 mm pitch,
+is the one Artix UltraScale+ package whose GTH transceivers run at
+16.3 Gb/s and whose PCIe block is a Gen4 x8 (the same die in SBVB484 and
+SFVB784 is Gen3 x8 at 12.5 Gb/s), so the host link stays as specified
+with Gen3 as a cable fallback. The fit is recorded in `board_psram.yaml`
+under the class (`resources`, `io_plan`) and checked by `board.py`:
+
+| Resource | Needed | Available |
+| --- | ---: | ---: |
+| HP I/O at 1.2 V: the DDR4 x64 | 124 | 156 |
+| HD I/O at 1.8 V: two links, SPI, JTAG, refclk, QSPI, UART, SFP+ control | 52 | 72 |
+| GTH lanes: PCIe x8 and the SFP+ | 9 | 12 |
+
+The DDR4 takes all three HP banks (the part supports DDR4 to 2400 Mb/s
+in the -2 grade; the four x16 devices run at whatever the MIG controller
+and the board's routing allow, and the bandwidth need here is small), the
+1.8 V signals sit on the HD banks with twenty spare pins, and three
+transceivers are free. 170K logic cells and 576 DSPs are far more than
+the ring endpoint, the sampler and a soft-core scheduler take. The AU25P
+in the same package has 208 HP and 96 HD I/O and 12 GTY but only a Gen3
+x8 block, and the KU5P is Gen3 x16 with 280 I/O at a higher price; the
+Spartan UltraScale+ SU150P has a Gen4 x8 block, eight GTH and hard memory
+controllers on its XP5IO banks, and is the part to look at again once its
+DDR4 support and availability are firm. The choice moves the class from
+"AU25P/KU5P class" to a part number; the footprint in the KiCad project
+was FFVB676 already.
+
 ### The PSRAM clock: one per device
 
 The first cut shared one clock among four devices. `python -m hw.si`
@@ -449,8 +480,9 @@ arrive.
 4. LPDDR5X versus GDDR6. The simulator wants 75 to 100 GB/s per ASIC with
    int4 KV; two LPDDR5X-9600 x32 devices give 77 GB/s raw. GDDR6 doubles that
    at higher PHY effort and power.
-5. FPGA part selection against the pin budget in `board.md`: two links, DDR4
-   x64, PCIe x8, SPI with ten chip selects, JTAG, optional SFP+.
+5. Done for the PSRAM board: the XCAU15P-2FFVB676E, above, with the fit
+   checked by `board.py`. The single board's FPGA is still the class
+   name; the same check applies once it names a part.
 6. Host side: the retimer or adapter card and the cable length the Gen4
    link tolerates; the fallback is a Gen3 cable or a redriver at the
    rear panel.

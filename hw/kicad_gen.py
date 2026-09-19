@@ -708,7 +708,7 @@ def build_design(board: Board) -> Design:
     pkg = PACKAGES["fpga"]
     x, y, rotation = lay.nodes[fpga_ref]
     fpga = Part(fpga_ref, "fpga", pkg.name, x, y, rotation, pkg.body_w, pkg.body_h, fpga_ball_map(board),
-                value="FPGA", package=pkg)
+                value=board.classes["fpga"].get("part", "FPGA"), package=pkg)
     design.parts.append(fpga)
     ddr_signals = expand_signals(board.kinds["ddr4_x16"]["signals"])
     for n, device in enumerate(board.instances("ddr4")):
@@ -1150,7 +1150,7 @@ def build_motherboard_design(board: Board, card: Design) -> Design:
     first_in = lane_centre(slot_of[chips[0]], "in")
     fx = x0 + (half - 1) * SLOT_PITCH + SLOT_BODY_W / 2 + 40.0 + pkg.body_w / 2
     fpga = Part(fpga_ref, "fpga", pkg.name, fx, first_in[1], 180.0, pkg.body_w, pkg.body_h,
-                fpga_ball_map(board, link_in="S", link_out="E", pcie="N"), value="FPGA", package=pkg)
+                fpga_ball_map(board, link_in="S", link_out="E", pcie="N"), value=board.classes["fpga"].get("part", "FPGA"), package=pkg)
     design.parts.append(fpga)
     # DDR4 on the west edge with its regulators beyond it, the FPGA's own
     # regulator to the south, the clock generator between the rows.
@@ -1249,7 +1249,7 @@ def build_folded_motherboard(board: Board, card: Design) -> Design:
     # shares that edge with PCIe (towards the rear), DDR4 sits on the east
     # towards the PSU bay and its regulator on the west, where nothing runs.
     fpga = Part(fpga_ref, "fpga", pkg.name, fx, fy, 0.0, pkg.body_w, pkg.body_h,
-                fpga_ball_map(board, link_in="S", link_out="N", pcie="S", ddr="E"), value="FPGA", package=pkg)
+                fpga_ball_map(board, link_in="S", link_out="N", pcie="S", ddr="E"), value=board.classes["fpga"].get("part", "FPGA"), package=pkg)
     design.parts.append(fpga)
     # The clock generator and the I/O regulator sit left of the row, clear of the turn.
     place_fpga_neighbours(design, fpga, 30.0, 130.0, ddr_side=1.0, regulator_side="W")

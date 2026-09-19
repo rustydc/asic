@@ -100,6 +100,20 @@ class BoardTest(unittest.TestCase):
         self.assertIn("slot 9", svg)
         self.assertIn("38 signals over the edge", svg)
 
+    def test_fpga_part_fits_its_interfaces(self) -> None:
+        board = Board.load(HW / "board_psram.yaml")
+        fit = {resource: (needed, available) for resource, needed, available in board.fpga_fit()}
+        self.assertEqual(fit["HP I/O (1.2 V: DDR4)"], (124, 156))
+        self.assertEqual(fit["HD I/O (1.8 V: links, management, configuration)"], (52, 72))
+        self.assertEqual(fit["transceiver lanes (PCIe x8, SFP+)"], (9, 12))
+        self.assertIn("| HP I/O (1.2 V: DDR4) | 124 | 156 |", board.summary_markdown())
+        # A part with one transceiver quad too few is caught.
+        data = copy.deepcopy(board.data)
+        data["part_classes"]["fpga"]["resources"]["gth"] = 8
+        self.assertTrue(any("transceiver lanes" in p and "needs 9" in p for p in Board(data).check()))
+        # The single board has not chosen a part and reports no fit.
+        self.assertEqual(self.board.fpga_fit(), [])
+
     def test_modular_checks_catch_a_device_on_the_wrong_card_and_a_shared_slot(self) -> None:
         board = Board.load(HW / "board_psram.yaml")
         data = copy.deepcopy(board.data)
