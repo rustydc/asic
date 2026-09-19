@@ -93,7 +93,7 @@ def parse_report(report: str, period_ps: float, clock: str = "clk") -> StaResult
     achievable_ps = period_ps - slack_ps
     return StaResult(period_ps, slack_ps, critical_ps, start.group(1) if start else "?",
                      end.group(1) if end else "?", 1e6 / achievable_ps if achievable_ps > 0 else float("inf"),
-                     report[-6000:])
+                     report)
 
 
 def main() -> None:
