@@ -629,7 +629,7 @@ module fabric_kv_append #(
     wire            nv_out;
     wire [NL*8-1:0] n_y;
     fabric_rmsnorm #(.D(IDIM), .XW(8), .OW(8), .L(NL), .SW(SW), .LUT_DIR(LUT_DIR)) u_norm (
-        .clk(clk), .rst_n(rst_n), .in_valid(nv_in), .in_x(n_x), .in_gain({NL{16'd1}}), .mult(16'd1), .shift(6'd7),
+        .clk(clk), .rst_n(rst_n), .in_valid(nv_in), .n_beats((IDIM / NL)), .in_x(n_x), .in_gain({NL{16'd1}}), .mult(16'd1), .shift(6'd7),
         .eps({SW{1'b0}}), .out_valid(nv_out), .out_y(n_y));
     reg [IDIM*8-1:0] unit;
     reg [7:0]  scale;

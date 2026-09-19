@@ -3,8 +3,8 @@
 // DMAs, several tokens of different contexts interleaved in one stream.
 //
 // The program is a list of steps.  Each step is a command to one unit
-// (unit id, engine, a length, a source and destination buffer and an
-// argument), up to seven buffer ids it consumes, up to two it produces
+// (unit id, engine, a length, a source and destination buffer and two
+// arguments), up to seven buffer ids it consumes, up to two it produces
 // (each either a write or a contribution to a whole vector), and a last
 // flag.  The controller issues in program order.  Per buffer id it keeps
 // the number of outstanding writers and readers; the head step issues when
@@ -44,6 +44,7 @@ module fabric_sequencer #(
     output wire [15:0]          cmd_src,
     output wire [15:0]          cmd_dst,
     output wire [31:0]          cmd_arg,
+    output wire [31:0]          cmd_arg2,
     output wire [7:0]           cmd_tag,
     input  wire [NU-1:0]        cmd_ready,      // the addressed engine of that unit is free
     // completions, one port per engine
@@ -63,6 +64,7 @@ module fabric_sequencer #(
     assign cmd_arg    = cur[63:32];
     assign cmd_src    = cur[79:64];
     assign cmd_dst    = cur[95:80];
+    assign cmd_arg2   = cur[201:170];
     assign cmd_tag    = pc[7:0];
     wire [7:0]   cur_c [0:NC-1];
     wire [7:0]   cur_p [0:NP-1];

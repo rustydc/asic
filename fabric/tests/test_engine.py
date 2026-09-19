@@ -1,0 +1,119 @@
+import shutil
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+
+import numpy as np
+
+from fabric import engine as E
+from fabric import layer as L
+from fabric import sequencer as S
+from fabric.memory import MemoryMap
+from fabric.tile import TileSpec
+
+RTL = Path(__file__).parents[1] / "rtl"
+SOURCES = [RTL / name for name in ("fabric_vector.sv", "fabric_norm.sv", "fabric_recurrent.sv", "fabric_ffn.sv", "fabric_tile.sv",
+                                   "fabric_sequencer.sv", "fabric_engine.sv", "tb_layer_engine.sv")]
+
+
+class LayoutTest(unittest.TestCase):
+    def test_layout_places_every_operand_once_and_aligned(self) -> None:
+        from fixed_llm_poc import tiny_config
+        cfg = tiny_config()
+        spec, mm = TileSpec(rows=cfg.hidden_size, cols=16), MemoryMap.from_config(cfg)
+        prog = S.recurrent_program(cfg, None, spec, mm)
+        lay = E.Layout(prog, S.recurrent_layout(cfg, spec, mm)["sizes"])
+        self.assertTrue(all(a % 16 == 0 for a in lay.vb.values()))
+        spans = sorted((a, a + lay.size(n)) for n, a in lay.vb.items())
+        for (a0, a1), (b0, b1) in zip(spans, spans[1:]):
+            self.assertLessEqual(a1, b0)                                     # no two buffers overlap
+        self.assertEqual(len([n for n in lay.vb if n.startswith("s_slot")]), 4)    # the four heads' slots
+        words = S.encode(prog, lay)
+        conv = next(i for i, s in enumerate(prog) if s.name == "conv")
+        self.assertEqual((words[conv] >> 64) & 0xFFFF, lay.vb["P1"])            # src
+        self.assertEqual((words[conv] >> 170) & 0xFFFFFFFF, lay.vb["hist_next"])  # arg2
+        # A stream keeps the slots shared and gives each token its own copies of the rest.
+        two = S.stream(prog, 2)
+        lay2 = E.Layout(two, S.recurrent_layout(cfg, spec, mm)["sizes"])
+        self.assertIn("x@0", lay2.vb)
+        self.assertIn("x@1", lay2.vb)
+        self.assertEqual(len([n for n in lay2.vb if n.startswith("s_slot")]), 4)
+        self.assertEqual(len(lay2.mem), 2 * len(lay.mem))
+
+
+@unittest.skipUnless(shutil.which("iverilog") and shutil.which("vvp"), "iverilog not installed")
+class EngineRtlTest(unittest.TestCase):
+    """The layer engine reproduces the integer recurrent layer bit for bit
+    on the tiny geometry: the residual out, the int8 state and its scales,
+    the conv history."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        try:
+            import torch
+            from fixed_llm_poc import ASICDecoderLayer, tiny_config
+        except ImportError:  # pragma: no cover
+            raise unittest.SkipTest("PyTorch not installed")
+        cls.cfg = cfg = tiny_config()
+        torch.manual_seed(0)
+        layer = ASICDecoderLayer(cfg, 0)
+        w = {k: v.detach().double().numpy() for k, v in layer.state_dict().items()}
+        cls.spec = TileSpec(rows=cfg.hidden_size, cols=16)
+        cls.mm = MemoryMap.from_config(cfg)
+        rng = np.random.default_rng(3)
+        nv, hk, hv = cfg.linear_num_value_heads, cfg.linear_key_head_dim, cfg.linear_value_head_dim
+        cls.conv_dim = layer.linear_attn.conv_dim
+        cls.xs = [rng.standard_normal(cfg.hidden_size) * 2.0 for _ in range(6)]
+        s, hist, runs = np.zeros((nv, hk, hv)), np.zeros((cls.conv_dim, cfg.linear_conv_kernel - 1)), []
+        for x in cls.xs:
+            r = L.recurrent_layer_float(w, cfg, x, s, hist)
+            s, hist = r["s_next"], r["hist_next"]
+            runs.append(r)
+        cal = L.calibrate(runs, L.RECURRENT_CAL_KEYS)
+        cal["x2"] = max(cal["x2"], max(float(np.abs(x).max()) for x in cls.xs))
+        cls.c = L.compile_recurrent_layer(w, cfg, cls.spec, cal)
+        cls.prog = S.recurrent_program(cfg, cls.c, cls.spec, cls.mm)
+
+    def context_after(self, tokens: int) -> dict:
+        """The int8 state, its scales and the history after ``tokens`` tokens of the sequence."""
+        cfg, nv, hk, hv = self.cfg, self.cfg.linear_num_value_heads, self.cfg.linear_key_head_dim, self.cfg.linear_value_head_dim
+        s = np.zeros((nv, hk, hv), dtype=np.int64)
+        sc = np.tile([L.ONE_U, 0, 0, 0], (nv, 1)).astype(np.int64)
+        hist = np.zeros((self.conv_dim, cfg.linear_conv_kernel - 1), dtype=np.int64)
+        for x in self.xs[:tokens]:
+            r = L.recurrent_layer_int(self.c, cfg, self.spec, np.rint(x / self.c.s_h).astype(np.int64), s, hist, scale=sc)
+            s, sc, hist = r["s_next"], r["scale_next"], r["hist_next"]
+        return {"x": np.rint(self.xs[tokens] / self.c.s_h).astype(np.int64), "s_mem": s, "scale_mem": sc, "hist_mem": hist}
+
+    def run_engine(self, steps: list[S.Step], inputs: dict) -> int:
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            run = E.EngineRun(work, self.cfg, self.c, self.spec, self.mm, steps, inputs)
+            args = [f"-Ptb_layer_engine.{name}={value}" for name, value in run.params.items()]
+            subprocess.run(["iverilog", "-g2012", "-I", str(RTL), "-s", "tb_layer_engine", "-o", "sim.vvp", *args, *map(str, SOURCES)],
+                           cwd=work, check=True, capture_output=True, text=True)
+            out = subprocess.run(["vvp", "sim.vvp"], cwd=work, check=True, capture_output=True, text=True).stdout
+            self.assertIn("PASS", out, out)
+            self.assertEqual(run.check(work), [])
+            issue = [tuple(int(v) for v in line.split()) for line in (work / "issue.txt").read_text().splitlines()]
+        self.assertEqual([row[1] for row in issue], [i % 256 for i in range(len(steps))])     # program order, tags in step order
+        passed = next(line for line in out.splitlines() if line.startswith("PASS"))
+        return int(passed.split(" in ")[1].split()[0])
+
+    def test_one_token_from_a_running_context(self) -> None:
+        inputs = self.context_after(2)
+        self.assertGreater(np.abs(inputs["s_mem"]).max(), 0)
+        cycles = self.run_engine(self.prog, inputs)
+        self.assertGreater(cycles, S.schedule(self.prog).cycles // 2)
+
+    def test_a_stream_of_two_contexts(self) -> None:
+        two = S.stream(self.prog, 2)
+        inputs = {}
+        for token, tokens in ((0, 3), (1, 1)):
+            inputs.update({f"{k}@{token}": v for k, v in self.context_after(tokens).items()})
+        self.run_engine(two, inputs)
+
+
+if __name__ == "__main__":
+    unittest.main()

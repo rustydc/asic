@@ -28,7 +28,7 @@ module tb_rmsnorm #(
     wire            out_valid;
     wire [L*OW-1:0] out_y;
     fabric_rmsnorm #(.D(D), .XW(XW), .OW(OW), .L(L), .SW(SW)) dut (
-        .clk(clk), .rst_n(rst_n), .in_valid(in_valid), .in_x(in_x), .in_gain(in_gain),
+        .clk(clk), .rst_n(rst_n), .in_valid(in_valid), .n_beats(BEATS[$clog2(BEATS):0]), .in_x(in_x), .in_gain(in_gain),
         .mult(MULT[15:0]), .shift(SHIFT[5:0]), .eps(EPS), .out_valid(out_valid), .out_y(out_y));
 
     integer i, b, k, errors, got;

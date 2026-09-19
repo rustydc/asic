@@ -973,9 +973,8 @@ token's traffic. The int8 state took the recurrent layer from 175 to
 106 µs, the head-major window, the page bursts, int4 keys and values and
 the corrected block rows took the global layer from 270 to 108 µs at the
 end of the context, and the stream takes both to the port's own time.
-What the program does not yet carry is the per-context addressing (the
-DMA steps take an argument field for it) and the command bus into the
-real units' start ports.
+The program carries the per-context addressing in its operand fields and
+the command bus into the real units is the layer engine below.
 
 ### Tokens per second
 
@@ -1000,6 +999,65 @@ values in record bursts) gave 1,500 tokens/s one token at a time and
 took that to 3,360. More devices scale the port: at 24 the port bound is
 5,100 tokens/s and at 32 it is 6,800, with the tiles at 16,000 the next
 ceiling after the port.
+
+## The layer engine
+
+`rtl/fabric_engine.sv` is the sequencer wired into the real units:
+`fabric_layer_engine` puts the controller in front of the tile array, the
+two norm engines, the conv, the gates, four int8 state engines, SwiGLU,
+the residual add and a memory port, all sharing one byte-addressed
+vector buffer (`fabric_vb`, a multi-port SRAM stand-in that reads 16
+bytes at any byte address a cycle later and writes 16 bytes with byte
+enables). Each unit sits behind an *adapter* with the same face to the
+controller: it accepts a command when idle (a length, source and
+destination byte addresses, two 32-bit arguments, the tag), turns it into
+the unit's start pulses and beat streams, writes the results back, and
+returns the tag one cycle after the last write. The adapters' operand
+conventions are the program's (`sequencer.operands`): a norm command
+names its constant set, whether the input is int8 or int16 and where the
+gate vector is for the gated norm; a pass command names the pass and its
+row blocks; a state-engine command names q, k, v, the head's gates word
+and the slot; a memory command moves beats between the memory (beat
+addresses) and the buffer. A step's `ops` hold these as references to
+buffers by name, and `engine.Layout` places every buffer a program
+references (a stream's per-token copies included, the state slots once)
+and resolves them when `encode` writes the image; the second argument
+word took bits 201:170 of the program word.
+
+Two units changed to serve every shape from one instance: the norm takes
+its beat count at run time (its result does not depend on the width of
+the sum of squares beyond it being wide enough, so one 96-wide instance
+with 16-bit lanes is the residual norm, the L2 normaliser and the gated
+norm), and the state engine's slot is a header beat (scale, exponent,
+peak, saturated count) followed by the rows, which is also its record in
+memory. The tile array is one engine: `engine.py` compiles the four
+passes' matrices into tiles (56 of 96 × 16 on the tiny geometry), writes
+each tile's ROM image and a pass table naming, per tile, its pass, row
+block, the tile whose partial sums it continues, and where in the
+destination its output goes; the adapter starts a row block's tiles
+together, broadcasts the activations two per cycle from the buffer,
+chains the next row block through the accumulators, and after the last
+requantizer walk writes each tile's bytes (or, for the gate heads' one-
+column matrices, the raw accumulators as words) to their offsets.
+
+`tb_layer_engine` loads the images `engine.EngineRun` writes (the program,
+the tiles, the constant tables, the vector buffer with the token's
+residual, a behavioural beat memory with the context's history and
+state), runs the program and dumps the buffer and the memory; the Python
+side compares the residual out, every head's state rows and scale beat
+and the conv history with `run_program` on the same steps, and they are
+equal bit for bit: one token from a running context of the tiny
+recurrent layer (33 steps, 1,288 cycles) and a stream of two contexts'
+tokens (66 steps) in `test_engine.py`. The engine's cycle count is not
+the timing model's (the model said 804): the adapters move one beat per
+cycle at 8 lanes, the tile pass here is 48 cycles per row block plus the
+walk, and the memory model returns a beat per cycle; the timing model's
+lanes and the port's bandwidth are the full-size design's, so the
+schedule numbers above stand and the engine is the correctness proof.
+Left for the global layer: the rotary and attention adapters and the
+index scan, record reader and append behind the memory unit (their
+units are checked on their own above); the engine reports those units as
+never ready.
 
 ## RTL
 
@@ -1042,7 +1100,10 @@ stripe unit, with `tb_hpi` checking them against `fabric.hpi`;
 `tb_async_fifo` and `tb_mem_bridge`; `rtl/fabric_phy.sv` the delay line
 and the DLL, with `tb_dll`; `rtl/fabric_sequencer.sv` the token sequencer,
 with `tb_sequencer` running the programs of `fabric.sequencer` over stub
-units.
+units; `rtl/fabric_engine.sv` the layer engine (the vector buffer, an
+adapter per unit and the top), with `tb_layer_engine` running the
+recurrent program of `fabric.engine` over the real units against the
+integer model.
 
 `rtl/fabric_memory.sv` holds the memory side: the behavioural
 `fabric_mem_model` for the testbenches, `fabric_mem_arbiter`,
@@ -1072,11 +1133,13 @@ bit for bit, at int8 and int4 KV and with the 128-wide index and the
    amortizes the ROM read across a chunk of tokens from one context.
 6. Done: the vector datapath between the passes, the memory side, the
    HPI controller for the chosen PSRAM with its clock crossing and its
-   PHY, and the token sequencer with its layer programs, above. Open
-   behind them: the sequencer's integration with the real units (the
-   command bus into each unit's start, the buffer addressing, the
-   per-context arguments), the simulator's traffic terms brought in line
-   with the map, and synthesis of the units for area. The state traffic,
-   the global layer's traffic and the stream of tokens are done, above;
-   the next memory lever is the index scan's record size, which is the
-   model's, and after that the device count.
+   PHY, the token sequencer with its layer programs and the layer engine
+   that runs the recurrent program over the real units, above. Open
+   behind them: the global layer on the engine (rotary and attention
+   adapters, the scan, reader and append behind the memory unit), the
+   engine's memory port onto the HPI bridge in place of the behavioural
+   memory, the simulator's traffic terms brought in line with the map,
+   and synthesis of the units for area. The state traffic, the global
+   layer's traffic and the stream of tokens are done, above; the next
+   memory lever is the index scan's record size, which is the model's,
+   and after that the device count.

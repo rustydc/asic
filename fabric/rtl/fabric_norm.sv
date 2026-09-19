@@ -10,7 +10,10 @@
 // input beat.  sqrt(D) is in mult; with mult = 1 and shift = 7 the unit is
 // an L2 normaliser emitting an int8 unit vector.
 //
-// Latency: D/L input beats, 7 cycles, then D/L output beats.
+// Latency: D/L input beats, 7 cycles, then D/L output beats.  A vector
+// shorter than D is normalised over its first n_beats beats (D/L at most):
+// the result does not depend on SW beyond it being wide enough, so one
+// unit serves the residual norm, the unit norms and the gated norm.
 // Golden model: fabric/layer.py rmsnorm_int.
 
 `default_nettype none
@@ -28,6 +31,7 @@ module fabric_rmsnorm #(
     input  wire            clk,
     input  wire            rst_n,
     input  wire            in_valid,
+    input  wire [$clog2(D/L):0] n_beats,      // beats of this vector, D/L at most
     input  wire [L*XW-1:0] in_x,
     input  wire [L*GW-1:0] in_gain,
     input  wire [15:0]     mult,
@@ -79,7 +83,7 @@ module fabric_rmsnorm #(
                     gmem[wr] <= in_gain;
                     ss <= ss + beat_sq[SW-1:0];
                     wr <= wr + 1'b1;
-                    if (wr == BEATS - 1) begin
+                    if (wr == n_beats - 1) begin
                         phase <= 2'd1;
                         rs_start <= 1'b1;
                     end
@@ -96,7 +100,7 @@ module fabric_rmsnorm #(
                     rd_valid <= 1'b1;
                     rd_addr <= rd;
                     rd <= rd + 1'b1;
-                    if (rd == BEATS - 1) begin
+                    if (rd == n_beats - 1) begin
                         phase <= 2'd0;
                         wr <= 0;
                         ss <= 0;

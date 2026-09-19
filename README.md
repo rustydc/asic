@@ -34,7 +34,11 @@ LLM inference appliance built around the Qwen3.5 dense hybrid geometry.
   dataflow as a program of unit commands, proven against the integer
   layer, scheduled at full size, merged across tokens of different
   contexts so the memory port never waits, and run by a microcoded issue
-  engine with per-buffer scoreboards.
+  engine with per-buffer scoreboards. `fabric/engine.py` and
+  `fabric/rtl/fabric_engine.sv` are the layer engine: that controller
+  wired to the real tiles, vector units and state engines through one
+  vector buffer, running the recurrent layer's program bit for bit
+  against the integer model.
   `fabric/state.py` is the study that set the recurrent state's format,
   int8 with a per-head scale that carries the decay, halving the traffic
   the schedule showed to dominate; the global layer's traffic followed,

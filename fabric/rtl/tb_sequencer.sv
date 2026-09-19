@@ -67,14 +67,14 @@ module tb_sequencer #(
     wire [NU-1:0]      cmd_valid, cmd_ready;
     wire [3:0]         cmd_engine;
     wire [15:0]        cmd_len, cmd_src, cmd_dst;
-    wire [31:0]        cmd_arg;
+    wire [31:0]        cmd_arg, cmd_arg2;
     wire [7:0]         cmd_tag;
     wire [NU*NE-1:0]   done_valid;
     wire [NU*NE*8-1:0] done_tag;
     fabric_sequencer #(.NU(NU), .NE(NE), .PROG_FILE("program.hex")) dut (
         .clk(clk), .rst_n(rst_n), .start(start), .n_steps(N[15:0]), .running(running), .done(done),
         .cmd_valid(cmd_valid), .cmd_engine(cmd_engine), .cmd_len(cmd_len), .cmd_src(cmd_src), .cmd_dst(cmd_dst),
-        .cmd_arg(cmd_arg), .cmd_tag(cmd_tag), .cmd_ready(cmd_ready), .done_valid(done_valid), .done_tag(done_tag));
+        .cmd_arg(cmd_arg), .cmd_arg2(cmd_arg2), .cmd_tag(cmd_tag), .cmd_ready(cmd_ready), .done_valid(done_valid), .done_tag(done_tag));
 
     function automatic integer engines(input integer unit);
         case (unit)
