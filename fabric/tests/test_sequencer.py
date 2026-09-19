@@ -1,0 +1,196 @@
+import shutil
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+
+import numpy as np
+
+from fabric import layer as L
+from fabric import sequencer as S
+from fabric.memory import MemoryMap
+from fabric.tile import TileSpec
+
+RTL = Path(__file__).parents[1] / "rtl"
+
+
+def steps_of(*specs) -> list[S.Step]:
+    return [S.Step(name, "norm", 0, tuple(src), tuple(dst), 1) for name, src, dst in specs]
+
+
+class LinkTest(unittest.TestCase):
+    """The dependency rules that turn buffer names into the program's edges."""
+
+    def test_read_after_write_and_write_after_read(self) -> None:
+        steps = steps_of(("w", (), ("a",)), ("r", ("a",), ("b",)), ("w2", (), ("a",)), ("r2", ("a",), ()))
+        S.link(steps)
+        self.assertEqual(steps[1].deps, [0])          # reads a after its writer
+        self.assertEqual(steps[2].deps, [0, 1])       # overwrites a after its writer and its reader
+        self.assertEqual(steps[3].deps, [2])          # reads the new a only
+
+    def test_slices_and_whole_vectors(self) -> None:
+        steps = steps_of(("p0", (), ("y[0]",)), ("p1", (), ("y[1]",)), ("all", ("y",), ("z",)), ("one", ("y[1]",), ()),
+                         ("whole", (), ("y",)), ("slice_after", ("y[0]",), ()))
+        S.link(steps)
+        self.assertEqual(steps[2].deps, [0, 1])       # the whole vector waits for every slice
+        self.assertEqual(steps[3].deps, [1])          # a slice waits for its own writer
+        self.assertEqual(steps[4].deps, [0, 1, 2, 3])  # rewriting the whole waits for slice writers and all readers
+        self.assertEqual(steps[5].deps, [4])          # a slice waits for a whole-vector write
+
+    def test_window_barrier_and_encoding(self) -> None:
+        steps = steps_of(("w", (), ("a",)), *[(f"f{i}", (), (f"b{i}",)) for i in range(S.WINDOW + 2)], ("r", ("a",), ()))
+        S.link(steps)
+        S.apply_window(steps)
+        self.assertTrue(steps[-1].barrier)
+        self.assertFalse(any(s.barrier for s in steps[:-1]))
+        words = S.encode(steps)
+        self.assertEqual(words[-1] >> 32 & 0xFFFFFFFF, 0)          # the dependency is beyond the mask
+        self.assertEqual((words[-1] >> 8) & 1, 1)                  # so it is a barrier
+        self.assertEqual((words[-1] >> 9) & 1, 1)                  # and the last step
+        self.assertEqual((words[1] >> 32) & 1, 0)
+
+
+class ScheduleTest(unittest.TestCase):
+    def test_in_order_issue_engine_reuse_and_dependencies(self) -> None:
+        steps = [S.Step("a", "norm", 0, (), ("x",), 10), S.Step("b", "norm", 1, (), ("y",), 5),
+                 S.Step("c", "norm", 0, (), ("z",), 3), S.Step("d", "conv", 0, ("x", "y"), ("w",), 4)]
+        S.link(steps)
+        sched = S.schedule(steps, rtl=True)
+        self.assertEqual(sched.issue, [0, 1, 11, 12])        # c waits for engine 0 (free at 10 + 1); d issues in order after c
+        self.assertEqual(sched.end, [10, 6, 14, 16])
+        self.assertEqual(sched.cycles, 16)
+
+    def test_full_size_layers_are_memory_bound(self) -> None:
+        from fixed_llm_poc import ASICLMConfig
+        cfg = ASICLMConfig.qwen3_5_9b()
+        mm = MemoryMap.from_config(cfg)
+        rec = S.recurrent_program(cfg, None, TileSpec(), mm)
+        glob = S.global_program(cfg, None, TileSpec(), mm, mm.context_tokens - 1)
+        for steps in (rec, glob):
+            S.apply_window(steps)
+            sched = S.schedule(steps, rtl=True)
+            self.assertGreater(sched.busy("mem") / sched.cycles, 0.75)
+            self.assertEqual(sched.busy("tiles"), sum(s.cycles for s in steps if s.unit == "tiles"))
+        self.assertEqual(len([s for s in rec if s.unit == "tiles"]), 4)              # four passes
+        self.assertEqual(len([s for s in rec if s.name.startswith("delta")]), cfg.linear_num_value_heads)
+        self.assertEqual(sum(s.nbytes for s in rec), 2 * mm.state_bytes + 2 * mm.hist_bytes)
+        self.assertTrue(any(s.barrier for s in rec))                                  # the head loop outruns the window
+        self.assertIn("cycles per token", S.report_markdown(cfg, mm, 4095))
+
+
+class ProgramTest(unittest.TestCase):
+    """The programs reproduce the integer layers bit for bit on the tiny geometry."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        try:
+            import torch
+            from fixed_llm_poc import ASICDecoderLayer, tiny_config
+        except ImportError:  # pragma: no cover
+            raise unittest.SkipTest("PyTorch not installed")
+        cls.cfg = tiny_config()
+        torch.manual_seed(0)
+        cls.layers = {idx: ASICDecoderLayer(cls.cfg, idx) for idx in (0, 3)}
+        cls.spec = TileSpec(rows=cls.cfg.hidden_size, cols=16)
+        cls.mm = MemoryMap.from_config(cls.cfg)
+
+    @staticmethod
+    def weights(layer) -> dict:
+        return {k: v.detach().double().numpy() for k, v in layer.state_dict().items()}
+
+    def test_recurrent_program(self) -> None:
+        cfg, spec = self.cfg, self.spec
+        w = self.weights(self.layers[0])
+        rng = np.random.default_rng(3)
+        nv, hk, hv = cfg.linear_num_value_heads, cfg.linear_key_head_dim, cfg.linear_value_head_dim
+        conv_dim = self.layers[0].linear_attn.conv_dim
+        xs = [rng.standard_normal(cfg.hidden_size) * 2.0 for _ in range(6)]
+        s, hist, runs = np.zeros((nv, hk, hv)), np.zeros((conv_dim, cfg.linear_conv_kernel - 1)), []
+        for x in xs:
+            r = L.recurrent_layer_float(w, cfg, x, s, hist)
+            s, hist = r["s_next"], r["hist_next"]
+            runs.append(r)
+        cal = L.calibrate(runs, L.RECURRENT_CAL_KEYS)
+        cal["x2"] = max(cal["x2"], max(float(np.abs(x).max()) for x in xs))
+        c = L.compile_recurrent_layer(w, cfg, spec, cal)
+        prog = S.recurrent_program(cfg, c, spec, self.mm)
+        s_i = np.zeros((nv, hk, hv), dtype=np.int64)
+        hist_i = np.zeros((conv_dim, cfg.linear_conv_kernel - 1), dtype=np.int64)
+        s_mem, hist_mem = s_i.copy(), hist_i.copy()
+        for x in xs:
+            xi = np.rint(x / c.s_h).astype(np.int64)
+            ri = L.recurrent_layer_int(c, cfg, spec, xi, s_i, hist_i)
+            s_i, hist_i = ri["s_next"], ri["hist_next"]
+            env = S.run_program(prog, {"x": xi, "s_mem": s_mem, "hist_mem": hist_mem})
+            s_mem, hist_mem = env["s_mem"], env["hist_mem"]
+            np.testing.assert_array_equal(env["x2"], ri["x2"])
+            np.testing.assert_array_equal(env["mixer"], ri["mixer"])
+            np.testing.assert_array_equal(s_mem, ri["s_next"])
+            np.testing.assert_array_equal(hist_mem, ri["hist_next"])
+
+    def test_global_program(self) -> None:
+        cfg, spec = self.cfg, self.spec
+        w = self.weights(self.layers[3])
+        rng = np.random.default_rng(4)
+        nkv, hd = cfg.num_key_value_heads, cfg.head_dim
+        xs = [rng.standard_normal(cfg.hidden_size) * 2.0 for _ in range(6)]
+        kf, vf, runs = [], [], []
+        for pos, x in enumerate(xs):
+            own = L.global_layer_float(w, cfg, x, pos, np.zeros((nkv, 1, hd)), np.zeros((nkv, 1, hd)))
+            kf.append(own["k"])
+            vf.append(own["v"])
+            runs.append(L.global_layer_float(w, cfg, x, pos, np.stack(kf, axis=1), np.stack(vf, axis=1)))
+        cal = L.calibrate(runs, L.GLOBAL_CAL_KEYS)
+        cal["x2"] = max(cal["x2"], max(float(np.abs(x).max()) for x in xs))
+        c = L.compile_global_layer(w, cfg, spec, cal)
+        ki, vi = [], []
+        for pos, x in enumerate(xs):
+            xi = np.rint(x / c.s_h).astype(np.int64)
+            zero = np.zeros((nkv, 1, hd), dtype=np.int64)
+            own = L.global_layer_int(c, cfg, spec, xi, pos, zero, zero)
+            ki.append(own["k"])
+            vi.append(own["v"])
+            k_rows, v_rows = np.stack(ki, axis=1), np.stack(vi, axis=1)
+            ri = L.global_layer_int(c, cfg, spec, xi, pos, k_rows, v_rows)
+            env = S.run_program(S.global_program(cfg, c, spec, self.mm, pos), {"x": xi, "k_rows": k_rows, "v_rows": v_rows})
+            np.testing.assert_array_equal(env["x2"], ri["x2"])
+            for n in range(nkv):
+                np.testing.assert_array_equal(env[f"k[{n}]"], ri["k"][n])
+                np.testing.assert_array_equal(env[f"att[{n}]"], ri["att"].reshape(cfg.num_attention_heads, hd)[n * 2:(n + 1) * 2])
+
+
+@unittest.skipUnless(shutil.which("iverilog") and shutil.which("vvp"), "iverilog not installed")
+class SequencerRtlTest(unittest.TestCase):
+    """The controller runs each program over stub units in exactly the cycles
+    the model predicts, and the trace respects every dependency and engine."""
+
+    def run_program(self, steps: list[S.Step]) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            params = S.emit_program(work, steps)
+            args = [f"-Ptb_sequencer.{name}={value}" for name, value in params.items()]
+            subprocess.run(["iverilog", "-g2012", "-I", str(RTL), "-s", "tb_sequencer", "-o", "sim.vvp", *args,
+                            str(RTL / "fabric_sequencer.sv"), str(RTL / "tb_sequencer.sv")],
+                           cwd=work, check=True, capture_output=True, text=True)
+            out = subprocess.run(["vvp", "sim.vvp"], cwd=work, check=True, capture_output=True, text=True).stdout
+            trace = (work / "trace.txt").read_text()
+        self.assertIn("PASS", out, out)
+        self.assertEqual(S.check_trace(steps, trace), [])
+
+    def test_tiny_layers(self) -> None:
+        from fixed_llm_poc import tiny_config
+        cfg = tiny_config()
+        mm = MemoryMap.from_config(cfg)
+        self.run_program(S.recurrent_program(cfg, None, TileSpec(), mm))
+        self.run_program(S.global_program(cfg, None, TileSpec(), mm, 5))
+
+    def test_full_size_layers(self) -> None:
+        from fixed_llm_poc import ASICLMConfig
+        cfg = ASICLMConfig.qwen3_5_9b()
+        mm = MemoryMap.from_config(cfg)
+        self.run_program(S.recurrent_program(cfg, None, TileSpec(), mm))
+        self.run_program(S.global_program(cfg, None, TileSpec(), mm, mm.context_tokens - 1))
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -803,6 +803,71 @@ controller and the model share: the first data word sits `latency` clocks
 after the third command clock, and the 512 Mb part's RA[14] rides in bit
 1 of A3. Both are one-line changes if the vendor's figure says otherwise.
 
+## The token sequencer
+
+Everything above is a unit with a start and a done; `sequencer.py` and
+`rtl/fabric_sequencer.sv` are what runs them in order for a token. A layer
+is a fixed dataflow graph over a few dozen on-chip vector buffers (the
+residual, the pass input, the pass outputs, the per-head state slots), and
+the sequencer's program is that graph written out as a list of steps, each
+a command to one unit (a tile pass, a norm, a state-engine head, a DMA)
+with the buffers it reads and writes. The dependencies come from the
+buffer names: a reader waits for its buffer's last writer, a whole vector
+for every slice written into it, and a writer for the readers since the
+last write, since the buffers are reused. Three things are derived from
+the same list, so they cannot drift apart:
+
+* `run_program` executes the steps on the integer model and must
+  reproduce `recurrent_layer_int` and `global_layer_int` bit for bit
+  (`test_sequencer.py` does, over six tokens of each on the tiny
+  geometry), which proves the program's data flow, its head loops and its
+  buffer reuse are complete and legally ordered;
+* `schedule` runs a list scheduler over the steps with each unit's lanes
+  and latency from the RTL and the memory port's bandwidth at the HPI burst
+  efficiency, giving cycles per token and where the time goes;
+* `emit_program` writes the controller's program image: unit, engine,
+  length, the dependency mask over the previous 32 steps, and a barrier
+  where a dependency reaches further back (the recurrent layer's head loop
+  is 128 steps, so its `out_proj` pass is a barrier).
+
+The controller is a microcoded issue engine, not a state machine per
+layer: in program order, when the head step's dependencies have completed
+and its unit reports the addressed engine free, it sends the command and
+moves on without waiting; a unit returns the step's tag on its engine's
+done port, and completed steps are kept in a ring of bits relative to the
+head so a dependency is one compare. Units are black boxes to it, which is
+what lets `tb_sequencer` check it against stub units of programmed
+duration: the trace must respect every dependency and never overlap an
+engine, and the last completion must land on exactly the cycle the Python
+schedule gives, which it does for the tiny and the full-size programs of
+both layers (33, 23, 173 and 41 steps). The three timing rules the two
+share: a step issues after the previous issue, one cycle after the last of
+its dependencies completed, and one cycle after its engine's previous
+step completed.
+
+The full-size schedule is the finding. At the 9B geometry with sixteen
+PSRAMs (16 GB/s, 20 bytes per core cycle), one token through one layer:
+
+| Layer | Steps | Cycles | Time | Tiles | Memory port |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| recurrent | 173 | 140,073 | 175 µs | 9% | 80% |
+| global, position 4095 | 41 | 152,133 | 190 µs | 8% | 81% |
+| global, position 131071 | 41 | 215,621 | 270 µs | 6% | 87% |
+
+The tiles' four passes are 12,352 cycles; the rest is the memory port
+moving the recurrent state (2 MB per token per layer, int16, in and out)
+and, in the global layer, the index scan and the 1024 key-value rows per
+KV head. So on this board the sequencer's whole job is to keep the port
+streaming: the state engines double-buffer a head so the next head's read
+overlaps the update, and the four attention cores each own a KV head's
+stream. Halving the state traffic (int8 state with stochastic rounding, or
+a smaller value dimension) would matter more than anything in the units;
+the DRAM boards are not memory-bound this way. What the program does not
+yet carry is the per-context addressing (the DMA steps take an argument
+field for it) and the overlap of one token's memory steps with the previous
+token's passes, which the issue engine allows once two tokens' programs
+are concatenated with their buffers renamed.
+
 ## RTL
 
 `rtl/fabric_tile.sv` is the synthesizable tile with the ROM as a constant
@@ -842,7 +907,9 @@ are plain adders.
 stripe unit, with `tb_hpi` checking them against `fabric.hpi`;
 `rtl/fabric_cdc.sv` the asynchronous FIFO and the bridge, with
 `tb_async_fifo` and `tb_mem_bridge`; `rtl/fabric_phy.sv` the delay line
-and the DLL, with `tb_dll`.
+and the DLL, with `tb_dll`; `rtl/fabric_sequencer.sv` the token sequencer,
+with `tb_sequencer` running the programs of `fabric.sequencer` over stub
+units.
 
 `rtl/fabric_memory.sv` holds the memory side: the behavioural
 `fabric_mem_model` for the testbenches, `fabric_mem_arbiter`,
@@ -870,9 +937,12 @@ bit for bit, at int8 and int4 KV and with the 128-wide index and the
    equal, and the FFN-down pass reads the wider FFN vector.
 5. A multi-token variant of the column datapath for chunked prefill, which
    amortizes the ROM read across a chunk of tokens from one context.
-6. Done: the vector datapath between the passes, the memory side and the
+6. Done: the vector datapath between the passes, the memory side, the
    HPI controller for the chosen PSRAM with its clock crossing and its
-   PHY, above. Open behind them: the token sequencer that runs the tiles,
-   the units and the DMAs in order, stochastic rounding for the state if
-   int8 storage has to come back, the simulator's traffic terms brought
-   in line with the map, and synthesis of the units for area.
+   PHY, and the token sequencer with its layer programs, above. Open
+   behind them: the sequencer's integration with the real units (the
+   command bus into each unit's start, the buffer addressing, the
+   per-context arguments), stochastic rounding for the state, which the
+   schedule now says is worth more than any unit, the simulator's traffic
+   terms brought in line with the map, and synthesis of the units for
+   area.

@@ -30,6 +30,9 @@ LLM inference appliance built around the Qwen3.5 dense hybrid geometry.
   controller for the PSRAM board's chosen device, the AP Memory
   APS512XXN in x16 HPI mode, with a stripe unit over sixteen of them, the
   clock crossing to the core, and the PHY's delay lines with their DLL.
+  `fabric/sequencer.py` and its RTL are the token sequencer: a layer's
+  dataflow as a program of unit commands, proven against the integer
+  layer, scheduled at full size, and run by a microcoded issue engine.
 * [`clash/`](clash/) contains a synthesizable four-stage ASIC-shard seed with a
   deliberately small fixed-coefficient datapath for early RTL and P&R work.
 * [`sim/`](sim/) contains the cycle-stepped 32-stage appliance simulator for
