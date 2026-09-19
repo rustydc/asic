@@ -286,4 +286,211 @@ module fabric_delta_state #(
     end
 endmodule
 
+
+
+// ---------------------------------------------------------------------------
+// One head of the delta rule for one token on the int8 state with a scale.
+//
+// The state is S = g * T * 2^-e: T int8 rows, g a U16 scale and e a small
+// exponent per head, with peak the largest |T| written since the last
+// rescale (it restarts at a rescale).  After
+// `start` latches q, k, v, decay, beta, g, e and peak, the new scale is
+// g1 = (g * decay + 2^15) >> 16 (nsat is the number of saturated elements
+// written last token).  If g1 < 2^15 or nsat > K*V / 2^SAT_SHIFT the head is
+// rescaled this token: as the rows arrive T <- sat8((T * g1 + 2^(15-de)) >> (16-de))
+// with de = -1 when saturated (e > E_MIN), +1 when peak <= PEAK_GROW
+// (e < E_MAX), else 0; then g1 = 1 and
+// e <- e + de.  A sequential divider
+// forms r = floor(2^31 / g1).  Pass 1 keeps the rows and accumulates
+// pred = k . T; then
+//   pred_j = (acc_j * g1 + 2^(22+e)) >> (23 + e),  diff_j = sat16(v_j - pred_j),
+//   c_j    = (beta * diff_j * r + 2^(23-e)) >> (24 - e)
+// and pass 2 walks the kept rows: T'_ij = sat8(T_ij + ((k_i * c_j + 2^13) >> 14)),
+// streams them out, tracks the peak and the saturated count and
+// accumulates y = q . T'; after the last row
+//   y_j = sat16((y_acc_j * g1 + 2^(YSH+7+e)) >> (YSH + 8 + e)).
+// g_out and e_out are valid from two cycles after start, peak_out and
+// nsat_out with y.
+// Golden model: fabric/layer.py delta_state_int8.
+// ---------------------------------------------------------------------------
+module fabric_delta_state8 #(
+    parameter int K     = 128,
+    parameter int V     = 128,
+    parameter int YSH   = 11,
+    parameter int E_MIN = -4,
+    parameter int E_MAX = 6,
+    parameter int PEAK_GROW = 47,            // fabric.layer.PEAK_GROW
+    parameter int SAT_SHIFT = 6              // fabric.layer.SAT_SHIFT
+) (
+    input  wire            clk,
+    input  wire            rst_n,
+    input  wire            start,
+    input  wire [K*8-1:0]  q,
+    input  wire [K*8-1:0]  k,
+    input  wire [V*8-1:0]  v,
+    input  wire [15:0]     decay,
+    input  wire [15:0]     beta,
+    input  wire [15:0]     g_in,
+    input  wire [7:0]      e_in,
+    input  wire [7:0]      peak_in,
+    input  wire [15:0]     nsat_in,
+    output reg  [15:0]     g_out,
+    output reg  [7:0]      e_out,
+    output reg  [7:0]      peak_out,
+    output reg  [15:0]     nsat_out,
+    input  wire            row_in_valid,
+    input  wire [V*8-1:0]  row_in,
+    output reg             row_out_valid,
+    output reg  [V*8-1:0]  row_out,
+    output reg             y_valid,
+    output reg  [V*16-1:0] y
+);
+    localparam int KW = $clog2(K) + 1;
+    reg [K*8-1:0]  q_r, k_r;
+    reg [V*8-1:0]  v_r;
+    reg [15:0]     b_r, g1;
+    reg signed [7:0] e1;
+    reg            rescale;
+    reg signed [3:0] de;
+    reg [V*8-1:0]  t_mem [0:K-1];
+    reg [KW-1:0]   wr, rd;
+    reg [2:0]      phase;            // 0 pass 1, 1 diff, 2 beta*diff, 3 c, 4 pass 2, 5 y
+    reg signed [31:0] pred_acc [0:V-1];
+    reg signed [31:0] y_acc [0:V-1];
+    reg signed [15:0] diff [0:V-1];
+    reg signed [31:0] bd [0:V-1];
+    reg signed [24:0] c [0:V-1];
+    reg [7:0]      peak_acc;
+    reg [15:0]     nsat_acc;
+    wire           sat_in = ({16'd0, nsat_in} > ((K * V) >> SAT_SHIFT));
+
+    // The scale the cycle after start (gren keeps the unclamped value the
+    // rescaling multiplies by); then r = floor(2^31 / g1) by restoring
+    // division, one quotient bit per cycle.  The diff phase waits for it.
+    reg [31:0] gprod;
+    reg [15:0] gren;
+    reg        g1_ready, dividing, r_ready, saturated;
+    reg [32:0] rem, rem_next;
+    reg [16:0] quo;
+    reg [5:0]  dstep;
+    integer j;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            g1 <= 0; gren <= 0; e1 <= 0; rescale <= 1'b0; de <= 0; g1_ready <= 1'b0; g_out <= 0; e_out <= 0;
+            dividing <= 1'b0; r_ready <= 1'b0; rem <= 0; quo <= 0; dstep <= 0;
+        end else begin
+            g1_ready <= start;
+            if (start) begin
+                gprod = ({16'd0, g_in} * {16'd0, decay} + 32'd32768) >> 16;
+                saturated = sat_in;
+                gren <= gprod[15:0];
+                if (gprod < 32'd32768 || saturated) begin
+                    rescale <= 1'b1;
+                    if (saturated && $signed(e_in) > E_MIN) de <= -4'sd1;
+                    else if (!saturated && ({24'd0, peak_in} <= PEAK_GROW) && $signed(e_in) < E_MAX) de <= 4'sd1;
+                    else de <= 4'sd0;
+                    g1 <= 16'hFFFF;
+                end else begin
+                    rescale <= 1'b0; de <= 4'sd0; g1 <= gprod[15:0];
+                end
+                e1 <= $signed(e_in);
+            end
+            if (g1_ready) begin
+                if (rescale) e1 <= e1 + {{4{de[3]}}, de};
+                g_out <= g1; e_out <= rescale ? e1 + {{4{de[3]}}, de} : e1;
+                rem <= 0; quo <= 0; dstep <= 0; dividing <= 1'b1; r_ready <= 1'b0;
+            end else if (dividing) begin
+                rem_next = {rem[31:0], dstep == 6'd0};                    // the dividend 2^31, top bit first
+                if (rem_next >= {17'd0, g1}) begin rem <= rem_next - {17'd0, g1}; quo <= {quo[15:0], 1'b1}; end
+                else begin rem <= rem_next; quo <= {quo[15:0], 1'b0}; end
+                dstep <= dstep + 1'b1;
+                if (dstep == 6'd31) begin dividing <= 1'b0; r_ready <= 1'b1; end
+            end
+        end
+    end
+    wire [16:0] r = quo;
+
+    reg            va;
+    reg [V*8-1:0]  rowa;
+    reg [KW-1:0]   ia;
+    reg            vd;
+    reg [V*8-1:0]  rowd;
+    reg [KW-1:0]   id;
+    reg signed [63:0] tr, tn, dl, pr, mag, nsat;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            phase <= 3'd0; wr <= 0; rd <= 0; va <= 1'b0; vd <= 1'b0; row_out_valid <= 1'b0; peak_acc <= 0;
+        end else begin
+            va <= 1'b0; vd <= 1'b0; row_out_valid <= 1'b0;
+            if (start) begin
+                q_r <= q; k_r <= k; v_r <= v; b_r <= beta;
+                phase <= 3'd0; wr <= 0; rd <= 0;
+                // The peak runs since the last rescale; a rescale this token (decided in the same edge) restarts it.
+                peak_acc <= (((({16'd0, g_in} * {16'd0, decay} + 32'd32768) >> 16) < 32'd32768) || sat_in) ? 8'd0 : peak_in;
+                nsat_acc <= 0;
+                for (j = 0; j < V; j = j + 1) begin pred_acc[j] <= 0; y_acc[j] <= 0; end
+            end
+            if (phase == 3'd0 && row_in_valid) begin va <= 1'b1; rowa <= row_in; ia <= wr; wr <= wr + 1'b1; end
+            // Pass 1 stage B: rescale if due, keep, accumulate pred.
+            if (va) begin
+                for (j = 0; j < V; j = j + 1) begin
+                    tr = rescale ? fx_sat(fx_rnd_shr($signed(rowa[j*8 +: 8]) * $signed({48'b0, gren}), 16 - de), 8)
+                                 : $signed(rowa[j*8 +: 8]);
+                    t_mem[ia][j*8 +: 8] <= tr[7:0];
+                    pred_acc[j] <= pred_acc[j] + $signed(k_r[ia*8 +: 8]) * $signed(tr[7:0]);
+                end
+                if (ia == K - 1) phase <= 3'd1;
+            end
+            if (phase == 3'd1 && r_ready) begin
+                for (j = 0; j < V; j = j + 1) begin
+                    pr = fx_rnd_shr(pred_acc[j] * $signed({48'b0, g1}), 23 + e1);
+                    diff[j] <= fx_sat($signed({{56{v_r[j*8+7]}}, v_r[j*8 +: 8]}) - pr, 16);
+                end
+                phase <= 3'd2;
+            end
+            if (phase == 3'd2) begin
+                for (j = 0; j < V; j = j + 1) bd[j] <= $signed({48'b0, b_r}) * diff[j];
+                phase <= 3'd3;
+            end
+            if (phase == 3'd3) begin
+                for (j = 0; j < V; j = j + 1) c[j] <= fx_rnd_shr(bd[j] * $signed({47'b0, r}), 24 - e1);
+                phase <= 3'd4; rd <= 0;
+            end
+            if (phase == 3'd4) begin
+                vd <= 1'b1; rowd <= t_mem[rd]; id <= rd; rd <= rd + 1'b1;
+                if (rd == K - 1) phase <= 3'd5;
+            end
+            if (vd) begin
+                mag = peak_acc; nsat = nsat_acc;
+                for (j = 0; j < V; j = j + 1) begin
+                    dl = fx_rnd_shr($signed(k_r[id*8 +: 8]) * c[j], 14);
+                    tn = fx_sat($signed(rowd[j*8 +: 8]) + dl, 8);
+                    row_out[j*8 +: 8] <= tn[7:0];
+                    y_acc[j] <= y_acc[j] + $signed(q_r[id*8 +: 8]) * $signed(tn[7:0]);
+                    if ((tn < 0 ? -tn : tn) > mag) mag = (tn < 0 ? -tn : tn);
+                    if ((tn < 0 ? -tn : tn) >= 127) nsat = nsat + 1;
+                end
+                peak_acc <= mag[7:0]; nsat_acc <= nsat[15:0];
+                row_out_valid <= 1'b1;
+            end
+        end
+    end
+    reg y_pending;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) y_pending <= 1'b0;
+        else        y_pending <= vd && (id == K - 1);
+    end
+    always @(posedge clk) begin
+        if (y_pending) begin
+            for (j = 0; j < V; j = j + 1)
+                y[j*16 +: 16] <= fx_sat(fx_rnd_shr(y_acc[j] * $signed({48'b0, g1}), YSH + 8 + e1), 16);
+            peak_out <= peak_acc; nsat_out <= nsat_acc;
+        end
+    end
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) y_valid <= 1'b0;
+        else        y_valid <= y_pending;
+    end
+endmodule
+
 `default_nettype wire

@@ -77,6 +77,25 @@ class FixedPointTest(unittest.TestCase):
         s16_new, _ = L.delta_state_int(s16, k, v, q, d, 0)
         self.assertTrue((s8_new == s8).all())
         self.assertTrue((s16_new == 19980).all())
+        # The int8 state with a scale does decay: the scale carries it and the state is rescaled once when it halves.
+        t, g, e, peak, nsat = s8.copy(), L.ONE_U, 0, 100, 0
+        rescales = 0
+        for step in range(700):
+            t, g, e, peak, nsat, _ = L.delta_state_int8(t, k, v, q, d, 0, g, e, peak, nsat)
+            rescales += g == L.ONE_U
+        self.assertEqual(rescales, 1)
+        self.assertTrue((t == 50).all())                       # 100 * 0.999^n at the crossing, rounded once
+        self.assertEqual(e, 0)                                 # 50 leaves no room to double
+        value = t[0, 0] * g / L.ONE_U * 2.0 ** -e
+        self.assertLess(value, 100 * 0.999 ** 680)
+        self.assertGreater(value, 100 * 0.999 ** 720)
+        # A small state gains resolution at its rescale; one with enough saturated elements loses it at once.
+        t, g, e, peak, nsat, _ = L.delta_state_int8(np.full((128, 128), 20), k, v, q, int(0.4 * 65535), 0, L.ONE_U, 0, 20, 0)
+        self.assertEqual((e, t[0, 0]), (1, 16))                # 20 * 0.4 * 2
+        t, g, e, peak, nsat, _ = L.delta_state_int8(np.full((128, 128), 127), k, v, q, 65535, 0, L.ONE_U, 0, 127, 16384)
+        self.assertEqual((e, t[0, 0], g, nsat), (-1, 63, L.ONE_U, 0))   # 127 * 65535/65536 / 2, nothing saturated any more
+        t, g, e, peak, nsat, _ = L.delta_state_int8(np.full((128, 128), 127), k, v, q, 65535, 0, L.ONE_U, 0, 127, 200)
+        self.assertEqual((e, nsat), (0, 16384))                # 200 of 16384 saturated is within the 1/64 tolerated
 
     def test_attention_int_matches_a_float_softmax(self) -> None:
         rng = np.random.default_rng(2)
@@ -197,6 +216,43 @@ class LayerTest(unittest.TestCase):
             self.assertGreater(cosine(rf["x2"], ri["x2"] * consts.s_h), 0.99)
         self.assertLess(np.abs(s_i).max(), 32768)
 
+    def test_recurrent_layer_with_the_int8_state_tracks_the_int16_layer(self) -> None:
+        cfg = self.cfg
+        rng = np.random.default_rng(5)
+        w = self.weights(self.layers[0])
+        nv, hk, hv = cfg.linear_num_value_heads, cfg.linear_key_head_dim, cfg.linear_value_head_dim
+        conv_dim = self.layers[0].linear_attn.conv_dim
+        xs = [rng.standard_normal(cfg.hidden_size) * 2.0 for _ in range(12)]
+        s, hist, runs = np.zeros((nv, hk, hv)), np.zeros((conv_dim, cfg.linear_conv_kernel - 1)), []
+        for x in xs:
+            r = L.recurrent_layer_float(w, cfg, x, s, hist)
+            s, hist = r["s_next"], r["hist_next"]
+            runs.append(r)
+        cal = L.calibrate(runs, L.RECURRENT_CAL_KEYS)
+        cal["x2"] = max(cal["x2"], max(float(np.abs(x).max()) for x in xs))
+        consts = L.compile_recurrent_layer(w, cfg, self.spec, cal)
+        s16 = np.zeros((nv, hk, hv), dtype=np.int64)
+        t8 = np.zeros((nv, hk, hv), dtype=np.int64)
+        sc8 = np.tile([L.ONE_U, 0, 0, 0], (nv, 1)).astype(np.int64)
+        h16 = h8 = np.zeros((conv_dim, cfg.linear_conv_kernel - 1), dtype=np.int64)
+        state_cos, y_cos = [], []
+        for x in xs:
+            xi = np.rint(x / consts.s_h).astype(np.int64)
+            r16 = L.recurrent_layer_int(consts, cfg, self.spec, xi, s16, h16)
+            r8 = L.recurrent_layer_int(consts, cfg, self.spec, xi, t8, h8, scale=sc8)
+            s16, h16 = r16["s_next"], r16["hist_next"]
+            t8, sc8, h8 = r8["s_next"], r8["scale_next"], r8["hist_next"]
+            # S = g * T * 2^-e against the int16 state at s_v / 256.
+            eff = t8 * (sc8[:, 0] / L.ONE_U * 2.0 ** -sc8[:, 1])[:, None, None]
+            state_cos.append(cosine(eff.ravel(), s16.ravel() / 256))
+            y_cos.append(cosine(r8["y"], r16["y"]))
+            self.assertGreater(cosine(r8["x2"], r16["x2"]), 0.998)
+        # This random-init model's states are a few s_v and its decays near zero, so every
+        # head rescales every token and the exponent climbs to use the byte.
+        self.assertGreater(np.mean(state_cos[2:]), 0.99)
+        self.assertGreater(np.mean(y_cos[2:]), 0.98)
+        self.assertGreater(sc8[:, 1].max(), 0)
+
     def test_global_layer_int_tracks_the_float_layer(self) -> None:
         cfg = self.cfg
         rng = np.random.default_rng(4)
@@ -282,6 +338,12 @@ class VectorRtlTest(unittest.TestCase):
         rng = np.random.default_rng(14)
         self.check("tb_delta_state", lambda d: L.emit_delta_vectors(d, rng, 16, 16))
         self.check("tb_delta_state", lambda d: L.emit_delta_vectors(d, rng, 128, 128))
+
+    def test_delta_state8(self) -> None:
+        rng = np.random.default_rng(18)
+        for k, v, case in ((16, 16, "plain"), (16, 16, "renorm"), (16, 16, "grow"), (16, 16, "shrink"),
+                           (128, 128, "renorm"), (128, 128, "grow")):
+            self.check("tb_delta_state8", lambda d: L.emit_delta8_vectors(d, rng, k, v, case))
 
     def test_swiglu_and_residual(self) -> None:
         rng = np.random.default_rng(15)

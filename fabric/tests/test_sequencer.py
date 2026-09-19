@@ -69,11 +69,12 @@ class ScheduleTest(unittest.TestCase):
         for steps in (rec, glob):
             S.apply_window(steps)
             sched = S.schedule(steps, rtl=True)
-            self.assertGreater(sched.busy("mem") / sched.cycles, 0.75)
+            self.assertGreater(sched.busy("mem") / sched.cycles, 0.6)
             self.assertEqual(sched.busy("tiles"), sum(s.cycles for s in steps if s.unit == "tiles"))
         self.assertEqual(len([s for s in rec if s.unit == "tiles"]), 4)              # four passes
         self.assertEqual(len([s for s in rec if s.name.startswith("delta")]), cfg.linear_num_value_heads)
-        self.assertEqual(sum(s.nbytes for s in rec), 2 * mm.state_bytes + 2 * mm.hist_bytes)
+        self.assertEqual(sum(s.nbytes for s in rec), 2 * mm.state_bytes + 2 * mm.hist_bytes)     # the int8 state and its scales
+        self.assertLess(sum(s.nbytes for s in rec), 1.1 * 2 ** 20)
         self.assertTrue(any(s.barrier for s in rec))                                  # the head loop outruns the window
         self.assertIn("cycles per token", S.report_markdown(cfg, mm, 4095))
 
@@ -114,19 +115,29 @@ class ProgramTest(unittest.TestCase):
         cal["x2"] = max(cal["x2"], max(float(np.abs(x).max()) for x in xs))
         c = L.compile_recurrent_layer(w, cfg, spec, cal)
         prog = S.recurrent_program(cfg, c, spec, self.mm)
-        s_i = np.zeros((nv, hk, hv), dtype=np.int64)
+        s_i = np.zeros((nv, hk, hv), dtype=np.int64)                  # the int8 state and its per-head scale beats
+        sc_i = np.tile([L.ONE_U, 0, 0, 0], (nv, 1)).astype(np.int64)
         hist_i = np.zeros((conv_dim, cfg.linear_conv_kernel - 1), dtype=np.int64)
-        s_mem, hist_mem = s_i.copy(), hist_i.copy()
+        s_mem, sc_mem, hist_mem = s_i.copy(), sc_i.copy(), hist_i.copy()
         for x in xs:
             xi = np.rint(x / c.s_h).astype(np.int64)
-            ri = L.recurrent_layer_int(c, cfg, spec, xi, s_i, hist_i)
-            s_i, hist_i = ri["s_next"], ri["hist_next"]
-            env = S.run_program(prog, {"x": xi, "s_mem": s_mem, "hist_mem": hist_mem})
-            s_mem, hist_mem = env["s_mem"], env["hist_mem"]
+            ri = L.recurrent_layer_int(c, cfg, spec, xi, s_i, hist_i, scale=sc_i)
+            s_i, sc_i, hist_i = ri["s_next"], ri["scale_next"], ri["hist_next"]
+            env = S.run_program(prog, {"x": xi, "s_mem": s_mem, "scale_mem": sc_mem, "hist_mem": hist_mem})
+            s_mem, sc_mem, hist_mem = env["s_mem"], env["scale_mem"], env["hist_mem"]
             np.testing.assert_array_equal(env["x2"], ri["x2"])
             np.testing.assert_array_equal(env["mixer"], ri["mixer"])
             np.testing.assert_array_equal(s_mem, ri["s_next"])
+            np.testing.assert_array_equal(np.asarray(sc_mem), ri["scale_next"])
             np.testing.assert_array_equal(hist_mem, ri["hist_next"])
+        # The int16 program is the same list with the plain state.
+        mm16 = MemoryMap.from_config(cfg, state_bits=16)
+        prog16 = S.recurrent_program(cfg, c, spec, mm16)
+        s16 = np.zeros((nv, hk, hv), dtype=np.int64)
+        xi = np.rint(xs[0] / c.s_h).astype(np.int64)
+        ri = L.recurrent_layer_int(c, cfg, spec, xi, s16, np.zeros_like(hist_i))
+        env = S.run_program(prog16, {"x": xi, "s_mem": s16.copy(), "hist_mem": np.zeros_like(hist_i)})
+        np.testing.assert_array_equal(env["x2"], ri["x2"])
 
     def test_global_program(self) -> None:
         cfg, spec = self.cfg, self.spec

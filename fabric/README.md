@@ -569,16 +569,15 @@ the int8 requantizer.
 
 Two findings from building it:
 
-* **The recurrent state must be int16.** Round-to-nearest cannot apply a
-  slow decay to a narrow value: `S * d` rounds back to `S` whenever
-  `|S| < 1 / (1 - d)`, which at `d = 0.999` is every int8 value and the
-  bottom three percent of int16. The simulator's `recurrent_state_bytes`
-  (512 KB per layer) assumed int8; the state as designed here is 1 MB per
-  layer per token, read and written, which halves the recurrent-state
-  share of the memory budget in the PSRAM sweep unless the state uses
-  stochastic rounding or error feedback instead. The state engine keeps
-  one head's 32 KB on chip for the two passes of the update, so the memory
-  sees each row once each way.
+* **The recurrent state cannot be a plain int8.** Round-to-nearest cannot
+  apply a slow decay to a narrow value: `S * d` rounds back to `S`
+  whenever `|S| < 1 / (1 - d)`, which at `d = 0.999` is every int8 value
+  and the bottom three percent of int16. The first build kept the state
+  int16 (1 MB per layer per token, read and written), and the sequencer's
+  schedule then showed that traffic to be most of a token's time on the
+  PSRAM board. The resolution is the int8 state with a scale, below. The
+  state engine keeps one head on chip for the two passes of the update,
+  so the memory sees each row once each way.
 * **A cancellation head cannot survive int8.** On a random-init model a
   head whose delta output is a 1e-3 residual of its state flips sign in
   the integer layer, and the norm then amplifies the flip. Against a float
@@ -587,6 +586,67 @@ Two findings from building it:
   the residual stream); against the unquantised weights the residual
   stream still holds at 0.99 while the mixer of such a head does not. That
   is the int4 weights' business, and the quantisation-aware training's.
+
+### State traffic: int8 with a per-head scale
+
+The state is stored as `S = g * T * 2^-e`: `T` int8 rows, `g` a U16
+scale and `e` a small exponent per head (`e = 0` puts the LSB at `s_v`,
+the top byte of the int16 state's range), with the largest `|T|` written
+since the last rescale kept as `peak` and the number of saturated
+elements written last token as `nsat`; the four ride in one beat ahead
+of the head's rows. The decay multiplies the scale, not the stored
+values, so it costs no rounding at all; when the scale falls below one
+half the head is rescaled once (`T <- T * g * 2^de`, the only rounding
+the state ever sees, every ~700 tokens at `d = 0.999`) and the scale
+returns to one. The exponent moves to keep the byte in use: up one at a
+rescale when the largest value written since the previous rescale was at
+most 47 (the byte never more than a third used over the whole period),
+and down one at once, any token, when more than one in sixty-four of the
+elements saturated. Both rules were chosen by sweep. Shrinking on the
+first saturated element halved the resolution of heads that would only
+ever clip a percent of their elements, and cost 0.994 to 0.986 on the
+slow regime below; and deciding the growth from the rescaled peak rather
+than the period's made a head with a near-zero decay, whose state is a
+fresh outer product every token, grow and saturate in alternate tokens.
+The rank-one
+update is added at `1 / g`, a
+reciprocal the engine forms by a 32-cycle restoring division per head,
+and the read-out `y = q . S'` is the accumulator times `g`, shifted so its
+int16 encoding is the one the gated norm already takes. `fabric.state`
+runs the candidates against the float rule on synthetic heads (unit int8
+keys, int8 values, U16 gates, three decay regimes); the cosine of the
+read-out over the last two thousand of three thousand tokens:
+
+| Scheme | slow (d = 0.999) | fast (d = 0.98) | mixed (0.905 to 0.999) |
+| --- | ---: | ---: | ---: |
+| int16 round-to-nearest (built first) | 0.9999 / 0.9999 | 1.0000 / 0.9999 | 1.0000 / 0.9999 |
+| int8 round-to-nearest | 0.9845 / 0.9698 | 0.9015 / 0.8046 | 0.9822 / 0.9545 |
+| int8 stochastic rounding | 0.9850 / 0.9650 | 0.9752 / 0.9227 | 0.9781 / 0.9309 |
+| **int8 with a per-head scale and exponent** | 0.9945 / 0.9881 | 0.9958 / 0.9843 | 0.9957 / 0.9879 |
+
+(mean / minimum over tokens.) Stochastic rounding, the usual answer, is
+unbiased but adds a random walk the slow decay barely damps; the scale
+removes the rounding instead of averaging it, and plain round-to-nearest
+on the increments is then better than stochastic. The exponent is what
+makes the byte robust to a model's actual magnitudes: the random-init
+tiny model's states are a few `s_v` with decays near zero, so at a fixed
+LSB of `s_v` the int8 layer tracked the int16 one at only 0.95 on the
+state, and with the exponent climbing to use the byte it tracks at 0.99
+on the state, 0.98 on the state output and 0.999 on the residual stream
+(`test_layer.py`). The
+alternative of deferring the state write over several tokens (read the
+state, apply pending rank-one updates on the fly, write every `m`
+tokens) was rejected on silicon: the pending vectors of every context on
+the die (49 contexts, three layers, 32 heads) are 1.2 MB of SRAM per
+token of deferral. `delta_state_int8` is the model, `fabric_delta_state8`
+the engine (int8 rows in and out, the scale beat in and out, one fewer
+multiplier per element than the int16 engine in pass 1 and a peak and
+saturation count in pass 2), `tb_delta_state8` checks it bit for bit in
+the four cases (no rescale, a rescale that keeps the exponent, one that
+raises it, a saturation that lowers it), and the memory map's default is
+`state_bits = 8` with `state_bits = 16` still available.
+The traffic is 512 KB and 512 B per layer per token each way, which is
+what the simulator's `recurrent_state_bytes` had assumed.
 
 Per token and layer the arithmetic outside the tiles is about 2M
 multiply-adds in the state engine (four operations over 32 × 128 × 128),
@@ -662,30 +722,28 @@ attention output tracks it at 0.95, with the residual stream at 0.995.
 Capacity and traffic for the 9B geometry at 128K context
 (`MemoryMap.report_markdown`):
 
-| Store | int16 state, int8 KV | int16 state, int4 KV | int8 state, int4 KV |
+| Store | int8 state, int8 KV (taken) | int8 state, int4 KV | int16 state, int8 KV (first build) |
 | --- | ---: | ---: | ---: |
-| per context | 21.7 MB | 12.8 MB | 11.2 MB |
-| contexts in 1 GB (PSRAM board) | 49 | 83 | 95 |
-| contexts in 4 GB (LPDDR5X) | 197 | 335 | 382 |
-| traffic per token, three state layers | 6.3 MB | 6.3 MB | 3.1 MB |
-| traffic per token, global layer | 1.8 MB | 1.2 MB | 1.2 MB |
+| per context | 20.1 MB | 11.2 MB | 21.7 MB |
+| contexts in 1 GB (PSRAM board) | 53 | 95 | 49 |
+| contexts in 4 GB (LPDDR5X) | 213 | 382 | 197 |
+| traffic per token, three state layers | 3.1 MB | 3.1 MB | 6.3 MB |
+| traffic per token, global layer | 1.8 MB | 1.2 MB | 1.8 MB |
 
-Two things the map says about the simulator. The int16 state doubles the
-recurrent-state traffic the simulator's `recurrent_state_bytes` carries
-and makes it three quarters of the die's memory traffic. And the
-simulator's retrieval term fetches `top_blocks x retrieval_block_size`
-positions, 512 records per token, where the model attends over one mean
-record per block, 32: the simulator's global-layer traffic is about 2.5
-times what this memory side moves, so the memory-bound sweeps in
-`sim/README.md` are pessimistic on the global side and optimistic on the
-recurrent side until `recurrent_state_bytes` and the selected-position
-count follow this map.
+The int8 state is the scaled one of the layer section: 512 KB of rows and
+512 B of scales per layer per context, which is the figure the
+simulator's `recurrent_state_bytes` carries. What the map still says
+about the simulator: its retrieval term fetches `top_blocks x
+retrieval_block_size` positions, 512 records per token, where the model
+attends over one mean record per block, 32, so the simulator's
+global-layer traffic is about 2.5 times what this memory side moves and
+the memory-bound sweeps in `sim/README.md` are pessimistic on the global
+side until the selected-position count follows this map.
 
-Not here: the sequencer that orders the units across a token (state DMA
-per head interleaved with the fabric passes, the append and scan while
-the attention waits), the memory controller and PHY for the chosen
-device, error detection on the stored state, and context allocation and
-eviction, which the FPGA owns.
+Not here: error detection on the stored state, and context allocation and
+eviction, which the FPGA owns. The sequencer that orders the units across
+a token and the memory controller and PHY for the chosen device are in
+their own sections below.
 
 ## The memory device and its controller
 
@@ -850,18 +908,19 @@ PSRAMs (16 GB/s, 20 bytes per core cycle), one token through one layer:
 
 | Layer | Steps | Cycles | Time | Tiles | Memory port |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| recurrent | 173 | 140,073 | 175 µs | 9% | 80% |
+| recurrent, int16 state (first build) | 173 | 140,073 | 175 µs | 9% | 80% |
+| recurrent, int8 state with a scale | 173 | 85,673 | 107 µs | 14% | 67% |
 | global, position 4095 | 41 | 152,133 | 190 µs | 8% | 81% |
 | global, position 131071 | 41 | 215,621 | 270 µs | 6% | 87% |
 
 The tiles' four passes are 12,352 cycles; the rest is the memory port
-moving the recurrent state (2 MB per token per layer, int16, in and out)
-and, in the global layer, the index scan and the 1024 key-value rows per
-KV head. So on this board the sequencer's whole job is to keep the port
-streaming: the state engines double-buffer a head so the next head's read
-overlaps the update, and the four attention cores each own a KV head's
-stream. Halving the state traffic (int8 state with stochastic rounding, or
-a smaller value dimension) would matter more than anything in the units;
+moving the recurrent state (1 MB per token per layer in and out as int8
+with its scales, 2 MB as int16) and, in the global layer, the index scan
+and the 1024 key-value rows per KV head. So on this board the sequencer's
+whole job is to keep the port streaming: the state engines double-buffer
+a head so the next head's read overlaps the update, and the four
+attention cores each own a KV head's stream. The int8 state was the
+largest single lever (it took the recurrent layer from 175 to 107 µs);
 the DRAM boards are not memory-bound this way. What the program does not
 yet carry is the per-context addressing (the DMA steps take an argument
 field for it) and the overlap of one token's memory steps with the previous
@@ -942,7 +1001,6 @@ bit for bit, at int8 and int4 KV and with the 128-wide index and the
    PHY, and the token sequencer with its layer programs, above. Open
    behind them: the sequencer's integration with the real units (the
    command bus into each unit's start, the buffer addressing, the
-   per-context arguments), stochastic rounding for the state, which the
-   schedule now says is worth more than any unit, the simulator's traffic
-   terms brought in line with the map, and synthesis of the units for
-   area.
+   per-context arguments), the simulator's traffic terms brought in line
+   with the map, and synthesis of the units for area. The state traffic
+   is done: int8 with a per-head scale, above.

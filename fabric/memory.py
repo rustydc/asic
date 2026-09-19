@@ -86,7 +86,7 @@ class MemoryMap:
     index_dim: int = 128
     recurrent_layers: int = 3
     global_layers: int = 1
-    state_bits: int = 16
+    state_bits: int = 8              # int8 with a U16 scale per head (fabric.layer.delta_state_int8); 16 is the plain int16 state
     kv_bits: int = 8
 
     @classmethod
@@ -106,9 +106,18 @@ class MemoryMap:
         return self.v_dim * self.state_bits // 8
 
     @property
+    def state_scale_bytes(self) -> int:
+        """The per-head scales of the int8 state: one beat each, ahead of the rows."""
+        return self.v_heads * BEAT if self.state_bits == 8 else 0
+
+    @property
+    def state_head_bytes(self) -> int:
+        return self.k_dim * self.state_row_bytes
+
+    @property
     def state_bytes(self) -> int:
-        """One recurrent layer's state for one context."""
-        return self.v_heads * self.k_dim * self.state_row_bytes
+        """One recurrent layer's state for one context: the scales, then every head's rows."""
+        return self.state_scale_bytes + self.v_heads * self.state_head_bytes
 
     @property
     def hist_bytes(self) -> int:
@@ -184,8 +193,12 @@ class MemoryMap:
     def context_base(self, ctx: int) -> int:
         return ctx * self.context_bytes
 
+    def state_scale_addr(self, ctx: int, layer: int, head: int) -> int:
+        """The beat holding the head's U16 scale in its first two bytes (int8 state only)."""
+        return self.context_base(ctx) + self.regions()[f"state{layer}"][0] + head * BEAT
+
     def state_row_addr(self, ctx: int, layer: int, head: int, row: int) -> int:
-        base = self.context_base(ctx) + self.regions()[f"state{layer}"][0]
+        base = self.context_base(ctx) + self.regions()[f"state{layer}"][0] + self.state_scale_bytes
         return base + (head * self.k_dim + row) * self.state_row_bytes
 
     def hist_addr(self, ctx: int, layer: int) -> int:

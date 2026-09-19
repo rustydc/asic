@@ -26,27 +26,30 @@ def cosine(a, b) -> float:
 
 class MapTest(unittest.TestCase):
     def test_nine_b_map_sizes_and_capacity(self) -> None:
-        mm = M.MemoryMap()                                   # the 9B geometry, int16 state, int8 KV
-        self.assertEqual(mm.state_bytes, 32 * 128 * 128 * 2)
+        mm = M.MemoryMap()                                   # the 9B geometry, int8 state with its scales, int8 KV
+        self.assertEqual(mm.state_bytes, 32 * 16 + 32 * 128 * 128)
+        self.assertEqual(M.MemoryMap(state_bits=16).state_bytes, 32 * 128 * 128 * 2)
         self.assertEqual(mm.kv_record_bytes, 512)
         self.assertEqual(mm.window_bytes, 512 * 4 * 512)
         self.assertEqual(mm.blocks, 8192)
         self.assertEqual(mm.index_record_bytes, 80)
         regions = mm.regions()
         self.assertEqual(regions["state0"][0], 0)
-        self.assertEqual(regions["hist0"][0], mm.state_bytes)
+        self.assertEqual(regions["hist0"][0], -(-mm.state_bytes // M.ALIGN) * M.ALIGN)
         self.assertTrue(all(off % M.ALIGN == 0 for off, _ in regions.values()))
-        # int4 KV halves the block store; int8 state halves the state.
+        # int4 KV halves the block store; the int8 state is half the int16 one plus a beat per head.
         four = M.MemoryMap(kv_bits=4)
         self.assertEqual(four.block_store_bytes, mm.block_store_bytes // 2)
-        self.assertEqual(M.MemoryMap(state_bits=8).state_bytes, mm.state_bytes // 2)
+        self.assertEqual(mm.state_bytes, M.MemoryMap(state_bits=16).state_bytes // 2 + 32 * M.BEAT)
         self.assertGreater(mm.contexts_that_fit(4 << 30), four.contexts_that_fit(1 << 30))
         self.assertGreaterEqual(four.contexts_that_fit(1 << 30), 32)
         self.assertIn("| **total** |", mm.report_markdown({"PSRAM": 1 << 30}))
 
     def test_addresses_follow_the_records(self) -> None:
         mm = M.MemoryMap(**SMALL)
-        self.assertEqual(mm.state_row_addr(0, 0, 1, 2), (16 + 2) * 32)
+        self.assertEqual(mm.state_scale_addr(0, 0, 1), M.BEAT)
+        self.assertEqual(mm.state_row_addr(0, 0, 1, 2), mm.state_scale_bytes + (16 + 2) * mm.state_row_bytes)
+        self.assertEqual(M.MemoryMap(**SMALL, state_bits=16).state_row_addr(0, 0, 1, 2), (16 + 2) * 32)
         self.assertEqual(mm.window_record_addr(0, 17, 1), mm.regions()["window0"][0] + (1 * 2 + 1) * mm.kv_record_bytes)
         self.assertEqual(mm.block_record_addr(1, 3, 0), mm.context_bytes + mm.regions()["blocks0"][0] + 3 * 2 * mm.kv_record_bytes)
         self.assertEqual(mm.index_record_addr(0, 5), mm.regions()["index0"][0] + 5 * mm.index_record_bytes)

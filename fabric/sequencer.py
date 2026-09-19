@@ -152,15 +152,17 @@ def _slot(engine: int, k: int) -> str:
 
 def recurrent_program(cfg, c: L.RecurrentConsts | None, spec: TileSpec, mm: MemoryMap, t: Timing = Timing()) -> list[Step]:
     """One token through a recurrent layer.  Inputs in the environment:
-    ``x`` (int16 residual), ``s_mem[h]`` (the state rows of each head),
-    ``hist_mem`` (the conv history).  With ``c`` None the program has its
-    shape and timing but cannot be run."""
+    ``x`` (int16 residual), ``s_mem[h]`` (the state rows of each head) and,
+    for the int8 state, ``scale_mem[h]`` (its scale, exponent and peak), ``hist_mem`` (the conv
+    history).  With ``c`` None the program has its shape and timing but
+    cannot be run."""
     nk, nv, hk, hv = cfg.linear_num_key_heads, cfg.linear_num_value_heads, cfg.linear_key_head_dim, cfg.linear_value_head_dim
     d, kd, vd = cfg.hidden_size, nk * hk, nv * hv
     conv_dim, ffn = 2 * kd + vd, cfg.layer_intermediate_size(0)
     n_delta = UNITS["delta"][1]
     repeat = nv // nk
-    head_bytes = mm.state_bytes // mm.v_heads if mm.v_heads == nv else hk * hv * 2
+    int8_state = mm.state_bits == 8
+    head_bytes = hk * hv * mm.state_bits // 8 + (BEAT if int8_state else 0)   # the rows and the scale beat
     steps: list[Step] = []
 
     def add(name, unit, src, dst, cycles, func=None, engine=0, nbytes=0):
@@ -197,17 +199,28 @@ def recurrent_program(cfg, c: L.RecurrentConsts | None, spec: TileSpec, mm: Memo
     for h in range(nv):
         e_id, k = h % n_delta, h // n_delta
         slot = _slot(e_id, k)
-        add(f"dma.s_rd[{h}]", "mem", (), (slot,), t.memory(head_bytes, 2048),
-            lambda e, h=h, slot=slot: e.__setitem__(slot, e["s_mem"][h]), nbytes=head_bytes)
+        def s_rd(e, h=h, slot=slot):                       # the slot holds the rows and, for int8, the scale beat
+            e[slot] = (e["s_mem"][h], tuple(int(x) for x in e["scale_mem"][h])) if int8_state else e["s_mem"][h]
+        add(f"dma.s_rd[{h}]", "mem", (), (slot,), t.memory(head_bytes, 2048), s_rd, nbytes=head_bytes)
 
         def delta(e, h=h, slot=slot):
             v = e["conv"][2 * kd + h * hv:2 * kd + (h + 1) * hv]
-            e[slot], e[f"y[{h}]"] = L.delta_state_int(e[slot], e[f"k_unit[{h // repeat}]"], v, e[f"q_unit[{h // repeat}]"],
-                                                     int(e["decay"][h]), int(e["beta"][h]))
+            k_unit, q_unit = e[f"k_unit[{h // repeat}]"], e[f"q_unit[{h // repeat}]"]
+            if int8_state:
+                t_new, *scale_new, e[f"y[{h}]"] = L.delta_state_int8(e[slot][0], k_unit, v, q_unit, int(e["decay"][h]),
+                                                                     int(e["beta"][h]), *e[slot][1])
+                e[slot] = (t_new, tuple(scale_new))
+            else:
+                e[slot], e[f"y[{h}]"] = L.delta_state_int(e[slot], k_unit, v, q_unit, int(e["decay"][h]), int(e["beta"][h]))
         add(f"delta[{h}]", "delta", (slot, f"q_unit[{h // repeat}]", f"k_unit[{h // repeat}]", "conv", "decay", "beta"),
             (slot, f"y[{h}]"), 2 * hk + hk + 4 + t.delta_latency, delta, engine=e_id)
-        add(f"dma.s_wr[{h}]", "mem", (slot,), (), t.memory(head_bytes, 2048),
-            lambda e, h=h, slot=slot: e["s_mem"].__setitem__(h, e[slot]), nbytes=head_bytes)
+
+        def s_wr(e, h=h, slot=slot):
+            if int8_state:
+                e["s_mem"][h], e["scale_mem"][h] = e[slot]
+            else:
+                e["s_mem"][h] = e[slot]
+        add(f"dma.s_wr[{h}]", "mem", (slot,), (), t.memory(head_bytes, 2048), s_wr, nbytes=head_bytes)
 
         def gnorm(e, h=h):
             gate = L.silu_fixed(L.requant(e["z"][h * hv:(h + 1) * hv], c.z_mult, c.z_shift, 16))

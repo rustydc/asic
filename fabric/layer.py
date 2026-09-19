@@ -315,6 +315,77 @@ def delta_state_int(s: np.ndarray, k: np.ndarray, v: np.ndarray, q: np.ndarray, 
     return s_new, y
 
 
+HALF_U = 1 << (UB - 1)        # the scale below which the int8 state is rescaled
+E_MIN, E_MAX = -4, 6          # the exponent of the int8 state's LSB, s_v * 2^-e
+PEAK_GROW = 47                # a head whose peak since its last rescale is at most this doubles its resolution
+SAT_SHIFT = 6                 # a head with more than K*V / 2^SAT_SHIFT saturated elements halves its resolution at once
+
+
+def state_recip(g: int) -> int:
+    """``floor(2^31 / g)`` for a scale in ``[2^15, 2^16)``: ``1 / g`` in Q1.15, 32768 to 65536."""
+    return (1 << 31) // int(g)
+
+
+def state_rescale(g: int, decay: int, e: int, peak: int, nsat: int, elements: int) -> tuple[int, bool, int]:
+    """The head's new scale and whether this token rescales the stored state:
+    ``(g1, rescale, de)``.  The scale takes the decay; the state is rescaled
+    by ``g1 * 2^de`` (and the scale returns to one) when the scale has
+    fallen below one half or more than ``elements / 2^SAT_SHIFT`` of the
+    state saturated last token.  ``de`` is +1 when the largest value written
+    since the last rescale was at most ``PEAK_GROW`` (the byte never more
+    than a third used, so the resolution doubles), -1 to back off from
+    saturation, else 0."""
+    g1 = rnd_shr(int(g) * int(decay), UB)
+    saturated = nsat > (elements >> SAT_SHIFT)
+    if not (g1 < HALF_U or saturated):
+        return g1, False, 0
+    if saturated and e > E_MIN:
+        de = -1
+    elif not saturated and peak <= PEAK_GROW and e < E_MAX:
+        de = 1
+    else:
+        de = 0
+    return g1, True, de
+
+
+def delta_state_int8(t: np.ndarray, k: np.ndarray, v: np.ndarray, q: np.ndarray, decay: int, beta: int,
+                     g: int, e: int, peak: int, nsat: int, ysh: int | None = None
+                     ) -> tuple[np.ndarray, int, int, int, int, np.ndarray]:
+    """One token of the delta rule on one head whose state is int8 with a scale.
+
+    The state is ``S = g * T * 2^-e``: ``T`` int8 ``[K, V]``, ``g`` a U16 scale
+    and ``e`` a small exponent per head (``e = 0`` puts the LSB at ``s_v``,
+    the top byte of the int16 state's range), with ``peak`` the largest
+    ``|T|`` written since the last rescale and ``nsat`` the number of
+    saturated elements written last token.  The decay multiplies the scale,
+    not the stored values, so it costs no rounding; when the scale falls
+    below one half (or enough of the state saturated) the head is rescaled
+    once, the only rounding the state sees, and the exponent moves to keep
+    the byte in use.  The rank-one update is added at ``1 / g``, and
+    ``y = q . S'`` is shifted into int16 exactly as ``delta_state_int``
+    does.  Returns the new state, scale, exponent, peak, saturated count
+    and ``y``.
+    """
+    t = np.asarray(t, dtype=np.int64)
+    k = np.asarray(k, dtype=np.int64)
+    v = np.asarray(v, dtype=np.int64)
+    q = np.asarray(q, dtype=np.int64)
+    kk, vv = t.shape
+    ysh = ysh_for(kk) if ysh is None else ysh
+    g1, rescale, de = state_rescale(g, decay, e, peak, nsat, kk * vv)
+    if rescale:
+        t = sat(rnd_shr(t * g1, UB - de), 8)                            # times g1 * 2^de
+        g1, e = ONE_U, e + de
+    r = state_recip(g1)
+    pred = rnd_shr((k[:, None] * t).sum(axis=0) * g1, 7 + UB + e)      # at the scale of v
+    diff = sat(v - pred, 16)
+    c = rnd_shr(int(beta) * diff * r, 24 - e)                           # beta * diff / g in LSBs, k's 2^-7 still to come
+    t_new = sat(t + rnd_shr(k[:, None] * c[None, :], 14), 8)
+    y = sat(rnd_shr((q[:, None] * t_new).sum(axis=0) * g1, ysh + 8 + e), 16)
+    peak_new = max(0 if rescale else int(peak), int(np.abs(t_new).max()))    # the largest |T| since the last rescale
+    return t_new, int(g1), int(e), peak_new, int((np.abs(t_new) >= 127).sum()), y
+
+
 def swiglu_int(g: np.ndarray, u: np.ndarray, mult_g: int, sh_g: int, mult_o: int, sh_o: int) -> np.ndarray:
     """``silu(g) * u`` on int8 fabric outputs, back to int8."""
     tg = sat(requant(np.asarray(g, dtype=np.int64), mult_g, sh_g, 16), 16)
@@ -799,9 +870,13 @@ def _ffn_int(c: FfnConsts, spec: TileSpec, x1: np.ndarray) -> dict:
     return r
 
 
-def recurrent_layer_int(c: RecurrentConsts, cfg, spec: TileSpec, x: np.ndarray, s: np.ndarray, hist: np.ndarray) -> dict:
+def recurrent_layer_int(c: RecurrentConsts, cfg, spec: TileSpec, x: np.ndarray, s: np.ndarray, hist: np.ndarray,
+                        scale: np.ndarray | None = None) -> dict:
     """One token through the integer recurrent layer: ``x`` int16, ``s``
-    int16 ``[v_heads, K, V]``, ``hist`` int8 ``[conv_dim, kernel - 1]``."""
+    int16 ``[v_heads, K, V]``, ``hist`` int8 ``[conv_dim, kernel - 1]``.
+    With ``scale`` (an int array ``[v_heads, 4]`` of ``g``, ``e``, ``peak``
+    and ``nsat`` per head) the state is the int8 ``T`` of
+    ``delta_state_int8`` and the result carries ``scale_next``."""
     nk, nv, hk, hv = cfg.linear_num_key_heads, cfg.linear_num_value_heads, cfg.linear_key_head_dim, cfg.linear_value_head_dim
     kd = nk * hk
     r: dict = {"h": _norm(x, c.norm)}
@@ -820,10 +895,17 @@ def recurrent_layer_int(c: RecurrentConsts, cfg, spec: TileSpec, x: np.ndarray, 
                                            c.gate_sh_b, c.a_coef, c.dt_bias)
     s_next = np.zeros_like(s)
     y = np.zeros((nv, hv), dtype=np.int64)
+    scale_next = np.zeros((nv, 4), dtype=np.int64)
     for h in range(nv):
-        s_next[h], y[h] = delta_state_int(s[h], r["k_unit"][h], r["v"][h], r["q_unit"][h], int(r["decay"][h]),
-                                          int(r["beta"][h]))
+        if scale is None:
+            s_next[h], y[h] = delta_state_int(s[h], r["k_unit"][h], r["v"][h], r["q_unit"][h], int(r["decay"][h]),
+                                              int(r["beta"][h]))
+        else:
+            s_next[h], *scale_next[h], y[h] = delta_state_int8(s[h], r["k_unit"][h], r["v"][h], r["q_unit"][h],
+                                                               int(r["decay"][h]), int(r["beta"][h]), *map(int, scale[h]))
     r["s_next"], r["y"] = s_next, y
+    if scale is not None:
+        r["scale_next"] = scale_next
     z = r["z"].reshape(nv, hv)
     y_norm = np.zeros((nv, hv), dtype=np.int64)
     for h in range(nv):
@@ -971,6 +1053,42 @@ def emit_delta_vectors(directory: Path, rng: np.random.Generator, k: int, v: int
     write_hex(directory / "expected_s.hex", [pack(row) for row in s_new], 16 * v)
     write_hex(directory / "expected_y.hex", y, 16)
     return _params(directory, K=k, V=v, DECAY=decay, BETA=beta, YSH=ysh_for(k))
+
+
+def emit_delta8_vectors(directory: Path, rng: np.random.Generator, k: int, v: int, case: str) -> dict:
+    """Vectors for the int8 state engine.  ``case``: ``plain`` (no rescale this
+    token), ``renorm`` (the scale crosses one half, exponent kept), ``grow``
+    (rescale with room to double the resolution), ``shrink`` (the state
+    saturated last token, resolution halved)."""
+    directory.mkdir(parents=True, exist_ok=True)
+    limit = min(40, PEAK_GROW) if case == "grow" else 126        # no saturated element unless the case wants them
+    t = rng.integers(-limit, limit + 1, (k, v))
+    if case == "shrink":                                          # more than 1 / 2^SAT_SHIFT of the head saturated
+        t.ravel()[:(k * v >> SAT_SHIFT) + 2] = 127
+    kq = rng.standard_normal((2, k))
+    kq = np.rint(kq / np.linalg.norm(kq, axis=1, keepdims=True) * 127).astype(np.int64)
+    vv = rng.integers(-128, 128, v)
+    g = int(rng.integers(HALF_U, ONE_U + 1))
+    if case == "renorm":                                        # the scale lands in [0.4, 0.5): the peak keeps the exponent
+        decay = int(rng.integers(-(-(int(0.4 * (1 << UB)) << UB) // g), (HALF_U << UB) // g))
+    elif case == "grow":
+        decay = int(rng.integers(0, (HALF_U << UB) // g))
+    else:
+        decay = int(rng.integers(-(-(HALF_U << UB) // g), 1 << UB))
+    beta = int(rng.integers(0, 1 << UB))
+    e, peak, nsat = int(rng.integers(E_MIN + 1, E_MAX)), int(np.abs(t).max()), int((np.abs(t) >= 127).sum())
+    t_new, g_new, e_new, peak_new, nsat_new, y = delta_state_int8(t, kq[0], vv, kq[1], decay, beta, g, e, peak, nsat)
+    assert (g_new == ONE_U) == (case != "plain") and e_new - e == {"grow": 1, "shrink": -1}.get(case, 0), case
+    pack = lambda row: int(sum((int(x) & 0xFF) << (8 * j) for j, x in enumerate(row)))
+    write_hex(directory / "s.hex", [pack(row) for row in t], 8 * v)
+    write_hex(directory / "k.hex", kq[0], 8)
+    write_hex(directory / "q.hex", kq[1], 8)
+    write_hex(directory / "v.hex", vv, 8)
+    write_hex(directory / "expected_s.hex", [pack(row) for row in t_new], 8 * v)
+    write_hex(directory / "expected_y.hex", y, 16)
+    return _params(directory, K=k, V=v, DECAY=decay, BETA=beta, G=g, E=e & 0xFF, PEAK=peak, NSAT=nsat, EXPECTED_G=g_new,
+                   EXPECTED_E=e_new & 0xFF, EXPECTED_PEAK=peak_new, EXPECTED_NSAT=nsat_new, YSH=ysh_for(k),
+                   PEAK_GROW=PEAK_GROW, SAT_SHIFT=SAT_SHIFT)
 
 
 def emit_ffn_vectors(directory: Path, rng: np.random.Generator, n: int, lanes: int) -> dict:
