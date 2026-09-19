@@ -10,8 +10,8 @@
  "requirements": {
   "rated_tokens_per_second": 5000.0,
   "core_amps": 21.462500000000002,
-  "signal_balls": 346,
-  "signal_grounds": 87,
+  "signal_balls": 358,
+  "signal_grounds": 90,
   "core_balls": 43,
   "ground_balls": 43,
   "rail_balls": {
@@ -7749,9 +7749,9 @@
    "col": 2,
    "x": -9.200000000000001,
    "y": -9.200000000000001,
-   "kind": "rail",
-   "interface": "VDD_CORE",
-   "signal": "",
+   "kind": "signal",
+   "interface": "psram_clk",
+   "signal": "CLK7",
    "escape": null
   },
   {
@@ -7760,9 +7760,9 @@
    "col": 3,
    "x": -8.4,
    "y": -9.200000000000001,
-   "kind": "ground",
-   "interface": "GND",
-   "signal": "",
+   "kind": "signal",
+   "interface": "psram_clk",
+   "signal": "CLK8",
    "escape": null
   },
   {
@@ -7771,9 +7771,9 @@
    "col": 4,
    "x": -7.6000000000000005,
    "y": -9.200000000000001,
-   "kind": "rail",
-   "interface": "VDD_CORE",
-   "signal": "",
+   "kind": "signal",
+   "interface": "psram_clk",
+   "signal": "CLK9",
    "escape": null
   },
   {
@@ -7793,9 +7793,9 @@
    "col": 6,
    "x": -6.0,
    "y": -9.200000000000001,
-   "kind": "rail",
-   "interface": "VDD_CORE",
-   "signal": "",
+   "kind": "signal",
+   "interface": "psram_clk",
+   "signal": "CLK10",
    "escape": null
   },
   {
@@ -7804,9 +7804,9 @@
    "col": 7,
    "x": -5.2,
    "y": -9.200000000000001,
-   "kind": "ground",
-   "interface": "GND",
-   "signal": "",
+   "kind": "signal",
+   "interface": "psram_clk",
+   "signal": "CLK11",
    "escape": null
   },
   {
@@ -7815,9 +7815,9 @@
    "col": 8,
    "x": -4.4,
    "y": -9.200000000000001,
-   "kind": "rail",
-   "interface": "VDD_CORE",
-   "signal": "",
+   "kind": "signal",
+   "interface": "psram_clk",
+   "signal": "CLK12",
    "escape": null
   },
   {
@@ -7826,9 +7826,9 @@
    "col": 9,
    "x": -3.6,
    "y": -9.200000000000001,
-   "kind": "ground",
-   "interface": "GND",
-   "signal": "",
+   "kind": "signal",
+   "interface": "psram_clk",
+   "signal": "CLK13",
    "escape": null
   },
   {
@@ -7837,8 +7837,8 @@
    "col": 10,
    "x": -2.8000000000000003,
    "y": -9.200000000000001,
-   "kind": "rail",
-   "interface": "VDD_CORE",
+   "kind": "ground",
+   "interface": "GND",
    "signal": "",
    "escape": null
   },
@@ -7848,9 +7848,9 @@
    "col": 11,
    "x": -2.0,
    "y": -9.200000000000001,
-   "kind": "ground",
-   "interface": "GND",
-   "signal": "",
+   "kind": "signal",
+   "interface": "psram_clk",
+   "signal": "CLK14",
    "escape": null
   },
   {
@@ -7859,9 +7859,9 @@
    "col": 12,
    "x": -1.2000000000000002,
    "y": -9.200000000000001,
-   "kind": "rail",
-   "interface": "VDD_CORE",
-   "signal": "",
+   "kind": "signal",
+   "interface": "psram_clk",
+   "signal": "CLK15",
    "escape": null
   },
   {
@@ -8240,9 +8240,9 @@
    "col": 17,
    "x": 2.8000000000000003,
    "y": -10.0,
-   "kind": "rail",
-   "interface": "VDD_CORE",
-   "signal": "",
+   "kind": "signal",
+   "interface": "psram_clk",
+   "signal": "CLK4",
    "escape": null
   },
   {
@@ -8251,9 +8251,9 @@
    "col": 18,
    "x": 3.6,
    "y": -10.0,
-   "kind": "ground",
-   "interface": "GND",
-   "signal": "",
+   "kind": "signal",
+   "interface": "psram_clk",
+   "signal": "CLK5",
    "escape": null
   },
   {
@@ -8262,8 +8262,8 @@
    "col": 19,
    "x": 4.4,
    "y": -10.0,
-   "kind": "rail",
-   "interface": "VDD_CORE",
+   "kind": "ground",
+   "interface": "GND",
    "signal": "",
    "escape": null
   },
@@ -8273,9 +8273,9 @@
    "col": 20,
    "x": 5.2,
    "y": -10.0,
-   "kind": "ground",
-   "interface": "GND",
-   "signal": "",
+   "kind": "signal",
+   "interface": "psram_clk",
+   "signal": "CLK6",
    "escape": null
   },
   {

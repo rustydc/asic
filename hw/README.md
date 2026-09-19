@@ -392,9 +392,41 @@ single board cannot offer.
 Placeholders, beyond the usual ones: the finger and slot geometry stand
 in for a real connector drawing. The PSRAM is chosen: the AP Memory
 APS512XXN-OB9-BG, 512 Mb x16 HPI at 250 MHz in a 24-ball 6 × 8 mm BGA at
-1.0 mm pitch, twenty signals per device with the single-ended clock
-shared by four devices (`psram_clk` on the die, four balls placed with
-the small interfaces), and its controller is in `fabric/rtl/fabric_hpi.sv`.
+1.0 mm pitch, twenty signals per device including its own single-ended
+clock (`psram_clk` on the die, sixteen balls placed with the small
+interfaces, which spill into a third row), and its controller is in
+`fabric/rtl/fabric_hpi.sv`.
+
+### The PSRAM clock: one per device
+
+The first cut shared one clock among four devices. `python -m hw.si`
+settles whether that survives, with a small time-domain solver: every
+trace an LC ladder of 1 mm segments (50 Ω at 160 mm/ns), 2 ps steps, the
+driver a 0.35 ns ramp behind its drive resistance, each receiver the
+datasheet's 5 pF package input behind 1 nH of ball and half a picofarad of
+pad, judged at the die against the datasheet: a 0.6 ns edge at most
+(tKHKL at 250 MHz), −0.4 to VDD + 0.4 V absolute maximum, one clean
+crossing of the 0.4 / 1.4 V band per edge, 45 to 55 percent duty, and a
+0.4 ns skew budget of our own. `si_psram_clock.md` is the result over a
+star of four, a fly-by of four with and without an end termination, a
+star of two and a point-to-point net, at drive resistances from 12 to
+50 Ω and at two trunk lengths, 20 mm (clock balls beside the memory)
+and 55 mm (the clock balls on the south edge as placed, round the
+package).
+
+Four devices on one net is 20 pF of package input, and an edge that meets
+tKHKL into 20 pF needs a drive under 20 Ω, which then rings past the
+absolute maximum: the star of four passes at one drive value on the short
+trunk and nowhere on the trunk as placed, and the fly-by, whose loaded
+line slows to a third of its speed, passes nowhere. Two per clock passes
+in a narrow band around 33 Ω. One clock per device passes from 33 to 50 Ω
+at every length on the card, and a 50 Ω total drive (the pad driver plus
+a series resistor) gives a reflection-free 0.4 ns edge. So the die carries
+sixteen clocks, twelve more balls than the shared version, each a
+series-terminated point-to-point trace; the 28 × 28 package still has
+room. The constants are placeholders for the card's stack-up and are
+named in `si.py` so the study reruns when the fabricator's numbers
+arrive.
 
 ## Open items before schematic entry in an EDA tool
 

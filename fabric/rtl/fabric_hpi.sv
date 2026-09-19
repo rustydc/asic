@@ -219,6 +219,8 @@ module fabric_hpi_channel #(
 ) (
     input  wire         clk,
     input  wire         rst_n,
+    input  wire         phy_ready,             // the PHY's delay lines are set (the DLL is locked)
+    output wire         phy_quiet,             // the slave delay lines may take a new code (CE# high)
     output reg          clk_en,                // the device clock runs only after the power-up wait
     output reg          init_done,
     output reg          device_ok,
@@ -293,6 +295,7 @@ module fabric_hpi_channel #(
     assign xact_ready  = (state == S_IDLE) && init_done;
     assign wdata_ready = (state == S_COLLECT);
     assign rdata       = buffer[bcount];
+    assign phy_quiet   = ce_n;                 // no frame or data on the wires while CE# is high
 
     task automatic load_frame(input [7:0] cmd, input [24:0] wa, input [7:0] mr);
         begin
@@ -319,9 +322,9 @@ module fabric_hpi_channel #(
             xact_done <= 1'b0;
             if (state != S_WDATA && state != S_WEND) dm_rise <= 2'b11;
             case (state)
-                S_PU: begin                                   // power-up: clock stopped, CE# high
-                    wait_r <= wait_r + 1'b1;
-                    if (wait_r == TPU_CYCLES - 1) begin clk_en <= 1'b1; state <= S_RESET; fedge <= 0; wait_r <= 0; end
+                S_PU: begin                                   // power-up: clock stopped, CE# high; the PHY locks meanwhile
+                    if (wait_r != TPU_CYCLES - 1) wait_r <= wait_r + 1'b1;
+                    else if (phy_ready) begin clk_en <= 1'b1; state <= S_RESET; fedge <= 0; wait_r <= 0; end
                 end
                 S_RESET: begin                                // global reset: FFh, CE# low four clocks
                     if (fedge == 0) begin ce_n <= 1'b0; d_rise <= 16'h00FF; dq_oe <= 1'b1; end

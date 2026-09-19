@@ -77,14 +77,15 @@ class DeviceTest(unittest.TestCase):
 
 @unittest.skipUnless(shutil.which("iverilog") and shutil.which("vvp"), "iverilog not installed")
 class HpiRtlTest(unittest.TestCase):
-    def run_rtl(self, ndev: int, seed: int, transactions: int = 20) -> str:
+    def run_rtl(self, ndev: int, seed: int, transactions: int = 20, **extra: object) -> str:
         with tempfile.TemporaryDirectory() as directory:
             work = Path(directory)
             params = H.emit_hpi_vectors(work, np.random.default_rng(seed), ndev=ndev, device_kb=16,
                                         transactions=transactions, max_beats=300)
+            params.update(extra)
             args = [f"-Ptb_hpi.{name}={value}" for name, value in params.items()]
             subprocess.run(["iverilog", "-g2012", "-I", str(RTL), "-s", "tb_hpi", "-o", "sim.vvp", *args,
-                            str(RTL / "fabric_hpi.sv"), str(RTL / "tb_hpi.sv")],
+                            str(RTL / "fabric_phy.sv"), str(RTL / "fabric_hpi.sv"), str(RTL / "tb_hpi.sv")],
                            cwd=work, check=True, capture_output=True, text=True)
             result = subprocess.run(["vvp", "sim.vvp"], cwd=work, check=True, capture_output=True, text=True)
         return result.stdout + result.stderr
@@ -125,11 +126,42 @@ class CdcRtlTest(unittest.TestCase):
                                             transactions=16, max_beats=300)
                 args = [f"-Ptb_mem_bridge.{name}={value}" for name, value in params.items()] + [f"-Ptb_mem_bridge.CORE_NS={core_ns}"]
                 subprocess.run(["iverilog", "-g2012", "-I", str(RTL), "-s", "tb_mem_bridge", "-o", "sim.vvp", *args,
-                                str(RTL / "fabric_cdc.sv"), str(RTL / "fabric_hpi.sv"), str(RTL / "tb_mem_bridge.sv")],
+                                str(RTL / "fabric_phy.sv"), str(RTL / "fabric_cdc.sv"), str(RTL / "fabric_hpi.sv"),
+                                str(RTL / "tb_mem_bridge.sv")],
                                cwd=work, check=True, capture_output=True, text=True)
                 result = subprocess.run(["vvp", "sim.vvp"], cwd=work, check=True, capture_output=True, text=True)
             out = result.stdout + result.stderr
             self.assertIn("PASS", out, out)
+            self.assertNotIn("ERROR", out, out)
+
+
+@unittest.skipUnless(shutil.which("iverilog") and shutil.which("vvp"), "iverilog not installed")
+class PhyRtlTest(unittest.TestCase):
+    """The DLL on its own across tap lengths, then the controller through its delay lines."""
+
+    def run_dll(self, **params: object) -> str:
+        with tempfile.TemporaryDirectory() as directory:
+            args = [f"-Ptb_dll.{name}={value}" for name, value in params.items()]
+            subprocess.run(["iverilog", "-g2012", "-I", str(RTL), "-s", "tb_dll", "-o", "sim.vvp", *args,
+                            str(RTL / "fabric_phy.sv"), str(RTL / "tb_dll.sv")],
+                           cwd=directory, check=True, capture_output=True, text=True)
+            return subprocess.run(["vvp", "sim.vvp"], cwd=directory, check=True, capture_output=True, text=True).stdout
+
+    def test_dll_locks_from_25_to_90_ps_taps(self) -> None:
+        for tap_ps in (25.0, 40.0, 60.0, 90.0):
+            out = self.run_dll(TAP_PS=tap_ps)
+            self.assertIn("PASS", out, out)
+            self.assertIn(f"quarter {round(4000 / tap_ps / 4)} taps", out, out)
+
+    def test_dll_reports_a_line_too_short_for_the_period(self) -> None:
+        out = self.run_dll(TAP_PS=25.0, TAPS=128, EXPECT_RANGE_ERR=1)
+        self.assertIn("PASS", out, out)
+
+    def test_bursts_through_the_delay_lines(self) -> None:
+        for tap_ps in (25.0, 90.0):
+            out = HpiRtlTest.run_rtl(self, 4, 32, transactions=12, USE_DLL=1, TAP_PS=tap_ps)
+            self.assertIn("PASS", out, out)
+            self.assertIn(f"quarter {round(4000 / tap_ps / 4)} taps", out, out)
             self.assertNotIn("ERROR", out, out)
 
 

@@ -693,8 +693,9 @@ The PSRAM board's device is chosen: the **AP Memory APS512XXN-OB9-BG**,
 512 Mb, the Xccela DDR interface in its 16-bit HPI mode, 250 MHz, 1.62 to
 1.98 V, a 24-ball 6 × 8 mm BGA at 1.0 mm pitch, per its datasheet (rev
 1.0, November 2025). Sixteen of them give a layer die 1 GB at 16 GB/s over
-twenty signals per device (DQ0-15, DQS/DM0, DQS/DM1, CE#, CLK), the clock
-shared by four devices, on 1.8 V LVCMOS with no DRAM PHY. `hpi.py` holds
+twenty signals per device (DQ0-15, DQS/DM0, DQS/DM1, CE#, CLK), a clock
+per device (`hw/si.py`: four on one clock cannot meet the device's 0.6 ns
+edge), on 1.8 V LVCMOS with no DRAM PHY. `hpi.py` holds
 the geometry, the mode-register encodings, the command frame and the
 striping; `rtl/fabric_hpi.sv` is the controller.
 
@@ -733,8 +734,29 @@ devices; the stripe unit tracks issued chunks in a queue and drains their
 page buffers in order, and a write is done when every chunk's channel has
 finished, not when the data has left the port. The device clock is the
 controller clock delayed a quarter period and the capture strobe is DQS
-delayed the same, which are the PHY's two delay lines; in the testbench
-they are `#` delays.
+delayed the same, which are the PHY's two delay lines.
+
+The delay lines are in `rtl/fabric_phy.sv`. A tap line's delay is code
+times tap, and the tap moves with process, voltage and temperature (25 to
+90 ps is the range the design takes), so a master DLL measures the clock
+period in taps: a replica line delays the clock, the delayed clock samples
+the reference, and the search walks the code up through the high half and
+the low half of the period until the sample returns high, which is one
+period; after that it dithers one tap either side of the boundary and
+tracks. The quarter is that code over four, and the slave lines (the
+device clock and the two DQS strobes of every channel) take a new quarter
+only while every channel has CE# high, so a code step never lands in a
+frame or a burst. The line is 256 taps, so a 25 ps tap still spans the
+4 ns period; a line that cannot span it is reported on `range_err`
+rather than searched forever. The channel waits for the lock before it
+starts the device (`phy_ready`), which costs nothing since the lock
+(220 to 680 clocks) is over long before the 150 µs power-up wait.
+`fabric_delay_line` is the behavioural stand-in for the hard cell; the DLL
+and the gating are synthesizable. `tb_dll` checks the lock, the period
+within a tap and the slave delay within a tap and a half at taps of 25,
+40, 60 and 90 ps, and `tb_hpi` and `tb_mem_bridge` run the whole
+controller through the delay lines and the DLL (`USE_DLL`) instead of the
+ideal quarter-period delays.
 
 Burst efficiency at 250 MHz, three command clocks plus the minimum
 latency, two words per clock, and tCPH:
@@ -819,7 +841,8 @@ are plain adders.
 `rtl/fabric_hpi.sv` holds the device model, the channel controller and the
 stripe unit, with `tb_hpi` checking them against `fabric.hpi`;
 `rtl/fabric_cdc.sv` the asynchronous FIFO and the bridge, with
-`tb_async_fifo` and `tb_mem_bridge`.
+`tb_async_fifo` and `tb_mem_bridge`; `rtl/fabric_phy.sv` the delay line
+and the DLL, with `tb_dll`.
 
 `rtl/fabric_memory.sv` holds the memory side: the behavioural
 `fabric_mem_model` for the testbenches, `fabric_mem_arbiter`,
@@ -848,9 +871,8 @@ bit for bit, at int8 and int4 KV and with the 128-wide index and the
 5. A multi-token variant of the column datapath for chunked prefill, which
    amortizes the ROM read across a chunk of tokens from one context.
 6. Done: the vector datapath between the passes, the memory side and the
-   HPI controller for the chosen PSRAM with its clock crossing, above.
-   Open behind them: the token sequencer that runs the tiles, the units
-   and the DMAs in order, the two delay lines of the PHY, stochastic rounding for
-   the state if int8 storage has to come back, the simulator's traffic
-   terms brought in line with the map, and synthesis of the units for
-   area.
+   HPI controller for the chosen PSRAM with its clock crossing and its
+   PHY, above. Open behind them: the token sequencer that runs the tiles,
+   the units and the DMAs in order, stochastic rounding for the state if
+   int8 storage has to come back, the simulator's traffic terms brought
+   in line with the map, and synthesis of the units for area.

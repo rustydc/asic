@@ -533,11 +533,11 @@ interface_kinds:
     io_standard: 1.8 V LVCMOS series-terminated (placeholder)
     max_length_mm: 200
   psram_x16:
-    description: one HPI x16 PSRAM port (APS512XXN in x16 mode; DQ, DQS/DM per byte lane, CE#); the single-ended CLK is shared by four devices and counted under psram_clk
+    description: one HPI x16 PSRAM port (APS512XXN in x16 mode; DQ, DQS/DM per byte lane, CE#); the single-ended CLK is one per device and counted under psram_clk
     signals: {dq: 16, dqs: 2, ce: 1}
   psram_clk:
-    description: the four single-ended 250 MHz PSRAM clocks, one per group of four devices, placed with the small interfaces
-    signals: {clk: 4}
+    description: the sixteen single-ended 250 MHz PSRAM clocks, one per device because four devices on one clock cannot meet the 0.6 ns edge (hw/si.py), placed with the small interfaces
+    signals: {clk: 16}
     misc: true               # placed with the small interfaces on the die
     on_card: true            # wired to the card's devices, never over the connector
   pcie_x16_edge:

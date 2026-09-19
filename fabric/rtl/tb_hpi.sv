@@ -13,7 +13,10 @@ module tb_hpi #(
     parameter int NR        = 1,
     parameter int MR0       = 8'h18,
     parameter int MR4       = 8'h60,
-    parameter int MR8       = 8'h43
+    parameter int MR8       = 8'h43,
+    parameter int  USE_DLL  = 0,                      // the PHY's delay lines and DLL instead of ideal delays
+    parameter real TAP_PS   = 60.0,
+    parameter int  TAPS     = 256
 );
     localparam int DW = 128;
     localparam real T = 4.0;                          // 250 MHz
@@ -45,7 +48,15 @@ module tb_hpi #(
         .x_wdata_valid(x_wdata_valid), .x_wdata_ready(x_wdata_ready), .x_wdata(x_wdata), .x_rdata_valid(x_rdata_valid),
         .x_rdata_ready(x_rdata_ready), .x_rdata(x_rdata), .x_done(x_done));
 
-    wire [NDEV-1:0] clk_en, init_done, device_ok, ce_n, dq_oe, dqs_oe;
+    wire [NDEV-1:0] clk_en, init_done, device_ok, ce_n, dq_oe, dqs_oe, phy_quiet;
+    // The PHY: one master DLL on the controller clock; the slaves take its
+    // quarter code when every channel has CE# high.
+    localparam int CW = $clog2(TAPS);
+    wire          dll_locked, dll_range_err;
+    wire [CW-1:0] dll_period, quarter;
+    fabric_dll #(.TAPS(TAPS), .TAP_PS(TAP_PS)) dll (.clk(clk), .rst_n(rst_n), .update_ok(&phy_quiet), .locked(dll_locked),
+                                                    .range_err(dll_range_err), .period_code(dll_period), .quarter(quarter));
+    wire phy_ready = USE_DLL ? dll_locked : 1'b1;
     wire [NDEV*16-1:0] dq_c, dq_d;
     wire [NDEV*2-1:0]  dm_c, dqs_dev;
     wire [NDEV*2-1:0]  dqs_d;
@@ -55,13 +66,22 @@ module tb_hpi #(
         for (g = 0; g < NDEV; g = g + 1) begin : g_dev
             // The device clock: gated and a quarter period late.  DQS to the
             // controller: a quarter period late, low when the device releases it.
-            assign #(T / 4) clk_dev[g] = clk & clk_en[g];
+            // Either ideal delays or the PHY's slave delay lines on the DLL's code.
             wire [1:0] dqs_bus = dqs_oe[g] ? dqs_dev[g*2 +: 2] : 2'b00;
-            assign #(T / 4) dqs_d[g*2 +: 2] = dqs_bus;
+            wire       clk_gated = clk & clk_en[g];
+            if (USE_DLL) begin : g_phy
+                fabric_delay_line #(.TAPS(TAPS), .TAP_PS(TAP_PS)) l_clk  (.in(clk_gated), .code(quarter), .out(clk_dev[g]));
+                fabric_delay_line #(.TAPS(TAPS), .TAP_PS(TAP_PS)) l_dqs0 (.in(dqs_bus[0]), .code(quarter), .out(dqs_d[g*2]));
+                fabric_delay_line #(.TAPS(TAPS), .TAP_PS(TAP_PS)) l_dqs1 (.in(dqs_bus[1]), .code(quarter), .out(dqs_d[g*2+1]));
+            end else begin : g_ideal
+                assign #(T / 4) clk_dev[g] = clk_gated;
+                assign #(T / 4) dqs_d[g*2 +: 2] = dqs_bus;
+            end
             wire [15:0] dq_bus_c = dq_oe[g] ? dq_c[g*16 +: 16] : 16'hzzzz;   // controller drive
             wire [15:0] dq_bus_d = dqs_oe[g] ? dq_d[g*16 +: 16] : 16'hzzzz;  // device drive (DQ with DQS)
             fabric_hpi_channel #(.MR0(MR0), .MR4(MR4), .MR8(MR8), .TPU_CYCLES(60), .TRST_CYCLES(20)) ch (
-                .clk(clk), .rst_n(rst_n), .clk_en(clk_en[g]), .init_done(init_done[g]), .device_ok(device_ok[g]),
+                .clk(clk), .rst_n(rst_n), .phy_ready(phy_ready), .phy_quiet(phy_quiet[g]),
+                .clk_en(clk_en[g]), .init_done(init_done[g]), .device_ok(device_ok[g]),
                 .xact_valid(x_valid[g]), .xact_ready(x_ready[g]), .xact_write(x_write), .xact_addr(x_addr), .xact_beats(x_beats),
                 .wdata_valid(x_wdata_valid[g]), .wdata_ready(x_wdata_ready[g]), .wdata(x_wdata),
                 .rdata_valid(x_rdata_valid[g]), .rdata_ready(x_rdata_ready[g]), .rdata(x_rdata[g*DW +: DW]), .xact_done(x_done[g]),
@@ -131,7 +151,9 @@ module tb_hpi #(
         $readmemh("expected_devs.hex", edev);
         check = 1;
         #1;
-        if (errors == 0) $display("PASS: %0d requests over %0d devices", N, NDEV);
+        if (USE_DLL && !dll_locked) begin errors = errors + 1; $display("DLL not locked"); end
+        if (errors == 0 && USE_DLL) $display("PASS: %0d requests over %0d devices, DLL quarter %0d taps of %0.0f ps", N, NDEV, quarter, TAP_PS);
+        else if (errors == 0) $display("PASS: %0d requests over %0d devices", N, NDEV);
         else $display("FAIL: %0d mismatches", errors);
         $finish;
     end

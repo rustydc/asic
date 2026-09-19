@@ -109,7 +109,7 @@ class PinoutTest(unittest.TestCase):
         # 16 ports of 19 signals plus a ground each: 320 balls in the outer five rows of three edges.
         self.assertEqual(pinout.memory_balls_needed(board), 320)
         self.assertEqual(p.package.name, "FCBGA784_28x28_P0.8")
-        self.assertEqual(p.requirements.signal_balls, 24 + 304 + 14 + 4)     # the four shared PSRAM clocks
+        self.assertEqual(p.requirements.signal_balls, 24 + 304 + 14 + 16)    # a clock per PSRAM (hw/si.py)
         rows, cols = p.package.rows, p.package.cols
         link = [b for b in p.balls if b.interface in ("link_in", "link_out")]
         self.assertEqual(len(link), 24)
@@ -122,8 +122,8 @@ class PinoutTest(unittest.TestCase):
         memory = [b for b in p.balls if b.kind == "signal" and b.interface.startswith("psram_") and b.interface != "psram_clk"]
         self.assertEqual(len(memory), 304)
         clocks = [b for b in p.balls if b.interface == "psram_clk"]
-        self.assertEqual(len(clocks), 4)
-        self.assertTrue(all(b.row >= rows - 2 for b in clocks))              # with the small interfaces
+        self.assertEqual(len(clocks), 16)
+        self.assertTrue(all(b.row >= rows - 3 for b in clocks))              # with the small interfaces, spilling to a third row
         depth = [min(b.row, b.col, rows - 1 - b.row, cols - 1 - b.col) for b in memory]
         self.assertLessEqual(max(depth), 4)
         self.assertTrue(all(b.row >= rows - 2 for b in p.balls if b.interface in ("mgmt", "jtag", "refclk", "strap")))

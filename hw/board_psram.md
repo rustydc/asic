@@ -37,7 +37,7 @@ U_FPGA -> U_A0 -> U_A1 -> U_A2 -> U_A3 -> U_A4 -> U_A5 -> U_A6 -> U_A7 -> U_H0 -
 
 | Class | Signal pins |
 | --- | ---: |
-| layer_asic | 346 |
+| layer_asic | 358 |
 | head_asic | 38 |
 | psram | 19 |
 | fpga | 214 |

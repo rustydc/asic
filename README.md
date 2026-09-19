@@ -28,7 +28,8 @@ LLM inference appliance built around the Qwen3.5 dense hybrid geometry.
   reader into the attention core, with a float twin that reproduces the
   reference retrieval token by token. `fabric/hpi.py` and its RTL are the
   controller for the PSRAM board's chosen device, the AP Memory
-  APS512XXN in x16 HPI mode, with a stripe unit over sixteen of them.
+  APS512XXN in x16 HPI mode, with a stripe unit over sixteen of them, the
+  clock crossing to the core, and the PHY's delay lines with their DLL.
 * [`clash/`](clash/) contains a synthesizable four-stage ASIC-shard seed with a
   deliberately small fixed-coefficient datapath for early RTL and P&R work.
 * [`sim/`](sim/) contains the cycle-stepped 32-stage appliance simulator for
@@ -44,10 +45,11 @@ LLM inference appliance built around the Qwen3.5 dense hybrid geometry.
   the package, one head ASIC, liquid cooled), their consistency checks
   including a throughput-driven power budget, the rendered block diagrams,
   a derivation of the ASIC package and ball map from the power model and
-  the interface list, and a generator that turns either description into a
+  the interface list, a generator that turns either description into a
   KiCad 7 project with the board outline and chassis keep-outs, the ring
   placed as a regular polygon of rotated chips, stackup, all nets, and the
-  activation ring routed.
+  activation ring routed, and a time-domain signal-integrity check of the
+  PSRAM clock nets that settled on one clock per device.
 
 ## Reference geometries
 

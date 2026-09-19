@@ -8,13 +8,13 @@ Rated at 5000 tokens/s the core rail draws 21 A (3.0 pJ per MAC, 0.8 V), one bal
 
 | Need | Balls |
 | --- | ---: |
-| Signals (24 link, 304 memory, 18 management) | 346 |
-| Signal ground returns (1 per 4) | 87 |
+| Signals (24 link, 304 memory, 30 management) | 358 |
+| Signal ground returns (1 per 4) | 90 |
 | Core rail | 43 |
 | Ground for the core | 43 |
 | VDD_IO_1V8 | 24 |
 | VDD_PLL_0V9 | 2 |
-| **Total** | **545** |
+| **Total** | **560** |
 
 ## Candidates
 
@@ -35,8 +35,8 @@ FCBGA784_28x28_P0.8: 28 x 28 at 0.8 mm, 23 mm body.
 | link_out | 12 | S edge, beside it |
 | 16 memory channels | 304 | N and E and W rows, lanes with a ground after each |
 | mgmt, jtag, refclk, strap | 14 | S row |
-| VDD_CORE | 183 | interior checkerboard |
-| GND | 229 | interior checkerboard and lane returns |
+| VDD_CORE | 175 | interior checkerboard |
+| GND | 225 | interior checkerboard and lane returns |
 | VDD_IO_1V8 | 24 | interior |
 | VDD_PLL_0V9 | 2 | interior |
 

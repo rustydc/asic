@@ -365,15 +365,16 @@ def assign(board: Board, package: PackageSpec, need: Requirements) -> list[Ball]
             i, j = next(positions)
             place(i, j, "ground", "GND", "")
 
-    # Small interfaces on the south row (between the link blocks when those
-    # are on the south edge too), a ground after every four; or, when the
-    # south rows hold memory, in the west columns outside the link port.
+    # Small interfaces on the south rows (between the link blocks when those
+    # are on the south edge too), outer row first and a third row when the
+    # outer two are full, a ground after every four; or, when the south rows
+    # hold memory, in the west columns outside the link port.
     if edges.get("misc", "S") == "W":
         memory_rows = set(range(signal_rows)) | set(range(package.rows - signal_rows, package.rows))
         misc = ((i, j) for j0 in (0, 2) for i in range(package.rows) for j in (j0, j0 + 1)
                 if i not in memory_rows and i not in link_rows_taken and (i, j) not in taken)
     else:
-        misc = ((i, j) for i in (package.rows - 1, package.rows - 2) for j in range(2, package.cols - 2)
+        misc = ((i, j) for i in (package.rows - 1, package.rows - 2, package.rows - 3) for j in range(2, package.cols - 2)
                 if (i, j) not in taken)
     try:
         for n, (interface, signal) in enumerate(misc_signals(board)):
