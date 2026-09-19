@@ -1,34 +1,11 @@
 // Self-checking harness for fabric_layer_engine: runs a program written by
 // fabric.engine.EngineRun over the real units and dumps the vector buffer
 // and the memory for the Python side to compare bit for bit.  The memory
-// behind the port is a behavioural beat memory here (fabric_beat_memory);
-// the HPI bridge and its DMAs are checked by tb_mem_bridge.
+// behind the port is fabric_memory.sv's behavioural model; the HPI bridge
+// that replaces it on the die is checked by tb_mem_bridge.
 
 `timescale 1ns/1ps
 `default_nettype none
-
-module fabric_beat_memory #(
-    parameter int BEATS = 1024,
-    parameter     INIT_FILE = ""
-) (
-    input  wire         clk,
-    input  wire [31:0]  rd_addr,
-    output reg  [127:0] rd_data,
-    input  wire         wr_en,
-    input  wire [31:0]  wr_addr,
-    input  wire [127:0] wr_data
-);
-    reg [127:0] mem [0:BEATS-1];
-    integer i;
-    initial begin
-        if (INIT_FILE != "") $readmemh(INIT_FILE, mem);
-        else for (i = 0; i < BEATS; i = i + 1) mem[i] = 128'd0;
-    end
-    always @(posedge clk) begin
-        rd_data <= (rd_addr < BEATS) ? mem[rd_addr] : 128'd0;
-        if (wr_en && wr_addr < BEATS) mem[wr_addr] <= wr_data;
-    end
-endmodule
 
 module tb_layer_engine #(
     parameter int N    = 33,
@@ -40,6 +17,23 @@ module tb_layer_engine #(
     parameter int KK   = 4,
     parameter int CONV = 128,
     parameter int FFN  = 192,
+    parameter int NH   = 4,
+    parameter int NKV  = 2,
+    parameter int HD   = 24,
+    parameter int RD   = 6,
+    parameter int IDIM = 32,
+    parameter int W    = 16,
+    parameter int BS   = 4,
+    parameter int TOP  = 2,
+    parameter int KV_BITS = 4,
+    parameter int REC_BYTES = 32,
+    parameter int RPB  = 64,
+    parameter int MAXR = 64,
+    parameter int WINDOW_OFF = 0,
+    parameter int BLOCK_OFF  = 2048,
+    parameter int INDEX_OFF  = 6144,
+    parameter int SUMS_OFF   = 8192,
+    parameter int ATT_L = 8,
     parameter int ROWS = 96,
     parameter int COLS = 16,
     parameter int P    = 2,
@@ -61,15 +55,20 @@ module tb_layer_engine #(
 
     reg          start = 0;
     wire         running, done;
-    wire [31:0]  mem_rd_addr, mem_wr_addr;
-    wire [127:0] mem_rd_data, mem_wr_data;
-    wire         mem_wr_en;
-    fabric_layer_engine #(.D(D), .NK(NK), .NV(NV), .HK(HK), .HV(HV), .KK(KK), .CONV(CONV), .ROWS(ROWS), .COLS(COLS), .P(P), .NT(NT),
-                          .WB(WB), .ACC(ACC), .SB(SB), .SHB(SHB), .SW(SW), .YSH(YSH), .VB_BYTES(VB_BYTES)) dut (
+    wire         req_valid, req_ready, req_write, wdata_valid, wdata_ready, rdata_valid;
+    wire [31:0]  req_addr;
+    wire [11:0]  req_beats;
+    wire [127:0] wdata, rdata;
+    fabric_layer_engine #(.D(D), .NK(NK), .NV(NV), .HK(HK), .HV(HV), .KK(KK), .CONV(CONV), .NH(NH), .NKV(NKV), .HD(HD), .RD(RD), .IDIM(IDIM),
+                          .W(W), .BS(BS), .TOP(TOP), .KV_BITS(KV_BITS), .REC_BYTES(REC_BYTES), .RPB(RPB), .MAXR(MAXR),
+                          .WINDOW_OFF(WINDOW_OFF), .BLOCK_OFF(BLOCK_OFF), .INDEX_OFF(INDEX_OFF), .SUMS_OFF(SUMS_OFF), .ATT_L(ATT_L),
+                          .ROWS(ROWS), .COLS(COLS), .P(P), .NT(NT), .WB(WB), .ACC(ACC), .SB(SB), .SHB(SHB), .SW(SW), .YSH(YSH), .VB_BYTES(VB_BYTES)) dut (
         .clk(clk), .rst_n(rst_n), .start(start), .n_steps(N[15:0]), .running(running), .done(done),
-        .mem_rd_addr(mem_rd_addr), .mem_rd_data(mem_rd_data), .mem_wr_en(mem_wr_en), .mem_wr_addr(mem_wr_addr), .mem_wr_data(mem_wr_data));
-    fabric_beat_memory #(.BEATS(MEM_BEATS), .INIT_FILE("mem_init.hex")) u_mem (
-        .clk(clk), .rd_addr(mem_rd_addr), .rd_data(mem_rd_data), .wr_en(mem_wr_en), .wr_addr(mem_wr_addr), .wr_data(mem_wr_data));
+        .m_req_valid(req_valid), .m_req_ready(req_ready), .m_req_write(req_write), .m_req_addr(req_addr), .m_req_beats(req_beats),
+        .m_wdata_valid(wdata_valid), .m_wdata_ready(wdata_ready), .m_wdata(wdata), .m_rdata_valid(rdata_valid), .m_rdata(rdata));
+    fabric_mem_model #(.DW(128), .WORDS(MEM_BEATS), .LAT(2), .FILE("mem_init.hex")) u_mem (
+        .clk(clk), .rst_n(rst_n), .req_valid(req_valid), .req_ready(req_ready), .req_write(req_write), .req_addr(req_addr),
+        .req_beats(req_beats), .wdata_valid(wdata_valid), .wdata_ready(wdata_ready), .wdata(wdata), .rdata_valid(rdata_valid), .rdata(rdata));
 
     // The issue trace, for the Python side's dependency check.
     integer trace, issues = 0, t0 = 0, guard;

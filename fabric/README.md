@@ -677,6 +677,7 @@ per context                              per token, global layer
   window      512 x 4 heads x [K|V]                 and its index record (4-bit codes + scale)
   blocks      8192 x 4 heads x [K|V]       scan     index records 0..n-1, score, top-32
   index       8192 x (64 B codes, scale)   read     512 window + 32 block records -> attention core
+  sums        2 x 4 x 256 + 128 int16      (the running sums of the block being filled)
 ```
 
 | Record | Layout | Bytes (9B, int8 KV) |
@@ -695,7 +696,9 @@ transaction at a time. The units:
   head's rows on the write side; the test runs a 128 x 128 head through
   the DMA, the engine and the arbiter and checks the memory image after.
 * `fabric_kv_append` writes the token's KV records into the window slot,
-  keeps the block sums on chip, and at a block's end writes the block
+  adds the token to the context's block sums (which come and go through
+  its ports: the layer engine keeps them in the context's `sums` record,
+  so contexts may interleave), and at a block's end writes the block
   records and its index record: the block mean, L2-normalised by the norm
   unit, its absolute maximum as the scale, and
   `code = round((u / scale + 1) * 15 / 2)` by the reciprocal unit.
@@ -964,15 +967,17 @@ one token through one layer:
 | --- | ---: | ---: | ---: | ---: |
 | recurrent, int16 state (first build) | 173 | 140,073 cycles, 175 µs | | 111,546 |
 | recurrent, int8 state with a scale | 173 | 84,764 cycles, 106 µs | 58,143 cycles, 73 µs | 57,146 |
-| global, position 4095 | 41 | 53,606 cycles, 67 µs | 30,406 cycles, 38 µs | 30,396 |
-| global, position 131071 | 41 | 86,620 cycles, 108 µs | 63,420 cycles, 79 µs | 63,410 |
+| global, position 4095 | 41 | 54,177 cycles, 68 µs | 30,977 cycles, 39 µs | 30,967 |
+| global, position 131071 | 41 | 87,191 cycles, 109 µs | 63,991 cycles, 80 µs | 63,981 |
 
 Streamed, each layer sits within two percent of its memory port: the
 tiles' four passes (12,352 cycles) and every unit hide under the other
 token's traffic. The int8 state took the recurrent layer from 175 to
 106 µs, the head-major window, the page bursts, int4 keys and values and
-the corrected block rows took the global layer from 270 to 108 µs at the
-end of the context, and the stream takes both to the port's own time.
+the corrected block rows took the global layer from 270 to 109 µs at the
+end of the context (the last microsecond is the per-context block sums
+the append reads and writes back, so contexts may interleave), and the
+stream takes both to the port's own time.
 The program carries the per-context addressing in its operand fields and
 the command bus into the real units is the layer engine below.
 
@@ -981,17 +986,17 @@ the command bus into the real units is the layer engine below.
 A die runs its three recurrent layers and its global layer for every
 token and the eight dies work on different contexts' tokens at once, so
 the appliance's throughput is one die's. With the port the only thing
-binding, at the end of a 128K context a die spends 3 × 73 + 79 = 297 µs
-per token streamed, 426 one token at a time:
+binding, at the end of a 128K context a die spends 3 × 73 + 80 = 298 µs
+per token streamed, 427 one token at a time:
 
 | Position | One token at a time | Streamed | Memory port bound |
 | --- | ---: | ---: | ---: |
-| 4,095 | 2,600 tokens/s | 3,900 | 3,960 |
-| 131,071 | 2,350 tokens/s | 3,360 | 3,410 |
+| 4,095 | 2,590 tokens/s | 3,890 | 3,950 |
+| 131,071 | 2,340 tokens/s | 3,360 | 3,400 |
 
 The simulator's own figure for this board is 2,506 tokens/s at 10.3 ms;
 it agrees with the unstreamed number and does not know about the stream.
-A single conversation sees the ring's latency, eight dies of 297 µs, about
+A single conversation sees the ring's latency, eight dies of 298 µs, about
 2.4 ms per token or 400 tokens/s, before the head dies and the link. With
 the same schedule the first build's formats (int16 state, int8 keys and
 values in record bursts) gave 1,500 tokens/s one token at a time and
@@ -1040,24 +1045,52 @@ chains the next row block through the accumulators, and after the last
 requantizer walk writes each tile's bytes (or, for the gate heads' one-
 column matrices, the raw accumulators as words) to their offsets.
 
+The global layer's units sit behind three more adapters. The rotary
+unit's table command writes the sines and cosines of the position's
+rotary frequencies to a buffer; its head command runs a head's int8
+vector through the head norm (a second norm instance with 16-bit output
+and the norm weight as a gain table), rotates it by the table and
+requantizes it to int8. The attention adapter feeds one core the group's
+queries, its gates from the pass output, then each record's key and value
+beats from the head's rows buffer, reading a beat and presenting it until
+the core takes it, so the core's exponential stalls are honoured by the
+handshake. The memory unit grew from a beat mover into the die's memory
+port proper: the mover (the recurrent DMAs), the append, the index scan
+with its top-K and the record reader are four requesters behind
+`fabric_mem_arbiter`, and the port speaks the request protocol of
+`fabric_memory.sv` (the same the HPI bridge presents). The append command
+loads the token's keys, values and index projection from the buffer and
+the context's running block sums from memory, runs `fabric_kv_append`
+and writes the sums back; the scan command codes the unit index query
+exactly as the append codes its keys, scores the eligible index records
+and writes the top-K ids; the rows command turns the selection into
+requests, the window in page runs then one record per chosen block, and
+lays the reader's int8 rows into the head's buffer. The block sums moved
+into the memory map for this (`sums0`, one record per context): the
+append unit had kept them in registers, which no interleaving of
+contexts could share.
+
 `tb_layer_engine` loads the images `engine.EngineRun` writes (the program,
 the tiles, the constant tables, the vector buffer with the token's
-residual, a behavioural beat memory with the context's history and
-state), runs the program and dumps the buffer and the memory; the Python
-side compares the residual out, every head's state rows and scale beat
-and the conv history with `run_program` on the same steps, and they are
-equal bit for bit: one token from a running context of the tiny
-recurrent layer (33 steps, 1,288 cycles) and a stream of two contexts'
-tokens (66 steps) in `test_engine.py`. The engine's cycle count is not
-the timing model's (the model said 804): the adapters move one beat per
-cycle at 8 lanes, the tile pass here is 48 cycles per row block plus the
-walk, and the memory model returns a beat per cycle; the timing model's
-lanes and the port's bandwidth are the full-size design's, so the
-schedule numbers above stand and the engine is the correctness proof.
-Left for the global layer: the rotary and attention adapters and the
-index scan, record reader and append behind the memory unit (their
-units are checked on their own above); the engine reports those units as
-never ready.
+residual, the memory model with the context's history and state, or its
+window, block store, index and sums), runs the program and dumps the
+buffer and the memory; the Python side compares the residual out and the
+memory with `run_program` on the same steps and with the memory model,
+and they are equal bit for bit (`test_engine.py`): the recurrent layer
+for one token from a running context (33 steps, 1,288 cycles) and a
+stream of two contexts' tokens (66 steps); the global layer for a token
+at position 31 of a filled context, where four blocks are eligible, two
+are chosen and the token closes a block (23 steps, 1,696 cycles: the
+window record, the block record, the index record and the sums all
+land), and a stream of two contexts at positions 31 and 20. The engine's
+cycle counts are not the timing model's (it said 804 and 762): the
+adapters move one beat per cycle at 8 lanes, the tile pass here is 48
+cycles per row block plus the walk, the attention core takes a beat
+every other cycle, and the memory model returns a beat per cycle; the
+timing model's lanes and the port's bandwidth are the full-size design's,
+so the schedule numbers above stand and the engine is the correctness
+proof. What the engine still lacks is the HPI bridge on its memory port
+in place of the model, and the multi-token prefill the tiles do not do.
 
 ## RTL
 
@@ -1101,9 +1134,9 @@ stripe unit, with `tb_hpi` checking them against `fabric.hpi`;
 and the DLL, with `tb_dll`; `rtl/fabric_sequencer.sv` the token sequencer,
 with `tb_sequencer` running the programs of `fabric.sequencer` over stub
 units; `rtl/fabric_engine.sv` the layer engine (the vector buffer, an
-adapter per unit and the top), with `tb_layer_engine` running the
-recurrent program of `fabric.engine` over the real units against the
-integer model.
+adapter per unit, the memory unit with its arbiter and the top), with
+`tb_layer_engine` running both layers' programs of `fabric.engine` over
+the real units against the integer model and the memory model.
 
 `rtl/fabric_memory.sv` holds the memory side: the behavioural
 `fabric_mem_model` for the testbenches, `fabric_mem_arbiter`,
@@ -1134,12 +1167,10 @@ bit for bit, at int8 and int4 KV and with the 128-wide index and the
 6. Done: the vector datapath between the passes, the memory side, the
    HPI controller for the chosen PSRAM with its clock crossing and its
    PHY, the token sequencer with its layer programs and the layer engine
-   that runs the recurrent program over the real units, above. Open
-   behind them: the global layer on the engine (rotary and attention
-   adapters, the scan, reader and append behind the memory unit), the
-   engine's memory port onto the HPI bridge in place of the behavioural
-   memory, the simulator's traffic terms brought in line with the map,
-   and synthesis of the units for area. The state traffic, the global
+   that runs both layers' programs over the real units, above. Open
+   behind them: the engine's memory port onto the HPI bridge in place of
+   the behavioural memory, the simulator's traffic terms brought in line
+   with the map, and synthesis of the units for area. The state traffic, the global
    layer's traffic and the stream of tokens are done, above; the next
    memory lever is the index scan's record size, which is the model's,
    and after that the device count.

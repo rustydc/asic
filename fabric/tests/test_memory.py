@@ -209,7 +209,7 @@ class MemoryRtlTest(unittest.TestCase):
 
     def test_kv_append(self) -> None:
         rng = np.random.default_rng(22)
-        self.check("tb_kv_append", lambda d: M.emit_kv_append_vectors(d, rng, M.MemoryMap(**SMALL), 20, 2))
+        self.check("tb_kv_append", lambda d: M.emit_kv_append_vectors(d, rng, M.MemoryMap(**SMALL), 22, 2))     # two tokens into a block: the sums are live
         self.check("tb_kv_append", lambda d: M.emit_kv_append_vectors(d, rng, M.MemoryMap(**SMALL, kv_bits=4), 20, 2))
 
     def test_record_reader_into_attention(self) -> None:

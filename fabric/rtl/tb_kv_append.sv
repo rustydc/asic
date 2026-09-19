@@ -15,8 +15,11 @@ module tb_kv_append #(
     parameter int WINDOW_BASE = 0,
     parameter int BLOCK_BASE  = 0,
     parameter int INDEX_BASE  = 0,
+    parameter int SUMS_BASE   = 0,
     parameter int WORDS       = 1024
 );
+    localparam int SUMS_BITS  = (2 * NKV * HD + IDIM) * 16;
+    localparam int SUMS_BEATS = (SUMS_BITS + 127) / 128;
     localparam int DW = 128;
     reg clk = 0, rst_n = 0;
     always #5 clk = ~clk;
@@ -36,14 +39,20 @@ module tb_kv_append #(
     reg [31:0]         pos = 0;
     reg [NKV*HD*8-1:0] k_rows = 0, v_rows = 0;
     reg [IDIM*8-1:0]   idx_k = 0;
+    reg [NKV*HD*16-1:0] sk_in = 0, sv_in = 0;               // the running sums, handed back token to token
+    reg [IDIM*16-1:0]   si_in = 0;
+    wire [NKV*HD*16-1:0] sk_out, sv_out;
+    wire [IDIM*16-1:0]   si_out;
     wire               done;
     fabric_kv_append #(.DW(DW), .HD(HD), .NKV(NKV), .IDIM(IDIM), .BS(BS), .KV_BITS(KV_BITS), .W(W)) dut (
         .clk(clk), .rst_n(rst_n), .start(start), .pos(pos), .window_base(WINDOW_BASE[31:0]), .block_base(BLOCK_BASE[31:0]),
-        .index_base(INDEX_BASE[31:0]), .k_rows(k_rows), .v_rows(v_rows), .idx_k(idx_k), .done(done),
+        .index_base(INDEX_BASE[31:0]), .k_rows(k_rows), .v_rows(v_rows), .idx_k(idx_k),
+        .sum_k_in(sk_in), .sum_v_in(sv_in), .sum_i_in(si_in), .sum_k_out(sk_out), .sum_v_out(sv_out), .sum_i_out(si_out), .done(done),
         .req_valid(req_valid), .req_ready(req_ready), .req_addr(req_addr), .req_beats(req_beats),
         .wdata_valid(wdata_valid), .wdata_ready(wdata_ready), .wdata(wdata));
 
     integer t, i, errors, guard;
+    reg [SUMS_BEATS*128-1:0] sums_rec;
     reg seen_done = 0;
     always @(posedge clk) if (done) seen_done <= 1;
 
@@ -58,6 +67,7 @@ module tb_kv_append #(
         rst_n = 1;
         for (t = 0; t < TOKENS; t = t + 1) begin
             @(negedge clk);
+            sk_in = sk_out; sv_in = sv_out; si_in = si_out;
             start = 1; pos = t; k_rows = km[t]; v_rows = vm[t]; idx_k = im[t];
             seen_done = 0;
             @(negedge clk);
@@ -67,6 +77,9 @@ module tb_kv_append #(
             if (!seen_done) begin $display("FAIL: token %0d never done", t); $finish; end
         end
         repeat (4) @(posedge clk);
+        // The running sums go back to the context's record, as the engine's memory unit does.
+        sums_rec = {si_out, sv_out, sk_out};
+        for (i = 0; i < SUMS_BEATS; i = i + 1) mem.mem[SUMS_BASE / 16 + i] = sums_rec[i*128 +: 128];
         for (i = 0; i < WORDS; i = i + 1)
             if (mem.mem[i] !== expected[i]) begin
                 errors = errors + 1;

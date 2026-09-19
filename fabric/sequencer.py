@@ -76,7 +76,10 @@ NL = 8                       # lanes of the norm, swiglu and residual adapters
 CL = 4                       # channels per beat of the conv adapter
 HIST_REC = 4                 # bytes per channel of the conv history in the vector buffer (kernel - 1 used)
 SLOT_HEADER = BEAT           # the state slot: one beat of scale, exponent, peak, saturated count, then the rows
-MEM_RD, MEM_WR = 0, 1        # the memory unit's operations: memory to vector buffer, vector buffer to memory
+MEM_RD, MEM_WR = 0, 1        # the memory unit's operations (arg2[3:0]): memory to vector buffer, vector buffer to memory
+MEM_APPEND, MEM_SCAN, MEM_ROWS = 2, 3, 4   # the global layer's: append the token, scan the index, stream a head's rows
+MEM_PAGE_SHIFT = 7           # a memory page (the map's alignment) in beats: the context base travels as a page number
+ROT_TABLE, ROT_HEAD = 0, 1   # the rotary unit's operations (arg[3:0]); arg[7:4] the head kind, 0 q and 1 k
 NORM_INT16 = 1 << 8          # the norm's input elements are int16 (else int8)
 NORM_GATED = 1 << 9          # the norm's gain is silu of the requantized int8 vector at arg[31:16]
 NORM_RESIDUAL, NORM_UNIT, NORM_GATE, NORM_FFN = 0, 1, 2, 3    # the norm's constant sets
@@ -145,15 +148,16 @@ def _plain(name: str) -> str:
 def operands(**fields) -> dict:
     """The command fields of a step for the layer engine: ``src``, ``dst``,
     ``arg``, ``arg2`` and ``len``, each an int, a reference ``(buffer,
-    byte_offset)`` resolved against the engine's layout, or a list of
-    ``(shift, value)`` parts OR-ed together.  Vector-buffer references are
-    byte addresses, memory references (``m_...``) beat addresses."""
+    byte_offset)`` resolved against the engine's layout (a third element
+    shifts the address right, for a page number), or a list of ``(shift,
+    value)`` parts OR-ed together.  Vector-buffer references are byte
+    addresses, memory references (``m_...``) beat addresses."""
     return {k: v for k, v in fields.items() if v is not None}
 
 
 def _rename_value(value, token: int):
     if isinstance(value, tuple):
-        return (_renamed(value[0], token), value[1])
+        return (_renamed(value[0], token),) + value[1:]
     if isinstance(value, list):
         return [(sh, _rename_value(v, token)) for sh, v in value]
     return value
@@ -164,7 +168,7 @@ def resolve_value(value, layout) -> int:
     if value is None:
         return 0
     if isinstance(value, tuple):
-        return layout.address(value[0]) + value[1]
+        return (layout.address(value[0]) + value[1]) >> (value[2] if len(value) > 2 else 0)
     if isinstance(value, list):
         return sum(resolve_value(v, layout) << sh for sh, v in value)
     return int(value)
@@ -241,7 +245,7 @@ def recurrent_program(cfg, c: L.RecurrentConsts | None, spec: TileSpec, mm: Memo
     hist_bytes = _beats(conv_dim * (cfg.linear_conv_kernel - 1)) * BEAT
     hist_beats = lay["sizes"]["hist"] // BEAT
     add("dma.hist_rd", "mem", (), ("hist",), t.memory(hist_bytes, 2048), lambda e: e.__setitem__("hist", e["hist_mem"]), nbytes=hist_bytes,
-        ops=operands(src=("m_hist", 0), dst=("hist", 0), arg=MEM_RD, len=hist_beats))
+        ops=operands(src=("m_hist", 0), dst=("hist", 0), arg2=MEM_RD, len=hist_beats))
     add("norm.h", "norm", ("x",), ("A",), t.norm(d), lambda e: e.__setitem__("A", L._norm(e["x"], c.norm)),
         ops=operands(src=("x", 0), dst=("A", 0), arg=NORM_RESIDUAL | NORM_INT16, len=d // NL))
 
@@ -259,7 +263,7 @@ def recurrent_program(cfg, c: L.RecurrentConsts | None, spec: TileSpec, mm: Memo
     add("conv", "conv", ("P1", "hist"), ("conv", "hist_next"), -(-conv_dim // t.l_conv) + t.conv_latency, conv,
         ops=operands(src=("P1", 0), dst=("conv", 0), arg=("hist", 0), arg2=("hist_next", 0), len=conv_dim // CL))
     add("dma.hist_wr", "mem", ("hist_next",), (), t.memory(hist_bytes, 2048), lambda e: e.__setitem__("hist_mem", e["hist_next"]), nbytes=hist_bytes,
-        ops=operands(src=("hist_next", 0), dst=("m_hist", 0), arg=MEM_WR, len=hist_beats))
+        ops=operands(src=("hist_next", 0), dst=("m_hist", 0), arg2=MEM_WR, len=hist_beats))
     add("gates", "gates", ("P1",), ("gates",), nv + t.gates_latency,
         lambda e: e.update(zip(("decay", "beta"), L.head_gates_int(e["a_acc"][:nv], e["b_acc"][:nv], c.gate_mult_a, c.gate_sh_a,
                                                                     c.gate_mult_b, c.gate_sh_b, c.a_coef, c.dt_bias))),
@@ -278,7 +282,7 @@ def recurrent_program(cfg, c: L.RecurrentConsts | None, spec: TileSpec, mm: Memo
         def s_rd(e, h=h, slot=slot):                       # the slot holds the rows and, for int8, the scale beat
             e[slot] = (e["s_mem"][h], tuple(int(x) for x in e["scale_mem"][h])) if int8_state else e["s_mem"][h]
         add(f"dma.s_rd[{h}]", "mem", (), (slot,), t.memory(head_bytes, 2048), s_rd, nbytes=head_bytes,
-            ops=operands(src=(f"m_s[{h}]", 0), dst=(slot, 0), arg=MEM_RD, len=slot_beats))
+            ops=operands(src=(f"m_s[{h}]", 0), dst=(slot, 0), arg2=MEM_RD, len=slot_beats))
 
         def delta(e, h=h, slot=slot):
             v = e["conv"][2 * kd + h * hv:2 * kd + (h + 1) * hv]
@@ -301,7 +305,7 @@ def recurrent_program(cfg, c: L.RecurrentConsts | None, spec: TileSpec, mm: Memo
             else:
                 e["s_mem"][h] = e[slot]
         add(f"dma.s_wr[{h}]", "mem", (slot,), (), t.memory(head_bytes, 2048), s_wr, nbytes=head_bytes,
-            ops=operands(src=(slot, 0), dst=(f"m_s[{h}]", 0), arg=MEM_WR, len=slot_beats))
+            ops=operands(src=(slot, 0), dst=(f"m_s[{h}]", 0), arg2=MEM_WR, len=slot_beats))
 
         def gnorm(e, h=h):
             gate = L.silu_fixed(L.requant(e["z"][h * hv:(h + 1) * hv], c.z_mult, c.z_shift, 16))
@@ -376,15 +380,21 @@ def global_program(cfg, c: L.GlobalConsts | None, spec: TileSpec, mm: MemoryMap,
     """One token through a global layer at position ``pos``.  Inputs in the
     environment: ``x``, and the memory side as ``k_rows``/``v_rows``
     ``[kv_heads, N, hd]`` (the window then the retrieved blocks, as the
-    record reader would stream them)."""
+    record reader would stream them).  Every step carries its operands for
+    the layer engine (``global_layout``); the memory steps name the
+    context's memory image ``m_ctx`` by page and the position."""
     nh, nkv, hd, rd = cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim, cfg.rotary_dim
     d, ffn, group = cfg.hidden_size, cfg.layer_intermediate_size(cfg.global_layer_offset), nh // nkv
+    lay = global_layout(cfg, spec, mm)
+    off_k, off_v, off_iq, off_ik = lay["off_k"], lay["off_v"], lay["off_iq"], lay["off_ik"]
+    ctx = [(16, ("m_ctx", 0, MEM_PAGE_SHIFT))]
     steps: list[Step] = []
 
     def add(name, unit, src, dst, cycles, func=None, engine=0, nbytes=0, ops=None):
         steps.append(Step(name, unit, engine, tuple(src), tuple(dst), int(cycles), func, nbytes, ops=ops))
 
-    add("norm.h", "norm", ("x",), ("A",), t.norm(d), lambda e: e.__setitem__("A", L._norm(e["x"], c.norm)))
+    add("norm.h", "norm", ("x",), ("A",), t.norm(d), lambda e: e.__setitem__("A", L._norm(e["x"], c.norm)),
+        ops=operands(src=("x", 0), dst=("A", 0), arg=NORM_RESIDUAL | NORM_INT16, len=d // NL))
 
     def qkv(e):                                         # one buffer P1: q, gate | k | v | index_q | index_k
         _, qg = L._fabric(c.q_proj, e["A"], spec)
@@ -394,29 +404,36 @@ def global_program(cfg, c: L.GlobalConsts | None, spec: TileSpec, mm: MemoryMap,
         e["v"] = L._fabric(c.v_proj, e["A"], spec)[1].reshape(nkv, hd)
         _, e["index_q"] = L._fabric(c.index_q, e["A"], spec)
         _, e["index_k"] = L._fabric(c.index_k, e["A"], spec)
-    add("pass.qkv", "tiles", ("A",), ("P1",), t.tile_pass(d), qkv)
+    add("pass.qkv", "tiles", ("A",), ("P1",), t.tile_pass(d), qkv,
+        ops=operands(src=("A", 0), dst=("P1", 0), arg=[(0, 0), (8, -(-d // spec.rows))]))
     add("rotary.table", "rotary", (), ("rot",), rd // 2 + t.rotary_latency,
-        lambda e: e.__setitem__("rot", L.rotary_table_int(pos, c.inv_freq)))
+        lambda e: e.__setitem__("rot", L.rotary_table_int(pos, c.inv_freq)),
+        ops=operands(dst=("rot", 0), arg=ROT_TABLE, arg2=pos, len=rd // 2))
     add("norm.index_q", "norm", ("P1",), ("iq",), t.norm(cfg.index_dim),
-        lambda e: e.__setitem__("index_q_unit", L._norm(e["index_q"], c.unit_norm)))
+        lambda e: e.__setitem__("index_q_unit", L._norm(e["index_q"], c.unit_norm)),
+        ops=operands(src=("P1", off_iq), dst=("iq", 0), arg=NORM_UNIT, len=cfg.index_dim // NL))
     rot_cycles = t.norm(hd) + -(-hd // t.l_vec) + t.rotary_latency
     for n in range(nkv):
         def krot(e, n=n):
             e[f"k[{n}]"] = L.rotary_int(L._norm(e["k_raw"][n], c.k_norm), *e["rot"], rd, c.rot_mult_k, c.rot_sh_k)
-        add(f"rotary.k[{n}]", "rotary", ("P1", "rot"), ("+k",), rot_cycles, krot, engine=n % UNITS["rotary"][1])
+        add(f"rotary.k[{n}]", "rotary", ("P1", "rot"), ("+k",), rot_cycles, krot, engine=n % UNITS["rotary"][1],
+            ops=operands(src=("P1", off_k + n * hd), dst=("k", n * hd), arg=ROT_HEAD | (1 << 4), arg2=("rot", 0), len=hd // NL))
     for h in range(nh):
         def qrot(e, h=h):
             e[f"q[{h}]"] = L.rotary_int(L._norm(e["q_raw"][h], c.q_norm), *e["rot"], rd, c.rot_mult_q, c.rot_sh_q)
-        add(f"rotary.q[{h}]", "rotary", ("P1", "rot"), (f"+qg[{h // group}]",), rot_cycles, qrot, engine=h % UNITS["rotary"][1])
+        add(f"rotary.q[{h}]", "rotary", ("P1", "rot"), (f"+qg[{h // group}]",), rot_cycles, qrot, engine=h % UNITS["rotary"][1],
+            ops=operands(src=("P1", h * 2 * hd), dst=(f"qg[{h // group}]", (h % group) * hd), arg=ROT_HEAD, arg2=("rot", 0), len=hd // NL))
     # The memory side: append this token's records, scan the index, then stream rows to the cores.
-    append_bytes = nkv * mm.kv_record_bytes + (nkv * mm.kv_record_bytes + mm.index_record_bytes) // mm.block
-    add("mem.append", "mem", ("k", "P1"), (), t.memory(append_bytes, mm.kv_record_bytes), nbytes=append_bytes)
+    append_bytes = nkv * mm.kv_record_bytes + (nkv * mm.kv_record_bytes + mm.index_record_bytes) // mm.block + 2 * mm.sums_bytes
+    add("mem.append", "mem", ("k", "P1"), (), t.memory(append_bytes, mm.kv_record_bytes), nbytes=append_bytes,
+        ops=operands(src=("k", 0), dst=("P1", off_ik), arg=[(0, ("P1", off_v))] + ctx, arg2=[(0, MEM_APPEND), (4, pos)]))
     # The scan reads the index a page of records per request; the rows are the
     # window (head-major, page bursts) and one mean record per selected block.
     eligible = eligible_blocks(pos, mm.local_window, mm.block)
     scan_bytes = eligible * mm.index_record_bytes
     add("mem.scan", "mem", ("iq",), ("sel",), t.memory(scan_bytes, mm.index_burst_records * mm.index_record_bytes),
-        lambda e: e.__setitem__("selected", None), nbytes=scan_bytes)
+        lambda e: e.__setitem__("selected", None), nbytes=scan_bytes,
+        ops=operands(src=("iq", 0), dst=("sel", 0), arg=ctx, arg2=[(0, MEM_SCAN), (4, pos)]))
     n_window, n_blocks = min(pos + 1, mm.local_window), min(cfg.top_blocks, eligible)
     rows = n_window + n_blocks
     row_cycles = 2 * -(-hd // t.l_attn) + t.attn_exp_stall
@@ -425,7 +442,8 @@ def global_program(cfg, c: L.GlobalConsts | None, spec: TileSpec, mm: MemoryMap,
         window_bytes, block_bytes = n_window * mm.kv_record_bytes, n_blocks * mm.kv_record_bytes
         add(f"mem.rows[{n}]", "mem", ("sel",), (f"rows[{n}]",),
             t.memory(window_bytes, mm.window_burst_records * mm.kv_record_bytes) + t.memory(block_bytes, mm.kv_record_bytes),
-            lambda e, n=n: e.__setitem__(f"rows[{n}]", (e["k_rows"][n], e["v_rows"][n])), nbytes=window_bytes + block_bytes)
+            lambda e, n=n: e.__setitem__(f"rows[{n}]", (e["k_rows"][n], e["v_rows"][n])), nbytes=window_bytes + block_bytes,
+            ops=operands(src=("sel", 0), dst=(f"rows[{n}]", 0), arg=[(0, n)] + ctx, arg2=[(0, MEM_ROWS), (4, pos)], len=rows))
 
         def attn(e, n=n, heads=heads):
             q = np.stack([e[f"q[{h}]"] for h in heads])
@@ -433,17 +451,46 @@ def global_program(cfg, c: L.GlobalConsts | None, spec: TileSpec, mm: MemoryMap,
             e[f"att[{n}]"] = L.attention_int(q, e["gate"][heads], k_rows, v_rows, mult_s=c.mult_s, sh_s=c.sh_s,
                                              mult_gate=c.mult_gate, sh_gate=c.sh_gate, mult_o=c.mult_o, sh_o=c.sh_o)
         add(f"attn[{n}]", "attn", (f"qg[{n}]", "P1", f"rows[{n}]"), ("+att",),
-            rows * row_cycles + group * (hd // t.l_attn) + t.attn_out_latency, attn, engine=n % UNITS["attn"][1])
+            rows * row_cycles + group * (hd // t.l_attn) + t.attn_out_latency, attn, engine=n % UNITS["attn"][1],
+            ops=operands(src=(f"qg[{n}]", 0), dst=("att", n * group * hd), arg=[(0, ("P1", n * group * 2 * hd + hd)), (16, (f"rows[{n}]", 0))],
+                         len=rows))
 
     def o_proj(e):
         att = np.concatenate([e[f"att[{n}]"] for n in range(nkv)]).reshape(nh * hd)
         _, e["mixer"] = L._fabric(c.o_proj, att, spec)
-    add("pass.o_proj", "tiles", ("att",), ("mixer",), t.tile_pass(nh * hd), o_proj)
+    add("pass.o_proj", "tiles", ("att",), ("mixer",), t.tile_pass(nh * hd), o_proj,
+        ops=operands(src=("att", 0), dst=("mixer", 0), arg=[(0, 1), (8, -(-(nh * hd) // spec.rows))]))
     add("residual.1", "residual", ("x", "mixer"), ("x1",), -(-d // t.l_vec) + t.residual_latency,
-        lambda e: e.__setitem__("x1", L.residual_int(e["x"], e["mixer"], c.res_mult, c.res_shift)))
+        lambda e: e.__setitem__("x1", L.residual_int(e["x"], e["mixer"], c.res_mult, c.res_shift)),
+        ops=operands(src=("x", 0), arg=[(0, ("mixer", 0)), (16, 0)], dst=("x1", 0), len=d // NL))
     _ffn_steps(add, c.ffn if c is not None else None, spec, d, ffn, t)
     link(steps)
     return steps
+
+
+def global_layout(cfg, spec: TileSpec, mm: MemoryMap) -> dict:
+    """The global program's buffers as the layer engine holds them: byte
+    sizes of every vector-buffer name and of the context's memory image
+    ``m_ctx`` (the map's window, block store, index and block sums), and the
+    offsets inside the pass-1 output ``P1`` (``q, gate per head | k | v |
+    index_q | index_k``).  ``rot`` holds the sines then the cosines of the
+    rotary frequencies as int16; ``sel`` the count then the ids of the
+    selected blocks as int16; ``rows[n]`` the head's key and value records
+    as int8."""
+    nh, nkv, hd, rd = cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim, cfg.rotary_dim
+    d, ffn, group, idim = cfg.hidden_size, cfg.layer_intermediate_size(cfg.global_layer_offset), nh // nkv, cfg.index_dim
+    align = lambda n: -(-n // BEAT) * BEAT
+    off_k = nh * 2 * hd
+    off_v = off_k + nkv * hd
+    off_iq = off_v + nkv * hd
+    off_ik = off_iq + idim
+    sizes = {"x": 2 * d, "A": d, "P1": align(off_ik + idim), "rot": 2 * rd, "iq": idim, "k": nkv * hd,
+             "sel": 2 * (1 + cfg.top_blocks), "att": nh * hd, "mixer": d, "x1": 2 * d, "A2": d, "GU": 2 * ffn, "act": ffn,
+             "ffn": d, "x2": 2 * d, "m_ctx": mm.context_bytes}
+    for n in range(nkv):
+        sizes[f"qg[{n}]"] = group * hd
+        sizes[f"rows[{n}]"] = (mm.local_window + cfg.top_blocks) * 2 * hd
+    return {"sizes": sizes, "off_k": off_k, "off_v": off_v, "off_iq": off_iq, "off_ik": off_ik}
 
 
 # --------------------------------------------------------------------------

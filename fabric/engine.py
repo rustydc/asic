@@ -12,8 +12,11 @@ table, the constant tables of the vector units, the initial vector buffer
 and memory images, and the results the run must reproduce bit for bit
 (``run_program`` on the same steps).
 
-The memory behind the port is a behavioural beat memory in the testbench;
-the HPI bridge and its DMAs are checked on their own (``tb_mem_bridge``).
+Both layers run: the recurrent program with the state and history in
+memory, the global program with the context's window, block store, index
+and block sums.  The memory behind the port is ``fabric_memory.sv``'s
+behavioural model in the testbench; the HPI bridge that replaces it on the
+die is checked on its own (``tb_mem_bridge``).
 """
 from __future__ import annotations
 
@@ -39,11 +42,15 @@ def _refs(value) -> list[str]:
     return []
 
 
+PAGE_BEATS = 1 << S.MEM_PAGE_SHIFT
+
+
 class Layout:
     """Addresses of a program's buffers: vector-buffer names to byte
     offsets and memory-image names (``m_...``) to beat addresses, in order
-    of first reference, each buffer beat-aligned.  A stream's names carry
-    their token suffix; sizes are looked up by the plain name."""
+    of first reference, each buffer beat-aligned in the vector buffer and
+    page-aligned in memory.  A stream's names carry their token suffix;
+    sizes are looked up by the plain name."""
 
     def __init__(self, steps: list[S.Step], sizes: dict[str, int]) -> None:
         self.sizes = sizes
@@ -57,7 +64,7 @@ class Layout:
                     if name.startswith(S.MEM_PREFIX):
                         if name not in self.mem:
                             self.mem[name] = mem_next
-                            mem_next += beats
+                            mem_next += -(-beats // PAGE_BEATS) * PAGE_BEATS
                     elif name not in self.vb:
                         self.vb[name] = vb_next
                         vb_next += beats * BEAT
@@ -120,7 +127,7 @@ def read_hex_bytes(path: Path, width_bytes: int) -> bytes:
         line = line.split("//")[0].strip()
         if not line or line.startswith("@"):
             continue
-        out += int(line, 16).to_bytes(width_bytes, "little")
+        out += int(line.replace("x", "0").replace("z", "0"), 16).to_bytes(width_bytes, "little")   # an unwritten byte reads as zero
     return bytes(out)
 
 
@@ -128,17 +135,31 @@ def read_hex_bytes(path: Path, width_bytes: int) -> bytes:
 # Emission
 # --------------------------------------------------------------------------
 
-def _tiles(directory: Path, c: L.RecurrentConsts, spec: TileSpec, lay: dict) -> int:
-    """The tile ROM images, the flat requantizer tables and the pass table; returns the tile count."""
+def _passes(c) -> list:
+    """The four passes' matrices with the byte offset of each in its pass output, and whether raw accumulators are wanted."""
     ffn = c.ffn.gate_proj.out_features
-    passes = [[(c.in_proj_qkv, 0, False), (c.in_proj_z, lay["off_z"], False), (c.in_proj_b, lay["off_b"], True),
-               (c.in_proj_a, lay["off_a"], True)],
-              [(c.out_proj, 0, False)],
-              [(c.ffn.gate_proj, 0, False), (c.ffn.up_proj, ffn, False)],
-              [(c.ffn.down_proj, 0, False)]]
+    common = [[(c.ffn.gate_proj, 0, False), (c.ffn.up_proj, ffn, False)], [(c.ffn.down_proj, 0, False)]]
+    if isinstance(c, L.RecurrentConsts):
+        lay = _layout_of(c)
+        return [[(c.in_proj_qkv, 0, False), (c.in_proj_z, lay["off_z"], False), (c.in_proj_b, lay["off_b"], True),
+                 (c.in_proj_a, lay["off_a"], True)], [(c.out_proj, 0, False)]] + common
+    lay = _layout_of(c)
+    return [[(c.q_proj, 0, False), (c.k_proj, lay["off_k"], False), (c.v_proj, lay["off_v"], False),
+             (c.index_q, lay["off_iq"], False), (c.index_k, lay["off_ik"], False)], [(c.o_proj, 0, False)]] + common
+
+
+_LAYOUTS: dict[int, dict] = {}
+
+
+def _layout_of(c) -> dict:
+    return _LAYOUTS[id(c)]
+
+
+def _tiles(directory: Path, c, spec: TileSpec) -> int:
+    """The tile ROM images, the flat requantizer tables and the pass table; returns the tile count."""
     mult, shift, table = [], [], []
     t = 0
-    for p, matrices in enumerate(passes):
+    for p, matrices in enumerate(_passes(c)):
         for q, base, raw in matrices:
             cm = compile_matrix(q, spec)
             first = t
@@ -163,49 +184,82 @@ def _tiles(directory: Path, c: L.RecurrentConsts, spec: TileSpec, lay: dict) -> 
     return t
 
 
-def _consts(directory: Path, c: L.RecurrentConsts, sw: int) -> None:
-    def norm_entry(n: L.Norm, gmult: int = 0, gshift: int = 0) -> int:
-        assert n.gain is None or (np.ndim(n.gain) == 0 and int(n.gain) == 1)
+def _consts(directory: Path, c, cfg, sw: int) -> None:
+    """The constant tables of every unit; a layer kind's absent units get zero tables of the right size."""
+    def norm_entry(n: L.Norm | None, gmult: int = 0, gshift: int = 0) -> int:
+        if n is None:
+            return 0
         assert n.eps_int < (1 << sw)
         return int(n.mult) | (int(n.shift) << 16) | (gmult << 22) | (gshift << 38) | (int(n.eps_int) << 44)
-    write_hex(directory / "norm_consts.hex",
-              [norm_entry(c.norm), norm_entry(c.unit_norm), norm_entry(c.gated_norm, c.z_mult, c.z_shift), norm_entry(c.ffn.norm)], 44 + sw)
-    kernel = c.conv_w.shape[1]
-    write_hex(directory / "conv_taps.hex", [sum((int(v) & 0xFF) << (8 * j) for j, v in enumerate(row)) for row in c.conv_w], 8 * kernel)
-    write_hex(directory / "conv_consts.hex",
-              [int(mi) | (int(si) << 16) | (int(mo) << 22) | (int(so) << 38)
-               for mi, si, mo, so in zip(c.conv_mult_in, c.conv_sh_in, c.conv_mult_out, c.conv_sh_out)], 44)
-    write_hex(directory / "gates_consts.hex",
-              [int(ma) | (int(sa) << 16) | (int(mb) << 22) | (int(sb) << 38) | (int(ac) << 44) | ((int(db) & 0xFFFF) << 60)
-               for ma, sa, mb, sb, ac, db in zip(c.gate_mult_a, c.gate_sh_a, c.gate_mult_b, c.gate_sh_b, c.a_coef, c.dt_bias)], 76)
     f = c.ffn
+    recurrent = isinstance(c, L.RecurrentConsts)
+    nv, hd, rd = cfg.linear_num_value_heads, cfg.head_dim, cfg.rotary_dim
+    conv_dim = 2 * cfg.linear_num_key_heads * cfg.linear_key_head_dim + nv * cfg.linear_value_head_dim
+    gated = c.gated_norm if recurrent else None
+    write_hex(directory / "norm_consts.hex",
+              [norm_entry(c.norm), norm_entry(c.unit_norm), norm_entry(gated, *((c.z_mult, c.z_shift) if recurrent else (0, 0))),
+               norm_entry(f.norm)], 44 + sw)
+    if recurrent:
+        write_hex(directory / "conv_taps.hex", [sum((int(v) & 0xFF) << (8 * j) for j, v in enumerate(row)) for row in c.conv_w], 8 * cfg.linear_conv_kernel)
+        write_hex(directory / "conv_consts.hex",
+                  [int(mi) | (int(si) << 16) | (int(mo) << 22) | (int(so) << 38)
+                   for mi, si, mo, so in zip(c.conv_mult_in, c.conv_sh_in, c.conv_mult_out, c.conv_sh_out)], 44)
+        write_hex(directory / "gates_consts.hex",
+                  [int(ma) | (int(sa) << 16) | (int(mb) << 22) | (int(sb) << 38) | (int(ac) << 44) | ((int(db) & 0xFFFF) << 60)
+                   for ma, sa, mb, sb, ac, db in zip(c.gate_mult_a, c.gate_sh_a, c.gate_mult_b, c.gate_sh_b, c.a_coef, c.dt_bias)], 76)
+        write_hex(directory / "rot_consts.hex", [0, 0], 44 + sw)
+        write_hex(directory / "rot_gains.hex", [0] * (2 * hd), 16)
+        write_hex(directory / "inv_freq.hex", [0] * (rd // 2), 32)
+        write_hex(directory / "attn_consts.hex", [0], 66)
+    else:
+        write_hex(directory / "conv_taps.hex", [0] * conv_dim, 8 * cfg.linear_conv_kernel)
+        write_hex(directory / "conv_consts.hex", [0] * conv_dim, 44)
+        write_hex(directory / "gates_consts.hex", [0] * nv, 76)
+        # The head norms keep their weight as a gain table; the rotary requantizer rides in the gain fields.
+        write_hex(directory / "rot_consts.hex", [norm_entry(c.q_norm, c.rot_mult_q, c.rot_sh_q), norm_entry(c.k_norm, c.rot_mult_k, c.rot_sh_k)], 44 + sw)
+        write_hex(directory / "rot_gains.hex", list(c.q_norm.gain) + list(c.k_norm.gain), 16)
+        write_hex(directory / "inv_freq.hex", list(c.inv_freq), 32)
+        write_hex(directory / "attn_consts.hex",
+                  [c.mult_s | (c.sh_s << 16) | (c.mult_gate << 22) | (c.sh_gate << 38) | (c.mult_o << 44) | (c.sh_o << 60)], 66)
     write_hex(directory / "swiglu_consts.hex", [f.mult_g | (f.sh_g << 16) | (f.mult_o << 22) | (f.sh_o << 38)] + [0] * 15, 44)
     write_hex(directory / "residual_consts.hex", [c.res_mult | (c.res_shift << 16), f.res_mult | (f.res_shift << 16)] + [0] * 14, 22)
 
 
 class EngineRun:
-    """One run of the recurrent layer on the engine: the files in
-    ``directory``, the testbench parameters and the expected results."""
+    """One run of a layer on the engine: the files in ``directory``, the
+    testbench parameters and the expected results.  ``inputs`` are
+    ``run_program``'s (a stream's carry the token suffix); for the global
+    layer ``memory`` maps each token's ``m_ctx`` to its initial image and
+    the image expected after the run (``GlobalContextMemory`` before and
+    after the token's append)."""
 
-    def __init__(self, directory: Path, cfg, c: L.RecurrentConsts, spec: TileSpec, mm: MemoryMap, steps: list[S.Step],
-                 inputs: dict) -> None:
-        assert mm.state_bits == 8, "the engine holds the int8 state"
+    def __init__(self, directory: Path, cfg, c, spec: TileSpec, mm: MemoryMap, steps: list[S.Step], inputs: dict,
+                 memory: dict[str, tuple[bytes, bytes]] | None = None) -> None:
         directory.mkdir(parents=True, exist_ok=True)
-        self.cfg, self.steps = cfg, steps
+        self.cfg, self.steps, self.mm = cfg, steps, mm
+        self.recurrent = isinstance(c, L.RecurrentConsts)
         self.nv, self.hk, self.hv = cfg.linear_num_value_heads, cfg.linear_key_head_dim, cfg.linear_value_head_dim
         d, nk = cfg.hidden_size, cfg.linear_num_key_heads
         conv_dim, ffn = 2 * nk * self.hk + self.nv * self.hv, cfg.layer_intermediate_size(0)
-        lay = S.recurrent_layout(cfg, spec, mm)
+        lay = S.recurrent_layout(cfg, spec, mm) if self.recurrent else S.global_layout(cfg, spec, mm)
+        _LAYOUTS[id(c)] = lay
         self.layout = Layout(steps, lay["sizes"])
         self.suffixes = sorted({"" if "@" not in key else "@" + key.split("@")[1] for key in inputs})
-        # Images: the vector buffer holds each token's x, the memory its history and state.
+        # Images: the vector buffer holds each token's x, the memory its context.
         vb = bytearray(self.layout.vb_bytes)
         mem = bytearray(self.layout.mem_beats * BEAT)
+        self.expected_memory: dict[str, bytes] = {}
         for sfx in self.suffixes:
             self._place(vb, "x" + sfx, _int16(inputs["x" + sfx]))
-            self._place(mem, "m_hist" + sfx, _hist_bytes(inputs["hist_mem" + sfx]))
-            for h in range(self.nv):
-                self._place(mem, f"m_s[{h}]" + sfx, _slot_bytes(inputs["s_mem" + sfx][h], inputs["scale_mem" + sfx][h]))
+            if self.recurrent:
+                assert mm.state_bits == 8, "the engine holds the int8 state"
+                self._place(mem, "m_hist" + sfx, _hist_bytes(inputs["hist_mem" + sfx]))
+                for h in range(self.nv):
+                    self._place(mem, f"m_s[{h}]" + sfx, _slot_bytes(inputs["s_mem" + sfx][h], inputs["scale_mem" + sfx][h]))
+            else:
+                before, after = memory["m_ctx" + sfx]
+                self._place(mem, "m_ctx" + sfx, before)
+                self.expected_memory["m_ctx" + sfx] = after
         _write_bytes(directory / "vb_init.hex", bytes(vb))
         _write_beats(directory / "mem_init.hex", bytes(mem))
         # The expected results: the same steps on the integer model.
@@ -214,11 +268,17 @@ class EngineRun:
         # The program and everything the units load.
         L.write_luts(directory)
         write_hex(directory / "program.hex", S.encode(steps, self.layout), 256)
-        nt = _tiles(directory, c, spec, lay)
+        nt = _tiles(directory, c, spec)
         sw = L.sw_for(16, d)
-        _consts(directory, c, sw)
+        _consts(directory, c, cfg, sw)
+        regions = mm.regions()
         self.params = {"N": len(steps), "D": d, "NK": nk, "NV": self.nv, "HK": self.hk, "HV": self.hv, "KK": cfg.linear_conv_kernel,
-                       "CONV": conv_dim, "FFN": ffn, "ROWS": spec.rows, "COLS": spec.cols, "P": spec.rows_per_cycle, "NT": nt,
+                       "CONV": conv_dim, "FFN": ffn, "NH": cfg.num_attention_heads, "NKV": cfg.num_key_value_heads, "HD": cfg.head_dim,
+                       "RD": cfg.rotary_dim, "IDIM": cfg.index_dim, "W": mm.local_window, "BS": mm.block, "TOP": cfg.top_blocks,
+                       "KV_BITS": mm.kv_bits, "REC_BYTES": mm.kv_record_bytes, "RPB": mm.index_burst_records, "MAXR": mm.window_burst_records,
+                       "WINDOW_OFF": regions["window0"][0], "BLOCK_OFF": regions["blocks0"][0], "INDEX_OFF": regions["index0"][0],
+                       "SUMS_OFF": regions["sums0"][0], "ATT_L": 8,
+                       "ROWS": spec.rows, "COLS": spec.cols, "P": spec.rows_per_cycle, "NT": nt,
                        "WB": spec.weight_bits, "ACC": spec.acc_bits, "SB": spec.scale_bits, "SHB": spec.shift_bits, "SW": sw,
                        "YSH": L.ysh_for(self.hk), "VB_BYTES": self.layout.vb_bytes, "MEM_BEATS": self.layout.mem_beats,
                        "SCHEDULE_CYCLES": S.schedule(steps).cycles}
@@ -243,6 +303,14 @@ class EngineRun:
             x2 = np.frombuffer(take(vb, "x2" + sfx, 2 * self.cfg.hidden_size), dtype="<i2").astype(np.int64)
             if not np.array_equal(x2, self.expected["x2" + sfx]):
                 problems.append(f"x2{sfx}: {int((x2 != self.expected['x2' + sfx]).sum())} of {len(x2)} elements differ")
+            if not self.recurrent:
+                want = self.expected_memory["m_ctx" + sfx]
+                got = take(mem, "m_ctx" + sfx, len(want))
+                if got != want:
+                    first = next(i for i in range(len(want)) if got[i] != want[i])
+                    region = next((name for name, (off, size) in self.mm.regions().items() if name != "_total" and off <= first < off + size), "?")
+                    problems.append(f"memory{sfx}: first difference at byte {first} ({region})")
+                continue
             hist = np.frombuffer(take(mem, "m_hist" + sfx, self.layout.size("m_hist")), dtype=np.int8).astype(np.int64)
             hist = hist.reshape(-1, S.HIST_REC)[:, :self.cfg.linear_conv_kernel - 1]
             if not np.array_equal(hist, self.expected["hist_mem" + sfx]):

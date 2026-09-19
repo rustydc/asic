@@ -9,12 +9,29 @@ import numpy as np
 from fabric import engine as E
 from fabric import layer as L
 from fabric import sequencer as S
-from fabric.memory import MemoryMap
+from fabric.memory import GlobalContextMemory, MemoryMap
 from fabric.tile import TileSpec
 
 RTL = Path(__file__).parents[1] / "rtl"
-SOURCES = [RTL / name for name in ("fabric_vector.sv", "fabric_norm.sv", "fabric_recurrent.sv", "fabric_ffn.sv", "fabric_tile.sv",
-                                   "fabric_sequencer.sv", "fabric_engine.sv", "tb_layer_engine.sv")]
+SOURCES = [RTL / name for name in ("fabric_vector.sv", "fabric_norm.sv", "fabric_recurrent.sv", "fabric_ffn.sv", "fabric_attention.sv",
+                                   "fabric_memory.sv", "fabric_tile.sv", "fabric_sequencer.sv", "fabric_engine.sv", "tb_layer_engine.sv")]
+
+
+def run_engine(case: unittest.TestCase, cfg, c, spec, mm, steps: list[S.Step], inputs: dict, memory=None) -> int:
+    """Emit, simulate and check one program; returns the engine's cycle count."""
+    with tempfile.TemporaryDirectory() as directory:
+        work = Path(directory)
+        run = E.EngineRun(work, cfg, c, spec, mm, steps, inputs, memory)
+        args = [f"-Ptb_layer_engine.{name}={value}" for name, value in run.params.items()]
+        subprocess.run(["iverilog", "-g2012", "-I", str(RTL), "-s", "tb_layer_engine", "-o", "sim.vvp", *args, *map(str, SOURCES)],
+                       cwd=work, check=True, capture_output=True, text=True)
+        out = subprocess.run(["vvp", "sim.vvp"], cwd=work, check=True, capture_output=True, text=True).stdout
+        case.assertIn("PASS", out, out)
+        case.assertEqual(run.check(work), [])
+        issue = [tuple(int(v) for v in line.split()) for line in (work / "issue.txt").read_text().splitlines()]
+    case.assertEqual([row[1] for row in issue], [i % 256 for i in range(len(steps))])     # program order, tags in step order
+    passed = next(line for line in out.splitlines() if line.startswith("PASS"))
+    return int(passed.split(" in ")[1].split()[0])
 
 
 class LayoutTest(unittest.TestCase):
@@ -87,19 +104,7 @@ class EngineRtlTest(unittest.TestCase):
         return {"x": np.rint(self.xs[tokens] / self.c.s_h).astype(np.int64), "s_mem": s, "scale_mem": sc, "hist_mem": hist}
 
     def run_engine(self, steps: list[S.Step], inputs: dict) -> int:
-        with tempfile.TemporaryDirectory() as directory:
-            work = Path(directory)
-            run = E.EngineRun(work, self.cfg, self.c, self.spec, self.mm, steps, inputs)
-            args = [f"-Ptb_layer_engine.{name}={value}" for name, value in run.params.items()]
-            subprocess.run(["iverilog", "-g2012", "-I", str(RTL), "-s", "tb_layer_engine", "-o", "sim.vvp", *args, *map(str, SOURCES)],
-                           cwd=work, check=True, capture_output=True, text=True)
-            out = subprocess.run(["vvp", "sim.vvp"], cwd=work, check=True, capture_output=True, text=True).stdout
-            self.assertIn("PASS", out, out)
-            self.assertEqual(run.check(work), [])
-            issue = [tuple(int(v) for v in line.split()) for line in (work / "issue.txt").read_text().splitlines()]
-        self.assertEqual([row[1] for row in issue], [i % 256 for i in range(len(steps))])     # program order, tags in step order
-        passed = next(line for line in out.splitlines() if line.startswith("PASS"))
-        return int(passed.split(" in ")[1].split()[0])
+        return run_engine(self, self.cfg, self.c, self.spec, self.mm, steps, inputs)
 
     def test_one_token_from_a_running_context(self) -> None:
         inputs = self.context_after(2)
@@ -113,6 +118,75 @@ class EngineRtlTest(unittest.TestCase):
         for token, tokens in ((0, 3), (1, 1)):
             inputs.update({f"{k}@{token}": v for k, v in self.context_after(tokens).items()})
         self.run_engine(two, inputs)
+
+
+@unittest.skipUnless(shutil.which("iverilog") and shutil.which("vvp"), "iverilog not installed")
+class GlobalEngineRtlTest(unittest.TestCase):
+    """The global layer on the engine: the append, the index scan and
+    top-K, the record reader and the attention cores over a filled
+    context, bit for bit against the integer layer and the memory model."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        try:
+            import torch
+            from fixed_llm_poc import ASICDecoderLayer, tiny_config
+        except ImportError:  # pragma: no cover
+            raise unittest.SkipTest("PyTorch not installed")
+        cls.cfg = cfg = tiny_config()
+        torch.manual_seed(0)
+        layer = ASICDecoderLayer(cfg, 3)
+        w = {k: v.detach().double().numpy() for k, v in layer.state_dict().items()}
+        cls.spec = TileSpec(rows=cfg.hidden_size, cols=16)
+        cls.mm = MemoryMap.from_config(cfg, context_tokens=256, recurrent_layers=0)     # a small image: the global stores only
+        rng = np.random.default_rng(4)
+        nkv, hd = cfg.num_key_value_heads, cfg.head_dim
+        cls.xs = [rng.standard_normal(cfg.hidden_size) * 2.0 for _ in range(40)]
+        kf, vf, runs = [], [], []
+        for pos, x in enumerate(cls.xs):
+            own = L.global_layer_float(w, cfg, x, pos, np.zeros((nkv, 1, hd)), np.zeros((nkv, 1, hd)))
+            kf.append(own["k"])
+            vf.append(own["v"])
+            runs.append(L.global_layer_float(w, cfg, x, pos, np.stack(kf, axis=1), np.stack(vf, axis=1)))
+        cal = L.calibrate(runs, L.GLOBAL_CAL_KEYS)
+        cal["x2"] = max(cal["x2"], max(float(np.abs(x).max()) for x in cls.xs))
+        cls.c = L.compile_global_layer(w, cfg, cls.spec, cal)
+
+    def context_at(self, pos: int) -> tuple[dict, tuple[bytes, bytes]]:
+        """The context after positions before ``pos``, the token's inputs
+        (its rows as the memory serves them after its own append) and the
+        image before and after."""
+        cfg, mm = self.cfg, self.mm
+        nkv, hd = cfg.num_key_value_heads, cfg.head_dim
+        store = GlobalContextMemory(mm, cfg.top_blocks)
+        zero = np.zeros((nkv, 1, hd), dtype=np.int64)
+        own = None
+        for p in range(pos + 1):
+            xi = np.rint(self.xs[p] / self.c.s_h).astype(np.int64)
+            own = L.global_layer_int(self.c, cfg, self.spec, xi, p, zero, zero)
+            if p == pos:
+                before = bytes(store.image.data)
+            store.append(p, own["k"], own["v"], own["index_k"])
+        got = store.retrieve(pos, own["index_q_unit"])
+        inputs = {"x": np.rint(self.xs[pos] / self.c.s_h).astype(np.int64), "k_rows": got["k_rows"], "v_rows": got["v_rows"]}
+        return inputs, (before, bytes(store.image.data))
+
+    def test_one_token_at_a_block_end(self) -> None:
+        pos = 31                                     # four blocks eligible, two chosen; this token closes a block
+        inputs, images = self.context_at(pos)
+        self.assertEqual(inputs["k_rows"].shape[1], self.mm.local_window + self.cfg.top_blocks)
+        self.assertNotEqual(images[0], images[1])
+        prog = S.global_program(self.cfg, self.c, self.spec, self.mm, pos)
+        run_engine(self, self.cfg, self.c, self.spec, self.mm, prog, inputs, {"m_ctx": images})
+
+    def test_a_stream_of_two_contexts(self) -> None:
+        programs, inputs, memory = [], {}, {}
+        for token, pos in ((0, 31), (1, 20)):
+            own, images = self.context_at(pos)
+            inputs.update({f"{k}@{token}": v for k, v in own.items()})
+            memory[f"m_ctx@{token}"] = images
+            programs.append(S.retarget(S.global_program(self.cfg, self.c, self.spec, self.mm, pos), token))
+        run_engine(self, self.cfg, self.c, self.spec, self.mm, S.interleave(programs), inputs, memory)
 
 
 if __name__ == "__main__":

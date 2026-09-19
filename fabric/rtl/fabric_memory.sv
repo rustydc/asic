@@ -535,8 +535,10 @@ endmodule
 // ---------------------------------------------------------------------------
 // The global layer's append: this token's keys and values into its window
 // slot, the block sums, and at a block's end the block record and its index
-// record.  `start` latches the token; `done` when every write has been
-// issued and accepted.
+// record.  `start` latches the token with the context's running sums
+// (int16 per element, kept per context in memory by the caller); `done`
+// when every write has been issued and accepted, with the new sums on the
+// out ports (zero after a block's end).
 //
 //   window record   n * W + (pos mod W)       key then value, KV_BITS (head-major)
 //   block record    block * NKV + n           the rounded means, KV_BITS
@@ -563,6 +565,12 @@ module fabric_kv_append #(
     input  wire [NKV*HD*8-1:0] k_rows,
     input  wire [NKV*HD*8-1:0] v_rows,
     input  wire [IDIM*8-1:0]   idx_k,
+    input  wire [NKV*HD*16-1:0] sum_k_in,
+    input  wire [NKV*HD*16-1:0] sum_v_in,
+    input  wire [IDIM*16-1:0]  sum_i_in,
+    output wire [NKV*HD*16-1:0] sum_k_out,
+    output wire [NKV*HD*16-1:0] sum_v_out,
+    output wire [IDIM*16-1:0]  sum_i_out,
     output reg                 done,
     output reg                 req_valid,
     input  wire                req_ready,
@@ -592,7 +600,16 @@ module fabric_kv_append #(
     reg signed [SUMW-1:0] sum_k [0:NKV*HD-1];
     reg signed [SUMW-1:0] sum_v [0:NKV*HD-1];
     reg signed [SUMW-1:0] sum_i [0:IDIM-1];
-    reg [LOG_BS:0]      count;
+    genvar gs;
+    generate
+        for (gs = 0; gs < NKV*HD; gs = gs + 1) begin : g_sk
+            assign sum_k_out[gs*16 +: 16] = {{(16-SUMW){sum_k[gs][SUMW-1]}}, sum_k[gs]};
+            assign sum_v_out[gs*16 +: 16] = {{(16-SUMW){sum_v[gs][SUMW-1]}}, sum_v[gs]};
+        end
+        for (gs = 0; gs < IDIM; gs = gs + 1) begin : g_si
+            assign sum_i_out[gs*16 +: 16] = {{(16-SUMW){sum_i[gs][SUMW-1]}}, sum_i[gs]};
+        end
+    endgenerate
 
     // The record being written: packed key and value halves of one head.
     reg [REC_BEATS*DW-1:0] rec;
@@ -652,7 +669,7 @@ module fabric_kv_append #(
     integer b, e;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            state <= S_IDLE; head <= 0; beat <= 0; nbeat <= 0; count <= 0; req_valid <= 1'b0; done <= 1'b0;
+            state <= S_IDLE; head <= 0; beat <= 0; nbeat <= 0; req_valid <= 1'b0; done <= 1'b0;
             nv_in <= 1'b0; rc_start <= 1'b0; block_end <= 1'b0;
             for (j = 0; j < NKV*HD; j = j + 1) begin sum_k[j] <= 0; sum_v[j] <= 0; end
             for (j = 0; j < IDIM; j = j + 1) sum_i[j] <= 0;
@@ -664,12 +681,11 @@ module fabric_kv_append #(
                 S_IDLE: if (start) begin
                     k_r <= k_rows; v_r <= v_rows; idx_r <= idx_k; pos_r <= pos;
                     for (j = 0; j < NKV*HD; j = j + 1) begin
-                        sum_k[j] <= sum_k[j] + $signed(k_rows[j*8 +: 8]);
-                        sum_v[j] <= sum_v[j] + $signed(v_rows[j*8 +: 8]);
+                        sum_k[j] <= $signed(sum_k_in[j*16 +: SUMW]) + $signed(k_rows[j*8 +: 8]);
+                        sum_v[j] <= $signed(sum_v_in[j*16 +: SUMW]) + $signed(v_rows[j*8 +: 8]);
                     end
-                    for (j = 0; j < IDIM; j = j + 1) sum_i[j] <= sum_i[j] + $signed(idx_k[j*8 +: 8]);
-                    block_end <= (count == BS - 1);
-                    count <= (count == BS - 1) ? 0 : count + 1'b1;
+                    for (j = 0; j < IDIM; j = j + 1) sum_i[j] <= $signed(sum_i_in[j*16 +: SUMW]) + $signed(idx_k[j*8 +: 8]);
+                    block_end <= (pos[LOG_BS-1:0] == BS - 1);
                     head <= 0;
                     state <= S_WIN;
                 end

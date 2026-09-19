@@ -18,7 +18,12 @@
 //   fabric_gates_adapter   the per-head gates from the raw accumulators
 //   fabric_delta_adapter   one int8 state engine over a state slot
 //   fabric_swiglu_adapter, fabric_residual_adapter
-//   fabric_mem_adapter     beats between the memory port and the buffer
+//   fabric_rotary_adapter  the rotary table, and a head's norm, rotation
+//                          and requantization
+//   fabric_attn_adapter    one attention core over a head's rows
+//   fabric_mem_unit        the memory port: beats to and from the buffer,
+//                          the token's append, the index scan and the
+//                          record reader, behind one arbiter
 //   fabric_layer_engine    all of it behind start / done
 //
 // The program and every table come from fabric/engine.py, whose run of
@@ -759,12 +764,149 @@ module fabric_residual_adapter #(
 endmodule
 
 // ---------------------------------------------------------------------------
-// The memory unit: len beats between the memory port (beat addresses) and
-// the vector buffer.  arg[3:0] = 0: memory src to buffer dst; 1: buffer
-// src to memory dst.
+// The rotary unit.  arg[3:0] = 0: the table of sines then cosines of the
+// R/2 rotary frequencies at position arg2, as int16, to dst.  1: one head:
+// the int8 vector at src through the head norm with the kind's (arg[7:4],
+// 0 q and 1 k) gains and constants to int16, rotated by the table at arg2,
+// requantized to int8 at dst; len is the beat count.
 // ---------------------------------------------------------------------------
-module fabric_mem_adapter #(
-    parameter int AW = 16
+module fabric_rotary_adapter #(
+    parameter int HD = 24,
+    parameter int R  = 6,
+    parameter int NL = 8,
+    parameter int SW = 38,
+    parameter int AW = 16,
+    parameter     LUT_DIR = "./"
+) (
+    input  wire          clk,
+    input  wire          rst_n,
+    input  wire          cmd_valid,
+    input  wire [15:0]   cmd_src,
+    input  wire [15:0]   cmd_dst,
+    input  wire [31:0]   cmd_arg,
+    input  wire [31:0]   cmd_arg2,
+    input  wire [7:0]    cmd_tag,
+    output wire          cmd_ready,
+    output reg           done_valid,
+    output reg  [7:0]    done_tag,
+    output reg  [AW-1:0] rd_addr,
+    input  wire [127:0]  rd_data,
+    output reg           wr_en,
+    output reg  [AW-1:0] wr_addr,
+    output reg  [127:0]  wr_data,
+    output reg  [15:0]   wr_be
+);
+    localparam int H = R / 2, TB = 2 * R * 8, TBEATS = (2 * R + 15) / 16, BEATS = HD / NL;
+    reg [44+SW-1:0] consts [0:1];
+    reg [15:0]      gains [0:2*HD-1];
+    reg [31:0]      invf [0:H-1];
+    initial begin
+        $readmemh("rot_consts.hex", consts);
+        $readmemh("rot_gains.hex", gains);
+        $readmemh("inv_freq.hex", invf);
+    end
+    wire [H*32-1:0] inv_flat;
+    genvar gh;
+    generate for (gh = 0; gh < H; gh = gh + 1) begin : g_inv assign inv_flat[gh*32 +: 32] = invf[gh]; end endgenerate
+
+    localparam [2:0] S_IDLE = 0, S_TABLE = 1, S_TWRITE = 2, S_LOADT = 3, S_TLAND = 4, S_STREAM = 5, S_WAIT = 6, S_DONE = 7;
+    reg [2:0]    state;
+    reg [AW-1:0] src, dst, tab_addr;
+    reg [31:0]   pos;
+    reg [3:0]    kind;
+    reg [7:0]    tag, i, o, j, j_d;
+    reg          tstart, ldv, v1;
+    reg [44+SW-1:0] consts_r;
+    reg [TBEATS*128-1:0] tab_r;
+    reg [NL*16-1:0] g1;
+    wire [44+SW-1:0] k = consts_r;
+    assign cmd_ready = (state == S_IDLE);
+
+    wire            tdone;
+    wire [H*16-1:0] sin_tab, cos_tab;
+    fabric_rotary_table #(.R(R), .LUT_DIR(LUT_DIR)) u_table (
+        .clk(clk), .rst_n(rst_n), .start(tstart), .pos(pos), .inv_freq(inv_flat), .done(tdone), .sin_tab(sin_tab), .cos_tab(cos_tab));
+    wire [TBEATS*128-1:0] tabvec = {{(TBEATS*128-TB){1'b0}}, cos_tab, sin_tab};
+
+    reg [NL*16-1:0] x_in;
+    integer l;
+    always @* for (l = 0; l < NL; l = l + 1) x_in[l*16 +: 16] = {{8{rd_data[l*8+7]}}, rd_data[l*8 +: 8]};
+    wire             nv;
+    wire [NL*16-1:0] ny;
+    fabric_rmsnorm #(.D(HD), .XW(16), .OW(16), .L(NL), .SW(SW), .LUT_DIR(LUT_DIR)) u_norm (
+        .clk(clk), .rst_n(rst_n), .in_valid(v1), .n_beats(BEATS[$clog2(BEATS):0]), .in_x(x_in), .in_gain(g1), .mult(k[15:0]),
+        .shift(k[21:16]), .eps(k[44 +: SW]), .out_valid(nv), .out_y(ny));
+    wire            rv;
+    wire [NL*8-1:0] ry;
+    fabric_rotary #(.HD(HD), .R(R), .L(NL)) u_rot (
+        .clk(clk), .rst_n(rst_n), .in_valid(nv), .in_x(ny), .sin_tab(tab_r[R*8-1:0]), .cos_tab(tab_r[2*R*8-1:R*8]),
+        .mult(k[37:22]), .shift(k[43:38]), .out_valid(rv), .out_y(ry));
+
+    // The x beats are issued while S_STREAM holds; their data, and the gains registered with them, follow a cycle later.
+    always @* begin
+        rd_addr = src + i * NL;
+        if (state == S_LOADT) rd_addr = tab_addr + j * 16;
+    end
+    always @(posedge clk) begin
+        v1 <= (state == S_STREAM);
+        for (l = 0; l < NL; l = l + 1) g1[l*16 +: 16] <= gains[kind * HD + i * NL + l];
+    end
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            state <= S_IDLE; done_valid <= 1'b0; wr_en <= 1'b0; tstart <= 1'b0; ldv <= 1'b0; i <= 0; o <= 0; j <= 0;
+        end else begin
+            done_valid <= 1'b0; wr_en <= 1'b0; tstart <= 1'b0;
+            ldv <= (state == S_LOADT); j_d <= j;
+            if (ldv) tab_r[j_d*128 +: 128] <= rd_data;
+            case (state)
+                S_IDLE: if (cmd_valid) begin
+                    src <= cmd_src; dst <= cmd_dst; kind <= cmd_arg[7:4]; tab_addr <= cmd_arg2[AW-1:0]; pos <= cmd_arg2;
+                    consts_r <= consts[cmd_arg[4]]; tag <= cmd_tag; i <= 0; o <= 0; j <= 0;
+                    if (cmd_arg[3:0] == 0) begin tstart <= 1'b1; state <= S_TABLE; end
+                    else state <= S_LOADT;
+                end
+                S_TABLE: if (tdone) begin j <= 0; state <= S_TWRITE; end
+                S_TWRITE: begin
+                    wr_en <= 1'b1; wr_addr <= dst + j * 16; wr_data <= tabvec[j*128 +: 128];
+                    wr_be <= (2 * R - j * 16 >= 16) ? 16'hFFFF : ((16'd1 << (2 * R - j * 16)) - 1'b1);
+                    j <= j + 1'b1;
+                    if (j == TBEATS - 1) state <= S_DONE;
+                end
+                S_LOADT: begin
+                    j <= j + 1'b1;
+                    if (j == TBEATS - 1) state <= S_TLAND;
+                end
+                S_TLAND: state <= S_STREAM;                           // the last table beat lands
+                S_STREAM: begin
+                    i <= i + 1'b1;
+                    if (i == BEATS - 1) state <= S_WAIT;
+                end
+                S_WAIT: ;
+                default: begin done_valid <= 1'b1; done_tag <= tag; state <= S_IDLE; end
+            endcase
+            if (rv) begin
+                wr_en <= 1'b1; wr_addr <= dst + o * NL; wr_data <= {{(128-NL*8){1'b0}}, ry}; wr_be <= (16'd1 << NL) - 1'b1;
+                o <= o + 1'b1;
+                if (o == BEATS - 1) state <= S_DONE;
+            end
+        end
+    end
+endmodule
+
+// ---------------------------------------------------------------------------
+// One attention core.  src: the group's G query rows (int8, HD each);
+// arg[15:0]: the first head's gate row (the heads' gates are 2 HD apart);
+// arg[31:16]: the head's rows, len records of a key then a value row;
+// dst: the G output rows.  Beats are read then presented until the core
+// takes them, so its exponential stalls cost nothing but time.
+// ---------------------------------------------------------------------------
+module fabric_attn_adapter #(
+    parameter int HD = 24,
+    parameter int G  = 2,
+    parameter int L  = 8,
+    parameter int LW = 28,
+    parameter int AW = 16,
+    parameter     LUT_DIR = "./"
 ) (
     input  wire          clk,
     input  wire          rst_n,
@@ -777,44 +919,415 @@ module fabric_mem_adapter #(
     output wire          cmd_ready,
     output reg           done_valid,
     output reg  [7:0]    done_tag,
-    output wire [AW-1:0] rd_addr,
+    output reg  [AW-1:0] rd_addr,
+    input  wire [127:0]  rd_data,
+    output reg           wr_en,
+    output reg  [AW-1:0] wr_addr,
+    output reg  [127:0]  wr_data,
+    output reg  [15:0]   wr_be
+);
+    localparam int BEATS = HD / L;
+    reg [65:0] consts [0:0];
+    initial $readmemh("attn_consts.hex", consts);
+    localparam [2:0] S_IDLE = 0, S_START = 1, S_ISSUE = 2, S_PRESENT = 3, S_FINISH = 4, S_OUT = 5, S_DONE = 6;
+    reg [2:0]    state;
+    reg [AW-1:0] src, dst, gate, rows;
+    reg [15:0]   n, r, o;
+    reg [7:0]    tag, g, b;
+    reg [1:0]    phase;
+    reg          start, finish;
+    reg [65:0]   k;
+    assign cmd_ready = (state == S_IDLE);
+    wire            in_ready, out_valid, done;
+    wire [L*8-1:0]  out_data;
+    fabric_attention #(.HD(HD), .G(G), .L(L), .LW(LW), .LUT_DIR(LUT_DIR)) u_core (
+        .clk(clk), .rst_n(rst_n), .start(start), .in_valid(state == S_PRESENT), .in_ready(in_ready), .in_kind(phase),
+        .in_data(rd_data[L*8-1:0]), .finish(finish), .mult_s(k[15:0]), .sh_s(k[21:16]), .mult_gate(k[37:22]), .sh_gate(k[43:38]),
+        .mult_o(k[59:44]), .sh_o(k[65:60]), .out_valid(out_valid), .out_data(out_data), .done(done));
+    always @* begin
+        case (phase)
+            2'd0: rd_addr = src + g * HD + b * L;
+            2'd1: rd_addr = gate + g * 2 * HD + b * L;
+            2'd2: rd_addr = rows + r * 2 * HD + b * L;
+            default: rd_addr = rows + r * 2 * HD + HD + b * L;
+        endcase
+    end
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            state <= S_IDLE; done_valid <= 1'b0; wr_en <= 1'b0; start <= 1'b0; finish <= 1'b0; phase <= 0; g <= 0; b <= 0; r <= 0; o <= 0;
+        end else begin
+            done_valid <= 1'b0; wr_en <= 1'b0; start <= 1'b0; finish <= 1'b0;
+            case (state)
+                S_IDLE: if (cmd_valid) begin
+                    src <= cmd_src; dst <= cmd_dst; gate <= cmd_arg[15:0]; rows <= cmd_arg[31:16]; n <= cmd_len; tag <= cmd_tag;
+                    k <= consts[0]; phase <= 0; g <= 0; b <= 0; r <= 0; o <= 0; start <= 1'b1; state <= S_START;
+                end
+                S_START: state <= S_ISSUE;
+                S_ISSUE: state <= S_PRESENT;
+                S_PRESENT: if (in_ready) begin
+                    state <= S_ISSUE;
+                    if (b != BEATS - 1) b <= b + 1'b1;
+                    else begin
+                        b <= 0;
+                        case (phase)
+                            2'd0: if (g == G - 1) begin g <= 0; phase <= 2'd1; end else g <= g + 1'b1;
+                            2'd1: if (g == G - 1) begin g <= 0; phase <= 2'd2; if (n == 0) state <= S_FINISH; end else g <= g + 1'b1;
+                            2'd2: phase <= 2'd3;
+                            default: begin phase <= 2'd2; r <= r + 1'b1; if (r == n - 1) state <= S_FINISH; end
+                        endcase
+                    end
+                end
+                S_FINISH: begin finish <= 1'b1; state <= S_OUT; end
+                S_OUT: if (done) state <= S_DONE;
+                default: begin done_valid <= 1'b1; done_tag <= tag; state <= S_IDLE; end
+            endcase
+            if (out_valid) begin
+                wr_en <= 1'b1; wr_addr <= dst + o * L; wr_data <= {{(128-L*8){1'b0}}, out_data}; wr_be <= (16'd1 << L) - 1'b1;
+                o <= o + 1'b1;
+            end
+        end
+    end
+endmodule
+
+// ---------------------------------------------------------------------------
+// The memory unit.  arg2[3:0] is the operation, arg2[31:4] the position and
+// arg[31:16] the context's memory page (2 KB units) where the global layer
+// needs them:
+//   0  memory beats src (a beat address) to the buffer at dst, len beats
+//   1  buffer src to memory beats dst, len beats
+//   2  append: keys at src, values at arg[15:0], index projection at dst,
+//      with the context's running block sums read from and written back
+//      to its sums record
+//   3  scan: the int8 unit index query at src coded and scored over the
+//      eligible index records; the top-K ids (a count then the ids, int16)
+//      to dst
+//   4  rows: the selection at src; KV head arg[15:0]'s window records then
+//      its selected block records, as int8 key and value rows, to dst
+// The four requesters (a beat mover, the append, the scan, the record
+// reader) share the port through fabric_mem_arbiter.
+// ---------------------------------------------------------------------------
+module fabric_mem_unit #(
+    parameter int HD      = 24,
+    parameter int NKV     = 2,
+    parameter int IDIM    = 32,
+    parameter int BS      = 4,
+    parameter int W       = 16,
+    parameter int TOP     = 2,
+    parameter int KV_BITS = 4,
+    parameter int L       = 8,                  // int8 elements per beat out of the record reader
+    parameter int REC_BYTES  = 32,
+    parameter int RPB     = 64,                 // index records per scan request
+    parameter int MAXR    = 64,                 // window records per read request
+    parameter int WINDOW_OFF = 0,
+    parameter int BLOCK_OFF  = 2048,
+    parameter int INDEX_OFF  = 6144,
+    parameter int SUMS_OFF   = 8192,
+    parameter int AW      = 16,
+    parameter     LUT_DIR = "./"
+) (
+    input  wire          clk,
+    input  wire          rst_n,
+    input  wire          cmd_valid,
+    input  wire [15:0]   cmd_len,
+    input  wire [15:0]   cmd_src,
+    input  wire [15:0]   cmd_dst,
+    input  wire [31:0]   cmd_arg,
+    input  wire [31:0]   cmd_arg2,
+    input  wire [7:0]    cmd_tag,
+    output wire          cmd_ready,
+    output reg           done_valid,
+    output reg  [7:0]    done_tag,
+    output reg  [AW-1:0] rd_addr,
     input  wire [127:0]  rd_data,
     output reg           wr_en,
     output reg  [AW-1:0] wr_addr,
     output reg  [127:0]  wr_data,
     output reg  [15:0]   wr_be,
-    output wire [31:0]   mem_rd_addr,
-    input  wire [127:0]  mem_rd_data,
-    output reg           mem_wr_en,
-    output reg  [31:0]   mem_wr_addr,
-    output reg  [127:0]  mem_wr_data
+    output wire          m_req_valid,
+    input  wire          m_req_ready,
+    output wire          m_req_write,
+    output wire [31:0]   m_req_addr,
+    output wire [11:0]   m_req_beats,
+    output wire          m_wdata_valid,
+    input  wire          m_wdata_ready,
+    output wire [127:0]  m_wdata,
+    input  wire          m_rdata_valid,
+    input  wire [127:0]  m_rdata
 );
-    reg          busy, issuing, wrote, v1, to_mem;
-    reg [15:0]   n, i, o, src, dst;
-    reg [7:0]    tag;
-    assign cmd_ready   = !busy;
-    assign rd_addr     = src + i * 16;
-    assign mem_rd_addr = {16'd0, src} + i;
-    always @(posedge clk) v1 <= issuing;
+    localparam int DW = 128;
+    localparam int KB = (NKV * HD + 15) / 16, IB = (IDIM + 15) / 16;          // beats of the key rows, of an index vector
+    localparam int SUMS_BITS = (2 * NKV * HD + IDIM) * 16, SUMS_BEATS = (SUMS_BITS + 127) / 128;
+    localparam int SEL_BYTES = 2 * (1 + TOP), SEL_BEATS = (SEL_BYTES + 15) / 16;
+    localparam int LOG_BS = $clog2(BS), BEATS = HD / L;
+    localparam int NR = 4;
+
+    // The command.
+    reg [3:0]    op;
+    reg [31:0]   pos, ctx_base;
+    reg [15:0]   n, src, dst, arg_lo;
+    reg [7:0]    tag, head;
+
+    // Requesters onto the port.
+    wire [NR-1:0]     r_req_valid, r_req_ready, r_req_write, r_wdata_valid, r_wdata_ready, r_rdata_valid;
+    wire [NR*32-1:0]  r_req_addr;
+    wire [NR*12-1:0]  r_req_beats;
+    wire [NR*DW-1:0]  r_wdata;
+    wire [DW-1:0]     r_rdata;
+    fabric_mem_arbiter #(.N(NR), .DW(DW)) u_arb (
+        .clk(clk), .rst_n(rst_n), .r_req_valid(r_req_valid), .r_req_ready(r_req_ready), .r_req_write(r_req_write),
+        .r_req_addr(r_req_addr), .r_req_beats(r_req_beats), .r_wdata_valid(r_wdata_valid), .r_wdata_ready(r_wdata_ready),
+        .r_wdata(r_wdata), .r_rdata_valid(r_rdata_valid), .r_rdata(r_rdata),
+        .m_req_valid(m_req_valid), .m_req_ready(m_req_ready), .m_req_write(m_req_write), .m_req_addr(m_req_addr),
+        .m_req_beats(m_req_beats), .m_wdata_valid(m_wdata_valid), .m_wdata_ready(m_wdata_ready), .m_wdata(m_wdata),
+        .m_rdata_valid(m_rdata_valid), .m_rdata(m_rdata));
+
+    // Requester 0, the mover: a burst between memory and the buffer or the sums register.
+    localparam [1:0] MV_RD_VB = 0, MV_WR_VB = 1, MV_RD_REG = 2, MV_WR_REG = 3;
+    reg          mv_go, mv_busy, mv_req, mv_done, mv_present, mv_vbv;
+    reg [1:0]    mv_mode;
+    reg [31:0]   mv_maddr;
+    reg [AW-1:0] mv_vaddr;
+    reg [11:0]   mv_n, mv_i;
+    reg [SUMS_BEATS*128-1:0] sums_vec;
+    wire [SUMS_BEATS*128-1:0] sums_out_vec;
+    assign r_req_valid[0]   = mv_req;
+    assign r_req_write[0]   = (mv_mode == MV_WR_VB) || (mv_mode == MV_WR_REG);
+    assign r_req_addr[0*32 +: 32]  = mv_maddr;
+    assign r_req_beats[0*12 +: 12] = mv_n;
+    assign r_wdata_valid[0] = mv_present;
+    assign r_wdata[0*DW +: DW] = (mv_mode == MV_WR_REG) ? sums_out_vec[mv_i*128 +: 128] : rd_data;
+
+    // Requester 1, the append.
+    reg [NKV*HD*8-1:0] k_r, v_r;
+    reg [IDIM*8-1:0]   idx_r, u_r;
+    reg                ap_start;
+    wire               ap_done;
+    wire [NKV*HD*16-1:0] sum_k_out, sum_v_out;
+    wire [IDIM*16-1:0]   sum_i_out;
+    fabric_kv_append #(.DW(DW), .HD(HD), .NKV(NKV), .IDIM(IDIM), .BS(BS), .KV_BITS(KV_BITS), .W(W), .LUT_DIR(LUT_DIR)) u_append (
+        .clk(clk), .rst_n(rst_n), .start(ap_start), .pos(pos), .window_base(ctx_base + WINDOW_OFF), .block_base(ctx_base + BLOCK_OFF),
+        .index_base(ctx_base + INDEX_OFF), .k_rows(k_r), .v_rows(v_r), .idx_k(idx_r),
+        .sum_k_in(sums_vec[0 +: NKV*HD*16]), .sum_v_in(sums_vec[NKV*HD*16 +: NKV*HD*16]), .sum_i_in(sums_vec[2*NKV*HD*16 +: IDIM*16]),
+        .sum_k_out(sum_k_out), .sum_v_out(sum_v_out), .sum_i_out(sum_i_out), .done(ap_done),
+        .req_valid(r_req_valid[1]), .req_ready(r_req_ready[1]), .req_addr(r_req_addr[1*32 +: 32]), .req_beats(r_req_beats[1*12 +: 12]),
+        .wdata_valid(r_wdata_valid[1]), .wdata_ready(r_wdata_ready[1]), .wdata(r_wdata[1*DW +: DW]));
+    assign r_req_write[1] = 1'b1;
+    assign sums_out_vec = {{(SUMS_BEATS*128-SUMS_BITS){1'b0}}, sum_i_out, sum_v_out, sum_k_out};
+
+    // Requester 2, the index scan with its top-K.
+    reg              sc_start, tk_clear, tk_finish, sc_done_d;
+    reg [15:0]       n_blocks;
+    reg [IDIM*4-1:0] q_codes;
+    wire             sc_done, cand_valid, tk_out_valid, tk_out_last, tk_done;
+    wire [15:0]      cand_id, tk_out_id;
+    wire signed [31:0] cand_score, tk_out_score;
+    fabric_index_scan #(.DW(DW), .IDIM(IDIM), .IDW(16), .RPB(RPB)) u_scan (
+        .clk(clk), .rst_n(rst_n), .start(sc_start), .base(ctx_base + INDEX_OFF), .n_blocks(n_blocks), .q_codes(q_codes), .done(sc_done),
+        .cand_valid(cand_valid), .cand_id(cand_id), .cand_score(cand_score),
+        .req_valid(r_req_valid[2]), .req_ready(r_req_ready[2]), .req_addr(r_req_addr[2*32 +: 32]), .req_beats(r_req_beats[2*12 +: 12]),
+        .rdata_valid(r_rdata_valid[2]), .rdata(r_rdata));
+    assign r_req_write[2] = 1'b0;
+    assign r_wdata_valid[2] = 1'b0;
+    assign r_wdata[2*DW +: DW] = 0;
+    fabric_topk #(.K(TOP), .IDW(16), .SW(32)) u_topk (
+        .clk(clk), .rst_n(rst_n), .clear(tk_clear), .cand_valid(cand_valid), .cand_id(cand_id), .cand_score(cand_score),
+        .finish(tk_finish), .out_valid(tk_out_valid), .out_id(tk_out_id), .out_score(tk_out_score), .out_last(tk_out_last), .done(tk_done));
+    reg [7:0]  scale;
+    reg        rc_start;
+    wire       rc_done;
+    wire [16:0] rc_r;
+    wire [5:0]  rc_lz;
+    fabric_recip #(.LW(9), .LUT_DIR(LUT_DIR)) u_rc (.clk(clk), .start(rc_start), .l({scale, 1'b0}), .done(rc_done), .r(rc_r), .lz_out(rc_lz));
+    reg [SEL_BEATS*128-1:0] sel_r;             // the selection: count then ids as int16
+    reg [7:0]  sel_count;
+    wire signed [31:0] span = $signed(pos) - W + 1;
+    wire [15:0] eligible = (span < 0) ? 16'd0 : span[LOG_BS +: 16];
+
+    // Requester 3, the record reader.
+    reg          rr_addr_valid;
+    reg [31:0]   rr_addr;
+    reg [7:0]    rr_count;
+    wire         rr_addr_ready, rr_out_valid, rr_rec_done;
+    wire [1:0]   rr_kind;
+    wire [L*8-1:0] rr_data;
+    fabric_record_reader #(.DW(DW), .HD(HD), .KV_BITS(KV_BITS), .L(L), .MAXR(MAXR)) u_reader (
+        .clk(clk), .rst_n(rst_n), .addr_valid(rr_addr_valid), .addr_ready(rr_addr_ready), .addr(rr_addr), .addr_count(rr_count),
+        .req_valid(r_req_valid[3]), .req_ready(r_req_ready[3]), .req_addr(r_req_addr[3*32 +: 32]), .req_beats(r_req_beats[3*12 +: 12]),
+        .rdata_valid(r_rdata_valid[3]), .rdata(r_rdata), .out_valid(rr_out_valid), .out_ready(1'b1), .out_kind(rr_kind),
+        .out_data(rr_data), .rec_done(rr_rec_done));
+    assign r_req_write[3] = 1'b0;
+    assign r_wdata_valid[3] = 1'b0;
+    assign r_wdata[3*DW +: DW] = 0;
+    reg [15:0] rw_p, rw_last, rw_j, rw_total, rw_rec;
+    reg [7:0]  rw_ob;
+    reg        rw_blocks, rw_reqs_done;
+    wire [15:0] rw_wrap  = W - (rw_p % W);                                  // records before the window wraps
+    wire [15:0] rw_left  = rw_last - rw_p + 1;
+    wire [15:0] rw_run   = (rw_left < rw_wrap) ? rw_left : rw_wrap;
+    wire [7:0]  rw_cnt   = (rw_run > MAXR) ? MAXR[7:0] : rw_run[7:0];
+
+    // The loader: beats of the buffer into one of the operand registers.
+    localparam [2:0] T_K = 0, T_V = 1, T_I = 2, T_U = 3, T_SEL = 4;
+    reg          ld_on, ldv;
+    reg [2:0]    ld_tgt, ld_tgt_d;
+    reg [AW-1:0] ld_base;
+    reg [7:0]    ld_i, ld_i_d, ld_n;
+    always @* begin
+        rd_addr = ld_base + ld_i * 16;
+        if (mv_busy && mv_mode == MV_WR_VB) rd_addr = mv_vaddr + mv_i * 16;
+    end
+
+    localparam [4:0] S_IDLE = 0, S_MV = 1, S_DONE = 2,
+                     S_AP_LOAD = 3, S_AP_SUMS_RD = 4, S_AP_START = 5, S_AP_WAIT = 6, S_AP_SUMS_WR = 7,
+                     S_SC_LOAD = 8, S_SC_SCALE = 9, S_SC_RECIP = 10, S_SC_CODES = 11, S_SC_RUN = 12, S_SC_COLLECT = 13, S_SC_WRITE = 14,
+                     S_RW_LOAD = 15, S_RW_REQ = 16, S_RW_WAIT = 17;
+    reg [4:0] state;
+    assign cmd_ready = (state == S_IDLE);
+    integer j;
+    reg signed [63:0] t, mx;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            busy <= 1'b0; issuing <= 1'b0; wrote <= 1'b0; done_valid <= 1'b0; wr_en <= 1'b0; mem_wr_en <= 1'b0; i <= 0; o <= 0; n <= 0;
+            state <= S_IDLE; done_valid <= 1'b0; wr_en <= 1'b0; ld_on <= 1'b0; ldv <= 1'b0; ld_i <= 0; ld_n <= 0;
+            mv_go <= 1'b0; mv_busy <= 1'b0; mv_req <= 1'b0; mv_done <= 1'b0; mv_present <= 1'b0; mv_vbv <= 1'b0; mv_i <= 0;
+            ap_start <= 1'b0; sc_start <= 1'b0; tk_clear <= 1'b0; tk_finish <= 1'b0; sc_done_d <= 1'b0; rc_start <= 1'b0;
+            rr_addr_valid <= 1'b0; rw_p <= 0; rw_j <= 0; rw_rec <= 0; rw_ob <= 0; rw_blocks <= 1'b0; rw_reqs_done <= 1'b0; sel_count <= 0;
         end else begin
-            done_valid <= wrote; wrote <= 1'b0; wr_en <= 1'b0; mem_wr_en <= 1'b0;
-            if (cmd_valid && cmd_ready) begin
-                busy <= 1'b1; issuing <= 1'b1; n <= cmd_len; src <= cmd_src; dst <= cmd_dst; to_mem <= cmd_arg[0];
-                tag <= cmd_tag; i <= 0; o <= 0;
+            done_valid <= 1'b0; wr_en <= 1'b0; ap_start <= 1'b0; sc_start <= 1'b0; tk_clear <= 1'b0; tk_finish <= 1'b0; rc_start <= 1'b0;
+            mv_go <= 1'b0; mv_done <= 1'b0;
+            // Loader data lands a cycle after its issue.
+            ldv <= ld_on; ld_i_d <= ld_i; ld_tgt_d <= ld_tgt;
+            if (ld_on) begin
+                ld_i <= ld_i + 1'b1;
+                if (ld_i == ld_n - 1) ld_on <= 1'b0;
             end
-            if (issuing) begin
-                i <= i + 1'b1;
-                if (i == n - 1) issuing <= 1'b0;
+            if (ldv) case (ld_tgt_d)
+                T_K:   k_r[ld_i_d*128 +: 128] <= rd_data;
+                T_V:   v_r[ld_i_d*128 +: 128] <= rd_data;
+                T_I:   idx_r[ld_i_d*128 +: 128] <= rd_data;
+                T_U:   u_r[ld_i_d*128 +: 128] <= rd_data;
+                default: sel_r[ld_i_d*128 +: 128] <= rd_data;
+            endcase
+            // The mover.
+            if (mv_go) begin mv_busy <= 1'b1; mv_req <= 1'b1; mv_i <= 0; mv_present <= 1'b0; mv_vbv <= 1'b0; end
+            else if (mv_busy) begin
+                if (mv_req && r_req_ready[0]) mv_req <= 1'b0;
+                case (mv_mode)
+                    MV_RD_VB: if (r_rdata_valid[0]) begin
+                        wr_en <= 1'b1; wr_addr <= mv_vaddr + mv_i * 16; wr_data <= r_rdata; wr_be <= 16'hFFFF;
+                        mv_i <= mv_i + 1'b1;
+                        if (mv_i == mv_n - 1) begin mv_busy <= 1'b0; mv_done <= 1'b1; end
+                    end
+                    MV_RD_REG: if (r_rdata_valid[0]) begin
+                        sums_vec[mv_i*128 +: 128] <= r_rdata;
+                        mv_i <= mv_i + 1'b1;
+                        if (mv_i == mv_n - 1) begin mv_busy <= 1'b0; mv_done <= 1'b1; end
+                    end
+                    MV_WR_VB: begin
+                        // A beat is read from the buffer, then presented until taken.
+                        if (!mv_req && !mv_present && !mv_vbv) mv_vbv <= 1'b1;
+                        else if (mv_vbv) begin mv_vbv <= 1'b0; mv_present <= 1'b1; end
+                        else if (mv_present && r_wdata_ready[0]) begin
+                            mv_present <= 1'b0; mv_i <= mv_i + 1'b1;
+                            if (mv_i == mv_n - 1) begin mv_busy <= 1'b0; mv_done <= 1'b1; end
+                        end
+                    end
+                    default: begin
+                        if (!mv_req && !mv_present) mv_present <= 1'b1;
+                        else if (mv_present && r_wdata_ready[0]) begin
+                            mv_present <= 1'b0; mv_i <= mv_i + 1'b1;
+                            if (mv_i == mv_n - 1) begin mv_busy <= 1'b0; mv_done <= 1'b1; end
+                        end
+                    end
+                endcase
             end
-            if (v1) begin
-                if (to_mem) begin mem_wr_en <= 1'b1; mem_wr_addr <= {16'd0, dst} + o; mem_wr_data <= rd_data; end
-                else begin wr_en <= 1'b1; wr_addr <= dst + o * 16; wr_data <= mem_rd_data; wr_be <= 16'hFFFF; end
-                o <= o + 1'b1;
-                if (o == n - 1) begin wrote <= 1'b1; done_tag <= tag; busy <= 1'b0; end
+            // Top-K collection and the row writes run whenever their units produce.
+            sc_done_d <= sc_done;
+            if (tk_out_valid) begin sel_r[16 + sel_count*16 +: 16] <= tk_out_id; sel_count <= sel_count + 1'b1; end
+            if (rr_out_valid) begin
+                wr_en <= 1'b1; wr_be <= (16'd1 << L) - 1'b1; wr_data <= {{(128-L*8){1'b0}}, rr_data};
+                wr_addr <= dst + rw_rec * 2 * HD + ((rr_kind == 2'd3) ? HD : 0) + ((rw_ob < BEATS) ? rw_ob : rw_ob - BEATS) * L;
+                rw_ob <= rw_ob + 1'b1;
             end
+            if (rr_rec_done) begin rw_rec <= rw_rec + 1'b1; rw_ob <= 0; end
+            case (state)
+                S_IDLE: if (cmd_valid) begin
+                    op <= cmd_arg2[3:0]; pos <= {4'd0, cmd_arg2[31:4]}; ctx_base <= {5'd0, cmd_arg[31:16], 11'd0};
+                    n <= cmd_len; src <= cmd_src; dst <= cmd_dst; arg_lo <= cmd_arg[15:0]; head <= cmd_arg[7:0]; tag <= cmd_tag;
+                    case (cmd_arg2[3:0])
+                        4'd0: begin mv_go <= 1'b1; mv_mode <= MV_RD_VB; mv_maddr <= {12'd0, cmd_src, 4'd0}; mv_vaddr <= cmd_dst; mv_n <= cmd_len[11:0]; state <= S_MV; end
+                        4'd1: begin mv_go <= 1'b1; mv_mode <= MV_WR_VB; mv_maddr <= {12'd0, cmd_dst, 4'd0}; mv_vaddr <= cmd_src; mv_n <= cmd_len[11:0]; state <= S_MV; end
+                        4'd2: begin ld_on <= 1'b1; ld_tgt <= T_K; ld_base <= cmd_src; ld_i <= 0; ld_n <= KB; state <= S_AP_LOAD; end
+                        4'd3: begin ld_on <= 1'b1; ld_tgt <= T_U; ld_base <= cmd_src; ld_i <= 0; ld_n <= IB; state <= S_SC_LOAD; end
+                        default: begin ld_on <= 1'b1; ld_tgt <= T_SEL; ld_base <= cmd_src; ld_i <= 0; ld_n <= SEL_BEATS; state <= S_RW_LOAD; end
+                    endcase
+                end
+                S_MV: if (mv_done) state <= S_DONE;
+                // Append: keys, values, the index projection, then the sums, then the unit.
+                S_AP_LOAD: if (!ld_on && !ldv) begin
+                    if (ld_tgt == T_K) begin ld_on <= 1'b1; ld_tgt <= T_V; ld_base <= arg_lo; ld_i <= 0; ld_n <= KB; end
+                    else if (ld_tgt == T_V) begin ld_on <= 1'b1; ld_tgt <= T_I; ld_base <= dst; ld_i <= 0; ld_n <= IB; end
+                    else begin
+                        mv_go <= 1'b1; mv_mode <= MV_RD_REG; mv_maddr <= ctx_base + SUMS_OFF; mv_n <= SUMS_BEATS; state <= S_AP_SUMS_RD;
+                    end
+                end
+                S_AP_SUMS_RD: if (mv_done) begin ap_start <= 1'b1; state <= S_AP_WAIT; end
+                S_AP_WAIT: if (ap_done) begin
+                    mv_go <= 1'b1; mv_mode <= MV_WR_REG; mv_maddr <= ctx_base + SUMS_OFF; mv_n <= SUMS_BEATS; state <= S_AP_SUMS_WR;
+                end
+                S_AP_SUMS_WR: if (mv_done) state <= S_DONE;
+                // Scan: the query's codes, then the scan and the top-K, then the selection.
+                S_SC_LOAD: if (!ld_on && !ldv) state <= S_SC_SCALE;
+                S_SC_SCALE: begin
+                    mx = 1;
+                    for (j = 0; j < IDIM; j = j + 1) begin
+                        if ($signed(u_r[j*8 +: 8]) > mx) mx = $signed(u_r[j*8 +: 8]);
+                        if (-$signed(u_r[j*8 +: 8]) > mx) mx = -$signed(u_r[j*8 +: 8]);
+                    end
+                    scale <= mx[7:0]; rc_start <= 1'b1; state <= S_SC_RECIP;
+                end
+                S_SC_RECIP: if (rc_done) begin
+                    for (j = 0; j < IDIM; j = j + 1) begin
+                        t = fx_rnd_shr(64'sd15 * ($signed(u_r[j*8 +: 8]) + $signed({56'b0, scale})) * $signed({47'b0, rc_r}), 24 - rc_lz);
+                        if (t < 0) t = 0;
+                        if (t > 15) t = 15;
+                        q_codes[j*4 +: 4] <= t[3:0];
+                    end
+                    n_blocks <= eligible; tk_clear <= 1'b1; sel_count <= 0; sel_r <= 0; state <= S_SC_CODES;
+                end
+                S_SC_CODES: begin sc_start <= 1'b1; state <= S_SC_RUN; end
+                S_SC_RUN: if (sc_done_d) begin tk_finish <= 1'b1; state <= S_SC_COLLECT; end   // after the last candidate entered
+                S_SC_COLLECT: if (tk_done) begin rw_j <= 0; state <= S_SC_WRITE; end
+                S_SC_WRITE: begin
+                    wr_en <= 1'b1; wr_addr <= dst + rw_j * 16; wr_be <= (SEL_BYTES - rw_j * 16 >= 16) ? 16'hFFFF : ((16'd1 << (SEL_BYTES - rw_j * 16)) - 1'b1);
+                    wr_data <= (rw_j == 0) ? {sel_r[127:16], 8'd0, sel_count} : sel_r[rw_j*128 +: 128];
+                    rw_j <= rw_j + 1'b1;
+                    if (rw_j == SEL_BEATS - 1) state <= S_DONE;
+                end
+                // Rows: the window run by run, then one request per selected block.
+                S_RW_LOAD: if (!ld_on && !ldv) begin
+                    rw_p <= (pos + 1 > W) ? pos + 1 - W : 0; rw_last <= pos[15:0]; rw_j <= 0; rw_rec <= 0; rw_ob <= 0;
+                    rw_blocks <= 1'b0; rw_reqs_done <= 1'b0; rw_total <= ((pos + 1 > W) ? W : pos[15:0] + 1) + sel_r[7:0];
+                    state <= S_RW_REQ;
+                end
+                S_RW_REQ: begin
+                    if (rr_addr_valid && rr_addr_ready) begin
+                        rr_addr_valid <= 1'b0;
+                        if (!rw_blocks) rw_p <= rw_p + rw_cnt; else rw_j <= rw_j + 1'b1;
+                    end else if (!rr_addr_valid) begin
+                        if (!rw_blocks) begin
+                            if (rw_p <= rw_last) begin
+                                rr_addr_valid <= 1'b1; rr_count <= rw_cnt;
+                                rr_addr <= ctx_base + WINDOW_OFF + (head * W + rw_p % W) * REC_BYTES;
+                            end else rw_blocks <= 1'b1;
+                        end else if (rw_j < sel_r[7:0]) begin
+                            rr_addr_valid <= 1'b1; rr_count <= 8'd1;
+                            rr_addr <= ctx_base + BLOCK_OFF + (sel_r[16 + rw_j*16 +: 16] * NKV + head) * REC_BYTES;
+                        end else state <= S_RW_WAIT;
+                    end
+                end
+                S_RW_WAIT: if (rw_rec == rw_total) state <= S_DONE;
+                default: begin done_valid <= 1'b1; done_tag <= tag; state <= S_IDLE; end
+            endcase
         end
     end
 endmodule
@@ -830,7 +1343,24 @@ module fabric_layer_engine #(
     parameter int HV   = 16,
     parameter int KK   = 4,
     parameter int CONV = 128,
-    parameter int ROWS = 96,
+    parameter int NH   = 4,                     // the global layer
+    parameter int NKV  = 2,
+    parameter int HD   = 24,
+    parameter int RD   = 6,
+    parameter int IDIM = 32,
+    parameter int W    = 16,
+    parameter int BS   = 4,
+    parameter int TOP  = 2,
+    parameter int KV_BITS = 4,
+    parameter int REC_BYTES = 32,
+    parameter int RPB  = 64,
+    parameter int MAXR = 64,
+    parameter int WINDOW_OFF = 0,
+    parameter int BLOCK_OFF  = 2048,
+    parameter int INDEX_OFF  = 6144,
+    parameter int SUMS_OFF   = 8192,
+    parameter int ATT_L = 8,
+    parameter int ROWS = 96,                    // the tiles
     parameter int COLS = 16,
     parameter int P    = 2,
     parameter int NT   = 56,
@@ -851,17 +1381,25 @@ module fabric_layer_engine #(
     input  wire [15:0]  n_steps,
     output wire         running,
     output wire         done,
-    output wire [31:0]  mem_rd_addr,
-    input  wire [127:0] mem_rd_data,
-    output wire         mem_wr_en,
-    output wire [31:0]  mem_wr_addr,
-    output wire [127:0] mem_wr_data
+    // the memory port (fabric_memory.sv's request protocol)
+    output wire         m_req_valid,
+    input  wire         m_req_ready,
+    output wire         m_req_write,
+    output wire [31:0]  m_req_addr,
+    output wire [11:0]  m_req_beats,
+    output wire         m_wdata_valid,
+    input  wire         m_wdata_ready,
+    output wire [127:0] m_wdata,
+    input  wire         m_rdata_valid,
+    input  wire [127:0] m_rdata
 );
-    localparam int NU = 10, NE = 4, AW = 16, NL = 8, CL = 4;
+    localparam int NU = 10, NE = 4, AW = 16, NL = 8, CL = 4, GROUP = NH / NKV;
     localparam int U_TILES = 0, U_NORM = 1, U_CONV = 2, U_GATES = 3, U_DELTA = 4, U_SWIGLU = 5, U_RESIDUAL = 6, U_ROTARY = 7, U_ATTN = 8, U_MEM = 9;
     // Vector-buffer ports.
-    localparam int R_NORM = 0, R_TILES = 4, R_CONV = 5, R_GATES = 7, R_DELTA = 9, R_SWIGLU = 13, R_RESIDUAL = 15, R_MEM = 17, NR = 18;
-    localparam int W_NORM = 0, W_TILES = 2, W_CONV = 3, W_GATES = 5, W_DELTA = 6, W_SWIGLU = 10, W_RESIDUAL = 11, W_MEM = 12, NW = 13;
+    localparam int R_NORM = 0, R_TILES = 4, R_CONV = 5, R_GATES = 7, R_DELTA = 9, R_SWIGLU = 13, R_RESIDUAL = 15, R_MEM = 17,
+                   R_ROTARY = 18, R_ATTN = 20, NR = 24;
+    localparam int W_NORM = 0, W_TILES = 2, W_CONV = 3, W_GATES = 5, W_DELTA = 6, W_SWIGLU = 10, W_RESIDUAL = 11, W_MEM = 12,
+                   W_ROTARY = 13, W_ATTN = 15, NW = 19;
 
     wire [NU-1:0]      cmd_valid, cmd_ready;
     wire [3:0]         cmd_engine;
@@ -884,8 +1422,8 @@ module fabric_layer_engine #(
     fabric_vb #(.BYTES(VB_BYTES), .NR(NR), .NW(NW), .AW(AW), .INIT_FILE(VB_FILE)) u_vb (
         .clk(clk), .rd_addr(rd_addr), .rd_data(rd_data), .wr_en(wr_en), .wr_addr(wr_addr), .wr_data(wr_data), .wr_be(wr_be));
 
-    // Units without engines here: the rotary and attention cores of the global layer.
-    wire [NE-1:0] ready_norm, ready_delta;
+    wire [NE-1:0] ready_norm, ready_delta, ready_rotary, ready_attn;
+    wire ready_tiles, ready_conv, ready_gates, ready_swiglu, ready_residual, ready_mem;
     assign cmd_ready[U_TILES]    = (cmd_engine == 0) && ready_tiles;
     assign cmd_ready[U_NORM]     = (cmd_engine < 2) && ready_norm[cmd_engine];
     assign cmd_ready[U_CONV]     = (cmd_engine == 0) && ready_conv;
@@ -893,23 +1431,20 @@ module fabric_layer_engine #(
     assign cmd_ready[U_DELTA]    = ready_delta[cmd_engine];
     assign cmd_ready[U_SWIGLU]   = (cmd_engine == 0) && ready_swiglu;
     assign cmd_ready[U_RESIDUAL] = (cmd_engine == 0) && ready_residual;
-    assign cmd_ready[U_ROTARY]   = 1'b0;
-    assign cmd_ready[U_ATTN]     = 1'b0;
+    assign cmd_ready[U_ROTARY]   = (cmd_engine < 2) && ready_rotary[cmd_engine];
+    assign cmd_ready[U_ATTN]     = ready_attn[cmd_engine];
     assign cmd_ready[U_MEM]      = (cmd_engine == 0) && ready_mem;
-    assign done_valid[U_ROTARY*NE +: NE] = 0;
-    assign done_valid[U_ATTN*NE +: NE]   = 0;
-    assign done_tag[U_ROTARY*NE*8 +: NE*8] = 0;
-    assign done_tag[U_ATTN*NE*8 +: NE*8]   = 0;
     assign done_valid[U_TILES*NE + 1 +: 3] = 0;    assign done_tag[(U_TILES*NE + 1)*8 +: 24] = 0;
     assign done_valid[U_NORM*NE + 2 +: 2] = 0;     assign done_tag[(U_NORM*NE + 2)*8 +: 16] = 0;
     assign done_valid[U_CONV*NE + 1 +: 3] = 0;     assign done_tag[(U_CONV*NE + 1)*8 +: 24] = 0;
     assign done_valid[U_GATES*NE + 1 +: 3] = 0;    assign done_tag[(U_GATES*NE + 1)*8 +: 24] = 0;
     assign done_valid[U_SWIGLU*NE + 1 +: 3] = 0;   assign done_tag[(U_SWIGLU*NE + 1)*8 +: 24] = 0;
     assign done_valid[U_RESIDUAL*NE + 1 +: 3] = 0; assign done_tag[(U_RESIDUAL*NE + 1)*8 +: 24] = 0;
+    assign done_valid[U_ROTARY*NE + 2 +: 2] = 0;   assign done_tag[(U_ROTARY*NE + 2)*8 +: 16] = 0;
     assign done_valid[U_MEM*NE + 1 +: 3] = 0;      assign done_tag[(U_MEM*NE + 1)*8 +: 24] = 0;
     assign ready_norm[3:2] = 0;
+    assign ready_rotary[3:2] = 0;
 
-    wire ready_tiles, ready_conv, ready_gates, ready_swiglu, ready_residual, ready_mem;
     genvar e;
     generate
         for (e = 0; e < 2; e = e + 1) begin : g_norm
@@ -930,6 +1465,24 @@ module fabric_layer_engine #(
                 .rd_addr(rd_addr[(R_DELTA + e)*AW +: AW]), .rd_data(rd_data[(R_DELTA + e)*128 +: 128]),
                 .wr_en(wr_en[W_DELTA + e]), .wr_addr(wr_addr[(W_DELTA + e)*AW +: AW]), .wr_data(wr_data[(W_DELTA + e)*128 +: 128]),
                 .wr_be(wr_be[(W_DELTA + e)*16 +: 16]));
+        end
+        for (e = 0; e < 2; e = e + 1) begin : g_rotary
+            fabric_rotary_adapter #(.HD(HD), .R(RD), .NL(NL), .SW(SW), .AW(AW), .LUT_DIR(LUT_DIR)) u (
+                .clk(clk), .rst_n(rst_n), .cmd_valid(cmd_valid[U_ROTARY] && cmd_engine == e), .cmd_src(cmd_src), .cmd_dst(cmd_dst),
+                .cmd_arg(cmd_arg), .cmd_arg2(cmd_arg2), .cmd_tag(cmd_tag), .cmd_ready(ready_rotary[e]),
+                .done_valid(done_valid[U_ROTARY*NE + e]), .done_tag(done_tag[(U_ROTARY*NE + e)*8 +: 8]),
+                .rd_addr(rd_addr[(R_ROTARY + e)*AW +: AW]), .rd_data(rd_data[(R_ROTARY + e)*128 +: 128]),
+                .wr_en(wr_en[W_ROTARY + e]), .wr_addr(wr_addr[(W_ROTARY + e)*AW +: AW]), .wr_data(wr_data[(W_ROTARY + e)*128 +: 128]),
+                .wr_be(wr_be[(W_ROTARY + e)*16 +: 16]));
+        end
+        for (e = 0; e < NE; e = e + 1) begin : g_attn
+            fabric_attn_adapter #(.HD(HD), .G(GROUP), .L(ATT_L), .AW(AW), .LUT_DIR(LUT_DIR)) u (
+                .clk(clk), .rst_n(rst_n), .cmd_valid(cmd_valid[U_ATTN] && cmd_engine == e), .cmd_len(cmd_len), .cmd_src(cmd_src),
+                .cmd_dst(cmd_dst), .cmd_arg(cmd_arg), .cmd_tag(cmd_tag), .cmd_ready(ready_attn[e]),
+                .done_valid(done_valid[U_ATTN*NE + e]), .done_tag(done_tag[(U_ATTN*NE + e)*8 +: 8]),
+                .rd_addr(rd_addr[(R_ATTN + e)*AW +: AW]), .rd_data(rd_data[(R_ATTN + e)*128 +: 128]),
+                .wr_en(wr_en[W_ATTN + e]), .wr_addr(wr_addr[(W_ATTN + e)*AW +: AW]), .wr_data(wr_data[(W_ATTN + e)*128 +: 128]),
+                .wr_be(wr_be[(W_ATTN + e)*16 +: 16]));
         end
     endgenerate
 
@@ -969,12 +1522,15 @@ module fabric_layer_engine #(
         .rd_data_h(rd_data[R_RESIDUAL*128 +: 128]), .rd_data_y(rd_data[(R_RESIDUAL+1)*128 +: 128]),
         .wr_en(wr_en[W_RESIDUAL]), .wr_addr(wr_addr[W_RESIDUAL*AW +: AW]), .wr_data(wr_data[W_RESIDUAL*128 +: 128]), .wr_be(wr_be[W_RESIDUAL*16 +: 16]));
 
-    fabric_mem_adapter #(.AW(AW)) u_mem (
+    fabric_mem_unit #(.HD(HD), .NKV(NKV), .IDIM(IDIM), .BS(BS), .W(W), .TOP(TOP), .KV_BITS(KV_BITS), .L(ATT_L), .REC_BYTES(REC_BYTES),
+                      .RPB(RPB), .MAXR(MAXR), .WINDOW_OFF(WINDOW_OFF), .BLOCK_OFF(BLOCK_OFF), .INDEX_OFF(INDEX_OFF), .SUMS_OFF(SUMS_OFF),
+                      .AW(AW), .LUT_DIR(LUT_DIR)) u_mem (
         .clk(clk), .rst_n(rst_n), .cmd_valid(cmd_valid[U_MEM] && cmd_engine == 0), .cmd_len(cmd_len), .cmd_src(cmd_src), .cmd_dst(cmd_dst),
-        .cmd_arg(cmd_arg), .cmd_tag(cmd_tag), .cmd_ready(ready_mem), .done_valid(done_valid[U_MEM*NE]), .done_tag(done_tag[U_MEM*NE*8 +: 8]),
+        .cmd_arg(cmd_arg), .cmd_arg2(cmd_arg2), .cmd_tag(cmd_tag), .cmd_ready(ready_mem), .done_valid(done_valid[U_MEM*NE]), .done_tag(done_tag[U_MEM*NE*8 +: 8]),
         .rd_addr(rd_addr[R_MEM*AW +: AW]), .rd_data(rd_data[R_MEM*128 +: 128]),
         .wr_en(wr_en[W_MEM]), .wr_addr(wr_addr[W_MEM*AW +: AW]), .wr_data(wr_data[W_MEM*128 +: 128]), .wr_be(wr_be[W_MEM*16 +: 16]),
-        .mem_rd_addr(mem_rd_addr), .mem_rd_data(mem_rd_data), .mem_wr_en(mem_wr_en), .mem_wr_addr(mem_wr_addr), .mem_wr_data(mem_wr_data));
+        .m_req_valid(m_req_valid), .m_req_ready(m_req_ready), .m_req_write(m_req_write), .m_req_addr(m_req_addr), .m_req_beats(m_req_beats),
+        .m_wdata_valid(m_wdata_valid), .m_wdata_ready(m_wdata_ready), .m_wdata(m_wdata), .m_rdata_valid(m_rdata_valid), .m_rdata(m_rdata));
 endmodule
 
 `default_nettype wire

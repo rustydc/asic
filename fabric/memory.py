@@ -158,6 +158,12 @@ class MemoryMap:
     def index_bytes(self) -> int:
         return self.blocks * self.index_record_bytes
 
+    @property
+    def sums_bytes(self) -> int:
+        """The running sums of the block being filled (keys, values, index
+        projections as int16), kept per context so contexts may interleave."""
+        return _beats((2 * self.kv_heads * self.head_dim + self.index_dim) * 2) * BEAT
+
     # Layout ----------------------------------------------------------------
 
     @staticmethod
@@ -180,6 +186,8 @@ class MemoryMap:
             offset += self._align(self.block_store_bytes)
             out[f"index{layer}"] = (offset, self.index_bytes)
             offset += self._align(self.index_bytes)
+            out[f"sums{layer}"] = (offset, self.sums_bytes)
+            offset += self._align(self.sums_bytes)
         out["_total"] = (0, offset)
         return out
 
@@ -227,6 +235,9 @@ class MemoryMap:
         base = self.context_base(ctx) + self.regions()[f"index{layer}"][0]
         return base + block * self.index_record_bytes
 
+    def sums_addr(self, ctx: int, layer: int = 0) -> int:
+        return self.context_base(ctx) + self.regions()[f"sums{layer}"][0]
+
     # Traffic ---------------------------------------------------------------
 
     def bytes_per_token(self, pos: int, top_blocks: int) -> dict[str, int]:
@@ -237,6 +248,7 @@ class MemoryMap:
             "state": 2 * self.recurrent_layers * self.state_bytes,
             "history": 2 * self.recurrent_layers * self.conv_dim * (self.kernel - 1),
             "window_append": self.kv_heads * self.kv_record_bytes,
+            "block_sums": 2 * self.sums_bytes,
             "window_read": n_window * self.kv_heads * self.kv_record_bytes,
             "block_append": (self.kv_heads * self.kv_record_bytes + self.index_record_bytes) if (pos + 1) % self.block == 0 else 0,
             "index_scan": eligible * self.index_record_bytes,
@@ -404,6 +416,11 @@ class GlobalContextMemory:
         self.sum_idx = np.zeros(mm.index_dim, dtype=np.int64)
         self.next_pos = 0
 
+    def _write_sums(self) -> None:
+        """The running sums as the memory holds them: int16, keys then values then the index projections."""
+        record = np.concatenate([self.sum_k.reshape(-1), self.sum_v.reshape(-1), self.sum_idx]).astype("<i2").tobytes()
+        self.image.write(self.mm.sums_addr(self.ctx), record + bytes(self.mm.sums_bytes - len(record)))
+
     def _write_record(self, addr: int, k: np.ndarray, v: np.ndarray) -> None:
         half = self.mm.kv_half_bytes
         self.image.write(addr, kv_pack(kv_quant(k, self.mm.kv_bits), self.mm.kv_bits, half))
@@ -444,6 +461,7 @@ class GlobalContextMemory:
             self.sum_k[:] = 0
             self.sum_v[:] = 0
             self.sum_idx[:] = 0
+        self._write_sums()
         return out
 
     def scan(self, pos: int, q_unit: np.ndarray) -> tuple[list[tuple[int, int]], np.ndarray]:
@@ -598,7 +616,7 @@ def emit_kv_append_vectors(directory: Path, rng: np.random.Generator, mm: Memory
     regions = mm.regions()
     return _params(directory, TOKENS=tokens, HD=mm.head_dim, NKV=mm.kv_heads, IDIM=mm.index_dim, BS=mm.block,
                    KV_BITS=mm.kv_bits, W=mm.local_window, WINDOW_BASE=regions["window0"][0],
-                   BLOCK_BASE=regions["blocks0"][0], INDEX_BASE=regions["index0"][0],
+                   BLOCK_BASE=regions["blocks0"][0], INDEX_BASE=regions["index0"][0], SUMS_BASE=regions["sums0"][0],
                    WORDS=len(store.image.data) // BEAT)
 
 
