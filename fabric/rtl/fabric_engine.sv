@@ -67,7 +67,7 @@ module fabric_vb #(
             if (wr_en[p])
                 for (b = 0; b < 16; b = b + 1)
                     if (wr_be[p*16 + b] && (wr_addr[p*AW +: AW] + b < BYTES))
-                        mem[wr_addr[p*AW +: AW] + b] <= wr_data[p*128 + b*8 +: 8];
+                        mem[wr_addr[p*AW +: AW] + b] = wr_data[p*128 + b*8 +: 8];    // blocking: the reads above precede it, and Verilator wants it so
     end
 endmodule
 
