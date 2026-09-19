@@ -31,13 +31,17 @@ class SolverTest(unittest.TestCase):
 class ClockNetTest(unittest.TestCase):
     """The design decision: four devices on one clock fail the edge limit, one per device passes."""
 
-    def test_one_clock_per_device_passes_at_the_trunk_as_placed(self) -> None:
-        r = si.run(si.point_to_point(si.TRUNK_AS_PLACED_MM), 50.0)
-        m = r.loads["d0"]
-        self.assertTrue(r.ok)
-        self.assertLess(max(m.rise_ns, m.fall_ns), 0.45)
-        self.assertLess(m.v_max, si.VDD + 0.05)                  # a matched drive: no overshoot
-        self.assertTrue(m.clean)
+    def test_one_clock_per_device_passes_at_both_placements(self) -> None:
+        for trunk in (si.TRUNK_AS_PLACED_MM, si.TRUNK_SOUTH_MM):
+            r = si.run(si.point_to_point(trunk), 50.0)
+            m = r.loads["d0"]
+            self.assertTrue(r.ok)
+            self.assertLess(max(m.rise_ns, m.fall_ns), 0.45)
+            self.assertLess(m.v_max, si.VDD + 0.05)              # a matched drive: no overshoot
+            self.assertTrue(m.clean)
+        # The north placement also admits the stronger 33 ohm drive at every device.
+        for trunk in (15.0, 55.0):
+            self.assertTrue(si.run(si.point_to_point(trunk), 33.0).ok)
 
     def test_four_on_one_clock_fails_the_edge_limit(self) -> None:
         star = si.run(si.star(si.TRUNK_NORTH_MM, (12.0, 4.0, 4.0, 12.0)), 33.0)

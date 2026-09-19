@@ -192,6 +192,21 @@ def misc_signals(board: Board) -> list[tuple[str, str]]:
     return MISC_SIGNALS + extra
 
 
+def misc_edge(board: Board, interface: str) -> str:
+    """The package edge a small interface goes to: its own entry in `edges` if it has one, else the `misc` edge."""
+    edges = board.data["package_selection"]["edges"]
+    return edges.get(interface, edges.get("misc", "S"))
+
+
+def extra_misc_interfaces(board: Board) -> list[str]:
+    """The misc-kind interfaces beyond the management signals, in order."""
+    names = []
+    for interface, _ in misc_signals(board)[len(MISC_SIGNALS):]:
+        if interface not in names:
+            names.append(interface)
+    return names
+
+
 def link_rows(board: Board) -> int:
     """A link port is a two-deep block of this many positions along its edge."""
     return math.ceil(len(expand_signals(board.kinds["link"]["signals"])) / 2)
@@ -365,27 +380,42 @@ def assign(board: Board, package: PackageSpec, need: Requirements) -> list[Ball]
             i, j = next(positions)
             place(i, j, "ground", "GND", "")
 
-    # Small interfaces on the south rows (between the link blocks when those
-    # are on the south edge too), outer row first and a third row when the
-    # outer two are full, a ground after every four; or, when the south rows
-    # hold memory, in the west columns outside the link port.
-    if edges.get("misc", "S") == "W":
-        memory_rows = set(range(signal_rows)) | set(range(package.rows - signal_rows, package.rows))
-        misc = ((i, j) for j0 in (0, 2) for i in range(package.rows) for j in (j0, j0 + 1)
-                if i not in memory_rows and i not in link_rows_taken and (i, j) not in taken)
-    else:
-        misc = ((i, j) for i in (package.rows - 1, package.rows - 2, package.rows - 3) for j in range(2, package.cols - 2)
+    # Small interfaces, a ground after every four.  The management signals go
+    # to the `misc` edge and a misc-kind interface with its own entry in
+    # `edges` (the PSRAM clocks) to that edge.  South: the outer rows between
+    # the link blocks, a third row when the outer two are full.  West: the
+    # columns outside the link port, when the south rows hold memory.  North:
+    # the row just inside the memory rows, so the balls escape with the
+    # memory (a microvia deeper than the memory's own rows).  That row has
+    # eighteen positions between the east and west strips and no grounds of
+    # its own: the memory lanes above end in grounds and the checkerboard
+    # below is half ground, so its returns are already adjacent.
+    def misc_positions(edge: str):
+        if edge == "W":
+            memory_rows = set(range(signal_rows)) | set(range(package.rows - signal_rows, package.rows))
+            return ((i, j) for j0 in (0, 2) for i in range(package.rows) for j in (j0, j0 + 1)
+                    if i not in memory_rows and i not in link_rows_taken and (i, j) not in taken)
+        if edge == "N":
+            first = signal_rows if "N" in mem_edges else 0
+            return ((i, j) for i in (first, first + 1) for j in range(2, package.cols - 2) if (i, j) not in taken)
+        return ((i, j) for i in (package.rows - 1, package.rows - 2, package.rows - 3) for j in range(2, package.cols - 2)
                 if (i, j) not in taken)
-    try:
-        for n, (interface, signal) in enumerate(misc_signals(board)):
-            i, j = next(misc)
-            place(i, j, "signal", interface, signal)
-            if n % 4 == 3:
+
+    groups: dict[str, list[tuple[str, str]]] = {}
+    for interface, signal in misc_signals(board):
+        groups.setdefault(misc_edge(board, interface), []).append((interface, signal))
+    for edge, signals in groups.items():
+        misc = misc_positions(edge)
+        try:
+            for n, (interface, signal) in enumerate(signals):
                 i, j = next(misc)
-                place(i, j, "ground", "GND", "")
-    except StopIteration:
-        raise ValueError(f"{package.name}: no room for the small interfaces on the {edges.get('misc', 'S')} edge "
-                         "beside the link and memory balls") from None
+                place(i, j, "signal", interface, signal)
+                if n % 4 == 3 and edge != "N":
+                    i, j = next(misc)
+                    place(i, j, "ground", "GND", "")
+        except StopIteration:
+            raise ValueError(f"{package.name}: no room for the small interfaces on the {edge} edge "
+                             "beside the link and memory balls") from None
 
     # Everything else: ground and core in a checkerboard, rails sprinkled in.
     rails = list(need.rail_balls.items())
@@ -480,6 +510,9 @@ def report_markdown(pinout: Pinout, board: Board) -> str:
                 else ["| memory | 0 | in the package (HBM on the interposer), no balls |"]),
               f"| mgmt, jtag, refclk, strap | {sum(pinout.count('signal', i) for i in ('mgmt', 'jtag', 'refclk', 'strap'))} | "
               f"{rules['edges']['misc']} {'columns outside the link port' if rules['edges']['misc'] == 'W' else 'row'} |",
+              *[f"| {name} | {pinout.count('signal', name)} | {misc_edge(board, name)} "
+                f"{'row inside the memory rows' if misc_edge(board, name) == 'N' else 'row' if misc_edge(board, name) == 'S' else 'columns'} |"
+                for name in extra_misc_interfaces(board)],
               f"| VDD_CORE | {pinout.count('rail', 'VDD_CORE')} | interior checkerboard |",
               f"| GND | {pinout.count('ground')} | interior checkerboard and lane returns |"]
     for rail in need.rail_balls:
@@ -493,7 +526,8 @@ def report_markdown(pinout: Pinout, board: Board) -> str:
               f"* the die-edge assignment it implies: link ports on the {rules['edges']['link_in']} and {rules['edges']['link_out']} die edges, "
               + (f"the memory PHYs on the {' and '.join(memory_edges(board))} edge{'s' if len(memory_edges(board)) > 1 else ''}, "
                  if memory_channels(board) else "the HBM PHY on the north edge towards the stack, ")
-              + ("management on the west outside the link port;" if rules["edges"].get("misc") == "W" else "management on the south;"),
+              + ("management on the west outside the link port" if rules["edges"].get("misc") == "W" else "management on the south")
+              + "".join(f", {name} on the {misc_edge(board, name)}" for name in extra_misc_interfaces(board)) + ";",
               f"* the core current ({need.core_amps:.0f} A at the rating, {board.core_current_a('layer_asic', 50_000):.0f} A "
               "at 50K tokens/s) for the bump map and the substrate power planes.", "",
               "The substrate design, the bump map and the final ball map come back from them; the loop usually runs "

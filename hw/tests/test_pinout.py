@@ -123,12 +123,15 @@ class PinoutTest(unittest.TestCase):
         self.assertEqual(len(memory), 304)
         clocks = [b for b in p.balls if b.interface == "psram_clk"]
         self.assertEqual(len(clocks), 16)
-        self.assertTrue(all(b.row >= rows - 3 for b in clocks))              # with the small interfaces, spilling to a third row
+        self.assertTrue(all(b.row == 5 for b in clocks))                     # north, the row inside the memory rows
+        self.assertEqual(pinout.misc_edge(board, "psram_clk"), "N")
+        self.assertEqual(pinout.misc_edge(board, "mgmt"), "S")
         depth = [min(b.row, b.col, rows - 1 - b.row, cols - 1 - b.col) for b in memory]
         self.assertLessEqual(max(depth), 4)
         self.assertTrue(all(b.row >= rows - 2 for b in p.balls if b.interface in ("mgmt", "jtag", "refclk", "strap")))
         report = pinout.report_markdown(p, board)
         self.assertIn("S edge, beside it", report)
+        self.assertIn("| psram_clk | 16 | N row inside the memory rows |", report)
         # The single-board rule set is untouched: the 9B map still has 36-lane ports on W and E.
         self.assertEqual(pinout.link_rows(self.board), 18)
         self.assertEqual(pinout.memory_edges(self.board), ["N"])

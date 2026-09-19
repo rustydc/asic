@@ -277,12 +277,15 @@ def run(topology: Topology, r_drive: float, cycles: int = 6) -> Result:
 # The study
 # --------------------------------------------------------------------------
 
-# The card as generated: the clock balls sit on the die's south edge with
-# the small interfaces and the PSRAM rows stand north of the chip, so the
-# trunk goes round the 23 mm package: about 55 mm.  With the clock balls
-# moved to the north edge beside the memory it is about 20 mm.
-TRUNK_AS_PLACED_MM = 55.0
+# The card as generated: the clock balls sit on the die's north edge just
+# inside the memory rows and the PSRAM rows stand north of the chip, so a
+# trunk is 15 to 55 mm, about 20 for a device in the first row.  The first
+# cut had the clock balls on the south edge with the management pins and
+# the trunk went round the 23 mm package: about 55 mm, kept as the second
+# case.
 TRUNK_NORTH_MM = 20.0
+TRUNK_SOUTH_MM = 55.0
+TRUNK_AS_PLACED_MM = TRUNK_NORTH_MM
 DEVICE_PITCH_MM = 8.0        # 6 mm body plus 2 mm gap along the row
 R_DRIVE_SWEEP = (12.0, 18.0, 25.0, 33.0, 50.0)
 
@@ -297,7 +300,7 @@ def topologies(trunk_mm: float) -> list[Topology]:
     ]
 
 
-def study(trunks: tuple[float, ...] = (TRUNK_NORTH_MM, TRUNK_AS_PLACED_MM),
+def study(trunks: tuple[float, ...] = (TRUNK_NORTH_MM, TRUNK_SOUTH_MM),
           r_sweep: tuple[float, ...] = R_DRIVE_SWEEP) -> list[tuple[float, list[Result]]]:
     out = []
     for trunk in trunks:
@@ -312,7 +315,7 @@ def best(results: list[Result], topology_name: str) -> Result | None:
     return max(passing, key=lambda r: r.r_drive) if passing else None
 
 
-POINT_TO_POINT_LENGTHS_MM = (20.0, 40.0, 55.0, 70.0, 85.0)   # the nearest to the farthest device from the south-edge balls
+POINT_TO_POINT_LENGTHS_MM = (15.0, 30.0, 45.0, 55.0, 70.0)   # the nearest to the farthest device from the north-edge balls, and margin
 POINT_TO_POINT_DRIVES = (33.0, 50.0)
 
 
@@ -341,7 +344,7 @@ def report_markdown(results_by_trunk: list[tuple[float, list[Result]]], p2p: lis
         "",
     ]
     for trunk, results in results_by_trunk:
-        where = "clock balls on the north edge beside the memory" if trunk <= 30 else "clock balls on the south edge as placed, round the package"
+        where = "clock balls on the north edge beside the memory, as placed" if trunk <= 30 else "clock balls on the south edge with the management pins, the first cut, round the package"
         lines += [f"## Trunk {trunk:.0f} mm ({where})", "",
                   "| Topology | Drive | Worst edge | Peak | Trough | Clean | Duty | Skew | Verdict |",
                   "| --- | ---: | ---: | ---: | ---: | :---: | ---: | ---: | :---: |"]
@@ -367,9 +370,10 @@ def report_markdown(results_by_trunk: list[tuple[float, list[Result]]], p2p: lis
     lines += ["## Reading", "",
               "Four devices on one clock is 20 pF of package input on the net, and an edge that meets tKHKL into 20 pF "
               "needs a drive under 20 ohm, which then rings through the absolute maximum ratings; the star of four passes "
-              "at one drive value on the short trunk and nowhere on the trunk as placed, and the fly-by, whose loaded line "
+              "at one drive value on the north trunk and nowhere on the south one, and the fly-by, whose loaded line "
               "slows to a third of its speed, passes nowhere with or without an end termination. Two per clock passes in a "
-              "narrow band around 33 ohm. One clock per device passes from 33 to 50 ohm at every length on the card, with "
+              "narrow band around 33 ohm. One clock per device passes from 33 to 50 ohm at every length on the card (15 to "
+              "55 mm from the north-edge balls to the two rows of devices), with "
               "a 50 ohm total drive (the pad driver plus a series resistor) giving a reflection-free edge of 0.4 ns. So the "
               "die carries sixteen clocks (`psram_clk`, twelve more balls in the small-interface rows) and each is a "
               "series-terminated point-to-point trace.", ""]

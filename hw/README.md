@@ -393,9 +393,10 @@ Placeholders, beyond the usual ones: the finger and slot geometry stand
 in for a real connector drawing. The PSRAM is chosen: the AP Memory
 APS512XXN-OB9-BG, 512 Mb x16 HPI at 250 MHz in a 24-ball 6 × 8 mm BGA at
 1.0 mm pitch, twenty signals per device including its own single-ended
-clock (`psram_clk` on the die, sixteen balls placed with the small
-interfaces, which spill into a third row), and its controller is in
-`fabric/rtl/fabric_hpi.sv`.
+clock (`psram_clk` on the die, sixteen balls on the north edge in the row
+just inside the memory rows, `psram_clk: N` in `edges`, so each clock
+escapes with its memory and runs 15 to 55 mm to its device), and its
+controller is in `fabric/rtl/fabric_hpi.sv`.
 
 ### The PSRAM clock: one per device
 
@@ -410,21 +411,27 @@ crossing of the 0.4 / 1.4 V band per edge, 45 to 55 percent duty, and a
 0.4 ns skew budget of our own. `si_psram_clock.md` is the result over a
 star of four, a fly-by of four with and without an end termination, a
 star of two and a point-to-point net, at drive resistances from 12 to
-50 Ω and at two trunk lengths, 20 mm (clock balls beside the memory)
-and 55 mm (the clock balls on the south edge as placed, round the
-package).
+50 Ω and at two trunk lengths, 20 mm (the clock balls on the north edge
+beside the memory, as placed) and 55 mm (the first cut's placement on
+the south edge with the management pins, round the package).
 
 Four devices on one net is 20 pF of package input, and an edge that meets
 tKHKL into 20 pF needs a drive under 20 Ω, which then rings past the
-absolute maximum: the star of four passes at one drive value on the short
-trunk and nowhere on the trunk as placed, and the fly-by, whose loaded
+absolute maximum: the star of four passes at one drive value on the north
+trunk and nowhere on the south one, and the fly-by, whose loaded
 line slows to a third of its speed, passes nowhere. Two per clock passes
 in a narrow band around 33 Ω. One clock per device passes from 33 to 50 Ω
 at every length on the card, and a 50 Ω total drive (the pad driver plus
 a series resistor) gives a reflection-free 0.4 ns edge. So the die carries
 sixteen clocks, twelve more balls than the shared version, each a
-series-terminated point-to-point trace; the 28 × 28 package still has
-room. The constants are placeholders for the card's stack-up and are
+series-terminated point-to-point trace from the north edge, 15 to 55 mm
+long; the 28 × 28 package still has room, the clocks taking the sixteen
+of the eighteen positions in the sixth row on the north between the east
+and west strips, one row deeper than the memory (the report counts them
+among the balls that need a build-up escape), with no grounds of their
+own since the lanes above end in grounds and the checkerboard below is
+half ground. The constants are
+placeholders for the card's stack-up and are
 named in `si.py` so the study reruns when the fabricator's numbers
 arrive.
 

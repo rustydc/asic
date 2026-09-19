@@ -57,7 +57,7 @@ package_selection:
   amps_per_ball: 0.5
   signals_per_ground: 4
   signal_rows: 5
-  edges: {link_in: S, link_out: S, memory: [N, E, W], misc: S}
+  edges: {link_in: S, link_out: S, memory: [N, E, W], misc: S, psram_clk: N}   # the clocks north, beside the memory
   rail_balls: {VDD_IO_1V8: 24, VDD_PLL_0V9: 2}
   candidates:
     - {name: FCBGA784_28x28_P0.8, cols: 28, rows: 28, pitch: 0.8, body: 23.0, ball: 0.40}
@@ -536,9 +536,9 @@ interface_kinds:
     description: one HPI x16 PSRAM port (APS512XXN in x16 mode; DQ, DQS/DM per byte lane, CE#); the single-ended CLK is one per device and counted under psram_clk
     signals: {dq: 16, dqs: 2, ce: 1}
   psram_clk:
-    description: the sixteen single-ended 250 MHz PSRAM clocks, one per device because four devices on one clock cannot meet the 0.6 ns edge (hw/si.py), placed with the small interfaces
+    description: the sixteen single-ended 250 MHz PSRAM clocks, one per device because four devices on one clock cannot meet the 0.6 ns edge (hw/si.py), placed on the north edge just inside the memory rows so each runs about 20 mm to its device
     signals: {clk: 16}
-    misc: true               # placed with the small interfaces on the die
+    misc: true               # a small interface on the die, placed on its own edge (package_selection.edges)
     on_card: true            # wired to the card's devices, never over the connector
   pcie_x16_edge:
     description: PCIe x16 card-edge connector used mechanically, through-hole, 82 positions per side at 1.0 mm with our own pinout (placeholder geometry)
