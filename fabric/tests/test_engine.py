@@ -14,14 +14,15 @@ from fabric.tile import TileSpec
 
 RTL = Path(__file__).parents[1] / "rtl"
 SOURCES = [RTL / name for name in ("fabric_vector.sv", "fabric_norm.sv", "fabric_recurrent.sv", "fabric_ffn.sv", "fabric_attention.sv",
-                                   "fabric_memory.sv", "fabric_tile.sv", "fabric_sequencer.sv", "fabric_engine.sv", "tb_layer_engine.sv")]
+                                   "fabric_memory.sv", "fabric_tile.sv", "fabric_sequencer.sv", "fabric_engine.sv",
+                                   "fabric_phy.sv", "fabric_cdc.sv", "fabric_hpi.sv", "tb_layer_engine.sv")]
 
 
-def run_engine(case: unittest.TestCase, cfg, c, spec, mm, steps: list[S.Step], inputs: dict, memory=None) -> int:
-    """Emit, simulate and check one program; returns the engine's cycle count."""
+def run_engine(case: unittest.TestCase, cfg, c, spec, mm, steps: list[S.Step], inputs: dict, memory=None, ndev: int = 0) -> int:
+    """Emit, simulate and check one program; returns the engine's cycle count.  With ``ndev`` the memory is the HPI path."""
     with tempfile.TemporaryDirectory() as directory:
         work = Path(directory)
-        run = E.EngineRun(work, cfg, c, spec, mm, steps, inputs, memory)
+        run = E.EngineRun(work, cfg, c, spec, mm, steps, inputs, memory, ndev)
         args = [f"-Ptb_layer_engine.{name}={value}" for name, value in run.params.items()]
         subprocess.run(["iverilog", "-g2012", "-I", str(RTL), "-s", "tb_layer_engine", "-o", "sim.vvp", *args, *map(str, SOURCES)],
                        cwd=work, check=True, capture_output=True, text=True)
@@ -103,14 +104,29 @@ class EngineRtlTest(unittest.TestCase):
             s, sc, hist = r["s_next"], r["scale_next"], r["hist_next"]
         return {"x": np.rint(self.xs[tokens] / self.c.s_h).astype(np.int64), "s_mem": s, "scale_mem": sc, "hist_mem": hist}
 
-    def run_engine(self, steps: list[S.Step], inputs: dict) -> int:
-        return run_engine(self, self.cfg, self.c, self.spec, self.mm, steps, inputs)
+    def run_engine(self, steps: list[S.Step], inputs: dict, ndev: int = 0) -> int:
+        return run_engine(self, self.cfg, self.c, self.spec, self.mm, steps, inputs, ndev=ndev)
 
     def test_one_token_from_a_running_context(self) -> None:
         inputs = self.context_after(2)
         self.assertGreater(np.abs(inputs["s_mem"]).max(), 0)
         cycles = self.run_engine(self.prog, inputs)
         self.assertGreater(cycles, S.schedule(self.prog).cycles // 2)
+
+    def test_one_token_over_the_hpi_devices(self) -> None:
+        # The same token with the bridge, the stripe unit and four PSRAM models behind the memory port.
+        cycles = self.run_engine(self.prog, self.context_after(2), ndev=4)
+        self.assertGreater(cycles, S.schedule(self.prog).cycles // 2)
+
+    def test_a_chunk_of_three_tokens(self) -> None:
+        # Prefill: three tokens of one context through the multi-token tiles, each head's state moved once.
+        inputs = self.context_after(1)
+        inputs["x"] = np.stack([np.rint(x / self.c.s_h).astype(np.int64) for x in self.xs[1:4]])
+        chunk = S.recurrent_program(self.cfg, self.c, self.spec, self.mm, chunk=3)
+        self.assertEqual(len([s for s in chunk if s.unit == "mem"]), len([s for s in self.prog if s.unit == "mem"]))
+        cycles = self.run_engine(chunk, inputs)
+        single = self.run_engine(self.prog, self.context_after(1))
+        self.assertLess(cycles, 2.5 * single)                    # three tokens for well under three tokens' time
 
     def test_a_stream_of_two_contexts(self) -> None:
         two = S.stream(self.prog, 2)
@@ -171,6 +187,32 @@ class GlobalEngineRtlTest(unittest.TestCase):
         inputs = {"x": np.rint(self.xs[pos] / self.c.s_h).astype(np.int64), "k_rows": got["k_rows"], "v_rows": got["v_rows"]}
         return inputs, (before, bytes(store.image.data))
 
+    def chunk_at(self, pos: int, tokens: int) -> tuple[dict, tuple[bytes, bytes]]:
+        """A chunk from ``pos``: each token's rows as the memory serves them after its own append."""
+        cfg, mm = self.cfg, self.mm
+        nkv, hd = cfg.num_key_value_heads, cfg.head_dim
+        store = GlobalContextMemory(mm, cfg.top_blocks)
+        zero = np.zeros((nkv, 1, hd), dtype=np.int64)
+        xs, k_rows, v_rows = [], [], []
+        for p in range(pos + tokens):
+            xi = np.rint(self.xs[p] / self.c.s_h).astype(np.int64)
+            own = L.global_layer_int(self.c, cfg, self.spec, xi, p, zero, zero)
+            if p == pos:
+                before = bytes(store.image.data)
+            store.append(p, own["k"], own["v"], own["index_k"])
+            if p >= pos:
+                got = store.retrieve(p, own["index_q_unit"])
+                xs.append(xi)
+                k_rows.append(got["k_rows"])
+                v_rows.append(got["v_rows"])
+        return {"x": np.stack(xs), "k_rows": k_rows, "v_rows": v_rows}, (before, bytes(store.image.data))
+
+    def test_a_chunk_of_three_tokens(self) -> None:
+        # Prefill from position 30: the middle token closes a block; each token sees the earlier ones' records.
+        inputs, images = self.chunk_at(30, 3)
+        prog = S.global_program(self.cfg, self.c, self.spec, self.mm, 30, chunk=3)
+        run_engine(self, self.cfg, self.c, self.spec, self.mm, prog, inputs, {"m_ctx": images})
+
     def test_one_token_at_a_block_end(self) -> None:
         pos = 31                                     # four blocks eligible, two chosen; this token closes a block
         inputs, images = self.context_at(pos)
@@ -178,6 +220,12 @@ class GlobalEngineRtlTest(unittest.TestCase):
         self.assertNotEqual(images[0], images[1])
         prog = S.global_program(self.cfg, self.c, self.spec, self.mm, pos)
         run_engine(self, self.cfg, self.c, self.spec, self.mm, prog, inputs, {"m_ctx": images})
+
+    def test_one_token_over_the_hpi_devices(self) -> None:
+        pos = 31
+        inputs, images = self.context_at(pos)
+        prog = S.global_program(self.cfg, self.c, self.spec, self.mm, pos)
+        run_engine(self, self.cfg, self.c, self.spec, self.mm, prog, inputs, {"m_ctx": images}, ndev=4)
 
     def test_a_stream_of_two_contexts(self) -> None:
         programs, inputs, memory = [], {}, {}

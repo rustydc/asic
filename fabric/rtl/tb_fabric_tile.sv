@@ -14,25 +14,27 @@ module tb_fabric_tile #(
     parameter int P    = 2,
     parameter int ACC  = 24,
     parameter int SB   = 16,
-    parameter int SHB  = 5
+    parameter int SHB  = 5,
+    parameter int T    = 1
 );
     localparam int CYCLES = ROWS / P;
+    localparam int NA = T * COLS;
 
     reg                 clk = 0;
     reg                 rst_n = 0;
     reg                 start = 0;
-    reg  [COLS*ACC-1:0] psum_in = '0;
+    reg  [NA*ACC-1:0]   psum_in = '0;
     reg                 x_valid = 0;
-    reg  [P*AB-1:0]     x_data = '0;
+    reg  [T*P*AB-1:0]   x_data = '0;
     reg  [COLS*SB-1:0]  mult = '0;
     reg  [COLS*SHB-1:0] shift = '0;
     wire                x_ready;
     wire                done;
     wire                q_valid;
-    wire [COLS*ACC-1:0] psum_out;
-    wire [COLS*AB-1:0]  q_out;
+    wire [NA*ACC-1:0]   psum_out;
+    wire [NA*AB-1:0]    q_out;
 
-    fabric_tile #(.ROWS(ROWS), .COLS(COLS), .WB(WB), .AB(AB), .P(P), .ACC(ACC), .SB(SB), .SHB(SHB),
+    fabric_tile #(.ROWS(ROWS), .COLS(COLS), .WB(WB), .AB(AB), .P(P), .ACC(ACC), .SB(SB), .SHB(SHB), .T(T),
                   .ROM_FILE("rom.hex")) dut (
         .clk(clk), .rst_n(rst_n), .start(start), .psum_in(psum_in), .x_valid(x_valid), .x_data(x_data),
         .mult(mult), .shift(shift), .x_ready(x_ready), .done(done), .psum_out(psum_out), .q_out(q_out),
@@ -40,14 +42,14 @@ module tb_fabric_tile #(
 
     always #5 clk = ~clk;
 
-    reg [AB-1:0]  xmem   [0:ROWS-1];
-    reg [ACC-1:0] pmem   [0:COLS-1];
+    reg [AB-1:0]  xmem   [0:T*ROWS-1];                   // token-major
+    reg [ACC-1:0] pmem   [0:NA-1];
     reg [SB-1:0]  mmem   [0:COLS-1];
     reg [SHB-1:0] smem   [0:COLS-1];
-    reg [ACC-1:0] epsum  [0:COLS-1];
-    reg [AB-1:0]  eq     [0:COLS-1];
+    reg [ACC-1:0] epsum  [0:NA-1];
+    reg [AB-1:0]  eq     [0:NA-1];
 
-    integer i, b, errors, cyc, guard;
+    integer i, b, t, errors, cyc, guard;
 
     // Sticky flags so one-cycle pulses cannot race the checks below.
     reg seen_done = 0, seen_q_valid = 0;
@@ -64,10 +66,10 @@ module tb_fabric_tile #(
         $readmemh("expected_psum.hex", epsum);
         $readmemh("expected_q.hex", eq);
         for (i = 0; i < COLS; i = i + 1) begin
-            psum_in[i*ACC +: ACC] = pmem[i];
             mult[i*SB +: SB]      = mmem[i];
             shift[i*SHB +: SHB]   = smem[i];
         end
+        for (i = 0; i < NA; i = i + 1) psum_in[i*ACC +: ACC] = pmem[i];
 
         repeat (3) @(posedge clk);
         rst_n = 1;
@@ -84,7 +86,8 @@ module tb_fabric_tile #(
                 x_valid = 0;               // one-cycle bubble
                 @(negedge clk);
             end
-            for (b = 0; b < P; b = b + 1) x_data[b*AB +: AB] = xmem[cyc*P + b];
+            for (t = 0; t < T; t = t + 1)
+                for (b = 0; b < P; b = b + 1) x_data[(t*P + b)*AB +: AB] = xmem[t*ROWS + cyc*P + b];
             x_valid = 1;
             @(posedge clk);
             #1;
@@ -107,7 +110,7 @@ module tb_fabric_tile #(
         // The shared requantizer walks the columns after done; resolved
         // partial sums and requantized outputs are both valid at q_valid.
         guard = 0;
-        while (!seen_q_valid && guard < COLS + 16) begin
+        while (!seen_q_valid && guard < NA + 16) begin
             @(posedge clk);
             #1;
             guard = guard + 1;
@@ -117,21 +120,21 @@ module tb_fabric_tile #(
             $finish;
         end
         errors = 0;
-        for (i = 0; i < COLS; i = i + 1) begin
+        for (i = 0; i < NA; i = i + 1) begin
             if (psum_out[i*ACC +: ACC] !== epsum[i]) begin
                 errors = errors + 1;
                 if (errors <= 5)
                     $display("psum mismatch col %0d: got %h expected %h", i, psum_out[i*ACC +: ACC], epsum[i]);
             end
         end
-        for (i = 0; i < COLS; i = i + 1) begin
+        for (i = 0; i < NA; i = i + 1) begin
             if (q_out[i*AB +: AB] !== eq[i]) begin
                 errors = errors + 1;
                 if (errors <= 5)
                     $display("q mismatch col %0d: got %h expected %h", i, q_out[i*AB +: AB], eq[i]);
             end
         end
-        if (errors == 0) $display("PASS: %0d columns, %0d cycles", COLS, CYCLES);
+        if (errors == 0) $display("PASS: %0d columns, %0d tokens, %0d cycles", COLS, T, CYCLES);
         else             $display("FAIL: %0d mismatches", errors);
         $finish;
     end

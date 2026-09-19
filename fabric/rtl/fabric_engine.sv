@@ -177,10 +177,12 @@ endmodule
 //   continues (FF: none)  [16] last row block  [17] raw: write the
 //   accumulators as 32-bit words  [25:18] bytes to write  [41:26] byte
 //   offset of its output inside the destination.
-// A command runs pass arg[7:0] over arg[15:8] row blocks: each row block's
-// tiles start together and consume ROWS activations from src + rb * ROWS,
-// P per cycle; when the last block's requantizer walk ends every last-block
-// tile's output goes to dst + offset.
+// A command runs pass arg[7:0] over arg[15:8] row blocks for the
+// arg[23:16] tokens of a chunk (one at least, TMAX at most): each row
+// block's tiles start together and consume ROWS activations of every
+// token, P per cycle, token t's from src + t * arg2[15:0] + rb * ROWS;
+// when the last block's requantizer walk ends every last-block tile's
+// output for token t goes to dst + t * arg2[31:16] + offset.
 // ---------------------------------------------------------------------------
 module fabric_pass_adapter #(
     parameter int NT   = 4,
@@ -192,6 +194,7 @@ module fabric_pass_adapter #(
     parameter int ACC  = 24,
     parameter int SB   = 16,
     parameter int SHB  = 5,
+    parameter int TMAX = 1,
     parameter int AW   = 16
 ) (
     input  wire          clk,
@@ -201,21 +204,22 @@ module fabric_pass_adapter #(
     input  wire [15:0]   cmd_src,
     input  wire [15:0]   cmd_dst,
     input  wire [31:0]   cmd_arg,
+    input  wire [31:0]   cmd_arg2,
     input  wire [7:0]    cmd_tag,
     output wire          cmd_ready,
     output reg           done_valid,
     output reg  [7:0]    done_tag,
-    output wire [AW-1:0] rd_addr,
-    input  wire [127:0]  rd_data,
+    output wire [TMAX*AW-1:0] rd_addr,      // one port per token of the chunk
+    input  wire [TMAX*128-1:0] rd_data,
     output reg           wr_en,
     output reg  [AW-1:0] wr_addr,
     output reg  [127:0]  wr_data,
     output reg  [15:0]   wr_be
 );
     localparam int CYC = ROWS / P;
-    localparam int PW  = COLS * ACC;
-    localparam int QW  = COLS * AB;
-    localparam int VW  = COLS * 32;          // the output vector as raw words
+    localparam int PW  = TMAX * COLS * ACC;  // a tile's accumulators, token-major
+    localparam int QW  = TMAX * COLS * AB;
+    localparam int VW  = COLS * 32;          // one token's output vector as raw words
     reg [47:0]   tab [0:NT-1];
     reg [SB-1:0] mult_all [0:NT*COLS-1];
     reg [SHB-1:0] shift_all [0:NT*COLS-1];
@@ -227,14 +231,21 @@ module fabric_pass_adapter #(
 
     localparam [2:0] S_IDLE = 0, S_START = 1, S_STREAM = 2, S_WAIT = 3, S_WRITE = 4, S_DONE = 5;
     reg [2:0]    state;
-    reg [7:0]    pass, nrb, rb, t, tag;
-    reg [AW-1:0] src, dst;
+    reg [7:0]    pass, nrb, rb, t, tag, ntok, tok;
+    reg [AW-1:0] src, dst, in_stride, out_stride;
     reg [15:0]   i;
     reg [3:0]    j;
     reg [NT-1:0] sel;
     reg          xv;
     assign cmd_ready = (state == S_IDLE);
-    assign rd_addr   = src + rb * ROWS + i * P;
+    wire [TMAX*P*AB-1:0] x_data;
+    genvar gk;
+    generate
+        for (gk = 0; gk < TMAX; gk = gk + 1) begin : g_port
+            assign rd_addr[gk*AW +: AW] = src + gk * in_stride + rb * ROWS + i * P;
+            assign x_data[gk*P*AB +: P*AB] = rd_data[gk*128 +: P*AB];
+        end
+    endgenerate
 
     wire [NT-1:0]    q_valid_t, start_t;
     wire [NT*PW-1:0] psum_out_flat;
@@ -251,15 +262,15 @@ module fabric_pass_adapter #(
             wire [7:0]    chain   = tab[gt][15:8];
             wire [PW-1:0] psum_in = (chain == 8'hFF) ? {PW{1'b0}} : psum_out_flat[chain*PW +: PW];
             assign start_t[gt] = (state == S_START) && (tab[gt][3:0] == pass[3:0]) && (tab[gt][7:4] == rb[3:0]);
-            fabric_tile #(.ROWS(ROWS), .COLS(COLS), .WB(WB), .AB(AB), .P(P), .ACC(ACC), .SB(SB), .SHB(SHB), .ROM_FILE("")) u_tile (
-                .clk(clk), .rst_n(rst_n), .start(start_t[gt]), .psum_in(psum_in), .x_valid(xv), .x_data(rd_data[P*AB-1:0]),
+            fabric_tile #(.ROWS(ROWS), .COLS(COLS), .WB(WB), .AB(AB), .P(P), .ACC(ACC), .SB(SB), .SHB(SHB), .T(TMAX), .ROM_FILE("")) u_tile (
+                .clk(clk), .rst_n(rst_n), .start(start_t[gt]), .psum_in(psum_in), .x_valid(xv), .x_data(x_data),
                 .mult(mult_w), .shift(shift_w), .x_ready(), .done(), .psum_out(psum_out_flat[gt*PW +: PW]),
                 .q_out(q_out_flat[gt*QW +: QW]), .q_valid(q_valid_t[gt]));
             initial $readmemh($sformatf("tile_%0d.hex", gt), u_tile.rom.rom);
         end
     endgenerate
 
-    // The output vector of tile t: its requantized bytes, or its accumulators as words.
+    // The output vector of tile t for token tok: its requantized bytes, or its accumulators as words.
     wire [47:0]   cur     = tab[t];
     wire          cur_hit = (cur[3:0] == pass[3:0]) && cur[16];
     wire [7:0]    nbytes  = cur[25:18];
@@ -270,21 +281,22 @@ module fabric_pass_adapter #(
         vec = {VW{1'b0}};
         if (cur[17]) begin
             for (c = 0; c < COLS; c = c + 1)
-                vec[c*32 +: 32] = {{(32-ACC){psum_out_flat[t*PW + c*ACC + ACC - 1]}}, psum_out_flat[t*PW + c*ACC +: ACC]};
-        end else vec[QW-1:0] = q_out_flat[t*QW +: QW];
+                vec[c*32 +: 32] = {{(32-ACC){psum_out_flat[t*PW + (tok*COLS + c)*ACC + ACC - 1]}}, psum_out_flat[t*PW + (tok*COLS + c)*ACC +: ACC]};
+        end else vec[COLS*AB-1:0] = q_out_flat[t*QW + tok*COLS*AB +: COLS*AB];
     end
     wire [8:0]  remaining = nbytes - j * 16;
     wire [15:0] be_w      = (remaining >= 16) ? 16'hFFFF : ((16'd1 << remaining[3:0]) - 1'b1);
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            state <= S_IDLE; done_valid <= 1'b0; wr_en <= 1'b0; xv <= 1'b0; sel <= 0; i <= 0; j <= 0; t <= 0; rb <= 0;
+            state <= S_IDLE; done_valid <= 1'b0; wr_en <= 1'b0; xv <= 1'b0; sel <= 0; i <= 0; j <= 0; t <= 0; rb <= 0; tok <= 0;
         end else begin
             done_valid <= 1'b0; wr_en <= 1'b0; xv <= 1'b0;
             case (state)
                 S_IDLE: if (cmd_valid) begin
-                    pass <= cmd_arg[7:0]; nrb <= cmd_arg[15:8]; src <= cmd_src; dst <= cmd_dst; tag <= cmd_tag;
-                    rb <= 0; state <= S_START;
+                    pass <= cmd_arg[7:0]; nrb <= cmd_arg[15:8]; ntok <= (cmd_arg[23:16] == 0) ? 8'd1 : cmd_arg[23:16];
+                    src <= cmd_src; dst <= cmd_dst; in_stride <= cmd_arg2[15:0]; out_stride <= cmd_arg2[31:16]; tag <= cmd_tag;
+                    rb <= 0; tok <= 0; state <= S_START;
                 end
                 S_START: begin
                     sel <= start_t; i <= 0; state <= S_STREAM;
@@ -299,9 +311,12 @@ module fabric_pass_adapter #(
                 end
                 S_WRITE: begin
                     if (cur_hit) begin
-                        wr_en <= 1'b1; wr_addr <= dst + cur[41:26] + j * 16; wr_data <= vec[j*128 +: 128]; wr_be <= be_w;
-                        if (j == beats - 1) begin j <= 0; t <= t + 1'b1; if (t == NT - 1) state <= S_DONE; end
-                        else j <= j + 1'b1;
+                        wr_en <= 1'b1; wr_addr <= dst + tok * out_stride + cur[41:26] + j * 16; wr_data <= vec[j*128 +: 128]; wr_be <= be_w;
+                        if (j == beats - 1) begin
+                            j <= 0;
+                            if (tok == ntok - 1) begin tok <= 0; t <= t + 1'b1; if (t == NT - 1) state <= S_DONE; end
+                            else tok <= tok + 1'b1;
+                        end else j <= j + 1'b1;
                     end else begin
                         t <= t + 1'b1;
                         if (t == NT - 1) state <= S_DONE;
@@ -1364,6 +1379,7 @@ module fabric_layer_engine #(
     parameter int COLS = 16,
     parameter int P    = 2,
     parameter int NT   = 56,
+    parameter int TMAX = 1,                     // tokens a pass may carry (chunked prefill)
     parameter int WB   = 4,
     parameter int ACC  = 24,
     parameter int SB   = 16,
@@ -1396,8 +1412,8 @@ module fabric_layer_engine #(
     localparam int NU = 10, NE = 4, AW = 16, NL = 8, CL = 4, GROUP = NH / NKV;
     localparam int U_TILES = 0, U_NORM = 1, U_CONV = 2, U_GATES = 3, U_DELTA = 4, U_SWIGLU = 5, U_RESIDUAL = 6, U_ROTARY = 7, U_ATTN = 8, U_MEM = 9;
     // Vector-buffer ports.
-    localparam int R_NORM = 0, R_TILES = 4, R_CONV = 5, R_GATES = 7, R_DELTA = 9, R_SWIGLU = 13, R_RESIDUAL = 15, R_MEM = 17,
-                   R_ROTARY = 18, R_ATTN = 20, NR = 24;
+    localparam int R_NORM = 0, R_TILES = 4, R_CONV = R_TILES + TMAX, R_GATES = R_CONV + 2, R_DELTA = R_GATES + 2, R_SWIGLU = R_DELTA + 4,
+                   R_RESIDUAL = R_SWIGLU + 2, R_MEM = R_RESIDUAL + 2, R_ROTARY = R_MEM + 1, R_ATTN = R_ROTARY + 2, NR = R_ATTN + 4;
     localparam int W_NORM = 0, W_TILES = 2, W_CONV = 3, W_GATES = 5, W_DELTA = 6, W_SWIGLU = 10, W_RESIDUAL = 11, W_MEM = 12,
                    W_ROTARY = 13, W_ATTN = 15, NW = 19;
 
@@ -1486,10 +1502,10 @@ module fabric_layer_engine #(
         end
     endgenerate
 
-    fabric_pass_adapter #(.NT(NT), .ROWS(ROWS), .COLS(COLS), .WB(WB), .AB(8), .P(P), .ACC(ACC), .SB(SB), .SHB(SHB), .AW(AW)) u_tiles (
+    fabric_pass_adapter #(.NT(NT), .ROWS(ROWS), .COLS(COLS), .WB(WB), .AB(8), .P(P), .ACC(ACC), .SB(SB), .SHB(SHB), .TMAX(TMAX), .AW(AW)) u_tiles (
         .clk(clk), .rst_n(rst_n), .cmd_valid(cmd_valid[U_TILES] && cmd_engine == 0), .cmd_len(cmd_len), .cmd_src(cmd_src), .cmd_dst(cmd_dst),
-        .cmd_arg(cmd_arg), .cmd_tag(cmd_tag), .cmd_ready(ready_tiles), .done_valid(done_valid[U_TILES*NE]), .done_tag(done_tag[U_TILES*NE*8 +: 8]),
-        .rd_addr(rd_addr[R_TILES*AW +: AW]), .rd_data(rd_data[R_TILES*128 +: 128]),
+        .cmd_arg(cmd_arg), .cmd_arg2(cmd_arg2), .cmd_tag(cmd_tag), .cmd_ready(ready_tiles), .done_valid(done_valid[U_TILES*NE]), .done_tag(done_tag[U_TILES*NE*8 +: 8]),
+        .rd_addr(rd_addr[R_TILES*AW +: TMAX*AW]), .rd_data(rd_data[R_TILES*128 +: TMAX*128]),
         .wr_en(wr_en[W_TILES]), .wr_addr(wr_addr[W_TILES*AW +: AW]), .wr_data(wr_data[W_TILES*128 +: 128]), .wr_be(wr_be[W_TILES*16 +: 16]));
 
     fabric_conv_adapter #(.CL(CL), .KK(KK), .C(CONV), .AW(AW), .LUT_DIR(LUT_DIR)) u_conv (

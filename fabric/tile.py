@@ -221,27 +221,32 @@ def coefficient_multiples(x: np.ndarray, spec: TileSpec) -> np.ndarray:
 
 def tile_forward(tile: Tile, x: np.ndarray, spec: TileSpec, psum_in: np.ndarray | None = None
                  ) -> tuple[np.ndarray, np.ndarray]:
-    """Run one tile over an activation vector.
+    """Run one tile over an activation vector, or over a chunk of ``T``
+    tokens' vectors ``[T, rows]`` sharing the pass (the multi-token tile).
 
     Returns ``(psum, y)``: the raw accumulators after the pass and the
-    requantized outputs.  The accumulation order is the hardware's: banks of
-    ``rows_per_cycle`` rows, in row order, so overflow behaviour matches.
+    requantized outputs, ``[cols]`` or ``[T, cols]`` as the input was.  The
+    accumulation order is the hardware's: banks of ``rows_per_cycle`` rows,
+    in row order, so overflow behaviour matches.
     """
     x = np.asarray(x, dtype=np.int64)
-    if x.shape != (spec.rows,):
+    chunk = x.ndim == 2
+    x2 = x if chunk else x[None, :]
+    if x2.shape[1] != spec.rows:
         raise ValueError(f"expected {spec.rows} activations, got {x.shape}")
-    acc = np.zeros(spec.cols, dtype=np.int64) if psum_in is None else psum_in.astype(np.int64).copy()
-    multiples = coefficient_multiples(x, spec)                      # [rows, weight_max + 1]
+    acc = np.zeros((x2.shape[0], spec.cols), dtype=np.int64) if psum_in is None else np.asarray(psum_in, dtype=np.int64).reshape(x2.shape[0], spec.cols).copy()
+    multiples = coefficient_multiples(x2, spec)                     # [T, rows, weight_max + 1]
     w = tile.via_map.astype(np.int64)                               # [rows, cols]
     magnitude = np.abs(w)
     sign = np.sign(w)
     for cycle in range(spec.cycles_per_pass):
         rows = range(cycle * spec.rows_per_cycle, (cycle + 1) * spec.rows_per_cycle)
         for r in rows:
-            selected = multiples[r][magnitude[r]]                  # via-selected multiple per column
+            selected = multiples[:, r][:, magnitude[r]]             # via-selected multiple per token and column
             acc += sign[r] * selected
         acc = saturate(acc, spec.acc_bits)                          # accumulator wraps are a design error; saturate
-    return acc, requantize(acc, tile.mult, tile.shift, spec)
+    y = requantize(acc, tile.mult, tile.shift, spec)
+    return (acc, y) if chunk else (acc[0], y[0])
 
 
 def matrix_forward(compiled: CompiledMatrix, x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -436,8 +441,11 @@ def write_hex(path: Path, values: Iterable[int], width_bits: int) -> None:
 
 
 def emit_vectors(directory: Path, tile: Tile, x: np.ndarray, spec: TileSpec, psum_in: np.ndarray | None = None) -> dict:
-    """Write ROM contents, stimulus, and expected results for ``tb_fabric_tile.sv``."""
+    """Write ROM contents, stimulus, and expected results for ``tb_fabric_tile.sv``
+    (``x`` ``[rows]`` or ``[T, rows]`` for the multi-token tile, token-major in the files)."""
     directory.mkdir(parents=True, exist_ok=True)
+    x = np.asarray(x, dtype=np.int64)
+    tokens = x.shape[0] if x.ndim == 2 else 1
     words = tile.rom_words(spec)
     # ROM: one line per row, columns packed little-endian (column 0 in the lowest nibble).
     row_words = []
@@ -447,17 +455,17 @@ def emit_vectors(directory: Path, tile: Tile, x: np.ndarray, spec: TileSpec, psu
             word |= int(words[r, c]) << (c * spec.weight_bits)
         row_words.append(word)
     write_hex(directory / "rom.hex", row_words, spec.cols * spec.weight_bits)
-    write_hex(directory / "x.hex", x, spec.act_bits)
-    psum0 = np.zeros(spec.cols, dtype=np.int64) if psum_in is None else psum_in
+    write_hex(directory / "x.hex", x.reshape(-1), spec.act_bits)
+    psum0 = np.zeros(tokens * spec.cols, dtype=np.int64) if psum_in is None else np.asarray(psum_in, dtype=np.int64).reshape(-1)
     write_hex(directory / "psum_in.hex", psum0, spec.acc_bits)
     write_hex(directory / "mult.hex", tile.mult, spec.scale_bits)
     write_hex(directory / "shift.hex", tile.shift, spec.shift_bits)
     psum, y = tile_forward(tile, x, spec, psum0)
-    write_hex(directory / "expected_psum.hex", psum, spec.acc_bits)
-    write_hex(directory / "expected_q.hex", y, spec.act_bits)
+    write_hex(directory / "expected_psum.hex", np.asarray(psum).reshape(-1), spec.acc_bits)
+    write_hex(directory / "expected_q.hex", np.asarray(y).reshape(-1), spec.act_bits)
     params = {"rows": spec.rows, "cols": spec.cols, "weight_bits": spec.weight_bits, "act_bits": spec.act_bits,
               "rows_per_cycle": spec.rows_per_cycle, "acc_bits": spec.acc_bits, "scale_bits": spec.scale_bits,
-              "shift_bits": spec.shift_bits}
+              "shift_bits": spec.shift_bits, "tokens": tokens}
     (directory / "params.json").write_text(json.dumps(params, indent=2), encoding="utf-8")
     return params
 

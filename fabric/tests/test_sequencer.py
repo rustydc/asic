@@ -165,6 +165,23 @@ class ProgramTest(unittest.TestCase):
             np.testing.assert_array_equal(out[f"x2@{token}"], expect[token]["x2"])
             np.testing.assert_array_equal(out[f"s_mem@{token}"], expect[token]["s_next"])
             np.testing.assert_array_equal(np.asarray(out[f"scale_mem@{token}"]), expect[token]["scale_next"])
+        # A chunk of three tokens (prefill) is three tokens in turn, with each head's state read and written once.
+        chunk = S.recurrent_program(cfg, c, spec, self.mm, chunk=3)
+        self.assertEqual(len([s for s in chunk if s.unit == "tiles"]), 4)
+        self.assertEqual(len([s for s in chunk if s.name.startswith("dma.s_")]), 2 * nv)
+        self.assertEqual(len([s for s in chunk if s.name.startswith("delta")]), 3 * nv)
+        s_i = np.zeros((nv, hk, hv), dtype=np.int64)
+        sc_i = np.tile([L.ONE_U, 0, 0, 0], (nv, 1)).astype(np.int64)
+        hist_i = np.zeros((conv_dim, cfg.linear_conv_kernel - 1), dtype=np.int64)
+        env = S.run_program(chunk, {"x": np.stack([np.rint(x / c.s_h).astype(np.int64) for x in xs[:3]]), "s_mem": s_i.copy(),
+                                    "scale_mem": sc_i.copy(), "hist_mem": hist_i.copy()})
+        for k, x in enumerate(xs[:3]):
+            ri = L.recurrent_layer_int(c, cfg, spec, np.rint(x / c.s_h).astype(np.int64), s_i, hist_i, scale=sc_i)
+            s_i, sc_i, hist_i = ri["s_next"], ri["scale_next"], ri["hist_next"]
+            np.testing.assert_array_equal(env["x2"][k], ri["x2"])
+        np.testing.assert_array_equal(env["s_mem"], s_i)
+        np.testing.assert_array_equal(np.asarray(env["scale_mem"]), sc_i)
+        np.testing.assert_array_equal(env["hist_mem"], hist_i)
         # The int16 program is the same list with the plain state.
         mm16 = MemoryMap.from_config(cfg, state_bits=16)
         prog16 = S.recurrent_program(cfg, c, spec, mm16)
@@ -203,6 +220,17 @@ class ProgramTest(unittest.TestCase):
             for n in range(nkv):
                 np.testing.assert_array_equal(env[f"k[{n}]"], ri["k"][n])
                 np.testing.assert_array_equal(env[f"att[{n}]"], ri["att"].reshape(cfg.num_attention_heads, hd)[n * 2:(n + 1) * 2])
+        # A chunk of the last three positions: each token over the rows it would see, the passes shared.
+        chunk = S.global_program(cfg, c, spec, self.mm, 3, chunk=3)
+        self.assertEqual(len([s for s in chunk if s.unit == "tiles"]), 4)
+        self.assertEqual(len([s for s in chunk if s.name.startswith("mem.append")]), 3)
+        xi = np.stack([np.rint(x / c.s_h).astype(np.int64) for x in xs[3:6]])
+        rows_k = [np.stack(ki[:p + 1], axis=1) for p in range(3, 6)]
+        rows_v = [np.stack(vi[:p + 1], axis=1) for p in range(3, 6)]
+        env = S.run_program(chunk, {"x": xi, "k_rows": rows_k, "v_rows": rows_v})
+        for k, pos in enumerate(range(3, 6)):
+            ri = L.global_layer_int(c, cfg, spec, xi[k], pos, rows_k[k], rows_v[k])
+            np.testing.assert_array_equal(env["x2"][k], ri["x2"])
 
 
 @unittest.skipUnless(shutil.which("iverilog") and shutil.which("vvp"), "iverilog not installed")

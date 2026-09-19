@@ -1,8 +1,11 @@
 // Self-checking harness for fabric_layer_engine: runs a program written by
 // fabric.engine.EngineRun over the real units and dumps the vector buffer
 // and the memory for the Python side to compare bit for bit.  The memory
-// behind the port is fabric_memory.sv's behavioural model; the HPI bridge
-// that replaces it on the die is checked by tb_mem_bridge.
+// behind the port is fabric_memory.sv's behavioural model, or with USE_HPI
+// the die's own path: fabric_mem_bridge across the clock crossing, the
+// stripe unit, NDEV channel controllers and NDEV device models on the
+// 250 MHz controller clock, their images loaded from and dumped to
+// devs.hex / devs_out.hex through the stripe map.
 
 `timescale 1ns/1ps
 `default_nettype none
@@ -38,6 +41,7 @@ module tb_layer_engine #(
     parameter int COLS = 16,
     parameter int P    = 2,
     parameter int NT   = 56,
+    parameter int TMAX = 1,
     parameter int WB   = 4,
     parameter int ACC  = 24,
     parameter int SB   = 16,
@@ -46,7 +50,13 @@ module tb_layer_engine #(
     parameter int YSH  = 9,
     parameter int VB_BYTES  = 4096,
     parameter int MEM_BEATS = 128,
-    parameter int SCHEDULE_CYCLES = 0
+    parameter int SCHEDULE_CYCLES = 0,
+    parameter int USE_HPI   = 0,
+    parameter int NDEV      = 4,
+    parameter int DEV_WORDS = 4096,
+    parameter int MR0       = 8'h18,
+    parameter int MR4       = 8'h60,
+    parameter int MR8       = 8'h43
 );
     reg clk = 0, rst_n = 0;
     always #0.625 clk = ~clk;
@@ -62,16 +72,84 @@ module tb_layer_engine #(
     fabric_layer_engine #(.D(D), .NK(NK), .NV(NV), .HK(HK), .HV(HV), .KK(KK), .CONV(CONV), .NH(NH), .NKV(NKV), .HD(HD), .RD(RD), .IDIM(IDIM),
                           .W(W), .BS(BS), .TOP(TOP), .KV_BITS(KV_BITS), .REC_BYTES(REC_BYTES), .RPB(RPB), .MAXR(MAXR),
                           .WINDOW_OFF(WINDOW_OFF), .BLOCK_OFF(BLOCK_OFF), .INDEX_OFF(INDEX_OFF), .SUMS_OFF(SUMS_OFF), .ATT_L(ATT_L),
-                          .ROWS(ROWS), .COLS(COLS), .P(P), .NT(NT), .WB(WB), .ACC(ACC), .SB(SB), .SHB(SHB), .SW(SW), .YSH(YSH), .VB_BYTES(VB_BYTES)) dut (
+                          .ROWS(ROWS), .COLS(COLS), .P(P), .NT(NT), .TMAX(TMAX), .WB(WB), .ACC(ACC), .SB(SB), .SHB(SHB), .SW(SW), .YSH(YSH), .VB_BYTES(VB_BYTES)) dut (
         .clk(clk), .rst_n(rst_n), .start(start), .n_steps(N[15:0]), .running(running), .done(done),
         .m_req_valid(req_valid), .m_req_ready(req_ready), .m_req_write(req_write), .m_req_addr(req_addr), .m_req_beats(req_beats),
         .m_wdata_valid(wdata_valid), .m_wdata_ready(wdata_ready), .m_wdata(wdata), .m_rdata_valid(rdata_valid), .m_rdata(rdata));
-    fabric_mem_model #(.DW(128), .WORDS(MEM_BEATS), .LAT(2), .FILE("mem_init.hex")) u_mem (
-        .clk(clk), .rst_n(rst_n), .req_valid(req_valid), .req_ready(req_ready), .req_write(req_write), .req_addr(req_addr),
-        .req_beats(req_beats), .wdata_valid(wdata_valid), .wdata_ready(wdata_ready), .wdata(wdata), .rdata_valid(rdata_valid), .rdata(rdata));
+    wire mem_ready;                                       // the memory can take requests
+    reg  dump = 0;                                        // the memory images to their files
+    reg [15:0] dimg [0:NDEV*DEV_WORDS-1];                 // every device's words in turn
+    generate
+        if (USE_HPI) begin : g_hpi
+            reg mclk = 0;
+            always #2.0 mclk = ~mclk;                     // the controller clock, 250 MHz
+            wire          m_req_valid, m_req_ready, m_req_write, m_wdata_valid, m_wdata_ready, m_rdata_valid, rd_overflow;
+            wire [31:0]   m_req_addr;
+            wire [11:0]   m_req_beats;
+            wire [127:0]  m_wdata, m_rdata;
+            fabric_mem_bridge #(.DW(128)) bridge (
+                .c_clk(clk), .c_rst_n(rst_n), .c_req_valid(req_valid), .c_req_ready(req_ready), .c_req_write(req_write),
+                .c_req_addr(req_addr), .c_req_beats(req_beats), .c_wdata_valid(wdata_valid), .c_wdata_ready(wdata_ready),
+                .c_wdata(wdata), .c_rdata_valid(rdata_valid), .c_rdata(rdata),
+                .m_clk(mclk), .m_rst_n(rst_n), .m_req_valid(m_req_valid), .m_req_ready(m_req_ready), .m_req_write(m_req_write),
+                .m_req_addr(m_req_addr), .m_req_beats(m_req_beats), .m_wdata_valid(m_wdata_valid), .m_wdata_ready(m_wdata_ready),
+                .m_wdata(m_wdata), .m_rdata_valid(m_rdata_valid), .m_rdata(m_rdata), .rd_overflow(rd_overflow));
+            wire [NDEV-1:0]     x_valid, x_ready, x_wdata_valid, x_wdata_ready, x_rdata_valid, x_rdata_ready, x_done;
+            wire                x_write;
+            wire [24:0]         x_addr;
+            wire [7:0]          x_beats;
+            wire [127:0]        x_wdata;
+            wire [NDEV*128-1:0] x_rdata;
+            fabric_hpi_stripe #(.NDEV(NDEV), .DW(128)) stripe (
+                .clk(mclk), .rst_n(rst_n), .req_valid(m_req_valid), .req_ready(m_req_ready), .req_write(m_req_write), .req_addr(m_req_addr),
+                .req_beats(m_req_beats), .wdata_valid(m_wdata_valid), .wdata_ready(m_wdata_ready), .wdata(m_wdata), .rdata_valid(m_rdata_valid),
+                .rdata(m_rdata), .x_valid(x_valid), .x_ready(x_ready), .x_write(x_write), .x_addr(x_addr), .x_beats(x_beats),
+                .x_wdata_valid(x_wdata_valid), .x_wdata_ready(x_wdata_ready), .x_wdata(x_wdata), .x_rdata_valid(x_rdata_valid),
+                .x_rdata_ready(x_rdata_ready), .x_rdata(x_rdata), .x_done(x_done));
+            wire [NDEV-1:0]    clk_en, init_done, device_ok, ce_n, dq_oe, dqs_oe, phy_quiet;
+            wire [NDEV*16-1:0] dq_c, dq_d;
+            wire [NDEV*2-1:0]  dm_c, dqs_dev, dqs_d;
+            wire [NDEV-1:0]    clk_dev;
+            assign mem_ready = &init_done && &device_ok;
+            genvar g;
+            for (g = 0; g < NDEV; g = g + 1) begin : g_dev
+                wire [1:0] dqs_bus = dqs_oe[g] ? dqs_dev[g*2 +: 2] : 2'b00;
+                wire       clk_gated = mclk & clk_en[g];
+                assign #1.0 clk_dev[g] = clk_gated;                          // ideal quarter-period delays
+                assign #1.0 dqs_d[g*2 +: 2] = dqs_bus;
+                wire [15:0] dq_bus_c = dq_oe[g] ? dq_c[g*16 +: 16] : 16'hzzzz;
+                wire [15:0] dq_bus_d = dqs_oe[g] ? dq_d[g*16 +: 16] : 16'hzzzz;
+                fabric_hpi_channel #(.MR0(MR0), .MR4(MR4), .MR8(MR8), .TPU_CYCLES(60), .TRST_CYCLES(20)) ch (
+                    .clk(mclk), .rst_n(rst_n), .phy_ready(1'b1), .phy_quiet(phy_quiet[g]),
+                    .clk_en(clk_en[g]), .init_done(init_done[g]), .device_ok(device_ok[g]),
+                    .xact_valid(x_valid[g]), .xact_ready(x_ready[g]), .xact_write(x_write), .xact_addr(x_addr), .xact_beats(x_beats),
+                    .wdata_valid(x_wdata_valid[g]), .wdata_ready(x_wdata_ready[g]), .wdata(x_wdata),
+                    .rdata_valid(x_rdata_valid[g]), .rdata_ready(x_rdata_ready[g]), .rdata(x_rdata[g*128 +: 128]), .xact_done(x_done[g]),
+                    .ce_n(ce_n[g]), .dq_o(dq_c[g*16 +: 16]), .dq_oe(dq_oe[g]), .dq_i(dq_bus_d), .dm_o(dm_c[g*2 +: 2]), .dm_oe(),
+                    .dqs_d(dqs_d[g*2 +: 2]));
+                fabric_hpi_device #(.WORDS(DEV_WORDS), .T_DQSCK_NS(2.5 + 0.5 * (g % 4)), .PUSHOUT_SEED(7 + g)) dev (
+                    .clk(clk_dev[g]), .ce_n(ce_n[g]), .dq_i(dq_bus_c), .dq_o(dq_d[g*16 +: 16]), .dq_oe(),
+                    .dm_i(dm_c[g*2 +: 2]), .dqs_o(dqs_dev[g*2 +: 2]), .dqs_oe(dqs_oe[g]));
+                // The image in after every time-zero initialiser, and out at the dump.
+                integer w;
+                initial begin #1; for (w = 0; w < DEV_WORDS; w = w + 1) dev.mem[w] = dimg[g*DEV_WORDS + w]; end
+                always @(posedge dump) for (w = 0; w < DEV_WORDS; w = w + 1) dimg[g*DEV_WORDS + w] = dev.mem[w];
+            end
+            initial $readmemh("devs.hex", dimg);
+            always @(posedge dump) begin #1; $writememh("devs_out.hex", dimg); end
+            always @(posedge clk) if (rd_overflow) $display("FAIL: the bridge's read fifo overflowed");
+        end else begin : g_model
+            fabric_mem_model #(.DW(128), .WORDS(MEM_BEATS), .LAT(2), .FILE("mem_init.hex")) u_mem (
+                .clk(clk), .rst_n(rst_n), .req_valid(req_valid), .req_ready(req_ready), .req_write(req_write), .req_addr(req_addr),
+                .req_beats(req_beats), .wdata_valid(wdata_valid), .wdata_ready(wdata_ready), .wdata(wdata), .rdata_valid(rdata_valid), .rdata(rdata));
+            assign mem_ready = 1'b1;
+            always @(posedge dump) $writememh("mem_out.hex", u_mem.mem);
+        end
+    endgenerate
 
     // The issue trace, for the Python side's dependency check.
     integer trace, issues = 0, t0 = 0, guard;
+    reg finished = 0;
     always @(posedge clk) if (|(dut.cmd_valid & dut.cmd_ready)) begin
         if (issues == 0) t0 = cycle;
         $fdisplay(trace, "%0d %0d %0d %0d", issues, dut.cmd_tag, cycle, dut.u_seq.cur_unit);
@@ -80,16 +158,20 @@ module tb_layer_engine #(
 
     initial begin
         trace = $fopen("issue.txt", "w");
-        repeat (2) @(posedge clk);
+        repeat (4) @(posedge clk);
         rst_n = 1;
+        guard = 0;
+        while (!mem_ready && guard < 200000) begin @(posedge clk); guard = guard + 1; end
+        if (!mem_ready) begin $display("FAIL: the memory never came up"); $finish; end
         @(posedge clk); #0.1;
         start = 1; @(posedge clk); #0.1; start = 0;
         guard = 0;
-        while (!done && guard < 2000000) begin @(posedge clk); guard = guard + 1; end
+        while (!done && guard < 4000000) begin @(posedge clk); guard = guard + 1; end
+        finished = done;
         $fclose(trace);
         $writememh("vb_out.hex", dut.u_vb.mem);
-        $writememh("mem_out.hex", u_mem.mem);
-        if (!done) $display("FAIL: never finished, %0d of %0d issued", issues, N);
+        dump = 1; #10;
+        if (!finished) $display("FAIL: never finished, %0d of %0d issued", issues, N);
         else if (issues != N) $display("FAIL: %0d issued of %0d", issues, N);
         else $display("PASS: %0d steps in %0d cycles (the timing model said %0d)", N, cycle - t0, SCHEDULE_CYCLES);
         $finish;

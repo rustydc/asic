@@ -38,7 +38,9 @@ LLM inference appliance built around the Qwen3.5 dense hybrid geometry.
   `fabric/rtl/fabric_engine.sv` are the layer engine: that controller
   wired to the real tiles, vector units, state engines, attention cores
   and memory port through one vector buffer, running both layers'
-  programs bit for bit against the integer model and the memory model.
+  programs bit for bit against the integer model and the memory model,
+  over the memory model or the HPI path itself, one token at a time or
+  a prefill chunk of tokens on the multi-token tiles.
   `fabric/state.py` is the study that set the recurrent state's format,
   int8 with a per-head scale that carries the decay, halving the traffic
   the schedule showed to dominate; the global layer's traffic followed,

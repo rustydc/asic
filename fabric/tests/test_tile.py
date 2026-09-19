@@ -32,6 +32,16 @@ class ArithmeticTest(unittest.TestCase):
             np.testing.assert_array_equal(psum, reference_matmul(q, x))
             np.testing.assert_array_equal(y, requantize(reference_matmul(q, x), q.mult, q.shift, spec))
 
+    def test_a_chunk_of_tokens_shares_the_pass(self) -> None:
+        q = random_quantized(self.rng, SMALL.rows, SMALL.cols, SMALL)
+        tile = compile_matrix(q, SMALL).tiles[0]
+        xs = self.rng.integers(-128, 128, (4, SMALL.rows))
+        psum, y = tile_forward(tile, xs, SMALL)
+        self.assertEqual(psum.shape, (4, SMALL.cols))
+        for t in range(4):
+            np.testing.assert_array_equal(psum[t], reference_matmul(q, xs[t]))
+            np.testing.assert_array_equal(y[t], tile_forward(tile, xs[t], SMALL)[1])
+
     def test_chained_partial_sums(self) -> None:
         q = random_quantized(self.rng, SMALL.rows, SMALL.cols, SMALL)
         tile = compile_matrix(q, SMALL).tiles[0]
@@ -104,18 +114,18 @@ class MappingTest(unittest.TestCase):
 
 @unittest.skipUnless(shutil.which("iverilog") and shutil.which("vvp"), "iverilog not installed")
 class RtlTest(unittest.TestCase):
-    def run_rtl(self, spec: TileSpec, seed: int, with_psum: bool) -> str:
+    def run_rtl(self, spec: TileSpec, seed: int, with_psum: bool, tokens: int = 1) -> str:
         rng = np.random.default_rng(seed)
         q = random_quantized(rng, spec.rows, spec.cols, spec)
         tile = compile_matrix(q, spec).tiles[0]
-        x = rng.integers(-128, 128, spec.rows)
-        psum_in = rng.integers(-5000, 5000, spec.cols) if with_psum else None
+        x = rng.integers(-128, 128, (tokens, spec.rows) if tokens > 1 else spec.rows)
+        psum_in = rng.integers(-5000, 5000, tokens * spec.cols) if with_psum else None
         with tempfile.TemporaryDirectory() as directory:
             work = Path(directory)
             emit_vectors(work, tile, x, spec, psum_in)
             params = [f"-Ptb_fabric_tile.{name}={value}" for name, value in (
                 ("ROWS", spec.rows), ("COLS", spec.cols), ("WB", spec.weight_bits), ("AB", spec.act_bits),
-                ("P", spec.rows_per_cycle), ("ACC", spec.acc_bits), ("SB", spec.scale_bits), ("SHB", spec.shift_bits))]
+                ("P", spec.rows_per_cycle), ("ACC", spec.acc_bits), ("SB", spec.scale_bits), ("SHB", spec.shift_bits), ("T", tokens))]
             subprocess.run(["iverilog", "-g2012", "-o", "sim.vvp", *params,
                             str(RTL / "fabric_tile.sv"), str(RTL / "tb_fabric_tile.sv")],
                            cwd=work, check=True, capture_output=True, text=True)
@@ -128,6 +138,14 @@ class RtlTest(unittest.TestCase):
 
     def test_wide_tile_bit_exact(self) -> None:
         out = self.run_rtl(TileSpec(rows=256, cols=64, rows_per_cycle=4), seed=2, with_psum=False)
+        self.assertIn("PASS", out, out)
+
+    def test_multi_token_tile_bit_exact(self) -> None:
+        # Four tokens of one context through one pass: the ROM read once, four accumulators per column.
+        out = self.run_rtl(SMALL, seed=4, with_psum=True, tokens=4)
+        self.assertIn("PASS", out, out)
+        self.assertIn("4 tokens", out)
+        out = self.run_rtl(TileSpec(rows=256, cols=16, rows_per_cycle=4), seed=5, with_psum=False, tokens=3)
         self.assertIn("PASS", out, out)
 
     def test_full_depth_tile_bit_exact(self) -> None:

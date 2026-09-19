@@ -71,6 +71,24 @@ The per-column requantization constants are the only per-model numbers that
 are not in the via pattern. They live in SRAM loaded at boot over the
 management SPI, about 80 KB per die.
 
+### The multi-token tile
+
+Prefill has many tokens of one context, and the ROM read is the tile's
+one cost that does not scale with them. With the parameter `T` the column
+datapath carries `T` tokens per pass: the activation bus holds `P` rows
+of each token, the ROM word and its signed-digit tap decode are read once
+per column and bank, and each column keeps `T` carry-save accumulators
+whose terms are the shared taps applied to each token's activations (the
+one's-complement count of the negated taps depends on the coefficients
+alone, so it too is shared). The requantizer walks the `T x COLS` results
+token by token, and `psum_in`, `psum_out` and `q_out` are token-major.
+`tile_forward` takes a `[T, rows]` chunk, and `tb_fabric_tile` runs four
+tokens through the small tile and three through a 256 x 16 one bit for
+bit. At `T = 1` nothing changes; the area cost of `T` is the accumulators
+and the term reductions, about 1280 NAND2 per column per token by the
+density model's split, against the tile's ROM read and decode that the
+tokens share.
+
 ## Personalization
 
 Every coefficient bit is the presence or absence of one via in the ROM array.
@@ -1089,8 +1107,52 @@ cycles per row block plus the walk, the attention core takes a beat
 every other cycle, and the memory model returns a beat per cycle; the
 timing model's lanes and the port's bandwidth are the full-size design's,
 so the schedule numbers above stand and the engine is the correctness
-proof. What the engine still lacks is the HPI bridge on its memory port
-in place of the model, and the multi-token prefill the tiles do not do.
+proof.
+
+With `USE_HPI` the testbench puts the die's own memory path behind the
+port instead of the model: `fabric_mem_bridge` across the clock crossing
+to the 250 MHz controller clock, the stripe unit, four channel
+controllers and four PSRAM device models, their images loaded from and
+dumped to files through the stripe map (`hpi.StripedImage`). Both layers'
+single-token runs pass over it bit for bit, the memory steps now taking
+the device's time (a 17-beat state slot is a page burst on one device;
+the append's records and the sums land as bursts on their pages).
+
+### Prefill: a chunk of tokens
+
+`recurrent_program` and `global_program` take a `chunk`: consecutive
+tokens of one context whose passes run together on the multi-token
+tiles while the vector units, the state engines and the memory steps
+take the tokens in turn. A chunk's buffers hold its tokens' vectors in
+turn (a per-token step consumes its slice and produces its slice as a
+contribution, so the pass waits for every token's norm and every token's
+residual waits for the pass), the conv history passes from token to
+token inside the buffer with one read and one write, and each head's
+state is read once, updated `chunk` times on its slot and written once,
+which is the point: the state traffic, which the single-token schedule
+showed to bind, is paid once per chunk. The pass command names the token
+count and the per-token strides, the pass adapter reads each token's
+activations on its own port and writes each token's outputs at its
+stride, and the tile array is built with `TMAX` tokens. Both layers'
+three-token chunks run on the engine bit for bit: the recurrent layer
+from a running context (67 steps, 2,763 cycles against 1,288 for one
+token) and the global layer from position 30, where the middle token
+closes a block and each token's rows include the earlier tokens' records.
+
+At the 9B geometry a chunk of eight gives the recurrent layer 26,033
+cycles per token (32.5 µs) and 134 KB of memory traffic per token
+against 58,143 cycles and 1,073 KB streamed one token at a time; the
+tiles' four passes are 12,352 cycles of that and the rest is the
+vector units and the state engines running the eight tokens in turn
+under the in-order issue. The global layer's prefill gains nothing
+(70,738 cycles per token): its traffic is each token's own window and
+blocks, and the chunk only serialises the tokens' memory steps behind
+one another, so a prefilling die runs its recurrent layers chunked and
+its global layer streamed. A die prefilling at the chunk rate takes
+3 x 32.5 + 80 = 178 µs per token, 5,600 tokens/s, against 3,400 decoding
+at the end of the context; a larger chunk moves the recurrent layer no
+further, the passes being a fifth of it, and the next lever is the
+vector units' lanes.
 
 ## RTL
 
@@ -1136,7 +1198,8 @@ with `tb_sequencer` running the programs of `fabric.sequencer` over stub
 units; `rtl/fabric_engine.sv` the layer engine (the vector buffer, an
 adapter per unit, the memory unit with its arbiter and the top), with
 `tb_layer_engine` running both layers' programs of `fabric.engine` over
-the real units against the integer model and the memory model.
+the real units against the integer model and the memory model, with the
+memory model or the HPI path behind the port.
 
 `rtl/fabric_memory.sv` holds the memory side: the behavioural
 `fabric_mem_model` for the testbenches, `fabric_mem_arbiter`,
@@ -1162,15 +1225,16 @@ bit for bit, at int8 and int4 KV and with the 128-wide index and the
    consecutive passes without a shared resource between them — is not
    urgent. What the passes do need is balance: the model takes them as
    equal, and the FFN-down pass reads the wider FFN vector.
-5. A multi-token variant of the column datapath for chunked prefill, which
-   amortizes the ROM read across a chunk of tokens from one context.
+5. Done: the multi-token tile and the chunked programs for prefill,
+   above; the recurrent layer's state traffic is paid once per chunk.
+   What prefill still wants is the vector units' lanes, which the chunk
+   exposes as the next bound.
 6. Done: the vector datapath between the passes, the memory side, the
    HPI controller for the chosen PSRAM with its clock crossing and its
    PHY, the token sequencer with its layer programs and the layer engine
-   that runs both layers' programs over the real units, above. Open
-   behind them: the engine's memory port onto the HPI bridge in place of
-   the behavioural memory, the simulator's traffic terms brought in line
-   with the map, and synthesis of the units for area. The state traffic, the global
+   that runs both layers' programs over the real units and over the HPI
+   path, above. Open behind them: the simulator's traffic terms brought
+   in line with the map, and synthesis of the units for area. The state traffic, the global
    layer's traffic and the stream of tokens are done, above; the next
    memory lever is the index scan's record size, which is the model's,
    and after that the device count.

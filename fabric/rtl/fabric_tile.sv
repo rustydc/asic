@@ -8,6 +8,11 @@
 // carry-save form.  No carry chain runs per cycle anywhere in the column;
 // carries resolve once per pass in the shared requantizer walk.
 //
+// With T > 1 a pass carries T tokens of one context (chunked prefill): the
+// activation bus holds P rows of each token, the ROM word and its tap
+// decode are read once and serve T accumulators per column, and the
+// requantizer walks the T x COLS results token by token.
+//
 // The tile is split at the hard-macro boundary:
 //   fabric_rom      the via-programmed ROM (here a constant array from a hex
 //                   image; in silicon a ROM macro with P banks)
@@ -117,27 +122,29 @@ module fabric_columns #(
     parameter int P    = 2,             // rows consumed per cycle
     parameter int ACC  = 24,            // accumulator bits
     parameter int SB   = 16,            // requantization multiplier bits (unsigned)
-    parameter int SHB  = 5              // requantization shift bits
+    parameter int SHB  = 5,             // requantization shift bits
+    parameter int T    = 1              // tokens per pass
 ) (
     input  wire                     clk,
     input  wire                     rst_n,
     input  wire                     start,      // begin a pass: load psum_in into the accumulators
-    input  wire [COLS*ACC-1:0]      psum_in,    // chained partial sums (zero for a fresh pass)
-    input  wire                     x_valid,    // P activations for rows cycle*P .. cycle*P+P-1
-    input  wire [P*AB-1:0]          x_data,
+    input  wire [T*COLS*ACC-1:0]    psum_in,    // chained partial sums (zero for a fresh pass), token-major
+    input  wire                     x_valid,    // P activations of each token for rows cycle*P .. cycle*P+P-1
+    input  wire [T*P*AB-1:0]        x_data,     // token t, row b at (t*P + b)*AB
     input  wire [P*COLS*WB-1:0]     rom_words,  // coefficient words for the same P rows
     input  wire [COLS*SB-1:0]       mult,       // per-column requantization multiplier
     input  wire [COLS*SHB-1:0]      shift,      // per-column requantization shift
     output wire [$clog2(ROWS/P)-1:0] cycle,     // ROM address (row group)
     output wire                     x_ready,    // high while a pass is consuming activations
     output reg                      done,       // one-cycle pulse after the last rows are accumulated
-    output wire [COLS*ACC-1:0]      psum_out,   // resolved accumulators, valid when q_valid
-    output wire [COLS*AB-1:0]       q_out,      // requantized outputs, valid when q_valid
-    output wire                     q_valid     // pulses a few cycles after the COLS-cycle walk
+    output wire [T*COLS*ACC-1:0]    psum_out,   // resolved accumulators, valid when q_valid, token-major
+    output wire [T*COLS*AB-1:0]     q_out,      // requantized outputs, valid when q_valid, token-major
+    output wire                     q_valid     // pulses a few cycles after the T*COLS-cycle walk
 );
     localparam int CYCLES = ROWS / P;
     localparam int CW     = $clog2(CYCLES);
     localparam int ROWW   = COLS * WB;
+    localparam int NA     = T * COLS;   // accumulators
 
     // ------------------------------------------------------------------
     // Pass control.  Activations are consumed at the input rate; behind
@@ -187,13 +194,13 @@ module fabric_columns #(
     // The hard macro does the same: the via ROM word selects two taps of
     // the shifted activation bus per bank.
     // ------------------------------------------------------------------
-    reg  [P*AB-1:0]   x_a;
+    reg  [T*P*AB-1:0] x_a;
     reg  [P*ROWW-1:0] words_a;
     always @(posedge clk) begin
         x_a     <= x_data;
         words_a <= rom_words;
     end
-    genvar b, c, g;
+    genvar b, c, g, t;
 
     // ------------------------------------------------------------------
     // Columns.  Stage B: select two taps per bank by ROM word, one's
@@ -205,8 +212,8 @@ module fabric_columns #(
     // The accumulate enable and the load strobe are registered once per
     // column so no single net drives every accumulator (2*ACC + 1 loads).
     // ------------------------------------------------------------------
-    reg [ACC-1:0] acc_s [0:COLS-1];       // accumulator sum vector
-    reg [ACC-1:0] acc_c [0:COLS-1];       // accumulator carry vector (weight 2)
+    reg [ACC-1:0] acc_s [0:NA-1];         // accumulator sum vector, token t column c at t*COLS + c
+    reg [ACC-1:0] acc_c [0:NA-1];         // accumulator carry vector (weight 2)
     wire [COLS-1:0] en_g;
     wire [COLS-1:0] load_g;
     generate
@@ -222,10 +229,10 @@ module fabric_columns #(
 
     generate
         for (c = 0; c < COLS; c = c + 1) begin : g_col
-            wire [NT*ACC-1:0] b_ops;
-            wire [2*P-1:0]    neg_bus;
-            for (b = 0; b < P; b = b + 1) begin : g_term
-                wire signed [AB-1:0] xb   = x_a[b*AB +: AB];
+            // The tap decode of each bank's coefficient, once per column.
+            wire [P*2-1:0] shA_b, shB_b;
+            wire [P-1:0]   enA_b, enB_b, nA_b, nB_b;
+            for (b = 0; b < P; b = b + 1) begin : g_dec
                 wire signed [WB-1:0] word = words_a[b*ROWW + c*WB +: WB];
                 wire                 neg  = word[WB-1];
                 wire signed [WB:0]   wext = {word[WB-1], word};
@@ -246,59 +253,69 @@ module fabric_columns #(
                         default: ;
                     endcase
                 end
-                wire signed [TW-1:0] xext = {{(TW-AB){xb[AB-1]}}, xb};
-                wire signed [TW-1:0] tapA = enA ? (xext <<< shA) : {TW{1'b0}};
-                wire signed [TW-1:0] tapB = enB ? (xext <<< shB) : {TW{1'b0}};
-                // Negation as one's complement; the +1s are counted and enter
-                // the reduction as one more operand, so no incrementer chains.
-                wire                 nA   = neg;
-                wire                 nB   = neg ^ negB;
-                wire signed [TW-1:0] tA   = nA ? ~tapA : tapA;
-                wire signed [TW-1:0] tB   = nB ? ~tapB : tapB;
-                assign b_ops[(2*b)*ACC +: ACC]   = {{(ACC-TW){tA[TW-1]}}, tA};
-                assign b_ops[(2*b+1)*ACC +: ACC] = {{(ACC-TW){tB[TW-1]}}, tB};
-                assign neg_bus[2*b]      = nA;
-                assign neg_bus[2*b + 1]  = nB;
+                assign shA_b[b*2 +: 2] = shA;
+                assign shB_b[b*2 +: 2] = shB;
+                assign enA_b[b] = enA;
+                assign enB_b[b] = enB;
+                assign nA_b[b]  = neg;
+                assign nB_b[b]  = neg ^ negB;
             end
+            // Negation as one's complement; the +1s are counted and enter
+            // the reduction as one more operand, so no incrementer chains.
+            // The count depends on the coefficients only, so it is shared by the tokens.
             reg [NCW-1:0] negcount;
             integer nb;
             always @* begin
                 negcount = {NCW{1'b0}};
-                for (nb = 0; nb < 2 * P; nb = nb + 1) negcount = negcount + neg_bus[nb];
+                for (nb = 0; nb < P; nb = nb + 1) negcount = negcount + nA_b[nb] + nB_b[nb];
             end
-            assign b_ops[(2*P)*ACC +: ACC] = {{(ACC-NCW){1'b0}}, negcount};
+            for (t = 0; t < T; t = t + 1) begin : g_tok
+                wire [NT*ACC-1:0] b_ops;
+                for (b = 0; b < P; b = b + 1) begin : g_term
+                    wire signed [AB-1:0] xb   = x_a[(t*P + b)*AB +: AB];
+                    wire signed [TW-1:0] xext = {{(TW-AB){xb[AB-1]}}, xb};
+                    wire signed [TW-1:0] tapA = enA_b[b] ? (xext <<< shA_b[b*2 +: 2]) : {TW{1'b0}};
+                    wire signed [TW-1:0] tapB = enB_b[b] ? (xext <<< shB_b[b*2 +: 2]) : {TW{1'b0}};
+                    wire signed [TW-1:0] tA   = nA_b[b] ? ~tapA : tapA;
+                    wire signed [TW-1:0] tB   = nB_b[b] ? ~tapB : tapB;
+                    assign b_ops[(2*b)*ACC +: ACC]   = {{(ACC-TW){tA[TW-1]}}, tA};
+                    assign b_ops[(2*b+1)*ACC +: ACC] = {{(ACC-TW){tB[TW-1]}}, tB};
+                end
+                assign b_ops[(2*P)*ACC +: ACC] = {{(ACC-NCW){1'b0}}, negcount};
 
-            // Stage B: reduce to a carry-save pair, registered.
-            wire [ACC-1:0] bs_w, bc_w;
-            fabric_csa_tree #(.N(NT), .W(ACC)) u_b_tree (.ops(b_ops), .s(bs_w), .c(bc_w));
-            reg  [ACC-1:0] sb_s, sb_c;
-            always @(posedge clk) begin
-                sb_s <= bs_w;
-                sb_c <= bc_w;
-            end
+                // Stage B: reduce to a carry-save pair, registered.
+                wire [ACC-1:0] bs_w, bc_w;
+                fabric_csa_tree #(.N(NT), .W(ACC)) u_b_tree (.ops(b_ops), .s(bs_w), .c(bc_w));
+                reg  [ACC-1:0] sb_s, sb_c;
+                always @(posedge clk) begin
+                    sb_s <= bs_w;
+                    sb_c <= bc_w;
+                end
 
-            // Stage C: carry-save accumulate of four operands.  Datapath
-            // registers carry no reset: the registered `start` loads the
-            // accumulators one cycle after it is seen, two cycles before the
-            // first accumulate can arrive.
-            wire [4*ACC-1:0] c_ops = {{sb_c[ACC-2:0], 1'b0}, sb_s, {acc_c[c][ACC-2:0], 1'b0}, acc_s[c]};
-            wire [ACC-1:0]   cs_w, cc_w;
-            fabric_csa_tree #(.N(4), .W(ACC)) u_c_tree (.ops(c_ops), .s(cs_w), .c(cc_w));
-            always @(posedge clk) begin
-                if (load_g[c]) begin
-                    acc_s[c] <= psum_in[c*ACC +: ACC];
-                    acc_c[c] <= {ACC{1'b0}};
-                end else if (en_g[c]) begin
-                    acc_s[c] <= cs_w;
-                    acc_c[c] <= cc_w;
+                // Stage C: carry-save accumulate of four operands.  Datapath
+                // registers carry no reset: the registered `start` loads the
+                // accumulators one cycle after it is seen, two cycles before the
+                // first accumulate can arrive.
+                localparam int A = t * COLS + c;
+                wire [4*ACC-1:0] c_ops = {{sb_c[ACC-2:0], 1'b0}, sb_s, {acc_c[A][ACC-2:0], 1'b0}, acc_s[A]};
+                wire [ACC-1:0]   cs_w, cc_w;
+                fabric_csa_tree #(.N(4), .W(ACC)) u_c_tree (.ops(c_ops), .s(cs_w), .c(cc_w));
+                always @(posedge clk) begin
+                    if (load_g[c]) begin
+                        acc_s[A] <= psum_in[A*ACC +: ACC];
+                        acc_c[A] <= {ACC{1'b0}};
+                    end else if (en_g[c]) begin
+                        acc_s[A] <= cs_w;
+                        acc_c[A] <= cc_w;
+                    end
                 end
             end
         end
     endgenerate
 
     // ------------------------------------------------------------------
-    // Shared requantizer: walks the columns after the pass, one column per
-    // cycle, computing sat_AB((acc * mult + 2^(shift-1)) >>> shift):
+    // Shared requantizer: walks the accumulators after the pass, one per
+    // cycle (token by token), computing sat_AB((acc * mult + 2^(shift-1)) >>> shift):
     //   S0  one-hot select of the column's carry-save pair and constants
     //   R1  carry resolve, low half        R2  carry resolve, high half
     //   M   carry-save multiply with the rounding constant folded in
@@ -306,7 +323,7 @@ module fabric_columns #(
     //   Q   arithmetic shift, saturate, write
     // Every carry chain is at most ACC/2 or PW/3 bits long.
     // ------------------------------------------------------------------
-    localparam int QW  = $clog2(COLS);
+    localparam int QW  = $clog2(NA) + (NA == 1);
     localparam int PW  = ACC + SB + 1;
     localparam int RL  = ACC / 2;                 // resolve chunk
     localparam int C0  = PW / 3;                  // product add chunks
@@ -315,9 +332,9 @@ module fabric_columns #(
 
     reg              q_busy;
     reg  [QW-1:0]    q_col;
-    reg  [COLS-1:0]  sel_oh;
-    reg  [COLS*AB-1:0]  q_reg;
-    reg  [COLS*ACC-1:0] psum_reg;
+    reg  [NA-1:0]    sel_oh;
+    reg  [NA*AB-1:0]  q_reg;
+    reg  [NA*ACC-1:0] psum_reg;
     reg              q_valid_r;
     assign q_out    = q_reg;
     assign psum_out = psum_reg;
@@ -334,11 +351,11 @@ module fabric_columns #(
         accc_sel = {ACC{1'b0}};
         m_sel    = {SB{1'b0}};
         s_sel    = {SHB{1'b0}};
-        for (sc = 0; sc < COLS; sc = sc + 1) begin
+        for (sc = 0; sc < NA; sc = sc + 1) begin
             accs_sel = accs_sel | (acc_s[sc] & {ACC{sel_oh[sc]}});
             accc_sel = accc_sel | (acc_c[sc] & {ACC{sel_oh[sc]}});
-            m_sel    = m_sel    | (mult[sc*SB +: SB] & {SB{sel_oh[sc]}});
-            s_sel    = s_sel    | (shift[sc*SHB +: SHB] & {SHB{sel_oh[sc]}});
+            m_sel    = m_sel    | (mult[(sc % COLS)*SB +: SB] & {SB{sel_oh[sc]}});
+            s_sel    = s_sel    | (shift[(sc % COLS)*SHB +: SHB] & {SHB{sel_oh[sc]}});
         end
     end
 
@@ -392,11 +409,11 @@ module fabric_columns #(
             if (done) begin
                 q_busy <= 1'b1;
                 q_col  <= {QW{1'b0}};
-                sel_oh <= {{(COLS-1){1'b0}}, 1'b1};
+                sel_oh <= {{(NA-1){1'b0}}, 1'b1};
             end else if (q_busy) begin
-                if (q_col == COLS - 1) q_busy <= 1'b0;
+                if (q_col == NA - 1) q_busy <= 1'b0;
                 q_col  <= q_col + 1'b1;
-                sel_oh <= {sel_oh[COLS-2:0], 1'b0};
+                sel_oh <= {sel_oh[NA-2:0], 1'b0};
             end
             vS0 <= q_busy;
             vR1 <= vS0;
@@ -405,7 +422,7 @@ module fabric_columns #(
             vA1 <= vM;
             vA2 <= vA1;
             vA3 <= vA2;
-            q_valid_r <= vA3 && (colA3 == COLS - 1);
+            q_valid_r <= vA3 && (colA3 == NA - 1);
         end
     end
 
@@ -436,7 +453,7 @@ module fabric_columns #(
         pcM   <= pc_w;
         sM    <= sR2;
         if (vR2)
-            for (pi = 0; pi < COLS; pi = pi + 1)
+            for (pi = 0; pi < NA; pi = pi + 1)
                 if (pi == colR2) psum_reg[pi*ACC +: ACC] <= accR2;
         // A1: chunk 0 of the product add.
         colA1 <= colM;
@@ -456,7 +473,7 @@ module fabric_columns #(
         sA3    <= sA2;
         // Q: shift, saturate, write.
         if (vA3)
-            for (qi = 0; qi < COLS; qi = qi + 1)
+            for (qi = 0; qi < NA; qi = qi + 1)
                 if (qi == colA3) q_reg[qi*AB +: AB] <= q_sat;
     end
 
@@ -474,21 +491,22 @@ module fabric_tile #(
     parameter int ACC  = 24,
     parameter int SB   = 16,
     parameter int SHB  = 5,
+    parameter int T    = 1,
     parameter     ROM_FILE = ""
 ) (
-    input  wire                 clk,
-    input  wire                 rst_n,
-    input  wire                 start,
-    input  wire [COLS*ACC-1:0]  psum_in,
-    input  wire                 x_valid,
-    input  wire [P*AB-1:0]      x_data,
-    input  wire [COLS*SB-1:0]   mult,
-    input  wire [COLS*SHB-1:0]  shift,
-    output wire                 x_ready,
-    output wire                 done,
-    output wire [COLS*ACC-1:0]  psum_out,
-    output wire [COLS*AB-1:0]   q_out,
-    output wire                 q_valid
+    input  wire                  clk,
+    input  wire                  rst_n,
+    input  wire                  start,
+    input  wire [T*COLS*ACC-1:0] psum_in,
+    input  wire                  x_valid,
+    input  wire [T*P*AB-1:0]     x_data,
+    input  wire [COLS*SB-1:0]    mult,
+    input  wire [COLS*SHB-1:0]   shift,
+    output wire                  x_ready,
+    output wire                  done,
+    output wire [T*COLS*ACC-1:0] psum_out,
+    output wire [T*COLS*AB-1:0]  q_out,
+    output wire                  q_valid
 );
     wire [$clog2(ROWS/P)-1:0] cycle;
     wire [P*COLS*WB-1:0]      rom_words;
@@ -496,7 +514,7 @@ module fabric_tile #(
     fabric_rom #(.ROWS(ROWS), .COLS(COLS), .WB(WB), .P(P), .ROM_FILE(ROM_FILE)) rom (
         .cycle(cycle), .words(rom_words));
 
-    fabric_columns #(.ROWS(ROWS), .COLS(COLS), .WB(WB), .AB(AB), .P(P), .ACC(ACC), .SB(SB), .SHB(SHB)) columns (
+    fabric_columns #(.ROWS(ROWS), .COLS(COLS), .WB(WB), .AB(AB), .P(P), .ACC(ACC), .SB(SB), .SHB(SHB), .T(T)) columns (
         .clk(clk), .rst_n(rst_n), .start(start), .psum_in(psum_in), .x_valid(x_valid), .x_data(x_data),
         .rom_words(rom_words), .mult(mult), .shift(shift), .cycle(cycle), .x_ready(x_ready), .done(done),
         .psum_out(psum_out), .q_out(q_out), .q_valid(q_valid));

@@ -25,6 +25,7 @@ from pathlib import Path
 
 import numpy as np
 
+from fabric import hpi
 from fabric import layer as L
 from fabric import sequencer as S
 from fabric.memory import BEAT, MemoryMap
@@ -234,14 +235,16 @@ class EngineRun:
     after the token's append)."""
 
     def __init__(self, directory: Path, cfg, c, spec: TileSpec, mm: MemoryMap, steps: list[S.Step], inputs: dict,
-                 memory: dict[str, tuple[bytes, bytes]] | None = None) -> None:
+                 memory: dict[str, tuple[bytes, bytes]] | None = None, ndev: int = 0) -> None:
         directory.mkdir(parents=True, exist_ok=True)
-        self.cfg, self.steps, self.mm = cfg, steps, mm
+        self.cfg, self.steps, self.mm, self.ndev = cfg, steps, mm, ndev
         self.recurrent = isinstance(c, L.RecurrentConsts)
         self.nv, self.hk, self.hv = cfg.linear_num_value_heads, cfg.linear_key_head_dim, cfg.linear_value_head_dim
         d, nk = cfg.hidden_size, cfg.linear_num_key_heads
         conv_dim, ffn = 2 * nk * self.hk + self.nv * self.hv, cfg.layer_intermediate_size(0)
-        lay = S.recurrent_layout(cfg, spec, mm) if self.recurrent else S.global_layout(cfg, spec, mm)
+        xs = [v for k, v in inputs.items() if k.split("@")[0] == "x"]
+        self.chunk = xs[0].shape[0] if np.ndim(xs[0]) == 2 else 1          # tokens per pass: the residual's shape says
+        lay = S.recurrent_layout(cfg, spec, mm, self.chunk) if self.recurrent else S.global_layout(cfg, spec, mm, self.chunk)
         _LAYOUTS[id(c)] = lay
         self.layout = Layout(steps, lay["sizes"])
         self.suffixes = sorted({"" if "@" not in key else "@" + key.split("@")[1] for key in inputs})
@@ -262,6 +265,15 @@ class EngineRun:
                 self.expected_memory["m_ctx" + sfx] = after
         _write_bytes(directory / "vb_init.hex", bytes(vb))
         _write_beats(directory / "mem_init.hex", bytes(mem))
+        # With ndev the memory is the HPI devices: the image striped over them, a page per device in turn.
+        hpi_params = {"USE_HPI": 0}
+        if ndev:
+            self.device_bytes = max(2 * hpi.STRIPE_BYTES, 1 << (-(-len(mem) // (ndev * hpi.STRIPE_BYTES)) * hpi.STRIPE_BYTES - 1).bit_length())
+            striped = hpi.StripedImage(ndev, self.device_bytes)
+            striped.write(0, bytes(mem))
+            striped.to_hex(directory / "devs.hex")
+            mrs = hpi.mode_registers()
+            hpi_params = {"USE_HPI": 1, "NDEV": ndev, "DEV_WORDS": self.device_bytes // 2, "MR0": mrs[0], "MR4": mrs[4], "MR8": mrs[8]}
         # The expected results: the same steps on the integer model.
         copies = {k: (v.copy() if isinstance(v, np.ndarray) else v) for k, v in inputs.items()}
         self.expected = S.run_program(steps, copies)
@@ -278,10 +290,10 @@ class EngineRun:
                        "KV_BITS": mm.kv_bits, "REC_BYTES": mm.kv_record_bytes, "RPB": mm.index_burst_records, "MAXR": mm.window_burst_records,
                        "WINDOW_OFF": regions["window0"][0], "BLOCK_OFF": regions["blocks0"][0], "INDEX_OFF": regions["index0"][0],
                        "SUMS_OFF": regions["sums0"][0], "ATT_L": 8,
-                       "ROWS": spec.rows, "COLS": spec.cols, "P": spec.rows_per_cycle, "NT": nt,
+                       "ROWS": spec.rows, "COLS": spec.cols, "P": spec.rows_per_cycle, "NT": nt, "TMAX": self.chunk,
                        "WB": spec.weight_bits, "ACC": spec.acc_bits, "SB": spec.scale_bits, "SHB": spec.shift_bits, "SW": sw,
                        "YSH": L.ysh_for(self.hk), "VB_BYTES": self.layout.vb_bytes, "MEM_BEATS": self.layout.mem_beats,
-                       "SCHEDULE_CYCLES": S.schedule(steps).cycles}
+                       "SCHEDULE_CYCLES": S.schedule(steps).cycles, **hpi_params}
         (directory / "params.json").write_text(json.dumps(self.params))
 
     def _place(self, image: bytearray, name: str, data: bytes) -> None:
@@ -292,7 +304,14 @@ class EngineRun:
     def check(self, directory: Path) -> list[str]:
         """Compare the testbench's final images with the expected results; a list of mismatches."""
         vb = read_hex_bytes(directory / "vb_out.hex", 1)
-        mem = read_hex_bytes(directory / "mem_out.hex", BEAT)
+        if self.ndev:
+            words = read_hex_bytes(directory / "devs_out.hex", 2)
+            striped = hpi.StripedImage(self.ndev, self.device_bytes)
+            for dev in range(self.ndev):
+                striped.devices[dev][:] = words[dev * self.device_bytes:(dev + 1) * self.device_bytes]
+            mem = striped.read(0, self.layout.mem_beats * BEAT)
+        else:
+            mem = read_hex_bytes(directory / "mem_out.hex", BEAT)
         problems = []
 
         def take(image: bytes, name: str, n: int) -> bytes:
@@ -300,9 +319,10 @@ class EngineRun:
             return image[base:base + n]
 
         for sfx in self.suffixes:
-            x2 = np.frombuffer(take(vb, "x2" + sfx, 2 * self.cfg.hidden_size), dtype="<i2").astype(np.int64)
-            if not np.array_equal(x2, self.expected["x2" + sfx]):
-                problems.append(f"x2{sfx}: {int((x2 != self.expected['x2' + sfx]).sum())} of {len(x2)} elements differ")
+            x2 = np.frombuffer(take(vb, "x2" + sfx, 2 * self.cfg.hidden_size * self.chunk), dtype="<i2").astype(np.int64)
+            want = np.asarray(self.expected["x2" + sfx]).reshape(-1)
+            if not np.array_equal(x2, want):
+                problems.append(f"x2{sfx}: {int((x2 != want).sum())} of {len(x2)} elements differ")
             if not self.recurrent:
                 want = self.expected_memory["m_ctx" + sfx]
                 got = take(mem, "m_ctx" + sfx, len(want))
