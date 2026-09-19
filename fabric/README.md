@@ -699,14 +699,17 @@ transaction at a time. The units:
   records and its index record: the block mean, L2-normalised by the norm
   unit, its absolute maximum as the scale, and
   `code = round((u / scale + 1) * 15 / 2)` by the reciprocal unit.
-* `fabric_index_scan` reads the eligible index records, scores each as
-  `scale * sum (2q - 15)(2k - 15)` against the query's codes (32 codes per
-  beat), and hands the candidates to `fabric_topk`, a sorted list of K
-  entries that a candidate enters above the first it strictly beats.
-* `fabric_record_reader` takes record addresses, reads each record whole,
-  unpacks int4 to int8 where needed, and streams it to the attention core
-  as key beats then value beats; the test drives a retrieval's addresses
-  through it into `fabric_attention` and checks the heads' outputs.
+* `fabric_index_scan` reads the eligible index records a page at a time
+  (25 records per request), scores each as `scale * sum (2q - 15)(2k - 15)`
+  against the query's codes (32 codes per beat), and hands the candidates
+  to `fabric_topk`, a sorted list of K entries that a candidate enters
+  above the first it strictly beats.
+* `fabric_record_reader` takes requests of consecutive records (a page of
+  the window, or one block record), reads them in one burst into a record
+  buffer, unpacks int4 to int8 where needed, and streams them record by
+  record to the attention core as key beats then value beats; the test
+  drives a retrieval's requests through it into `fabric_attention` and
+  checks the heads' outputs.
 
 Retrieval semantics are the reference model's, and `GlobalContextMemoryFloat`
 reproduces `SparseGlobalMixer` token by token to 1e-6 over a sequence
@@ -719,16 +722,45 @@ codes by one level, at rounding ties. On the tiny model the integer store
 selects the same blocks as the float store seven times in ten and the
 attention output tracks it at 0.95, with the residual stream at 0.995.
 
+### The global layer's traffic
+
+The sequencer's schedule made the global layer the larger of the two once
+the state was int8, so its three memory terms were taken in turn:
+
+* **The window is head-major.** A KV head's positions are consecutive
+  (`kv_head * W + pos mod W`), so the record reader reads the window in
+  page bursts of eight int4 records (four at int8) at 96 percent burst
+  efficiency instead of a record per request at 86 (76 at int4), and the
+  append's four records per token go to four addresses instead of one.
+* **The index scan reads a page per request**, 25 records, at 96 percent
+  instead of one 80-byte record per request at 50.
+* **Keys and values are int4** by default (`kv_bits = 4`, 8 available),
+  which halves the window, the block store and the rows the cores read.
+  On the tiny model the attention output tracks the quantised-weight float
+  at 0.989 as int4 against 0.9996 as int8, and the residual stream at
+  0.99998 either way; the same order of loss the int8 state took, for half
+  the largest traffic term.
+
+The program had also been reading sixteen rows per retrieved block where
+the model attends over one mean record per block, the same over-count
+the simulator makes; corrected, one KV head reads the window and 32
+block records, 544 rows at the end of the context, not 1024.
+
 Capacity and traffic for the 9B geometry at 128K context
 (`MemoryMap.report_markdown`):
 
-| Store | int8 state, int8 KV (taken) | int8 state, int4 KV | int16 state, int8 KV (first build) |
+| Store | int8 state, int4 KV (taken) | int8 state, int8 KV | int16 state, int8 KV (first build) |
 | --- | ---: | ---: | ---: |
-| per context | 20.1 MB | 11.2 MB | 21.7 MB |
-| contexts in 1 GB (PSRAM board) | 53 | 95 | 49 |
-| contexts in 4 GB (LPDDR5X) | 213 | 382 | 197 |
+| per context | 11.2 MB | 20.1 MB | 21.7 MB |
+| contexts in 1 GB (PSRAM board) | 95 | 53 | 49 |
+| contexts in 4 GB (LPDDR5X) | 382 | 213 | 197 |
 | traffic per token, three state layers | 3.1 MB | 3.1 MB | 6.3 MB |
-| traffic per token, global layer | 1.8 MB | 1.2 MB | 1.8 MB |
+| traffic per token, global layer | 1.2 MB | 1.8 MB | 1.8 MB |
+
+Of the global layer's 1.2 MB at the end of the context, 0.65 MB is the
+index scan, 0.52 MB the window and 0.03 MB the block records: the scan
+is now the largest term, and its next lever is a coarser index (fewer
+code bits or a shorter index vector), which is the model's business.
 
 The int8 state is the scaled one of the layer section: 512 KB of rows and
 512 B of scales per layer per context, which is the figure the
@@ -826,9 +858,9 @@ latency, two words per clock, and tCPH:
 | a 256 B state row or int4 record | 64 | 84 | 76% |
 | an 80 B index record | 20 | 40 | 50% |
 
-The index scan is the one that suffers: at 80 B per record it runs at
-half rate, so packing index records into pages and scanning a page per
-burst is the first thing to do when the scan's traffic matters.
+The index scan suffered most: at 80 B per record it ran at half rate,
+which is why the scan now reads a page of records per request (the
+memory-side section above).
 
 The controller runs on the device clock and the arbiter and the units on
 the core's, 800 MHz against 250, so the memory port crosses a clock
@@ -910,18 +942,23 @@ PSRAMs (16 GB/s, 20 bytes per core cycle), one token through one layer:
 | --- | ---: | ---: | ---: | ---: | ---: |
 | recurrent, int16 state (first build) | 173 | 140,073 | 175 µs | 9% | 80% |
 | recurrent, int8 state with a scale | 173 | 85,673 | 107 µs | 14% | 67% |
-| global, position 4095 | 41 | 152,133 | 190 µs | 8% | 81% |
-| global, position 131071 | 41 | 215,621 | 270 µs | 6% | 87% |
+| global, position 4095, int8 KV, record bursts, 16 rows per block (first build) | 41 | 152,133 | 190 µs | 8% | 81% |
+| global, position 131071, the same | 41 | 215,621 | 270 µs | 6% | 87% |
+| global, position 4095, int4 KV, page bursts, one row per block | 41 | 53,606 | 67 µs | 23% | 57% |
+| global, position 131071, the same | 41 | 86,620 | 108 µs | 14% | 73% |
 
 The tiles' four passes are 12,352 cycles; the rest is the memory port
 moving the recurrent state (1 MB per token per layer in and out as int8
 with its scales, 2 MB as int16) and, in the global layer, the index scan
-and the 1024 key-value rows per KV head. So on this board the sequencer's
-whole job is to keep the port streaming: the state engines double-buffer
-a head so the next head's read overlaps the update, and the four
-attention cores each own a KV head's stream. The int8 state was the
-largest single lever (it took the recurrent layer from 175 to 107 µs);
-the DRAM boards are not memory-bound this way. What the program does not
+and the window and block rows of each KV head. So on this board the
+sequencer's whole job is to keep the port streaming: the state engines
+double-buffer a head so the next head's read overlaps the update, and the
+four attention cores each own a KV head's stream. The int8 state took the
+recurrent layer from 175 to 107 µs, and the head-major window, the page
+bursts, int4 keys and values and the corrected block rows took the global
+layer from 270 to 108 µs at the end of the context, with both layers now
+near 100 µs per token; the DRAM boards are not memory-bound this way.
+What the program does not
 yet carry is the per-context addressing (the DMA steps take an argument
 field for it) and the overlap of one token's memory steps with the previous
 token's passes, which the issue engine allows once two tokens' programs
@@ -1003,4 +1040,5 @@ bit for bit, at int8 and int4 KV and with the 128-wide index and the
    command bus into each unit's start, the buffer addressing, the
    per-context arguments), the simulator's traffic terms brought in line
    with the map, and synthesis of the units for area. The state traffic
-   is done: int8 with a per-head scale, above.
+   and the global layer's traffic are done, above; the next memory lever
+   is the index scan's record size, which is the model's.

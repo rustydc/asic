@@ -87,7 +87,7 @@ class MemoryMap:
     recurrent_layers: int = 3
     global_layers: int = 1
     state_bits: int = 8              # int8 with a U16 scale per head (fabric.layer.delta_state_int8); 16 is the plain int16 state
-    kv_bits: int = 8
+    kv_bits: int = 4                 # int4 halves the window rows, the largest global-layer traffic; 8 is available
 
     @classmethod
     def from_config(cls, cfg, **overrides) -> "MemoryMap":
@@ -204,9 +204,20 @@ class MemoryMap:
     def hist_addr(self, ctx: int, layer: int) -> int:
         return self.context_base(ctx) + self.regions()[f"hist{layer}"][0]
 
+    @property
+    def window_burst_records(self) -> int:
+        """Records of one KV head's window a page burst reads (the window is head-major)."""
+        return ALIGN // self.kv_record_bytes
+
+    @property
+    def index_burst_records(self) -> int:
+        """Index records the scan reads per request: a page's worth."""
+        return ALIGN // self.index_record_bytes
+
     def window_record_addr(self, ctx: int, pos: int, kv_head: int, layer: int = 0) -> int:
+        """Head-major: a KV head's positions are consecutive, so the reader bursts pages of them."""
         base = self.context_base(ctx) + self.regions()[f"window{layer}"][0]
-        return base + ((pos % self.local_window) * self.kv_heads + kv_head) * self.kv_record_bytes
+        return base + (kv_head * self.local_window + pos % self.local_window) * self.kv_record_bytes
 
     def block_record_addr(self, ctx: int, block: int, kv_head: int, layer: int = 0) -> int:
         base = self.context_base(ctx) + self.regions()[f"blocks{layer}"][0]
@@ -446,6 +457,17 @@ class GlobalContextMemory:
             candidates.append((b, index_score(q_codes, k_codes, record[mm.index_code_beats * BEAT])))
         return topk_stream(candidates, self.top), q_codes
 
+    @staticmethod
+    def requests(addrs: list[int], record_bytes: int, max_records: int) -> list[tuple[int, int]]:
+        """Group consecutive record addresses into ``(address, records)`` requests of at most ``max_records``."""
+        out: list[tuple[int, int]] = []
+        for a in addrs:
+            if out and a == out[-1][0] + out[-1][1] * record_bytes and out[-1][1] < max_records:
+                out[-1] = (out[-1][0], out[-1][1] + 1)
+            else:
+                out.append((a, 1))
+        return out
+
     def rows(self, pos: int, selected: list[tuple[int, int]]) -> tuple[np.ndarray, np.ndarray, list[int]]:
         """Key and value rows ``[kv_heads, N, hd]`` for the attention core: the
         window in position order, then the selected blocks in rank order;
@@ -467,7 +489,8 @@ class GlobalContextMemory:
     def retrieve(self, pos: int, q_unit: np.ndarray) -> dict:
         selected, q_codes = self.scan(pos, q_unit)
         k_rows, v_rows, addrs = self.rows(pos, selected)
-        return {"selected": selected, "q_codes": q_codes, "k_rows": k_rows, "v_rows": v_rows, "addrs": addrs}
+        return {"selected": selected, "q_codes": q_codes, "k_rows": k_rows, "v_rows": v_rows, "addrs": addrs,
+                "requests": self.requests(addrs, self.mm.kv_record_bytes, self.mm.window_burst_records)}
 
 
 class GlobalContextMemoryFloat:
@@ -553,7 +576,8 @@ def emit_index_scan_vectors(directory: Path, rng: np.random.Generator, mm: Memor
     write_hex(directory / "expected_id.hex", [i for i, _ in ranked], 16)
     write_hex(directory / "expected_score.hex", [s for _, s in ranked], 32)
     return _params(directory, IDIM=mm.index_dim, BLOCKS=blocks, K=k, BASE=mm.index_record_addr(0, 0),
-                   REC_BEATS=mm.index_code_beats + 1, WORDS=len(image.data) // BEAT, EXPECTED=len(ranked))
+                   REC_BEATS=mm.index_code_beats + 1, RPB=mm.index_burst_records, WORDS=len(image.data) // BEAT,
+                   EXPECTED=len(ranked))
 
 
 def emit_kv_append_vectors(directory: Path, rng: np.random.Generator, mm: MemoryMap, tokens: int, top: int) -> dict:
@@ -597,13 +621,13 @@ def emit_record_reader_vectors(directory: Path, rng: np.random.Generator, mm: Me
     out = attention_int(q, gate, got["k_rows"][0], got["v_rows"][0], **consts)
     pack8 = lambda row: int(sum((int(e) & 0xFF) << (8 * j) for j, e in enumerate(row)))
     store.image.to_hex(directory / "mem.hex")
-    write_hex(directory / "addrs.hex", got["addrs"], 32)
+    write_hex(directory / "reqs.hex", [(count << 32) | addr for addr, count in got["requests"]], 40)
     write_hex(directory / "q.hex", [pack8(row) for row in q], 8 * mm.head_dim)
     write_hex(directory / "gate.hex", [pack8(row) for row in gate], 8 * mm.head_dim)
     write_hex(directory / "expected_out.hex", [pack8(row) for row in out], 8 * mm.head_dim)
-    return _params(directory, HD=mm.head_dim, KV_BITS=mm.kv_bits, G=g, L=lanes, N=len(got["addrs"]),
-                   REC_BEATS=mm.kv_record_bytes // BEAT, WORDS=len(store.image.data) // BEAT,
-                   **{k.upper(): v for k, v in consts.items()})
+    return _params(directory, HD=mm.head_dim, KV_BITS=mm.kv_bits, G=g, L=lanes, N=len(got["requests"]),
+                   NREC=len(got["addrs"]), MAXR=mm.window_burst_records, REC_BEATS=mm.kv_record_bytes // BEAT,
+                   WORDS=len(store.image.data) // BEAT, **{k.upper(): v for k, v in consts.items()})
 
 
 def emit_row_dma_vectors(directory: Path, rng: np.random.Generator, k: int, v: int) -> dict:

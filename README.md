@@ -35,7 +35,9 @@ LLM inference appliance built around the Qwen3.5 dense hybrid geometry.
   layer, scheduled at full size, and run by a microcoded issue engine.
   `fabric/state.py` is the study that set the recurrent state's format,
   int8 with a per-head scale that carries the decay, halving the traffic
-  the schedule showed to dominate.
+  the schedule showed to dominate; the global layer's traffic followed,
+  with a head-major window read in page bursts, a page-per-request index
+  scan and int4 keys and values.
 * [`clash/`](clash/) contains a synthesizable four-stage ASIC-shard seed with a
   deliberately small fixed-coefficient datapath for early RTL and P&R work.
 * [`sim/`](sim/) contains the cycle-stepped 32-stage appliance simulator for

@@ -10,7 +10,9 @@ module tb_record_reader #(
     parameter int KV_BITS   = 8,
     parameter int G         = 2,
     parameter int L         = 16,
-    parameter int N         = 18,
+    parameter int N         = 18,                         // requests
+    parameter int NREC      = 18,                         // records
+    parameter int MAXR      = 4,
     parameter int REC_BEATS = 8,
     parameter int WORDS     = 1024,
     parameter int MULT_S    = 4096,
@@ -24,7 +26,7 @@ module tb_record_reader #(
     localparam int BEATS = HD / L;
     reg clk = 0, rst_n = 0;
     always #5 clk = ~clk;
-    reg [31:0]     am [0:N-1];
+    reg [39:0]     am [0:N-1];                            // count << 32 | address
     reg [HD*8-1:0] qm [0:G-1], gm [0:G-1], em [0:G-1];
 
     wire          req_valid, req_ready, rdata_valid;
@@ -37,11 +39,12 @@ module tb_record_reader #(
 
     reg           addr_valid = 0;
     reg [31:0]    addr = 0;
+    reg [7:0]     addr_count = 0;
     wire          addr_ready, rd_valid, rd_ready, rec_done;
     wire [1:0]    rd_kind;
     wire [L*8-1:0] rd_data;
-    fabric_record_reader #(.DW(DW), .HD(HD), .KV_BITS(KV_BITS), .L(L)) reader (
-        .clk(clk), .rst_n(rst_n), .addr_valid(addr_valid), .addr_ready(addr_ready), .addr(addr),
+    fabric_record_reader #(.DW(DW), .HD(HD), .KV_BITS(KV_BITS), .L(L), .MAXR(MAXR)) reader (
+        .clk(clk), .rst_n(rst_n), .addr_valid(addr_valid), .addr_ready(addr_ready), .addr(addr), .addr_count(addr_count),
         .req_valid(req_valid), .req_ready(req_ready), .req_addr(req_addr), .req_beats(req_beats),
         .rdata_valid(rdata_valid), .rdata(rdata), .out_valid(rd_valid), .out_ready(rd_ready), .out_kind(rd_kind),
         .out_data(rd_data), .rec_done(rec_done));
@@ -87,7 +90,7 @@ module tb_record_reader #(
     endtask
 
     initial begin
-        $readmemh("addrs.hex", am);
+        $readmemh("reqs.hex", am);
         $readmemh("q.hex", qm);
         $readmemh("gate.hex", gm);
         $readmemh("expected_out.hex", em);
@@ -105,13 +108,13 @@ module tb_record_reader #(
         for (n = 0; n < N; n = n + 1) begin
             @(negedge clk);
             while (!addr_ready) @(negedge clk);
-            addr_valid = 1; addr = am[n];
+            addr_valid = 1; addr = am[n][31:0]; addr_count = am[n][39:32];
             @(posedge clk); #1;
             addr_valid = 0;
         end
         guard = 0;
-        while (recs < N && guard < N * (REC_BEATS + 2 * BEATS + 20)) begin @(posedge clk); #1; guard = guard + 1; end
-        if (recs != N) begin $display("FAIL: %0d records read of %0d", recs, N); $finish; end
+        while (recs < NREC && guard < NREC * (REC_BEATS + 2 * BEATS + 20)) begin @(posedge clk); #1; guard = guard + 1; end
+        if (recs != NREC) begin $display("FAIL: %0d records read of %0d", recs, NREC); $finish; end
         @(negedge clk);
         while (!in_ready) @(negedge clk);
         finish = 1;
@@ -121,7 +124,7 @@ module tb_record_reader #(
         while (!seen_done && guard < G * (BEATS + 20)) begin @(posedge clk); #1; guard = guard + 1; end
         if (!seen_done) $display("FAIL: attention never done");
         else if (got != G * BEATS) $display("FAIL: %0d output beats of %0d", got, G * BEATS);
-        else if (errors == 0) $display("PASS: %0d records into %0d heads", N, G);
+        else if (errors == 0) $display("PASS: %0d records in %0d requests into %0d heads", NREC, N, G);
         else $display("FAIL: %0d mismatches", errors);
         $finish;
     end

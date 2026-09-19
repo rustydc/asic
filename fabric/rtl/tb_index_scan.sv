@@ -10,6 +10,7 @@ module tb_index_scan #(
     parameter int K         = 8,
     parameter int BASE      = 0,
     parameter int REC_BEATS = 5,
+    parameter int RPB       = 25,
     parameter int WORDS     = 256,
     parameter int EXPECTED  = 8
 );
@@ -32,7 +33,7 @@ module tb_index_scan #(
     wire             scan_done, cand_valid;
     wire [15:0]      cand_id;
     wire signed [31:0] cand_score;
-    fabric_index_scan #(.DW(DW), .IDIM(IDIM), .IDW(16)) scan (
+    fabric_index_scan #(.DW(DW), .IDIM(IDIM), .IDW(16), .RPB(RPB)) scan (
         .clk(clk), .rst_n(rst_n), .start(start), .base(BASE[31:0]), .n_blocks(BLOCKS[15:0]), .q_codes(qm[0]),
         .done(scan_done), .cand_valid(cand_valid), .cand_id(cand_id), .cand_score(cand_score),
         .req_valid(req_valid), .req_ready(req_ready), .req_addr(req_addr), .req_beats(req_beats),
@@ -82,7 +83,7 @@ module tb_index_scan #(
         while (!seen_done && guard < K + 10) begin @(posedge clk); #1; guard = guard + 1; end
         if (!seen_done) $display("FAIL: never done");
         else if (got != EXPECTED) $display("FAIL: %0d entries, expected %0d", got, EXPECTED);
-        else if (errors == 0) $display("PASS: top %0d of %0d blocks", K, BLOCKS);
+        else if (errors == 0) $display("PASS: top %0d of %0d blocks, %0d records per request", K, BLOCKS, RPB);
         else $display("FAIL: %0d mismatches", errors);
         $finish;
     end

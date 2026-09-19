@@ -293,16 +293,21 @@ def global_program(cfg, c: L.GlobalConsts | None, spec: TileSpec, mm: MemoryMap,
     # The memory side: append this token's records, scan the index, then stream rows to the cores.
     append_bytes = nkv * mm.kv_record_bytes + (nkv * mm.kv_record_bytes + mm.index_record_bytes) // mm.block
     add("mem.append", "mem", ("k", "v", "index_k"), (), t.memory(append_bytes, mm.kv_record_bytes), nbytes=append_bytes)
-    scan_bytes = eligible_blocks(pos, mm.local_window, mm.block) * mm.index_record_bytes
-    add("mem.scan", "mem", ("index_q_unit",), ("selected",), t.memory(scan_bytes, mm.index_record_bytes),
+    # The scan reads the index a page of records per request; the rows are the
+    # window (head-major, page bursts) and one mean record per selected block.
+    eligible = eligible_blocks(pos, mm.local_window, mm.block)
+    scan_bytes = eligible * mm.index_record_bytes
+    add("mem.scan", "mem", ("index_q_unit",), ("selected",), t.memory(scan_bytes, mm.index_burst_records * mm.index_record_bytes),
         lambda e: e.__setitem__("selected", None), nbytes=scan_bytes)
-    rows = min(pos + 1, mm.local_window) + min(cfg.top_blocks, eligible_blocks(pos, mm.local_window, mm.block)) * mm.block
+    n_window, n_blocks = min(pos + 1, mm.local_window), min(cfg.top_blocks, eligible)
+    rows = n_window + n_blocks
     row_cycles = 2 * -(-hd // t.l_attn) + t.attn_exp_stall
     for n in range(nkv):
         heads = list(range(n * group, (n + 1) * group))
-        rows_bytes = rows * mm.kv_record_bytes
-        add(f"mem.rows[{n}]", "mem", ("selected",), (f"rows[{n}]",), t.memory(rows_bytes, mm.kv_record_bytes),
-            lambda e, n=n: e.__setitem__(f"rows[{n}]", (e["k_rows"][n], e["v_rows"][n])), nbytes=rows_bytes)
+        window_bytes, block_bytes = n_window * mm.kv_record_bytes, n_blocks * mm.kv_record_bytes
+        add(f"mem.rows[{n}]", "mem", ("selected",), (f"rows[{n}]",),
+            t.memory(window_bytes, mm.window_burst_records * mm.kv_record_bytes) + t.memory(block_bytes, mm.kv_record_bytes),
+            lambda e, n=n: e.__setitem__(f"rows[{n}]", (e["k_rows"][n], e["v_rows"][n])), nbytes=window_bytes + block_bytes)
 
         def attn(e, n=n, heads=heads):
             q = np.stack([e[f"q[{h}]"] for h in heads])

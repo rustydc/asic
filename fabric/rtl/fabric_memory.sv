@@ -353,7 +353,8 @@ endmodule
 module fabric_index_scan #(
     parameter int DW   = 128,
     parameter int IDIM = 128,
-    parameter int IDW  = 16
+    parameter int IDW  = 16,
+    parameter int RPB  = 25                                // records per request (a page)
 ) (
     input  wire              clk,
     input  wire              rst_n,
@@ -376,12 +377,17 @@ module fabric_index_scan #(
     localparam int CB   = (IDIM + CPB - 1) / CPB;          // code beats
     localparam int REC  = (CB + 1) * (DW / 8);             // record bytes
     localparam int BW   = $clog2(CB + 1) + 1;
+    localparam int RW   = $clog2(RPB + 1);
     reg              busy, inflight;
-    reg [IDW-1:0]    blk;
+    reg [IDW-1:0]    blk;                                  // the block being scored
+    reg [IDW-1:0]    first;                                // the first block of the request
+    reg [RW-1:0]     count, got;                           // records in the request, records finished
     reg [BW-1:0]     beat;
     reg signed [31:0] acc;
+    wire [IDW-1:0]   left = n_blocks - blk;
+    wire [RW-1:0]    want = (left > RPB) ? RPB[RW-1:0] : left[RW-1:0];
     assign req_addr  = base + blk * REC;
-    assign req_beats = CB + 1;
+    assign req_beats = want * (CB + 1);
     // Partial dot product of this beat's codes.
     integer c;
     reg signed [63:0] part;
@@ -395,8 +401,8 @@ module fabric_index_scan #(
     wire signed [63:0] final_score = acc * $signed({56'b0, rdata[7:0]});
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            busy <= 1'b0; inflight <= 1'b0; blk <= 0; beat <= 0; acc <= 0; req_valid <= 1'b0;
-            done <= 1'b0; cand_valid <= 1'b0;
+            busy <= 1'b0; inflight <= 1'b0; blk <= 0; first <= 0; count <= 0; got <= 0; beat <= 0; acc <= 0;
+            req_valid <= 1'b0; done <= 1'b0; cand_valid <= 1'b0;
         end else begin
             done <= 1'b0;
             cand_valid <= 1'b0;
@@ -405,17 +411,23 @@ module fabric_index_scan #(
                 if (n_blocks == 0) done <= 1'b1;
                 else begin busy <= 1'b1; req_valid <= 1'b1; end
             end else if (busy) begin
-                if (req_valid && req_ready) begin req_valid <= 1'b0; inflight <= 1'b1; beat <= 0; acc <= 0; end
+                if (req_valid && req_ready) begin
+                    req_valid <= 1'b0; inflight <= 1'b1; beat <= 0; acc <= 0; count <= want; got <= 0;
+                end
                 if (inflight && rdata_valid) begin
                     if (beat < CB) begin
                         acc <= acc + part[31:0];
                         beat <= beat + 1'b1;
                     end else begin
                         cand_valid <= 1'b1; cand_id <= blk; cand_score <= final_score[31:0];
-                        inflight <= 1'b0;
+                        beat <= 0; acc <= 0;
                         blk <= blk + 1'b1;
-                        if (blk == n_blocks - 1) begin busy <= 1'b0; done <= 1'b1; end
-                        else req_valid <= 1'b1;
+                        got <= got + 1'b1;
+                        if (got == count - 1) begin
+                            inflight <= 1'b0;
+                            if (blk == n_blocks - 1) begin busy <= 1'b0; done <= 1'b1; end
+                            else req_valid <= 1'b1;
+                        end
                     end
                 end
             end
@@ -424,26 +436,31 @@ module fabric_index_scan #(
 endmodule
 
 // ---------------------------------------------------------------------------
-// Record reader: each address names a key-then-value record of one KV head;
-// the record is read whole, unpacked from KV_BITS to int8, and streamed to
-// the attention core as HD/L key beats (kind 2) then HD/L value beats
-// (kind 3), honouring its ready.  Addresses arrive on a valid/ready queue.
+// Record reader: each request names `count` consecutive key-then-value
+// records of one KV head (a page of the head-major window, or one block
+// record); they are read in one burst into a buffer of MAXR records,
+// unpacked from KV_BITS to int8, and streamed record by record to the
+// attention core as HD/L key beats (kind 2) then HD/L value beats (kind 3),
+// honouring its ready.  Requests arrive on a valid/ready queue; rec_done
+// pulses per record.
 // ---------------------------------------------------------------------------
 module fabric_record_reader #(
     parameter int DW      = 128,
     parameter int HD      = 256,
     parameter int KV_BITS = 8,
-    parameter int L       = 64
+    parameter int L       = 64,
+    parameter int MAXR    = 8                              // records per request at most
 ) (
     input  wire           clk,
     input  wire           rst_n,
     input  wire           addr_valid,
     output wire           addr_ready,
     input  wire [31:0]    addr,
+    input  wire [7:0]     addr_count,
     output reg            req_valid,
     input  wire           req_ready,
     output reg  [31:0]    req_addr,
-    output wire [11:0]    req_beats,
+    output reg  [11:0]    req_beats,
     input  wire           rdata_valid,
     input  wire [DW-1:0]  rdata,
     output reg            out_valid,
@@ -458,11 +475,12 @@ module fabric_record_reader #(
     localparam int OUT_BEATS  = 2 * (HD / L);
     localparam int BW         = $clog2(REC_BEATS) + 1;
     localparam int OW         = $clog2(OUT_BEATS) + 1;
-    reg [2*HD*8-1:0] rec;                                  // unpacked key then value
+    localparam int RW         = $clog2(MAXR) + 1;
+    reg [2*HD*8-1:0] recs [0:MAXR-1];                      // unpacked key then value, per record of the request
     reg              busy, inflight, emitting;
     reg [BW-1:0]     beat;
     reg [OW-1:0]     ob;
-    assign req_beats  = REC_BEATS;
+    reg [RW-1:0]     count, wrec, rrec;                    // records in the request, filled, emitted
     assign addr_ready = !busy;
     // Unpack one beat to EPB int8 elements.
     integer e;
@@ -473,35 +491,42 @@ module fabric_record_reader #(
             else              unpacked[e*8 +: 8] = {rdata[e*4 +: 4], 4'b0};
     end
     wire out_fire = out_valid && out_ready;
+    wire have_rec = (wrec != rrec);                        // a filled record awaits emission
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            busy <= 1'b0; inflight <= 1'b0; emitting <= 1'b0; beat <= 0; ob <= 0;
-            req_valid <= 1'b0; out_valid <= 1'b0; rec_done <= 1'b0;
+            busy <= 1'b0; inflight <= 1'b0; emitting <= 1'b0; beat <= 0; ob <= 0; count <= 0; wrec <= 0; rrec <= 0;
+            req_valid <= 1'b0; req_addr <= 0; req_beats <= 0; out_valid <= 1'b0; rec_done <= 1'b0;
         end else begin
             rec_done <= 1'b0;
             if (!busy && addr_valid) begin
-                busy <= 1'b1; req_valid <= 1'b1; req_addr <= addr; beat <= 0;
+                busy <= 1'b1; req_valid <= 1'b1; req_addr <= addr; req_beats <= addr_count * REC_BEATS;
+                count <= addr_count[RW-1:0]; beat <= 0; wrec <= 0; rrec <= 0;
             end
             if (req_valid && req_ready) begin req_valid <= 1'b0; inflight <= 1'b1; end
             if (inflight && rdata_valid) begin
-                // Beat b of half h lands at element h*HD + b*EPB.
-                if (beat < HALF_BEATS) rec[(beat*EPB)*8 +: EPB*8] <= unpacked;
-                else                   rec[(HD + (beat - HALF_BEATS)*EPB)*8 +: EPB*8] <= unpacked;
-                beat <= beat + 1'b1;
-                if (beat == REC_BEATS - 1) begin inflight <= 1'b0; emitting <= 1'b1; ob <= 0; end
+                // Beat b of half h of record wrec lands at element h*HD + b*EPB.
+                if (beat < HALF_BEATS) recs[wrec][(beat*EPB)*8 +: EPB*8] <= unpacked;
+                else                   recs[wrec][(HD + (beat - HALF_BEATS)*EPB)*8 +: EPB*8] <= unpacked;
+                if (beat == REC_BEATS - 1) begin
+                    beat <= 0; wrec <= wrec + 1'b1;
+                    if (wrec == count - 1) inflight <= 1'b0;
+                end else beat <= beat + 1'b1;
             end
             if (emitting) begin
                 if (!out_valid || out_fire) begin
                     out_valid <= 1'b1;
                     out_kind  <= (ob < OUT_BEATS / 2) ? 2'd2 : 2'd3;
-                    out_data  <= rec[ob*L*8 +: L*8];
+                    out_data  <= recs[rrec][ob*L*8 +: L*8];
                     ob <= ob + 1'b1;
                     if (ob == OUT_BEATS - 1) emitting <= 1'b0;
                 end
             end else if (out_fire) begin
                 out_valid <= 1'b0;
-                busy <= 1'b0;
                 rec_done <= 1'b1;
+                rrec <= rrec + 1'b1;
+                if (rrec == count - 1) busy <= 1'b0;
+            end else if (busy && !out_valid && have_rec) begin
+                emitting <= 1'b1; ob <= 0;
             end
         end
     end
@@ -513,7 +538,7 @@ endmodule
 // record.  `start` latches the token; `done` when every write has been
 // issued and accepted.
 //
-//   window record   (pos mod W) * NKV + n     key then value, KV_BITS
+//   window record   n * W + (pos mod W)       key then value, KV_BITS (head-major)
 //   block record    block * NKV + n           the rounded means, KV_BITS
 //   index record    block                     4-bit codes of the L2-normalised
 //                                             mean of index_k, then its scale
@@ -654,7 +679,7 @@ module fabric_kv_append #(
                         rec[b*DW +: DW] <= pack_beat(k_r, head, b);
                         rec[(HALF_BEATS + b)*DW +: DW] <= pack_beat(v_r, head, b);
                     end
-                    req_addr <= window_base + ((pos_r % W) * NKV + head) * REC_BYTES;
+                    req_addr <= window_base + (head * W + (pos_r % W)) * REC_BYTES;
                     beats_r <= REC_BEATS;
                     req_valid <= 1'b1;
                     beat <= 0;
