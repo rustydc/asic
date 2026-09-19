@@ -249,7 +249,9 @@ def synthesize(liberty: Path | Sequence[Path], *, rows: int = 256, cols: int = 8
         else:
             abc_cmd = f"abc {lib_args} {dont_use}"
         script = "\n".join([
-            *[f"read_verilog -sv {path.name}" for path in sources],
+            # -defer: elaborate only the top's tree at its parameters; the other modules in the
+            # files at their defaults (a 256-wide attention core, a 128 x 128 state) are gigabytes.
+            *[f"read_verilog -sv -defer {path.name}" for path in sources],
             f"chparam {chparam} {top}",
             f"hierarchy -check -top {top}",
             f"synth -top {top} -flatten",
