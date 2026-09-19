@@ -1101,10 +1101,10 @@ window, block store, index and sums), runs the program and dumps the
 buffer and the memory; the Python side compares the residual out and the
 memory with `run_program` on the same steps and with the memory model,
 and they are equal bit for bit (`test_engine.py`): the recurrent layer
-for one token from a running context (33 steps, 1,288 cycles) and a
+for one token from a running context (33 steps, 1,482 cycles) and a
 stream of two contexts' tokens (66 steps); the global layer for a token
 at position 31 of a filled context, where four blocks are eligible, two
-are chosen and the token closes a block (23 steps, 1,696 cycles: the
+are chosen and the token closes a block (23 steps, 1,704 cycles: the
 window record, the block record, the index record and the sums all
 land), and a stream of two contexts at positions 31 and 20. The engine's
 cycle counts are not the timing model's (it said 804 and 762): the
@@ -1141,7 +1141,7 @@ count and the per-token strides, the pass adapter reads each token's
 activations on its own port and writes each token's outputs at its
 stride, and the tile array is built with `TMAX` tokens. Both layers'
 three-token chunks run on the engine bit for bit: the recurrent layer
-from a running context (67 steps, 2,763 cycles against 1,288 for one
+from a running context (71 steps, 2,763 cycles against 1,482 for one
 token) and the global layer from position 30, where the middle token
 closes a block and each token's rows include the earlier tokens' records.
 
