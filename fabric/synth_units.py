@@ -53,8 +53,8 @@ UNITS = [
     Unit("residual", "fabric_residual", ("fabric_ffn.sv",), {"L": 4}, "the residual add, four lanes"),
     Unit("rotary", "fabric_rotary", ("fabric_attention.sv",), {"HD": 32, "R": 16, "L": 2}, "the rotation, two lanes"),
     Unit("rotary_table", "fabric_rotary_table", VEC + ("fabric_attention.sv",), {"R": 16}, "the rotary table", luts=True),
-    Unit("attention", "fabric_attention", VEC + ("fabric_attention.sv",), {"HD": 32, "G": 1, "L": 8, "LW": 28},
-         "the attention core, one head of 32, eight lanes", luts=True),
+    Unit("attention", "fabric_attention", VEC + ("fabric_attention.sv",), {"HD": 32, "G": 1, "L": 2, "LW": 28},
+         "the attention core, one head of 32, two lanes", luts=True),
     Unit("index_scan", "fabric_index_scan", ("fabric_memory.sv", "fabric_norm.sv") + VEC, {"IDIM": 32, "RPB": 8},
          "the index scan, 32 codes", luts=True),
     Unit("topk", "fabric_topk", ("fabric_memory.sv", "fabric_norm.sv") + VEC, {"K": 8}, "top-K of eight", luts=True),
@@ -147,7 +147,9 @@ def main() -> None:
         libs.append((name, Path(path), int(target)))
     units = [u for u in UNITS if args.units is None or u.name in args.units.split(",")]
     jobs = [(u, name, path, target, args.sta, args.keep) for u in units for name, path, target in libs]
-    results = []
+    # A rerun of some units replaces their rows in the existing file and keeps the others.
+    results = [r for r in (json.loads(args.out.read_text()) if args.out.exists() else [])
+               if not any(r["unit"] == u.name and r["library"] == name for u in units for name, _, _ in libs)]
     with ProcessPoolExecutor(max_workers=args.jobs) as pool:
         for result in pool.map(_job, jobs):
             results.append(result)
