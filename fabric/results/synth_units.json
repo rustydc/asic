@@ -1526,5 +1526,11 @@
       "OAI21x1_ASAP7_75t_R",
       "DFFHQNx1_ASAP7_75t_R"
     ]
+  },
+  {
+    "unit": "attention",
+    "library": "nangate45",
+    "error": "is a direct match for cell type $_DFF_PN0_.\n  cell DFFS_X1 (noninv, pins=5, area=5.32) is a direct match for cell type $_DFF_PN1_.\n  cell DFFRS_X1 (noninv, pins=6, area=6.38) is a direct match for cell type $_DFFSR_PNN_.\n  final dff cell mappings:\n    unmapped dff cell: $_DFF_N_\n    \\DFF_X1 _DFF_P_ (.CK( C), .D( D), .Q( Q), .QN(~Q));\n    unmapped dff cell: $_DFF_NN0_\n    unmapped dff cell: $_DFF_NN1_\n    unmapped dff cell: $_DFF_NP0_\n    unmapped dff cell: $_DFF_NP1_\n    \\DFFR_X1 _DFF_PN0_ (.CK( C), .D( D), .Q( Q), .QN(~Q), .RN( R));\n    \\DFFS_X1 _DFF_PN1_ (.CK( C), .D( D), .Q( Q), .QN(~Q), .SN( R));\n    unmapped dff cell: $_DFF_PP0_\n    unmapped dff cell: $_DFF_PP1_\n    unmapped dff cell: $_DFFSR_NNN_\n    unmapped dff cell: $_DFFSR_NNP_\n    unmapped dff cell: $_DFFSR_NPN_\n    unmapped dff cell: $_DFFSR_NPP_\n    \\DFFRS_X1 _DFFSR_PNN_ (.CK( C), .D( D), .Q( Q), .QN(~Q), .RN( R), .SN( S));\n    unmapped dff cell: $_DFFSR_PNP_\n    unmapped dff cell: $_DFFSR_PPN_\n    unmapped dff cell: $_DFFSR_PPP_\n\n7.1. Executing DFFLEGALIZE pass (convert FFs to types supported by the target).\nMapping DFF cells in module `\\fabric_attention':\n  mapped 75 $_DFF_PN0_ cells to \\DFFR_X1 cells.\n  mapped 3248 $_DFF_P_ cells to \\DFF_X1 cells.\n\n8. Executing ABC pass (technology mapping using ABC).\n\n8.1. Extracting gate netlist of module `\\fabric_attention' to `<abc-temp-dir>/input.blif'..\nExtracted 266742 gates and 271009 wires to a netlist network with 4265 inputs and 2820 outputs.\n\n8.1.1. Executing ABC.\n",
+    "seconds": 3479.7115561962128
   }
 ]
