@@ -901,10 +901,12 @@ is a fixed dataflow graph over a few dozen on-chip vector buffers (the
 residual, the pass input, the pass outputs, the per-head state slots), and
 the sequencer's program is that graph written out as a list of steps, each
 a command to one unit (a tile pass, a norm, a state-engine head, a DMA)
-with the buffers it reads and writes. The dependencies come from the
-buffer names: a reader waits for its buffer's last writer, a whole vector
-for every slice written into it, and a writer for the readers since the
-last write, since the buffers are reused. Three things are derived from
+with the buffers it consumes and produces. The dependencies come from the
+buffer names: a write waits for the buffer's outstanding writers and
+readers, a read for its outstanding writers, and a produce marked as a
+*contribution* (a head's slice of `y_norm`, one attention core's heads of
+`att`) waits only for the readers of the previous version while a consumer
+of the whole waits for every contribution. Three things are derived from
 the same list, so they cannot drift apart:
 
 * `run_program` executes the steps on the integer model and must
@@ -916,53 +918,88 @@ the same list, so they cannot drift apart:
   and latency from the RTL and the memory port's bandwidth at the HPI burst
   efficiency, giving cycles per token and where the time goes;
 * `emit_program` writes the controller's program image: unit, engine,
-  length, the dependency mask over the previous 32 steps, and a barrier
-  where a dependency reaches further back (the recurrent layer's head loop
-  is 128 steps, so its `out_proj` pass is a barrier).
+  length, up to seven consumed buffer ids, two produced ids and their
+  contribution bits.
 
 The controller is a microcoded issue engine, not a state machine per
-layer: in program order, when the head step's dependencies have completed
-and its unit reports the addressed engine free, it sends the command and
-moves on without waiting; a unit returns the step's tag on its engine's
-done port, and completed steps are kept in a ring of bits relative to the
-head so a dependency is one compare. Units are black boxes to it, which is
-what lets `tb_sequencer` check it against stub units of programmed
-duration: the trace must respect every dependency and never overlap an
-engine, and the last completion must land on exactly the cycle the Python
-schedule gives, which it does for the tiny and the full-size programs of
-both layers (33, 23, 173 and 41 steps). The three timing rules the two
-share: a step issues after the previous issue, one cycle after the last of
-its dependencies completed, and one cycle after its engine's previous
-step completed.
+layer. Per buffer id it keeps the number of outstanding writers and
+readers. In program order, when the head step's consumed buffers have no
+outstanding writer, its produced buffers no outstanding reader (and no
+writer, unless it contributes) and its unit reports the addressed engine
+free, it sends the command and moves on without waiting; a unit returns
+the step's tag on its engine's done port and the controller releases the
+step's buffers, forwarded into the same cycle's check. Units are black
+boxes to it, which is what lets `tb_sequencer` check it against stub
+units of programmed duration: the trace must respect every dependency and
+never overlap an engine, and the last completion must land on exactly the
+cycle the Python schedule gives, which it does for the tiny and the
+full-size programs of both layers and for two-token streams of them (33,
+23, 173, 41, 66, 346 and 82 steps). The three timing rules the two share:
+a step issues after the previous issue, one cycle after the last of its
+dependencies completed, and one cycle after its engine's previous step
+completed.
 
-The full-size schedule is the finding. At the 9B geometry with sixteen
-PSRAMs (16 GB/s, 20 bytes per core cycle), one token through one layer:
+### Streams of tokens
 
-| Layer | Steps | Cycles | Time | Tiles | Memory port |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| recurrent, int16 state (first build) | 173 | 140,073 | 175 µs | 9% | 80% |
-| recurrent, int8 state with a scale | 173 | 85,673 | 107 µs | 14% | 67% |
-| global, position 4095, int8 KV, record bursts, 16 rows per block (first build) | 41 | 152,133 | 190 µs | 8% | 81% |
-| global, position 131071, the same | 41 | 215,621 | 270 µs | 6% | 87% |
-| global, position 4095, int4 KV, page bursts, one row per block | 41 | 53,606 | 67 µs | 23% | 57% |
-| global, position 131071, the same | 41 | 86,620 | 108 µs | 14% | 73% |
+One token at a time leaves the memory port idle while the passes run and
+the tiles idle while the state streams. `stream` runs several tokens of
+different contexts at once: each token's program has its private buffers
+renamed with a token suffix (the state slots stay shared, they are the
+engines' physical buffers), and the programs are merged into one issue
+order by simulating, step by step, which token's next step could issue
+first under the controller's rules. The controller then executes the
+merged order as any other program; nothing in it knows about tokens. A
+second token in flight costs its own set of vector buffers, about 190 KB
+for the recurrent layer (48 KB of it the conv history), which is the
+price of the overlap. Because dependencies are tracked per buffer rather
+than by distance in the program, a step's producers may sit anywhere
+behind it in the merged order; the first controller tracked them in a
+32-step window with barriers beyond it, which the interleaving broke,
+and the counters replaced it.
 
-The tiles' four passes are 12,352 cycles; the rest is the memory port
-moving the recurrent state (1 MB per token per layer in and out as int8
-with its scales, 2 MB as int16) and, in the global layer, the index scan
-and the window and block rows of each KV head. So on this board the
-sequencer's whole job is to keep the port streaming: the state engines
-double-buffer a head so the next head's read overlaps the update, and the
-four attention cores each own a KV head's stream. The int8 state took the
-recurrent layer from 175 to 107 µs, and the head-major window, the page
-bursts, int4 keys and values and the corrected block rows took the global
-layer from 270 to 108 µs at the end of the context, with both layers now
-near 100 µs per token; the DRAM boards are not memory-bound this way.
-What the program does not
-yet carry is the per-context addressing (the DMA steps take an argument
-field for it) and the overlap of one token's memory steps with the previous
-token's passes, which the issue engine allows once two tokens' programs
-are concatenated with their buffers renamed.
+At the 9B geometry with sixteen PSRAMs (16 GB/s, 20 bytes per core cycle),
+one token through one layer:
+
+| Layer | Steps | One token at a time | Streamed, per token | Memory port busy |
+| --- | ---: | ---: | ---: | ---: |
+| recurrent, int16 state (first build) | 173 | 140,073 cycles, 175 µs | | 111,546 |
+| recurrent, int8 state with a scale | 173 | 84,764 cycles, 106 µs | 58,143 cycles, 73 µs | 57,146 |
+| global, position 4095 | 41 | 53,606 cycles, 67 µs | 30,406 cycles, 38 µs | 30,396 |
+| global, position 131071 | 41 | 86,620 cycles, 108 µs | 63,420 cycles, 79 µs | 63,410 |
+
+Streamed, each layer sits within two percent of its memory port: the
+tiles' four passes (12,352 cycles) and every unit hide under the other
+token's traffic. The int8 state took the recurrent layer from 175 to
+106 µs, the head-major window, the page bursts, int4 keys and values and
+the corrected block rows took the global layer from 270 to 108 µs at the
+end of the context, and the stream takes both to the port's own time.
+What the program does not yet carry is the per-context addressing (the
+DMA steps take an argument field for it) and the command bus into the
+real units' start ports.
+
+### Tokens per second
+
+A die runs its three recurrent layers and its global layer for every
+token and the eight dies work on different contexts' tokens at once, so
+the appliance's throughput is one die's. With the port the only thing
+binding, at the end of a 128K context a die spends 3 × 73 + 79 = 297 µs
+per token streamed, 426 one token at a time:
+
+| Position | One token at a time | Streamed | Memory port bound |
+| --- | ---: | ---: | ---: |
+| 4,095 | 2,600 tokens/s | 3,900 | 3,960 |
+| 131,071 | 2,350 tokens/s | 3,360 | 3,410 |
+
+The simulator's own figure for this board is 2,506 tokens/s at 10.3 ms;
+it agrees with the unstreamed number and does not know about the stream.
+A single conversation sees the ring's latency, eight dies of 297 µs, about
+2.4 ms per token or 400 tokens/s, before the head dies and the link. With
+the same schedule the first build's formats (int16 state, int8 keys and
+values in record bursts) gave 1,500 tokens/s one token at a time and
+1,900 at the port; the state, the global layer's traffic and the stream
+took that to 3,360. More devices scale the port: at 24 the port bound is
+5,100 tokens/s and at 32 it is 6,800, with the tiles at 16,000 the next
+ceiling after the port.
 
 ## RTL
 
@@ -1039,6 +1076,7 @@ bit for bit, at int8 and int4 KV and with the 128-wide index and the
    behind them: the sequencer's integration with the real units (the
    command bus into each unit's start, the buffer addressing, the
    per-context arguments), the simulator's traffic terms brought in line
-   with the map, and synthesis of the units for area. The state traffic
-   and the global layer's traffic are done, above; the next memory lever
-   is the index scan's record size, which is the model's.
+   with the map, and synthesis of the units for area. The state traffic,
+   the global layer's traffic and the stream of tokens are done, above;
+   the next memory lever is the index scan's record size, which is the
+   model's, and after that the device count.

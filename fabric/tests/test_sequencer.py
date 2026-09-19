@@ -28,26 +28,27 @@ class LinkTest(unittest.TestCase):
         self.assertEqual(steps[2].deps, [0, 1])       # overwrites a after its writer and its reader
         self.assertEqual(steps[3].deps, [2])          # reads the new a only
 
-    def test_slices_and_whole_vectors(self) -> None:
-        steps = steps_of(("p0", (), ("y[0]",)), ("p1", (), ("y[1]",)), ("all", ("y",), ("z",)), ("one", ("y[1]",), ()),
-                         ("whole", (), ("y",)), ("slice_after", ("y[0]",), ()))
+    def test_contributions_to_a_whole_vector(self) -> None:
+        steps = steps_of(("p0", (), ("+y",)), ("p1", (), ("+y",)), ("all", ("y",), ("z",)), ("again", ("y",), ()),
+                         ("p0b", (), ("+y",)), ("p1b", (), ("+y",)), ("all2", ("y",), ()))
         S.link(steps)
-        self.assertEqual(steps[2].deps, [0, 1])       # the whole vector waits for every slice
-        self.assertEqual(steps[3].deps, [1])          # a slice waits for its own writer
-        self.assertEqual(steps[4].deps, [0, 1, 2, 3])  # rewriting the whole waits for slice writers and all readers
-        self.assertEqual(steps[5].deps, [4])          # a slice waits for a whole-vector write
+        self.assertEqual(steps[1].deps, [])           # contributions do not wait for each other
+        self.assertEqual(steps[2].deps, [0, 1])       # the whole waits for every contribution
+        self.assertEqual(steps[4].deps, [2, 3])       # the next version waits for the readers of the last
+        self.assertEqual(steps[5].deps, [])
+        self.assertEqual(steps[6].deps, [4, 5])
 
-    def test_window_barrier_and_encoding(self) -> None:
-        steps = steps_of(("w", (), ("a",)), *[(f"f{i}", (), (f"b{i}",)) for i in range(S.WINDOW + 2)], ("r", ("a",), ()))
+    def test_encoding_carries_ids_and_contribution_bits(self) -> None:
+        steps = steps_of(("w", (), ("a",)), ("c", ("a",), ("+y",)), ("r", ("a", "y"), ()))
         S.link(steps)
-        S.apply_window(steps)
-        self.assertTrue(steps[-1].barrier)
-        self.assertFalse(any(s.barrier for s in steps[:-1]))
         words = S.encode(steps)
-        self.assertEqual(words[-1] >> 32 & 0xFFFFFFFF, 0)          # the dependency is beyond the mask
-        self.assertEqual((words[-1] >> 8) & 1, 1)                  # so it is a barrier
-        self.assertEqual((words[-1] >> 9) & 1, 1)                  # and the last step
-        self.assertEqual((words[1] >> 32) & 1, 0)
+        ids = S.buffer_ids(steps)
+        self.assertEqual((words[1] >> 96) & 0xFF, ids["a"])                # consumed
+        self.assertEqual((words[1] >> 104) & 0xFF, 0xFF)                   # no second consumed buffer
+        self.assertEqual((words[1] >> 152) & 0xFF, ids["y"])               # produced
+        self.assertEqual((words[1] >> 168) & 0b11, 0b01)                   # as a contribution
+        self.assertEqual((words[0] >> 168) & 0b11, 0)
+        self.assertEqual((words[2] >> 8) & 1, 1)                           # the last step
 
 
 class ScheduleTest(unittest.TestCase):
@@ -55,7 +56,7 @@ class ScheduleTest(unittest.TestCase):
         steps = [S.Step("a", "norm", 0, (), ("x",), 10), S.Step("b", "norm", 1, (), ("y",), 5),
                  S.Step("c", "norm", 0, (), ("z",), 3), S.Step("d", "conv", 0, ("x", "y"), ("w",), 4)]
         S.link(steps)
-        sched = S.schedule(steps, rtl=True)
+        sched = S.schedule(steps)
         self.assertEqual(sched.issue, [0, 1, 11, 12])        # c waits for engine 0 (free at 10 + 1); d issues in order after c
         self.assertEqual(sched.end, [10, 6, 14, 16])
         self.assertEqual(sched.cycles, 16)
@@ -67,16 +68,34 @@ class ScheduleTest(unittest.TestCase):
         rec = S.recurrent_program(cfg, None, TileSpec(), mm)
         glob = S.global_program(cfg, None, TileSpec(), mm, mm.context_tokens - 1)
         for steps in (rec, glob):
-            S.apply_window(steps)
-            sched = S.schedule(steps, rtl=True)
+            sched = S.schedule(steps)
             self.assertGreater(sched.busy("mem") / sched.cycles, 0.6)
             self.assertEqual(sched.busy("tiles"), sum(s.cycles for s in steps if s.unit == "tiles"))
         self.assertEqual(len([s for s in rec if s.unit == "tiles"]), 4)              # four passes
         self.assertEqual(len([s for s in rec if s.name.startswith("delta")]), cfg.linear_num_value_heads)
         self.assertEqual(sum(s.nbytes for s in rec), 2 * mm.state_bytes + 2 * mm.hist_bytes)     # the int8 state and its scales
         self.assertLess(sum(s.nbytes for s in rec), 1.1 * 2 ** 20)
-        self.assertTrue(any(s.barrier for s in rec))                                  # the head loop outruns the window
-        self.assertIn("cycles per token", S.report_markdown(cfg, mm, 4095))
+        self.assertIn("stream of tokens", S.report_markdown(cfg, mm, 4095))
+
+    def test_a_stream_of_tokens_runs_at_the_memory_port(self) -> None:
+        from fixed_llm_poc import ASICLMConfig
+        cfg = ASICLMConfig.qwen3_5_9b()
+        mm = MemoryMap.from_config(cfg)
+        for steps in (S.recurrent_program(cfg, None, TileSpec(), mm), S.global_program(cfg, None, TileSpec(), mm, mm.context_tokens - 1)):
+            single = S.schedule(steps)
+            interval = S.token_interval(steps)
+            port = single.busy("mem")
+            self.assertGreaterEqual(interval, port)                     # the port is the floor
+            self.assertLess(interval, 1.1 * port)                       # and the stream sits on it
+            self.assertLess(interval, 0.8 * single.cycles)              # well below one token at a time
+            two = S.stream(steps, 2)
+            self.assertEqual(len(two), 2 * len(steps))
+            self.assertLessEqual(len(S.buffer_ids(two)), S.MAX_IDS)
+            # The merge keeps each token's own order and every dependency it had.
+            for token in (0, 1):
+                own = [s.name for s in two if s.token == token]
+                self.assertEqual(own, [s.name for s in steps])
+            self.assertEqual(S.schedule(two).cycles, S.schedule(S.stream(steps, 2)).cycles)
 
 
 class ProgramTest(unittest.TestCase):
@@ -130,6 +149,22 @@ class ProgramTest(unittest.TestCase):
             np.testing.assert_array_equal(s_mem, ri["s_next"])
             np.testing.assert_array_equal(np.asarray(sc_mem), ri["scale_next"])
             np.testing.assert_array_equal(hist_mem, ri["hist_next"])
+        # Two contexts' tokens as one stream: each context's result is its own layer's.
+        two = S.stream(prog, 2)
+        env = {}
+        expect = []
+        for token in (0, 1):
+            xi = np.rint(xs[token] / c.s_h).astype(np.int64)
+            s0 = np.zeros((nv, hk, hv), dtype=np.int64)
+            sc0 = np.tile([L.ONE_U, 0, 0, 0], (nv, 1)).astype(np.int64)
+            h0 = np.zeros((conv_dim, cfg.linear_conv_kernel - 1), dtype=np.int64)
+            env.update({f"x@{token}": xi, f"s_mem@{token}": s0.copy(), f"scale_mem@{token}": sc0.copy(), f"hist_mem@{token}": h0.copy()})
+            expect.append(L.recurrent_layer_int(c, cfg, spec, xi, s0, h0, scale=sc0))
+        out = S.run_program(two, env)
+        for token in (0, 1):
+            np.testing.assert_array_equal(out[f"x2@{token}"], expect[token]["x2"])
+            np.testing.assert_array_equal(out[f"s_mem@{token}"], expect[token]["s_next"])
+            np.testing.assert_array_equal(np.asarray(out[f"scale_mem@{token}"]), expect[token]["scale_next"])
         # The int16 program is the same list with the plain state.
         mm16 = MemoryMap.from_config(cfg, state_bits=16)
         prog16 = S.recurrent_program(cfg, c, spec, mm16)
@@ -201,6 +236,16 @@ class SequencerRtlTest(unittest.TestCase):
         mm = MemoryMap.from_config(cfg)
         self.run_program(S.recurrent_program(cfg, None, TileSpec(), mm))
         self.run_program(S.global_program(cfg, None, TileSpec(), mm, mm.context_tokens - 1))
+
+    def test_streams_of_two_tokens(self) -> None:
+        from fixed_llm_poc import ASICLMConfig, tiny_config
+        cfg = tiny_config()
+        mm = MemoryMap.from_config(cfg)
+        self.run_program(S.stream(S.recurrent_program(cfg, None, TileSpec(), mm), 2))
+        cfg = ASICLMConfig.qwen3_5_9b()
+        mm = MemoryMap.from_config(cfg)
+        self.run_program(S.stream(S.recurrent_program(cfg, None, TileSpec(), mm), 2))          # 346 steps, tags wrap
+        self.run_program(S.stream(S.global_program(cfg, None, TileSpec(), mm, mm.context_tokens - 1), 2))
 
 
 if __name__ == "__main__":

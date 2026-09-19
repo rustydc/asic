@@ -1,12 +1,13 @@
 """The token sequencer: the program that runs a layer's tiles, vector
-units and DMAs in order for one token, and the controller that executes it.
+units and DMAs in order for one token, the merge of several tokens'
+programs into one stream, and the controller that executes it.
 
 A layer is a fixed dataflow graph over a few dozen on-chip vector buffers:
 the residual, the pass input, the pass outputs, the per-head state slots.
 This module writes that graph out as a *program*: a list of steps, each a
 command to one unit (a tile pass, a norm, a state-engine head, a DMA) with
-the buffers it reads and writes.  Three things are derived from the same
-list, so they cannot drift apart:
+the buffers it consumes and produces.  Three things are derived from the
+same list, so they cannot drift apart:
 
 * ``run_program`` executes the steps on the integer model of ``layer.py``
   and must reproduce ``recurrent_layer_int`` / ``global_layer_int`` bit for
@@ -14,22 +15,37 @@ list, so they cannot drift apart:
   reuse) is complete and in a legal order;
 * ``schedule`` runs a list scheduler over the steps with each unit's
   throughput and the memory port's bandwidth, giving cycles per token and
-  where the time goes; with ``rtl=True`` it applies the controller's exact
-  issue rules so the RTL testbench's cycle count must equal it;
-* ``emit_program`` writes the steps as the controller's program image, the
-  dependencies as a bitmask over the previous ``WINDOW`` steps and a
-  barrier where a dependency reaches further back.
+  where the time goes, under the controller's exact issue rules so the RTL
+  testbench's cycle count must equal it;
+* ``emit_program`` writes the steps as the controller's program image.
+
+Dependencies come from buffer names.  A step consumes the buffers it
+reads and produces the ones it writes; a write waits for the buffer's
+outstanding writers and readers, a read for its outstanding writers.  A
+produce marked ``+name`` is a *contribution* to a whole vector by one of
+several parallel producers (a head's slice of ``y_norm``): it waits only
+for the readers of the previous version, and a consumer of the whole waits
+for every contribution.
+
+Several tokens of different contexts run at once by ``stream``: each
+token's program has its buffers renamed with a token suffix (the state
+slots stay shared, they are the engines' physical buffers), and the
+programs are merged into one issue order by simulating which step could
+issue first, so one token's memory steps run under another's passes.
 
 The controller (``rtl/fabric_sequencer.sv``) is a microcoded issue engine:
-in program order, when a step's dependencies are done and its unit's
-engine is free, it sends the command and moves on; a completing unit
-returns the step's tag.  Units are black boxes to it, which is what lets
-one testbench check the controller against stub units of programmed
-duration.
+in program order, when the head step's consumed buffers have no
+outstanding writer, its produced buffers no outstanding writer or reader
+(readers only, for a contribution), and its unit reports the addressed
+engine free, it sends the command and moves on; a completing unit returns
+the step's tag and the controller releases the step's buffers.  Units are
+black boxes to it, which is what lets one testbench check the controller
+against stub units of programmed duration.
 """
 from __future__ import annotations
 
 import dataclasses
+import json
 import math
 from pathlib import Path
 from typing import Callable
@@ -45,12 +61,14 @@ from fabric.tile import TileSpec, write_hex
 # The units and their throughput (from the RTL's lanes and latencies)
 # --------------------------------------------------------------------------
 
-WINDOW = 32                  # dependency window of the controller, in steps
-ISSUE_LATENCY = 1            # cycles from a done to the dependent issue in the controller
+MAX_CONSUME = 7              # buffers a step may consume (the program word's fields)
+MAX_PRODUCE = 2              # buffers a step may produce
+MAX_IDS = 255                # buffer ids per program image (0xFF is "none")
 UNITS: dict[str, tuple[int, int]] = {   # name -> (id, engines)
     "tiles": (0, 1), "norm": (1, 2), "conv": (2, 1), "gates": (3, 1), "delta": (4, 4),
     "swiglu": (5, 1), "residual": (6, 1), "rotary": (7, 2), "attn": (8, 4), "mem": (9, 1),
 }
+SHARED_PREFIX = "s_slot"     # buffers shared by every token in flight: the state engines' slots
 
 
 @dataclasses.dataclass(frozen=True)
@@ -87,7 +105,7 @@ class Timing:
 
 
 # --------------------------------------------------------------------------
-# Steps and programs
+# Steps, dependencies, programs
 # --------------------------------------------------------------------------
 
 @dataclasses.dataclass
@@ -95,67 +113,73 @@ class Step:
     name: str
     unit: str
     engine: int
-    src: tuple[str, ...]
-    dst: tuple[str, ...]
+    src: tuple[str, ...]             # buffers consumed
+    dst: tuple[str, ...]             # buffers produced; "+name" contributes to a whole vector
     cycles: int
     func: Callable[[dict], None] | None = None
     nbytes: int = 0                  # memory traffic, for the report
+    token: int | None = None         # set on a stream's steps: their private buffers carry the token suffix
     deps: list[int] = dataclasses.field(default_factory=list)
-    barrier: bool = False            # a dependency beyond the window, or a whole-vector consumer
 
     def __post_init__(self) -> None:
         self.cycles = max(1, int(self.cycles))       # a command occupies its unit for at least a cycle
+        assert len(self.src) <= MAX_CONSUME and len(self.dst) <= MAX_PRODUCE, self.name
 
 
-def _base(token: str) -> str:
-    return token.split("[", 1)[0]
+def _plain(name: str) -> str:
+    return name[1:] if name.startswith("+") else name
+
+
+class Linker:
+    """The dependency rules, applied step by step: per buffer the writers of
+    its current version and the readers since."""
+
+    def __init__(self) -> None:
+        self.writers: dict[str, list[int]] = {}
+        self.readers: dict[str, list[int]] = {}
+
+    def deps_for(self, step: Step) -> list[int]:
+        deps: set[int] = set()
+        for name in step.src:
+            deps.update(self.writers.get(name, []))
+        for name in step.dst:
+            plain = _plain(name)
+            deps.update(self.readers.get(plain, []))
+            if not name.startswith("+"):
+                deps.update(self.writers.get(plain, []))
+        return sorted(deps)
+
+    def commit(self, step: Step, index: int) -> None:
+        for name in step.src:
+            self.readers.setdefault(name, []).append(index)
+        for name in step.dst:
+            plain = _plain(name)
+            if name.startswith("+") and not self.readers.get(plain):
+                self.writers.setdefault(plain, []).append(index)     # another contribution to the current version
+            else:
+                self.writers[plain] = [index]                        # a new version
+                self.readers[plain] = []
 
 
 def link(steps: list[Step]) -> None:
-    """Fill each step's dependencies from the buffers: a reader waits for the
-    last writer of its buffer (and, for a whole vector, of any slice of it;
-    for a slice, of the whole), a writer waits for the readers since the last
-    write (the buffer is reused), and a writer for the previous writer."""
-    last_write: dict[str, int] = {}
-    readers: dict[str, list[int]] = {}
+    """Fill each step's dependencies in program order."""
+    lk = Linker()
     for i, step in enumerate(steps):
-        deps: set[int] = set()
-        for token in step.src:
-            base = _base(token)
-            for name, w in last_write.items():
-                if name == token or name == base or (token == base and _base(name) == base):
-                    deps.add(w)
-        for token in step.dst:
-            base = _base(token)
-            for name, w in last_write.items():
-                if name == token or name == base or (token == base and _base(name) == base):
-                    deps.add(w)
-            for name, rs in readers.items():
-                if name == token or name == base or (token == base and _base(name) == base):
-                    deps.update(rs)
-        step.deps = sorted(d for d in deps if d != i)
-        for token in step.src:
-            readers.setdefault(token, []).append(i)
-        for token in step.dst:
-            if token == _base(token):                       # a whole-vector write supersedes its slices
-                for name in [n for n in last_write if _base(n) == token and n != token]:
-                    del last_write[name]
-                    readers.pop(name, None)
-            last_write[token] = i
-            readers[token] = []
+        step.deps = lk.deps_for(step)
+        lk.commit(step, i)
 
 
 def _slot(engine: int, k: int) -> str:
     """The physical state buffer of an engine: two per engine, so the next head's read overlaps this one."""
-    return f"s_slot[{engine * 2 + k % 2}]"
+    return f"{SHARED_PREFIX}[{engine * 2 + k % 2}]"
 
 
 def recurrent_program(cfg, c: L.RecurrentConsts | None, spec: TileSpec, mm: MemoryMap, t: Timing = Timing()) -> list[Step]:
     """One token through a recurrent layer.  Inputs in the environment:
     ``x`` (int16 residual), ``s_mem[h]`` (the state rows of each head) and,
-    for the int8 state, ``scale_mem[h]`` (its scale, exponent and peak), ``hist_mem`` (the conv
-    history).  With ``c`` None the program has its shape and timing but
-    cannot be run."""
+    for the int8 state, ``scale_mem[h]`` (its scale beat), ``hist_mem`` (the
+    conv history).  With ``c`` None the program has its shape and timing
+    but cannot be run."""
     nk, nv, hk, hv = cfg.linear_num_key_heads, cfg.linear_num_value_heads, cfg.linear_key_head_dim, cfg.linear_value_head_dim
     d, kd, vd = cfg.hidden_size, nk * hk, nv * hv
     conv_dim, ffn = 2 * kd + vd, cfg.layer_intermediate_size(0)
@@ -175,19 +199,19 @@ def recurrent_program(cfg, c: L.RecurrentConsts | None, spec: TileSpec, mm: Memo
     add("dma.hist_rd", "mem", (), ("hist",), t.memory(hist_bytes, 2048), lambda e: e.__setitem__("hist", e["hist_mem"]), nbytes=hist_bytes)
     add("norm.h", "norm", ("x",), ("A",), t.norm(d), lambda e: e.__setitem__("A", L._norm(e["x"], c.norm)))
 
-    def in_proj(e):
+    def in_proj(e):                                     # one buffer P1: qkv | z | b, a accumulators
         _, e["qkv"] = fabric(c.in_proj_qkv)(e["A"])
         _, e["z"] = fabric(c.in_proj_z)(e["A"])
         e["b_acc"], _ = fabric(c.in_proj_b)(e["A"])
         e["a_acc"], _ = fabric(c.in_proj_a)(e["A"])
-    add("pass.in_proj", "tiles", ("A",), ("qkv", "z", "b_acc", "a_acc"), t.tile_pass(d), in_proj)
+    add("pass.in_proj", "tiles", ("A",), ("P1",), t.tile_pass(d), in_proj)
 
     def conv(e):
         e["conv"], e["hist_next"] = L.conv_silu_int(e["hist"], e["qkv"], c.conv_w, c.conv_mult_in, c.conv_sh_in,
                                                     c.conv_mult_out, c.conv_sh_out)
-    add("conv", "conv", ("qkv", "hist"), ("conv", "hist_next"), -(-conv_dim // t.l_conv) + t.conv_latency, conv)
+    add("conv", "conv", ("P1", "hist"), ("conv", "hist_next"), -(-conv_dim // t.l_conv) + t.conv_latency, conv)
     add("dma.hist_wr", "mem", ("hist_next",), (), t.memory(hist_bytes, 2048), lambda e: e.__setitem__("hist_mem", e["hist_next"]), nbytes=hist_bytes)
-    add("gates", "gates", ("a_acc", "b_acc"), ("decay", "beta"), nv + t.gates_latency,
+    add("gates", "gates", ("P1",), ("gates",), nv + t.gates_latency,
         lambda e: e.update(zip(("decay", "beta"), L.head_gates_int(e["a_acc"][:nv], e["b_acc"][:nv], c.gate_mult_a, c.gate_sh_a,
                                                                     c.gate_mult_b, c.gate_sh_b, c.a_coef, c.dt_bias))))
     for i in range(nk):
@@ -212,7 +236,7 @@ def recurrent_program(cfg, c: L.RecurrentConsts | None, spec: TileSpec, mm: Memo
                 e[slot] = (t_new, tuple(scale_new))
             else:
                 e[slot], e[f"y[{h}]"] = L.delta_state_int(e[slot], k_unit, v, q_unit, int(e["decay"][h]), int(e["beta"][h]))
-        add(f"delta[{h}]", "delta", (slot, f"q_unit[{h // repeat}]", f"k_unit[{h // repeat}]", "conv", "decay", "beta"),
+        add(f"delta[{h}]", "delta", (slot, f"q_unit[{h // repeat}]", f"k_unit[{h // repeat}]", "conv", "gates"),
             (slot, f"y[{h}]"), 2 * hk + hk + 4 + t.delta_latency, delta, engine=e_id)
 
         def s_wr(e, h=h, slot=slot):
@@ -225,7 +249,7 @@ def recurrent_program(cfg, c: L.RecurrentConsts | None, spec: TileSpec, mm: Memo
         def gnorm(e, h=h):
             gate = L.silu_fixed(L.requant(e["z"][h * hv:(h + 1) * hv], c.z_mult, c.z_shift, 16))
             e[f"y_norm[{h}]"] = L._norm(e[f"y[{h}]"], c.gated_norm, gain=gate)
-        add(f"gnorm[{h}]", "norm", (f"y[{h}]", "z"), (f"y_norm[{h}]",), -(-hv // t.l_vec) + t.silu_latency + t.norm(hv), gnorm,
+        add(f"gnorm[{h}]", "norm", (f"y[{h}]", "P1"), ("+y_norm",), -(-hv // t.l_vec) + t.silu_latency + t.norm(hv), gnorm,
             engine=h % UNITS["norm"][1])
 
     def out_proj(e):
@@ -239,14 +263,14 @@ def recurrent_program(cfg, c: L.RecurrentConsts | None, spec: TileSpec, mm: Memo
     return steps
 
 
-def _ffn_steps(add, f: L.FfnConsts, spec: TileSpec, d: int, ffn: int, t: Timing) -> None:
+def _ffn_steps(add, f: L.FfnConsts | None, spec: TileSpec, d: int, ffn: int, t: Timing) -> None:
     add("norm.h2", "norm", ("x1",), ("A2",), t.norm(d), lambda e: e.__setitem__("A2", L._norm(e["x1"], f.norm)))
 
     def gate_up(e):
         _, e["gate"] = L._fabric(f.gate_proj, e["A2"], spec)
         _, e["up"] = L._fabric(f.up_proj, e["A2"], spec)
-    add("pass.gate_up", "tiles", ("A2",), ("gate", "up"), t.tile_pass(d), gate_up)
-    add("swiglu", "swiglu", ("gate", "up"), ("act",), -(-ffn // t.l_vec) + t.swiglu_latency,
+    add("pass.gate_up", "tiles", ("A2",), ("GU",), t.tile_pass(d), gate_up)
+    add("swiglu", "swiglu", ("GU",), ("act",), -(-ffn // t.l_vec) + t.swiglu_latency,
         lambda e: e.__setitem__("act", L.swiglu_int(e["gate"], e["up"], f.mult_g, f.sh_g, f.mult_o, f.sh_o)))
     add("pass.down", "tiles", ("act",), ("ffn",), t.tile_pass(ffn),
         lambda e: e.__setitem__("ffn", L._fabric(f.down_proj, e["act"], spec)[1]))
@@ -268,7 +292,7 @@ def global_program(cfg, c: L.GlobalConsts | None, spec: TileSpec, mm: MemoryMap,
 
     add("norm.h", "norm", ("x",), ("A",), t.norm(d), lambda e: e.__setitem__("A", L._norm(e["x"], c.norm)))
 
-    def qkv(e):
+    def qkv(e):                                         # one buffer P1: q, gate | k | v | index_q | index_k
         _, qg = L._fabric(c.q_proj, e["A"], spec)
         qg = qg.reshape(nh, 2 * hd)
         e["q_raw"], e["gate"] = qg[:, :hd], qg[:, hd:]
@@ -276,28 +300,28 @@ def global_program(cfg, c: L.GlobalConsts | None, spec: TileSpec, mm: MemoryMap,
         e["v"] = L._fabric(c.v_proj, e["A"], spec)[1].reshape(nkv, hd)
         _, e["index_q"] = L._fabric(c.index_q, e["A"], spec)
         _, e["index_k"] = L._fabric(c.index_k, e["A"], spec)
-    add("pass.qkv", "tiles", ("A",), ("q_raw", "gate", "k_raw", "v", "index_q", "index_k"), t.tile_pass(d), qkv)
+    add("pass.qkv", "tiles", ("A",), ("P1",), t.tile_pass(d), qkv)
     add("rotary.table", "rotary", (), ("rot",), rd // 2 + t.rotary_latency,
         lambda e: e.__setitem__("rot", L.rotary_table_int(pos, c.inv_freq)))
-    add("norm.index_q", "norm", ("index_q",), ("index_q_unit",), t.norm(cfg.index_dim),
+    add("norm.index_q", "norm", ("P1",), ("iq",), t.norm(cfg.index_dim),
         lambda e: e.__setitem__("index_q_unit", L._norm(e["index_q"], c.unit_norm)))
     rot_cycles = t.norm(hd) + -(-hd // t.l_vec) + t.rotary_latency
     for n in range(nkv):
         def krot(e, n=n):
             e[f"k[{n}]"] = L.rotary_int(L._norm(e["k_raw"][n], c.k_norm), *e["rot"], rd, c.rot_mult_k, c.rot_sh_k)
-        add(f"rotary.k[{n}]", "rotary", ("k_raw", "rot"), (f"k[{n}]",), rot_cycles, krot, engine=n % UNITS["rotary"][1])
+        add(f"rotary.k[{n}]", "rotary", ("P1", "rot"), ("+k",), rot_cycles, krot, engine=n % UNITS["rotary"][1])
     for h in range(nh):
         def qrot(e, h=h):
             e[f"q[{h}]"] = L.rotary_int(L._norm(e["q_raw"][h], c.q_norm), *e["rot"], rd, c.rot_mult_q, c.rot_sh_q)
-        add(f"rotary.q[{h}]", "rotary", ("q_raw", "rot"), (f"q[{h}]",), rot_cycles, qrot, engine=h % UNITS["rotary"][1])
+        add(f"rotary.q[{h}]", "rotary", ("P1", "rot"), (f"+qg[{h // group}]",), rot_cycles, qrot, engine=h % UNITS["rotary"][1])
     # The memory side: append this token's records, scan the index, then stream rows to the cores.
     append_bytes = nkv * mm.kv_record_bytes + (nkv * mm.kv_record_bytes + mm.index_record_bytes) // mm.block
-    add("mem.append", "mem", ("k", "v", "index_k"), (), t.memory(append_bytes, mm.kv_record_bytes), nbytes=append_bytes)
+    add("mem.append", "mem", ("k", "P1"), (), t.memory(append_bytes, mm.kv_record_bytes), nbytes=append_bytes)
     # The scan reads the index a page of records per request; the rows are the
     # window (head-major, page bursts) and one mean record per selected block.
     eligible = eligible_blocks(pos, mm.local_window, mm.block)
     scan_bytes = eligible * mm.index_record_bytes
-    add("mem.scan", "mem", ("index_q_unit",), ("selected",), t.memory(scan_bytes, mm.index_burst_records * mm.index_record_bytes),
+    add("mem.scan", "mem", ("iq",), ("sel",), t.memory(scan_bytes, mm.index_burst_records * mm.index_record_bytes),
         lambda e: e.__setitem__("selected", None), nbytes=scan_bytes)
     n_window, n_blocks = min(pos + 1, mm.local_window), min(cfg.top_blocks, eligible)
     rows = n_window + n_blocks
@@ -305,7 +329,7 @@ def global_program(cfg, c: L.GlobalConsts | None, spec: TileSpec, mm: MemoryMap,
     for n in range(nkv):
         heads = list(range(n * group, (n + 1) * group))
         window_bytes, block_bytes = n_window * mm.kv_record_bytes, n_blocks * mm.kv_record_bytes
-        add(f"mem.rows[{n}]", "mem", ("selected",), (f"rows[{n}]",),
+        add(f"mem.rows[{n}]", "mem", ("sel",), (f"rows[{n}]",),
             t.memory(window_bytes, mm.window_burst_records * mm.kv_record_bytes) + t.memory(block_bytes, mm.kv_record_bytes),
             lambda e, n=n: e.__setitem__(f"rows[{n}]", (e["k_rows"][n], e["v_rows"][n])), nbytes=window_bytes + block_bytes)
 
@@ -314,7 +338,7 @@ def global_program(cfg, c: L.GlobalConsts | None, spec: TileSpec, mm: MemoryMap,
             k_rows, v_rows = e[f"rows[{n}]"]
             e[f"att[{n}]"] = L.attention_int(q, e["gate"][heads], k_rows, v_rows, mult_s=c.mult_s, sh_s=c.sh_s,
                                              mult_gate=c.mult_gate, sh_gate=c.sh_gate, mult_o=c.mult_o, sh_o=c.sh_o)
-        add(f"attn[{n}]", "attn", tuple(f"q[{h}]" for h in heads) + ("gate", f"rows[{n}]"), (f"att[{n}]",),
+        add(f"attn[{n}]", "attn", (f"qg[{n}]", "P1", f"rows[{n}]"), ("+att",),
             rows * row_cycles + group * (hd // t.l_attn) + t.attn_out_latency, attn, engine=n % UNITS["attn"][1])
 
     def o_proj(e):
@@ -328,12 +352,96 @@ def global_program(cfg, c: L.GlobalConsts | None, spec: TileSpec, mm: MemoryMap,
     return steps
 
 
+# --------------------------------------------------------------------------
+# Streams of tokens
+# --------------------------------------------------------------------------
+
+def _shared(name: str) -> bool:
+    return _plain(name).startswith(SHARED_PREFIX)
+
+
+def _renamed(name: str, token: int) -> str:
+    return name if _shared(name) else f"{name}@{token}"
+
+
+def retarget(steps: list[Step], token: int) -> list[Step]:
+    """A copy of a token's program with its private buffers renamed for that token."""
+    out = []
+    for s in steps:
+        out.append(Step(s.name, s.unit, s.engine, tuple(_renamed(n, token) for n in s.src),
+                        tuple(_renamed(n, token) for n in s.dst), s.cycles, s.func, s.nbytes, token))
+    return out
+
+
+class _View(dict):
+    """The environment as one token sees it: its private names carry the token suffix."""
+
+    def __init__(self, env: dict, token: int) -> None:
+        super().__init__()
+        self.env, self.token = env, token
+
+    def _key(self, name: str) -> str:
+        return _renamed(name, self.token)
+
+    def __getitem__(self, name: str):
+        return self.env[self._key(name)]
+
+    def __setitem__(self, name: str, value) -> None:
+        self.env[self._key(name)] = value
+
+    def update(self, pairs) -> None:                    # type: ignore[override]
+        for name, value in dict(pairs).items():
+            self[name] = value
+
+
+def interleave(programs: list[list[Step]]) -> list[Step]:
+    """Merge token programs (already retargeted) into one issue order: at
+    each pick, the program whose next step could issue earliest under the
+    controller's rules goes next, the older token on a tie.  The merged
+    list carries its dependencies."""
+    lk = Linker()
+    merged: list[Step] = []
+    issue: list[int] = []
+    end: list[int] = []
+    free: dict[tuple[str, int], int] = {}
+    ptr = [0] * len(programs)
+    while any(p < len(prog) for p, prog in zip(ptr, programs)):
+        best = None
+        for j, prog in enumerate(programs):
+            if ptr[j] >= len(prog):
+                continue
+            step = prog[ptr[j]]
+            deps = lk.deps_for(step)
+            t0 = issue[-1] + 1 if issue else 0
+            for d in deps:
+                t0 = max(t0, end[d] + 1)
+            t0 = max(t0, free.get((step.unit, step.engine), 0))
+            if best is None or (t0, j) < (best[0], best[1]):
+                best = (t0, j, step, deps)
+        t0, j, step, deps = best
+        step.deps = deps
+        merged.append(step)
+        issue.append(t0)
+        end.append(t0 + step.cycles)
+        free[(step.unit, step.engine)] = t0 + step.cycles + 1
+        lk.commit(step, len(merged) - 1)
+        ptr[j] += 1
+    return merged
+
+
+def stream(program: list[Step], tokens: int) -> list[Step]:
+    """`tokens` consecutive tokens of one layer, of different contexts, as one merged program."""
+    return interleave([retarget(program, k) for k in range(tokens)])
+
+
 def run_program(steps: list[Step], inputs: dict) -> dict:
-    """Execute the steps in program order on the integer model; returns the environment."""
+    """Execute the steps in program order on the integer model; returns the
+    environment.  A stream's inputs carry the token suffix (``x@0``)."""
     env = dict(inputs)
+    views: dict[int, _View] = {}
     for step in steps:
         if step.func is not None:
-            step.func(env)
+            step.func(env if step.token is None else views.setdefault(step.token, _View(env, step.token)))
     return env
 
 
@@ -367,87 +475,101 @@ class Schedule:
         return "\n".join(lines)
 
 
-def apply_window(steps: list[Step], window: int = WINDOW) -> None:
-    """A dependency further back than the controller's window becomes a barrier."""
-    for i, step in enumerate(steps):
-        if any(i - d > window for d in step.deps):
-            step.barrier = True
-
-
-def schedule(steps: list[Step], rtl: bool = False) -> Schedule:
+def schedule(steps: list[Step]) -> Schedule:
     """In-order list scheduling: a step issues at the earliest cycle after
     the previous issue that is past the end of each dependency and of the
-    engine's previous step; a barrier (with ``rtl``, where they come from
-    the window) waits for everything before it."""
+    engine's previous step."""
     issue, end = [0] * len(steps), [0] * len(steps)
     free: dict[tuple[str, int], int] = {}
     for i, step in enumerate(steps):
         t0 = issue[i - 1] + 1 if i else 0
         for d in step.deps:
-            t0 = max(t0, end[d] + ISSUE_LATENCY)
-        if rtl and step.barrier:
-            t0 = max([t0] + [end[j] + ISSUE_LATENCY for j in range(i)])
+            t0 = max(t0, end[d] + 1)
         t0 = max(t0, free.get((step.unit, step.engine), 0))
         issue[i], end[i] = t0, t0 + step.cycles
         free[(step.unit, step.engine)] = end[i] + 1          # an engine finishing at e takes its next command at e + 1
     return Schedule(issue, end, steps)
 
 
+def token_interval(program: list[Step], tokens: int = 3) -> int:
+    """The steady-state cycles per token of a stream: the last token's cost on top of the others."""
+    a = schedule(stream(program, tokens)).cycles
+    b = schedule(stream(program, tokens - 1)).cycles
+    return a - b
+
+
 # --------------------------------------------------------------------------
 # The program image for the controller
 # --------------------------------------------------------------------------
 
+def buffer_ids(steps: list[Step]) -> dict[str, int]:
+    ids: dict[str, int] = {}
+    for step in steps:
+        for name in step.src + tuple(_plain(n) for n in step.dst):
+            if name not in ids:
+                ids[name] = len(ids)
+    assert len(ids) <= MAX_IDS, f"{len(ids)} buffers, the program word holds {MAX_IDS}"
+    return ids
+
+
 def encode(steps: list[Step]) -> list[int]:
-    """Each step as a 128-bit word: unit, engine, barrier, last, cycles (the
-    length the unit is given), the dependency mask over the previous WINDOW
-    steps; then source, destination and argument fields (unused by the stubs)."""
+    """Each step as a 256-bit word: unit, engine, last, the length the unit
+    is given, an argument, source and destination fields (unused by the
+    stubs), then up to seven consumed buffer ids, two produced ids and
+    their contribution bits (0xFF is no buffer)."""
+    ids = buffer_ids(steps)
     words = []
     for i, step in enumerate(steps):
-        mask = 0
-        for d in step.deps:
-            back = i - 1 - d
-            if back < WINDOW:
-                mask |= 1 << back
-        unit_id = UNITS[step.unit][0]
         assert step.cycles < (1 << 16) and step.engine < 16
-        w0 = unit_id | (step.engine << 4) | (int(step.barrier) << 8) | (int(i == len(steps) - 1) << 9) | (step.cycles << 16) | (mask << 32)
-        words.append(w0)
+        w = UNITS[step.unit][0] | (step.engine << 4) | (int(i == len(steps) - 1) << 8) | (step.cycles << 16)
+        consume = [ids[n] for n in step.src] + [0xFF] * (MAX_CONSUME - len(step.src))
+        produce = [ids[_plain(n)] for n in step.dst] + [0xFF] * (MAX_PRODUCE - len(step.dst))
+        contrib = sum(int(n.startswith("+")) << k for k, n in enumerate(step.dst))
+        for k, c in enumerate(consume):
+            w |= c << (96 + 8 * k)
+        for k, p in enumerate(produce):
+            w |= p << (152 + 8 * k)
+        w |= contrib << 168
+        words.append(w)
     return words
 
 
 def emit_program(directory: Path, steps: list[Step]) -> dict:
     """Write ``program.hex`` and the schedule the RTL must reproduce; returns the testbench parameters."""
-    apply_window(steps)
-    words = encode(steps)
-    write_hex(directory / "program.hex", words, 128)
-    sched = schedule(steps, rtl=True)
+    write_hex(directory / "program.hex", encode(steps), 256)
+    sched = schedule(steps)
     (directory / "expected_issue.txt").write_text("".join(f"{i} {a} {b}\n" for i, (a, b) in enumerate(zip(sched.issue, sched.end))))
     params = {"N": len(steps), "EXPECTED_CYCLES": sched.cycles}
     for name, (uid, engines) in UNITS.items():
         params[f"E{uid}"] = engines
-    (directory / "params.json").write_text(__import__("json").dumps(params))
+    (directory / "params.json").write_text(json.dumps(params))
     return params
 
 
 def check_trace(steps: list[Step], trace: str) -> list[str]:
     """Check a testbench trace (``tag unit engine issue done`` per line)
     against the program: every dependency ended before the issue, no engine
-    ran two steps at once, and the program order was kept."""
+    ran two steps at once, and the program order was kept.  Tags are the
+    step index modulo 256; the trace is in completion order."""
     rows = [tuple(int(v) for v in line.split()) for line in trace.strip().splitlines() if line.strip()]
     problems = []
     if len(rows) != len(steps):
         return [f"{len(rows)} trace rows for {len(steps)} steps"]
-    by_tag = {}
-    for tag, unit, engine, t_issue, t_done in rows:
-        by_tag[tag] = (unit, engine, t_issue, t_done)
+    # Issue order recovers the absolute index: the k-th issue is step k.
+    by_issue = sorted(rows, key=lambda r: r[3])
+    by_index = {}
+    for k, (tag, unit, engine, t_issue, t_done) in enumerate(by_issue):
+        if tag != k % 256:
+            problems.append(f"issue {k} carried tag {tag}")
+        by_index[k] = (unit, engine, t_issue, t_done)
     for i, step in enumerate(steps):
-        unit, engine, t_issue, t_done = by_tag[i]
+        unit, engine, t_issue, t_done = by_index[i]
         if unit != UNITS[step.unit][0] or engine != step.engine:
             problems.append(f"step {i} ran on unit {unit} engine {engine}")
         for d in step.deps:
-            if by_tag[d][3] > t_issue:
-                problems.append(f"step {i} issued at {t_issue} before dependency {d} ended at {by_tag[d][3]}")
-        if i and by_tag[i - 1][2] > t_issue:
+            if by_index[d][3] > t_issue:
+                problems.append(f"step {i} issued at {t_issue} before dependency {d} ended at {by_index[d][3]}")
+        if i and by_index[i - 1][2] > t_issue:
             problems.append(f"step {i} issued before step {i - 1}")
     busy: dict[tuple[int, int], list[tuple[int, int]]] = {}
     for tag, unit, engine, t_issue, t_done in rows:
@@ -465,14 +587,16 @@ def check_trace(steps: list[Step], trace: str) -> list[str]:
 # --------------------------------------------------------------------------
 
 def report_markdown(cfg, mm: MemoryMap, pos: int, t: Timing = Timing()) -> str:
-    """The two layers' schedules at a model's geometry."""
+    """The two layers' schedules at a model's geometry, one token at a time and as a stream."""
     spec = TileSpec()
     out = [f"# Token sequencer schedule: hidden {cfg.hidden_size}, position {pos}", ""]
     for title, steps in (("Recurrent layer", recurrent_program(cfg, None, spec, mm, t)),
                          ("Global layer", global_program(cfg, None, spec, mm, pos, t))):
-        apply_window(steps)
-        sched = schedule(steps, rtl=True)
-        out += [f"## {title}: {len(steps)} steps", "", sched.report(t), ""]
+        sched = schedule(steps)
+        interval = token_interval(steps)
+        out += [f"## {title}: {len(steps)} steps", "", sched.report(t), "",
+                f"stream of tokens: {interval} cycles per token ({interval / t.core_mhz:.1f} us), "
+                f"{100 * sched.busy('mem') / interval:.0f}% of the memory port", ""]
     return "\n".join(out)
 
 

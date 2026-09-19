@@ -60,7 +60,7 @@ module tb_sequencer #(
     always #0.625 clk = ~clk;
     integer cycle = 0, trace;
     always @(posedge clk) cycle <= cycle + 1;
-    integer issued_at [0:255];
+    integer issued_at [0:255];                            // by tag (the step index modulo 256)
 
     reg                start = 0;
     wire               running, done;
