@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import tempfile
 import time
 from concurrent.futures import ProcessPoolExecutor
@@ -67,7 +68,15 @@ UNITS = [
 ]
 
 
-def run_unit(unit: Unit, lib_name: str, liberty: Path, target_ps: int, sta: Path | None) -> dict:
+def path_cells(report: str) -> list[str]:
+    """The cell types along the worst path, in order, from OpenSTA's full report."""
+    start = report.find("Startpoint:")
+    end = report.find("data arrival time", start)
+    section = report[start:end] if start >= 0 and end >= 0 else ""
+    return re.findall(r"\((\w+)\)", section)
+
+
+def run_unit(unit: Unit, lib_name: str, liberty: Path, target_ps: int, sta: Path | None, keep: Path | None = None) -> dict:
     t0 = time.time()
     with tempfile.TemporaryDirectory() as directory:
         work = Path(directory)
@@ -75,7 +84,7 @@ def run_unit(unit: Unit, lib_name: str, liberty: Path, target_ps: int, sta: Path
         if unit.luts:
             L.write_luts(work)
             data = sorted(work.glob("lut_*.hex"))
-        netlist = work / "netlist.v"
+        netlist = (keep / f"{unit.name}_{lib_name}.v") if keep else (work / "netlist.v")
         try:
             synth = synthesize(liberty, top=unit.top, target_ps=target_ps, keep_netlist=netlist,
                                sources=[RTL_DIR / name for name in unit.sources], params=unit.params, data_files=data)
@@ -91,7 +100,8 @@ def run_unit(unit: Unit, lib_name: str, liberty: Path, target_ps: int, sta: Path
             try:
                 timing = run_sta(sta, [liberty], netlist, top=unit.top, period_ps=target_ps)
                 out.update(critical_path_ps=timing.critical_path_ps, worst_slack_ps=timing.worst_slack_ps,
-                           max_frequency_mhz=timing.max_frequency_mhz, startpoint=timing.startpoint, endpoint=timing.endpoint)
+                           max_frequency_mhz=timing.max_frequency_mhz, startpoint=timing.startpoint, endpoint=timing.endpoint,
+                           path_cells=path_cells(timing.report))
             except Exception as error:  # noqa: BLE001
                 out["sta_error"] = str(error)[-1500:]
         out["seconds"] = time.time() - t0
@@ -106,7 +116,7 @@ def report_markdown(results: list[dict]) -> str:
     libs = sorted({r["library"] for r in results})
     lines = ["| Unit | " + " | ".join(f"{lib}: path (ps) | {lib}: NAND2-eq" for lib in libs) + " |",
              "| --- | " + " | ".join("---: | ---:" for _ in libs) + " |"]
-    for unit in UNITS:
+    for unit in [u for u in UNITS if any(r["unit"] == u.name for r in results)]:
         row = [unit.name]
         for lib in libs:
             r = next((r for r in results if r["unit"] == unit.name and r["library"] == lib), None)
@@ -126,14 +136,17 @@ def main() -> None:
     parser.add_argument("--units", default=None, help="comma-separated unit names (default all)")
     parser.add_argument("--jobs", type=int, default=3)
     parser.add_argument("--out", type=Path, default=Path("fabric/results/synth_units.json"))
+    parser.add_argument("--keep", type=Path, default=None, help="directory for the mapped netlists")
     args = parser.parse_args()
+    if args.keep:
+        args.keep.mkdir(parents=True, exist_ok=True)
     libs = []
     for spec in args.lib:
         name, rest = spec.split("=", 1)
         path, target = rest.rsplit(":", 1)
         libs.append((name, Path(path), int(target)))
     units = [u for u in UNITS if args.units is None or u.name in args.units.split(",")]
-    jobs = [(u, name, path, target, args.sta) for u in units for name, path, target in libs]
+    jobs = [(u, name, path, target, args.sta, args.keep) for u in units for name, path, target in libs]
     results = []
     with ProcessPoolExecutor(max_workers=args.jobs) as pool:
         for result in pool.map(_job, jobs):
