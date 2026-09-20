@@ -70,6 +70,18 @@ module fabric_vb #(
     // in the other makes that one word from each, whatever the alignment, and
     // costs no port: of any two adjacent words exactly one is even.
     localparam int RMAX = 3, WMAX = 2;
+    // A bank's slots are flattened at a power-of-two stride, not at RMAX, so
+    // that "bank b's slot s" is a shift and an or rather than a multiply.  At
+    // RMAX = 3 the padding is one unused slot a bank, which nothing drives and
+    // synthesis drops; what it buys is that none of the two hundred-odd index
+    // expressions in this module becomes a 32-bit multiplier -- yosys's
+    // resource sharing spends about a quarter of a minute on each of those, and
+    // the module did not finish synthesis at all until they went away.
+    localparam int RSH  = (RMAX > 1) ? $clog2(RMAX) : 0;
+    localparam int RPOT = 1 << RSH;
+    localparam int WSH  = (WMAX > 1) ? $clog2(WMAX) : 0;
+    localparam int WPOT = 1 << WSH;
+    localparam int SB   = (NB*RPOT > 1) ? $clog2(NB*RPOT) : 1;
     localparam int WPB  = (1 << BSH) / 16;              // sixteen-byte words in a bank
     localparam int HALF = (WPB > 1) ? WPB / 2 : 1;      // words in each of its halves
     localparam int HW   = (HALF > 1) ? $clog2(HALF) : 1;
@@ -89,16 +101,16 @@ module fabric_vb #(
     // Which of a bank's ports each access takes.  Reads on one address share a
     // port, which is what lets two units stream the same beat of one buffer.
     integer      rn [0:NB-1];
-    reg [AW-1:0] ra [0:NB*RMAX-1];
-    reg          rv [0:NB*RMAX-1];
+    reg [AW-1:0] ra [0:NB*RPOT-1];
+    reg          rv [0:NB*RPOT-1];
     reg [1:0]    r_slot [0:NR-1];
     reg [BB-1:0] r_bank [0:NR-1];
     reg          r_got [0:NR-1];
     integer      wn [0:NB-1];
-    reg [AW-1:0] wa [0:NB*WMAX-1];
-    reg [127:0]  wd [0:NB*WMAX-1];
-    reg [15:0]   wm [0:NB*WMAX-1];
-    reg          wv [0:NB*WMAX-1];
+    reg [AW-1:0] wa [0:NB*WPOT-1];
+    reg [127:0]  wd [0:NB*WPOT-1];
+    reg [15:0]   wm [0:NB*WPOT-1];
+    reg          wv [0:NB*WPOT-1];
     integer i, j, b, s;
 `ifndef FABRIC_SYNTH
     integer      max_rd [0:NB-1], max_wr [0:NB-1];       // over the run, for the report
@@ -107,8 +119,8 @@ module fabric_vb #(
 
     always @(*) begin
         for (i = 0; i < NB; i = i + 1) begin rn[i] = 0; wn[i] = 0; end
-        for (i = 0; i < NB*RMAX; i = i + 1) begin ra[i] = 0; rv[i] = 1'b0; end
-        for (i = 0; i < NB*WMAX; i = i + 1) begin wa[i] = 0; wd[i] = 0; wm[i] = 0; wv[i] = 1'b0; end
+        for (i = 0; i < NB*RPOT; i = i + 1) begin ra[i] = 0; rv[i] = 1'b0; end
+        for (i = 0; i < NB*WPOT; i = i + 1) begin wa[i] = 0; wd[i] = 0; wm[i] = 0; wv[i] = 1'b0; end
         for (i = 0; i < NR; i = i + 1) begin
             r_bank[i] = bank_of(rd_addr[i*AW +: AW]);
             r_slot[i] = 0;
@@ -116,12 +128,12 @@ module fabric_vb #(
             if (rd_en[i] && (^rd_addr[i*AW +: AW] !== 1'bx)) begin
                 b = r_bank[i];
                 for (s = 0; s < RMAX; s = s + 1)           // a constant bound: synthesis wants one
-                    if (s < rn[b] && !r_got[i] && ra[b*RMAX + s] == rd_addr[i*AW +: AW]) begin
+                    if (s < rn[b] && !r_got[i] && ra[(b << RSH) + s] == rd_addr[i*AW +: AW]) begin
                         r_slot[i] = s[1:0]; r_got[i] = 1'b1;
                     end
                 if (!r_got[i] && rn[b] < RMAX) begin
-                    ra[b*RMAX + rn[b]] = rd_addr[i*AW +: AW];
-                    rv[b*RMAX + rn[b]] = 1'b1;
+                    ra[(b << RSH) + rn[b]] = rd_addr[i*AW +: AW];
+                    rv[(b << RSH) + rn[b]] = 1'b1;
                     r_slot[i] = rn[b][1:0];
                     r_got[i] = 1'b1;
                     rn[b] = rn[b] + 1;
@@ -132,10 +144,10 @@ module fabric_vb #(
             if (wr_en[i]) begin
                 b = bank_of(wr_addr[i*AW +: AW]);
                 if (wn[b] < WMAX) begin
-                    wa[b*WMAX + wn[b]] = wr_addr[i*AW +: AW];
-                    wd[b*WMAX + wn[b]] = wr_data[i*128 +: 128];
-                    wm[b*WMAX + wn[b]] = wr_be[i*16 +: 16];
-                    wv[b*WMAX + wn[b]] = 1'b1;
+                    wa[(b << WSH) + wn[b]] = wr_addr[i*AW +: AW];
+                    wd[(b << WSH) + wn[b]] = wr_data[i*128 +: 128];
+                    wm[(b << WSH) + wn[b]] = wr_be[i*16 +: 16];
+                    wv[(b << WSH) + wn[b]] = 1'b1;
                     wn[b] = wn[b] + 1;
                 end else wn[b] = wn[b] + 1;
             end
@@ -158,7 +170,7 @@ module fabric_vb #(
     end
 `endif
 
-    wire [NB*RMAX*128-1:0] even_q, odd_q;
+    wire [NB*RPOT*128-1:0] even_q, odd_q;
     genvar gb, gs;
     generate
         for (gb = 0; gb < NB; gb = gb + 1) begin : g_bank
@@ -172,29 +184,29 @@ module fabric_vb #(
             wire [NWR*128-1:0] e_wd, o_wd;
             wire [NWR*16-1:0]  e_wm, o_wm;
             for (gs = 0; gs < NRD; gs = gs + 1) begin : g_rd
-                wire [WIB-1:0] w = ra[gb*RMAX + gs][BSH-1:4];
-                assign r_en[gs] = rv[gb*RMAX + gs];
+                wire [WIB-1:0] w = ra[gb*RPOT + gs][BSH-1:4];
+                assign r_en[gs] = rv[gb*RPOT + gs];
                 assign e_ra[gs*HW +: HW] = ((w + {{(WIB-1){1'b0}}, w[0]}) >> 1);
                 assign o_ra[gs*HW +: HW] = (w >> 1);
-                assign even_q[(gb*RMAX + gs)*128 +: 128] = e_rd[gs*128 +: 128];
-                assign odd_q[(gb*RMAX + gs)*128 +: 128]  = o_rd[gs*128 +: 128];
+                assign even_q[(gb*RPOT + gs)*128 +: 128] = e_rd[gs*128 +: 128];
+                assign odd_q[(gb*RPOT + gs)*128 +: 128]  = o_rd[gs*128 +: 128];
             end
-            for (gs = NRD; gs < RMAX; gs = gs + 1) begin : g_rd_none
-                assign even_q[(gb*RMAX + gs)*128 +: 128] = {128{1'bx}};
-                assign odd_q[(gb*RMAX + gs)*128 +: 128]  = {128{1'bx}};
+            for (gs = NRD; gs < RPOT; gs = gs + 1) begin : g_rd_none
+                assign even_q[(gb*RPOT + gs)*128 +: 128] = {128{1'bx}};
+                assign odd_q[(gb*RPOT + gs)*128 +: 128]  = {128{1'bx}};
             end
             for (gs = 0; gs < NWR; gs = gs + 1) begin : g_wr
-                wire [WIB-1:0] w   = wa[gb*WMAX + gs][BSH-1:4];
-                wire [3:0]     off = wa[gb*WMAX + gs][3:0];
-                wire [255:0]   d32 = {128'd0, wd[gb*WMAX + gs]} << (off * 8);
-                wire [31:0]    m32 = {16'd0, wm[gb*WMAX + gs]} << off;
+                wire [WIB-1:0] w   = wa[gb*WPOT + gs][BSH-1:4];
+                wire [3:0]     off = wa[gb*WPOT + gs][3:0];
+                wire [255:0]   d32 = {128'd0, wd[gb*WPOT + gs]} << {off, 3'd0};
+                wire [31:0]    m32 = {16'd0, wm[gb*WPOT + gs]} << off;
                 // The window's low word is the one at w, the high word the next:
                 // whichever of the two is even goes to the even memory.
-                assign e_we[gs]            = wv[gb*WMAX + gs] && |(w[0] ? m32[31:16] : m32[15:0]);
+                assign e_we[gs]            = wv[gb*WPOT + gs] && |(w[0] ? m32[31:16] : m32[15:0]);
                 assign e_wa[gs*HW +: HW]   = ((w + {{(WIB-1){1'b0}}, w[0]}) >> 1);
                 assign e_wd[gs*128 +: 128] = w[0] ? d32[255:128] : d32[127:0];
                 assign e_wm[gs*16 +: 16]   = w[0] ? m32[31:16]   : m32[15:0];
-                assign o_we[gs]            = wv[gb*WMAX + gs] && |(w[0] ? m32[15:0] : m32[31:16]);
+                assign o_we[gs]            = wv[gb*WPOT + gs] && |(w[0] ? m32[15:0] : m32[31:16]);
                 assign o_wa[gs*HW +: HW]   = (w >> 1);
                 assign o_wd[gs*128 +: 128] = w[0] ? d32[127:0] : d32[255:128];
                 assign o_wm[gs*16 +: 16]   = w[0] ? m32[15:0]  : m32[31:16];
@@ -216,6 +228,7 @@ module fabric_vb #(
     reg          odd_q_sel [0:NR-1];
     reg          en_q [0:NR-1];
     reg [255:0]  win;
+    reg [SB-1:0] sel;                                   // the bank's slot, flattened
     always @(posedge clk)
         for (i = 0; i < NR; i = i + 1) begin
             slot_q[i] <= r_slot[i];
@@ -226,10 +239,11 @@ module fabric_vb #(
         end
     always @(*)
         for (j = 0; j < NR; j = j + 1) begin
-            i = bank_q[j] * RMAX + slot_q[j];
-            win = odd_q_sel[j] ? {even_q[i*128 +: 128], odd_q[i*128 +: 128]}
-                               : {odd_q[i*128 +: 128], even_q[i*128 +: 128]};
-            rd_data[j*128 +: 128] = en_q[j] ? win[off_q[j]*8 +: 128] : {128{1'bx}};
+            // The word offsets are concatenations, not products: see RSH above.
+            sel = (bank_q[j] << RSH) + slot_q[j];
+            win = odd_q_sel[j] ? {even_q[{sel, 7'd0} +: 128], odd_q[{sel, 7'd0} +: 128]}
+                               : {odd_q[{sel, 7'd0} +: 128], even_q[{sel, 7'd0} +: 128]};
+            rd_data[j*128 +: 128] = en_q[j] ? win[{1'b0, off_q[j], 3'd0} +: 128] : {128{1'bx}};
         end
 
 `ifndef FABRIC_SYNTH

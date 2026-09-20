@@ -39,6 +39,7 @@ class Unit:
     params: dict
     note: str
     luts: bool = False
+    noshare: bool = False              # skip yosys's SAT-based resource sharing
     files: tuple[tuple[str, str], ...] = ()      # (name, contents) written next to the sources
 
 
@@ -74,7 +75,7 @@ UNITS = [
     Unit("mem_arbiter", "fabric_mem_arbiter", ("fabric_memory.sv", "fabric_norm.sv") + VEC, {"N": 4}, "the memory arbiter, four requesters", luts=True),
     Unit("vector_buffer", "fabric_vb", ("fabric_sram.sv", "fabric_engine.sv"),
          {"BYTES": 1 << 16, "NR": 24, "NW": 19, "AW": 16, "NB": 8, "BSH": 13, "RCAP2": 5, "RCAP3": 1, "WCAP2": 2},
-         "the vector buffer's crossbar, 24 reads and 19 writes over eight banks (the banks are macros)"),
+         "the vector buffer's crossbar, 24 reads and 19 writes over eight banks (the banks are macros)", noshare=True),
     Unit("sequencer", "fabric_sequencer", ("fabric_sequencer.sv",), {"NU": 10, "NE": 4, "DEPTH": 64, "NID": 64},
          "the token sequencer, a 64-step program memory (as logic) and 64 buffer ids", files=(("program.hex", _program_image()),)),
 ]
@@ -102,7 +103,8 @@ def run_unit(unit: Unit, lib_name: str, liberty: Path, target_ps: int, sta: Path
         netlist = (keep / f"{unit.name}_{lib_name}.v") if keep else (work / "netlist.v")
         try:
             synth = synthesize(liberty, top=unit.top, target_ps=target_ps, keep_netlist=netlist,
-                               sources=[RTL_DIR / name for name in unit.sources], params=unit.params, data_files=data)
+                               sources=[RTL_DIR / name for name in unit.sources], params=unit.params, data_files=data,
+                               noshare=unit.noshare)
         except Exception as error:  # noqa: BLE001 - the report says what failed
             return {"unit": unit.name, "library": lib_name, "error": str(error)[-1500:], "seconds": time.time() - t0}
         out = {"unit": unit.name, "library": lib_name, "top": unit.top, "params": unit.params, "note": unit.note,
@@ -119,7 +121,7 @@ def run_unit(unit: Unit, lib_name: str, liberty: Path, target_ps: int, sta: Path
             macros = sram.macros_from_json(design)
             if macros:
                 process = sram.PROCESSES[lib_name]
-                libs.append(sram.write_liberty(macros, process, work / "sram.lib"))
+                libs.append(sram.write_liberty(macros, process, work / "sram.lib", reference=liberty))
                 out["sram"] = sram.inventory(macros, process)
                 out["area_um2"] += out["sram"]["area_um2"]
                 if nand2:

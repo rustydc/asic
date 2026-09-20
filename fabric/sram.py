@@ -190,13 +190,45 @@ def _cell(macro: Macro, process: Process) -> str:
 """
 
 
-def write_liberty(macros: Sequence[Macro], process: Process, path: Path) -> Path:
+THRESHOLDS = ("slew_lower_threshold_pct_rise", "slew_lower_threshold_pct_fall",
+              "slew_upper_threshold_pct_rise", "slew_upper_threshold_pct_fall",
+              "input_threshold_pct_rise", "input_threshold_pct_fall",
+              "output_threshold_pct_rise", "output_threshold_pct_fall",
+              "slew_derate_from_library")
+DEFAULT_THRESHOLDS = {"slew_lower_threshold_pct_rise": "30.0", "slew_lower_threshold_pct_fall": "30.0",
+                      "slew_upper_threshold_pct_rise": "70.0", "slew_upper_threshold_pct_fall": "70.0",
+                      "input_threshold_pct_rise": "50.0", "input_threshold_pct_fall": "50.0",
+                      "output_threshold_pct_rise": "50.0", "output_threshold_pct_fall": "50.0",
+                      "slew_derate_from_library": "1.0"}
+
+
+def thresholds(reference: Path | None) -> dict[str, str]:
+    """Where a library measures a delay from and to.
+
+    A liberty that does not say is rejected outright -- OpenSTA will not link
+    it -- and a liberty that says something different from the standard cells
+    beside it would have the macros' arcs measured between other points than
+    the logic's.  So they are read off the library the macros will be timed
+    with: NanGate's slews run 30 to 70 percent, ASAP7's 10 to 90."""
+    found = dict(DEFAULT_THRESHOLDS)
+    if reference is not None and Path(reference).exists():
+        text = Path(reference).read_text(encoding="utf-8", errors="ignore")
+        head = text[:text.find("cell (")] if "cell (" in text else text
+        for name in THRESHOLDS:
+            match = re.search(rf"^\s*{name}\s*:\s*([0-9.]+)\s*;", head, re.M)
+            if match:
+                found[name] = match.group(1)
+    return found
+
+
+def write_liberty(macros: Sequence[Macro], process: Process, path: Path, reference: Path | None = None) -> Path:
     """A liberty of the design's memories, for the timing tools to read beside
-    the standard cells."""
+    the standard cells (``reference``, whose thresholds the macros take)."""
     body = "".join(_cell(m, process) for m in macros)
+    limits = "".join(f"    {name} : {value};\n" for name, value in thresholds(reference).items())
     Path(path).write_text(f"""library (fabric_sram_{process.name}) {{
     delay_model : table_lookup;
-    time_unit : "1ps";
+{limits}    time_unit : "1ps";
     voltage_unit : "1V";
     current_unit : "1mA";
     capacitive_load_unit (1, pf);

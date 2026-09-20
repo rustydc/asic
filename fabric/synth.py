@@ -209,13 +209,19 @@ def map_ties(netlist: Path, liberties: Sequence[Path], output: Path, *, tie_hi: 
 def synthesize(liberty: Path | Sequence[Path], *, rows: int = 256, cols: int = 8, rows_per_cycle: int = 2, weight_bits: int = 4,
                act_bits: int = 8, acc_bits: int = 24, top: str = "fabric_columns",
                target_ps: int | None = None, keep_netlist: Path | None = None,
-               sources: Sequence[Path] | None = None, params: dict | None = None, data_files: Sequence[Path] = ()) -> SynthResult:
+               sources: Sequence[Path] | None = None, params: dict | None = None, data_files: Sequence[Path] = (),
+               noshare: bool = False) -> SynthResult:
     """Synthesize ``top`` against one liberty file, or several (e.g. ASAP7 splits cells across files).
 
     By default the column datapath of ``fabric_tile.sv`` with the tile
     parameters; any other unit by ``sources`` (its RTL files, the include
     directory being ``rtl/``), ``params`` (its parameter overrides) and
-    ``data_files`` (the hex images its ROMs read)."""
+    ``data_files`` (the hex images its ROMs read).
+
+    ``noshare`` drops yosys's SAT-based resource sharing.  It is a coarse
+    optimization that the crossbars do not benefit from -- they share nothing
+    -- and on a design their size it does not finish: the vector buffer spent
+    a quarter of a minute a cell and ran the machine out of memory."""
     liberties = [Path(p).resolve() for p in ([liberty] if isinstance(liberty, (str, Path)) else liberty)]
     if params is None:
         params = {"ROWS": rows, "COLS": cols, "WB": weight_bits, "AB": act_bits, "P": rows_per_cycle, "ACC": acc_bits}
@@ -254,7 +260,7 @@ def synthesize(liberty: Path | Sequence[Path], *, rows: int = 256, cols: int = 8
             *[f"read_verilog -sv -defer -DFABRIC_SYNTH {path.name}" for path in sources],
             *([f"chparam {chparam} {top}"] if chparam else []),   # a module with no parameters takes none
             f"hierarchy -check -top {top}",
-            f"synth -top {top} -flatten",
+            f"synth -top {top} -flatten" + (" -noshare" if noshare else ""),
             f"dfflibmap {lib_args}",
             abc_cmd,
             "opt_clean",
