@@ -1058,11 +1058,15 @@ layer 0 of the 9B at random initialisation, calibrated on three tokens,
 the second token of a running context through the engine at the
 design's own geometry, 4096 wide, 834 tiles of 4096 x 64 with the
 behavioural columns, 32 heads of 128 x 128 state. It passes bit for bit
-(the residual out, the state and its scales, the history) in 227,013
+(the residual out, the state and its scales, the history) in 227,255
 engine cycles for the 173-step program, against the timing model's
 84,764: the same 2.7x as the tiny geometry, and for the same reason,
 the adapters at 8 lanes and a beat a cycle against the model's 64-lane
-units. Getting it to run at all was a simulator lesson: the pass adapter
+units. Pipelining the units to the clock (below) cost 242 of those
+cycles, a tenth of a percent, since a full-size token is its tile passes
+and its memory; on the tiny geometry, where the vector units are most of
+the work, the same change cost six percent on a token and fourteen on a
+chunk of three. Getting it to run at all was a simulator lesson: the pass adapter
 gathered the tiles' outputs into two flat vectors of 1.28 Mbit and
 427 kbit driven in 834 slices, which Icarus builds as a chain of 834
 concatenations and re-propagates whole on every slice update, so the
@@ -1119,10 +1123,10 @@ window, block store, index and sums), runs the program and dumps the
 buffer and the memory; the Python side compares the residual out and the
 memory with `run_program` on the same steps and with the memory model,
 and they are equal bit for bit (`test_engine.py`): the recurrent layer
-for one token from a running context (33 steps, 1,482 cycles) and a
+for one token from a running context (33 steps, 1,568 cycles) and a
 stream of two contexts' tokens (66 steps); the global layer for a token
 at position 31 of a filled context, where four blocks are eligible, two
-are chosen and the token closes a block (23 steps, 1,704 cycles: the
+are chosen and the token closes a block (23 steps, 1,814 cycles: the
 window record, the block record, the index record and the sums all
 land), and a stream of two contexts at positions 31 and 20. The engine's
 cycle counts are not the timing model's (it said 804 and 762): the
@@ -1159,7 +1163,7 @@ count and the per-token strides, the pass adapter reads each token's
 activations on its own port and writes each token's outputs at its
 stride, and the tile array is built with `TMAX` tokens. Both layers'
 three-token chunks run on the engine bit for bit: the recurrent layer
-from a running context (71 steps, 2,763 cycles against 1,482 for one
+from a running context (71 steps, 3,165 cycles against 1,568 for one
 token) and the global layer from position 30, where the middle token
 closes a block and each token's rows include the earlier tokens' records.
 
