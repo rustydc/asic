@@ -268,6 +268,25 @@ class Layout:
     def size(self, name: str) -> int:
         return self.sizes[name.split("@")[0]]
 
+    def sram(self) -> dict:
+        """The memories the vector buffer is: per bank, the words its two
+        halves hold and the ports they carry.  A bank is two memories because
+        a sixteen-byte read at any byte address straddles two words, so the
+        even words are in one and the odd in the other; the bits are counted
+        once per read port, since that is how a read port is bought."""
+        fill = [0] * self.banks
+        for name in self.vb:
+            fill[self.bank[name]] += -(-self.size(name) // BEAT) * BEAT
+        banks = []
+        for b in range(self.banks):
+            words = -(-fill[b] // 16)                    # what the bank holds, not the stride it is addressed by
+            banks.append({"bank": b, "half_words": -(-words // 2), "used_bytes": fill[b],
+                          "reads": self.bank_reads[b], "writes": self.bank_writes[b],
+                          "bits": words * 128 * self.bank_reads[b]})
+        return {"banks": banks, "macros": 2 * self.banks, "word_bits": 128,
+                "buffer_bytes": sum(fill), "address_bytes": self.vb_bytes,
+                "sram_bits": sum(b["bits"] for b in banks)}
+
     def cap_mask(self, need: list[int], ports: int) -> int:
         """The banks that need at least ``ports`` of a kind, as a bit mask for
         the RTL's check."""

@@ -15,7 +15,7 @@ from fabric.memory import GlobalContextMemory, MemoryMap
 from fabric.tile import TileSpec
 
 RTL = Path(__file__).parents[1] / "rtl"
-SOURCES = [RTL / name for name in ("fabric_vector.sv", "fabric_norm.sv", "fabric_recurrent.sv", "fabric_ffn.sv", "fabric_attention.sv",
+SOURCES = [RTL / name for name in ("fabric_sram.sv", "fabric_vector.sv", "fabric_norm.sv", "fabric_recurrent.sv", "fabric_ffn.sv", "fabric_attention.sv",
                                    "fabric_memory.sv", "fabric_tile.sv", "fabric_sequencer.sv", "fabric_engine.sv",
                                    "fabric_phy.sv", "fabric_cdc.sv", "fabric_hpi.sv", "tb_layer_engine.sv")]
 

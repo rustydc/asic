@@ -156,7 +156,7 @@ module tb_layer_engine #(
     endgenerate
 
     // The issue trace, for the Python side's dependency check.
-    integer trace, issues = 0, t0 = 0, guard;
+    integer trace, issues = 0, t0 = 0, guard, took = 0;
     reg finished = 0;
     always @(posedge clk) if (|(dut.cmd_valid & dut.cmd_ready)) begin
         if (issues == 0) t0 = cycle;
@@ -275,14 +275,16 @@ module tb_layer_engine #(
         guard = 0;
         while (!done && guard < 4000000) begin @(posedge clk); guard = guard + 1; end
         finished = done;
+        took = cycle - t0;                        // here, not after the dumps: those take clocks of their own
         $fclose(trace);
         dump_ports;
         $fclose(span);
+        dut.u_vb.dumping = 1'b1; #0.1;            // the banks back into one image
         $writememh("vb_out.hex", dut.u_vb.mem);
         dump = 1; #10;
         if (!finished) $display("FAIL: never finished, %0d of %0d issued", issues, N);
         else if (issues != N) $display("FAIL: %0d issued of %0d", issues, N);
-        else $display("PASS: %0d steps in %0d cycles (the timing model said %0d)", N, cycle - t0, SCHEDULE_CYCLES);
+        else $display("PASS: %0d steps in %0d cycles (the timing model said %0d)", N, took, SCHEDULE_CYCLES);
         $finish;
     end
 endmodule

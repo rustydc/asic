@@ -41,7 +41,7 @@ module fabric_vb #(
     parameter int NR    = 1,
     parameter int NW    = 1,
     parameter int AW    = 16,
-    parameter int NB    = 1,       // banks; a bank is one write port and RCAP reads
+    parameter int NB    = 1,       // banks
     parameter int BSH   = 12,      // a bank's own address bits: bank b holds [b << BSH, (b+1) << BSH)
     parameter [63:0] RCAP2 = 0,    // banks that need a second read port
     parameter [63:0] RCAP3 = 0,    // and a third
@@ -57,24 +57,25 @@ module fabric_vb #(
     input  wire [NW*128-1:0] wr_data,
     input  wire [NW*16-1:0]  wr_be
 );
-    // The array is the banks: a buffer lives wholly in one, and a buffer's
-    // bank is the high bits of its address, so an adapter's byte address
-    // carries it and no port needs a bank field of its own.  What a bank
-    // cannot do is serve two reads of different addresses, or two writes, in
-    // a cycle.  `fabric.engine.Layout` colours the buffers so that never
-    // happens; the counts below are that colouring put to the engine rather
-    // than taken on trust, and a flat array answers the reads because, when
-    // the colouring holds, banks and a flat array answer alike.
-    reg [7:0] mem [0:BYTES-1];
-    integer i, p, q, b;
-    initial begin
-        if (INIT_FILE != "") $readmemh(INIT_FILE, mem);
-        else for (i = 0; i < BYTES; i = i + 1) mem[i] = 8'd0;
-    end
-    function automatic [127:0] rd16(input [AW-1:0] a);
-        integer k;
-        for (k = 0; k < 16; k = k + 1) rd16[k*8 +: 8] = (a + k < BYTES) ? mem[a + k] : 8'd0;
-    endfunction
+    // Banks of SRAM.  A buffer lives wholly in one, and a buffer's bank is the
+    // high bits of its address, so an adapter's byte address carries it and no
+    // port needs a bank field.  `fabric.engine.Layout` colours the buffers so
+    // that no bank is asked for more ports than it has; the counts below are
+    // that colouring put to the engine rather than taken on trust.
+    //
+    // A bank is two memories, not one.  The adapters read sixteen bytes at any
+    // byte address -- the norm and SwiGLU step eight bytes a beat, the conv and
+    // the gates four, the pass adapter two -- so a read straddles two words of
+    // a sixteen-byte memory.  Holding the even words in one memory and the odd
+    // in the other makes that one word from each, whatever the alignment, and
+    // costs no port: of any two adjacent words exactly one is even.
+    localparam int RMAX = 3, WMAX = 2;
+    localparam int WPB  = (1 << BSH) / 16;              // sixteen-byte words in a bank
+    localparam int HALF = (WPB > 1) ? WPB / 2 : 1;      // words in each of its halves
+    localparam int HW   = (HALF > 1) ? $clog2(HALF) : 1;
+    localparam int WIB  = (WPB > 1) ? $clog2(WPB) : 1;
+    localparam int BB   = (AW > BSH) ? AW - BSH : 1;
+
     function automatic integer bank_of(input [AW-1:0] a);
         bank_of = (AW > BSH) ? (a >> BSH) : 0;
     endfunction
@@ -85,41 +86,179 @@ module fabric_vb #(
         wcap_of = 1 + (WCAP2[bb] ? 1 : 0);
     endfunction
 
-    integer nrd [0:NB-1], nwr [0:NB-1];          // this cycle
-    integer max_rd [0:NB-1], max_wr [0:NB-1];    // over the run, for the report
-    reg dup;
+    // Which of a bank's ports each access takes.  Reads on one address share a
+    // port, which is what lets two units stream the same beat of one buffer.
+    integer      rn [0:NB-1];
+    reg [AW-1:0] ra [0:NB*RMAX-1];
+    reg          rv [0:NB*RMAX-1];
+    reg [1:0]    r_slot [0:NR-1];
+    reg [BB-1:0] r_bank [0:NR-1];
+    reg          r_got [0:NR-1];
+    integer      wn [0:NB-1];
+    reg [AW-1:0] wa [0:NB*WMAX-1];
+    reg [127:0]  wd [0:NB*WMAX-1];
+    reg [15:0]   wm [0:NB*WMAX-1];
+    reg          wv [0:NB*WMAX-1];
+    integer i, j, b, s;
+`ifndef FABRIC_SYNTH
+    integer      max_rd [0:NB-1], max_wr [0:NB-1];       // over the run, for the report
     initial for (i = 0; i < NB; i = i + 1) begin max_rd[i] = 0; max_wr[i] = 0; end
-    always @(posedge clk) begin
-        for (b = 0; b < NB; b = b + 1) begin nrd[b] = 0; nwr[b] = 0; end
-        for (p = 0; p < NR; p = p + 1)
-            if (rd_en[p]) begin
-                dup = 1'b0;                      // ports on one address share a read
-                for (q = 0; q < p; q = q + 1)
-                    if (rd_en[q] && rd_addr[q*AW +: AW] == rd_addr[p*AW +: AW]) dup = 1'b1;
-                if (!dup) begin
-                    b = bank_of(rd_addr[p*AW +: AW]);
-                    nrd[b] = nrd[b] + 1;
-                    if (nrd[b] > max_rd[b]) max_rd[b] = nrd[b];
-                    if (nrd[b] > cap_of(b)) $display("FAIL: bank %0d asked for %0d reads by port %0d, it has %0d", b, nrd[b], p, cap_of(b));
+`endif
+
+    always @(*) begin
+        for (i = 0; i < NB; i = i + 1) begin rn[i] = 0; wn[i] = 0; end
+        for (i = 0; i < NB*RMAX; i = i + 1) begin ra[i] = 0; rv[i] = 1'b0; end
+        for (i = 0; i < NB*WMAX; i = i + 1) begin wa[i] = 0; wd[i] = 0; wm[i] = 0; wv[i] = 1'b0; end
+        for (i = 0; i < NR; i = i + 1) begin
+            r_bank[i] = bank_of(rd_addr[i*AW +: AW]);
+            r_slot[i] = 0;
+            r_got[i] = 1'b0;
+            if (rd_en[i] && (^rd_addr[i*AW +: AW] !== 1'bx)) begin
+                b = r_bank[i];
+                for (s = 0; s < RMAX; s = s + 1)           // a constant bound: synthesis wants one
+                    if (s < rn[b] && !r_got[i] && ra[b*RMAX + s] == rd_addr[i*AW +: AW]) begin
+                        r_slot[i] = s[1:0]; r_got[i] = 1'b1;
+                    end
+                if (!r_got[i] && rn[b] < RMAX) begin
+                    ra[b*RMAX + rn[b]] = rd_addr[i*AW +: AW];
+                    rv[b*RMAX + rn[b]] = 1'b1;
+                    r_slot[i] = rn[b][1:0];
+                    r_got[i] = 1'b1;
+                    rn[b] = rn[b] + 1;
                 end
             end
-        for (p = 0; p < NW; p = p + 1)
-            if (wr_en[p]) begin
-                b = bank_of(wr_addr[p*AW +: AW]);
-                nwr[b] = nwr[b] + 1;
-                if (nwr[b] > max_wr[b]) max_wr[b] = nwr[b];
-                if (nwr[b] > wcap_of(b)) $display("FAIL: bank %0d asked for %0d writes, it has %0d", b, nwr[b], wcap_of(b));
+        end
+        for (i = 0; i < NW; i = i + 1)
+            if (wr_en[i]) begin
+                b = bank_of(wr_addr[i*AW +: AW]);
+                if (wn[b] < WMAX) begin
+                    wa[b*WMAX + wn[b]] = wr_addr[i*AW +: AW];
+                    wd[b*WMAX + wn[b]] = wr_data[i*128 +: 128];
+                    wm[b*WMAX + wn[b]] = wr_be[i*16 +: 16];
+                    wv[b*WMAX + wn[b]] = 1'b1;
+                    wn[b] = wn[b] + 1;
+                end else wn[b] = wn[b] + 1;
             end
-        // A bank answers only what it was asked for: an enable that is too
-        // narrow shows up as x in the unit that wanted the beat, as one that
-        // is too wide shows up in the counts above.
-        for (p = 0; p < NR; p = p + 1) rd_data[p*128 +: 128] <= rd_en[p] ? rd16(rd_addr[p*AW +: AW]) : {128{1'bx}};
-        for (p = 0; p < NW; p = p + 1)
-            if (wr_en[p])
-                for (b = 0; b < 16; b = b + 1)
-                    if (wr_be[p*16 + b] && (wr_addr[p*AW +: AW] + b < BYTES))
-                        mem[wr_addr[p*AW +: AW] + b] = wr_data[p*128 + b*8 +: 8];    // blocking: the reads above precede it, and Verilator wants it so
     end
+
+`ifndef FABRIC_SYNTH
+    // What the run asked of each bank, against what it has.
+    always @(posedge clk) begin
+        for (b = 0; b < NB; b = b + 1) begin
+            if (rn[b] > max_rd[b]) max_rd[b] = rn[b];
+            if (wn[b] > max_wr[b]) max_wr[b] = wn[b];
+            if (rn[b] > cap_of(b))  $display("FAIL: bank %0d asked for %0d reads, it has %0d", b, rn[b], cap_of(b));
+            if (wn[b] > wcap_of(b)) $display("FAIL: bank %0d asked for %0d writes, it has %0d", b, wn[b], wcap_of(b));
+        end
+        for (i = 0; i < NR; i = i + 1)
+            if (rd_en[i] && !r_got[i]) begin
+                if (^rd_addr[i*AW +: AW] === 1'bx) $display("FAIL: read port %0d is enabled on an unknown address", i);
+                else $display("FAIL: read port %0d got no port of bank %0d", i, r_bank[i]);
+            end
+    end
+`endif
+
+    wire [NB*RMAX*128-1:0] even_q, odd_q;
+    genvar gb, gs;
+    generate
+        for (gb = 0; gb < NB; gb = gb + 1) begin : g_bank
+            localparam int NRD = 1 + (RCAP2[gb] ? 1 : 0) + (RCAP3[gb] ? 1 : 0);
+            localparam int NWR = 1 + (WCAP2[gb] ? 1 : 0);
+            wire [NRD-1:0]     r_en;
+            wire [NRD*HW-1:0]  e_ra, o_ra;
+            wire [NRD*128-1:0] e_rd, o_rd;
+            wire [NWR-1:0]     e_we, o_we;
+            wire [NWR*HW-1:0]  e_wa, o_wa;
+            wire [NWR*128-1:0] e_wd, o_wd;
+            wire [NWR*16-1:0]  e_wm, o_wm;
+            for (gs = 0; gs < NRD; gs = gs + 1) begin : g_rd
+                wire [WIB-1:0] w = ra[gb*RMAX + gs][BSH-1:4];
+                assign r_en[gs] = rv[gb*RMAX + gs];
+                assign e_ra[gs*HW +: HW] = ((w + {{(WIB-1){1'b0}}, w[0]}) >> 1);
+                assign o_ra[gs*HW +: HW] = (w >> 1);
+                assign even_q[(gb*RMAX + gs)*128 +: 128] = e_rd[gs*128 +: 128];
+                assign odd_q[(gb*RMAX + gs)*128 +: 128]  = o_rd[gs*128 +: 128];
+            end
+            for (gs = NRD; gs < RMAX; gs = gs + 1) begin : g_rd_none
+                assign even_q[(gb*RMAX + gs)*128 +: 128] = {128{1'bx}};
+                assign odd_q[(gb*RMAX + gs)*128 +: 128]  = {128{1'bx}};
+            end
+            for (gs = 0; gs < NWR; gs = gs + 1) begin : g_wr
+                wire [WIB-1:0] w   = wa[gb*WMAX + gs][BSH-1:4];
+                wire [3:0]     off = wa[gb*WMAX + gs][3:0];
+                wire [255:0]   d32 = {128'd0, wd[gb*WMAX + gs]} << (off * 8);
+                wire [31:0]    m32 = {16'd0, wm[gb*WMAX + gs]} << off;
+                // The window's low word is the one at w, the high word the next:
+                // whichever of the two is even goes to the even memory.
+                assign e_we[gs]            = wv[gb*WMAX + gs] && |(w[0] ? m32[31:16] : m32[15:0]);
+                assign e_wa[gs*HW +: HW]   = ((w + {{(WIB-1){1'b0}}, w[0]}) >> 1);
+                assign e_wd[gs*128 +: 128] = w[0] ? d32[255:128] : d32[127:0];
+                assign e_wm[gs*16 +: 16]   = w[0] ? m32[31:16]   : m32[15:0];
+                assign o_we[gs]            = wv[gb*WMAX + gs] && |(w[0] ? m32[15:0] : m32[31:16]);
+                assign o_wa[gs*HW +: HW]   = (w >> 1);
+                assign o_wd[gs*128 +: 128] = w[0] ? d32[127:0] : d32[255:128];
+                assign o_wm[gs*16 +: 16]   = w[0] ? m32[15:0]  : m32[31:16];
+            end
+            fabric_sram #(.W(128), .D(HALF), .NRD(NRD), .NWR(NWR), .MB(8)) u_even (
+                .clk(clk), .rd_en(r_en), .rd_addr(e_ra), .rd_data(e_rd),
+                .wr_en(e_we), .wr_addr(e_wa), .wr_data(e_wd), .wr_mask(e_wm));
+            fabric_sram #(.W(128), .D(HALF), .NRD(NRD), .NWR(NWR), .MB(8)) u_odd (
+                .clk(clk), .rd_en(r_en), .rd_addr(o_ra), .rd_data(o_rd),
+                .wr_en(o_we), .wr_addr(o_wa), .wr_data(o_wd), .wr_mask(o_wm));
+        end
+    endgenerate
+
+    // The beat a port asked for, a cycle later: its two words in address order,
+    // shifted down to the byte it started at.
+    reg [1:0]    slot_q [0:NR-1];
+    reg [BB-1:0] bank_q [0:NR-1];
+    reg [3:0]    off_q [0:NR-1];
+    reg          odd_q_sel [0:NR-1];
+    reg          en_q [0:NR-1];
+    reg [255:0]  win;
+    always @(posedge clk)
+        for (i = 0; i < NR; i = i + 1) begin
+            slot_q[i] <= r_slot[i];
+            bank_q[i] <= r_bank[i];
+            off_q[i] <= rd_addr[i*AW +: 4];
+            odd_q_sel[i] <= rd_addr[i*AW + 4];
+            en_q[i] <= rd_en[i] && r_got[i];
+        end
+    always @(*)
+        for (j = 0; j < NR; j = j + 1) begin
+            i = bank_q[j] * RMAX + slot_q[j];
+            win = odd_q_sel[j] ? {even_q[i*128 +: 128], odd_q[i*128 +: 128]}
+                               : {odd_q[i*128 +: 128], even_q[i*128 +: 128]};
+            rd_data[j*128 +: 128] = en_q[j] ? win[off_q[j]*8 +: 128] : {128{1'bx}};
+        end
+
+`ifndef FABRIC_SYNTH
+    // The image in and out.  The memories hold it in words, the file in bytes,
+    // and the copy runs inside each bank because a generate instance cannot be
+    // reached by a variable index.
+    reg [7:0] mem [0:BYTES-1];
+    reg       dumping = 1'b0;
+    initial if (INIT_FILE != "") $readmemh(INIT_FILE, mem);
+    generate
+        for (gb = 0; gb < NB; gb = gb + 1) begin : g_img
+            integer wi, k;
+            initial begin
+                #1;
+                for (wi = 0; wi < HALF; wi = wi + 1)
+                    for (k = 0; k < 16; k = k + 1) begin
+                        g_bank[gb].u_even.mem[wi][k*8 +: 8] = (INIT_FILE != "") ? mem[gb*(1 << BSH) + (2*wi)*16 + k] : 8'd0;
+                        g_bank[gb].u_odd.mem[wi][k*8 +: 8]  = (INIT_FILE != "") ? mem[gb*(1 << BSH) + (2*wi+1)*16 + k] : 8'd0;
+                    end
+            end
+            always @(posedge dumping)
+                for (wi = 0; wi < HALF; wi = wi + 1)
+                    for (k = 0; k < 16; k = k + 1) begin
+                        mem[gb*(1 << BSH) + (2*wi)*16 + k]   = g_bank[gb].u_even.mem[wi][k*8 +: 8];
+                        mem[gb*(1 << BSH) + (2*wi+1)*16 + k] = g_bank[gb].u_odd.mem[wi][k*8 +: 8];
+                    end
+        end
+    endgenerate
+`endif
 endmodule
 
 // ---------------------------------------------------------------------------
@@ -1129,6 +1268,7 @@ module fabric_mem_unit #(
     output reg           done_valid,
     output reg  [7:0]    done_tag,
     output reg  [AW-1:0] rd_addr,
+    output wire          rd_en,          // the loader, or a move out of the buffer; else the port is idle
     input  wire [127:0]  rd_data,
     output reg           wr_en,
     output reg  [AW-1:0] wr_addr,
@@ -1268,6 +1408,7 @@ module fabric_mem_unit #(
         rd_addr = ld_base + ld_i * 16;
         if (mv_busy && mv_mode == MV_WR_VB) rd_addr = mv_vaddr + mv_i * 16;
     end
+    assign rd_en = ld_on || (mv_busy && mv_mode == MV_WR_VB);
 
     localparam [4:0] S_IDLE = 0, S_MV = 1, S_DONE = 2,
                      S_AP_LOAD = 3, S_AP_SUMS_RD = 4, S_AP_START = 5, S_AP_WAIT = 6, S_AP_SUMS_WR = 7,
@@ -1533,7 +1674,7 @@ module fabric_layer_engine #(
     assign rd_en[R_GATES +: 2]     = {2{!ready_gates}};
     assign rd_en[R_SWIGLU +: 2]    = {2{!ready_swiglu}};
     assign rd_en[R_RESIDUAL +: 2]  = {2{!ready_residual}};
-    assign rd_en[R_MEM]            = !ready_mem;
+
     genvar ge;
     generate
         for (ge = 0; ge < 2; ge = ge + 1) begin : g_en2
@@ -1657,7 +1798,7 @@ module fabric_layer_engine #(
                       .AW(AW), .LUT_DIR(LUT_DIR)) u_mem (
         .clk(clk), .rst_n(rst_n), .cmd_valid(cmd_valid[U_MEM] && cmd_engine == 0), .cmd_len(cmd_len), .cmd_src(cmd_src), .cmd_dst(cmd_dst),
         .cmd_a2(cmd_a2), .cmd_a3(cmd_a3), .cmd_arg(cmd_arg), .cmd_tag(cmd_tag), .cmd_ready(ready_mem), .done_valid(done_valid[U_MEM*NE]), .done_tag(done_tag[U_MEM*NE*8 +: 8]),
-        .rd_addr(rd_addr[R_MEM*AW +: AW]), .rd_data(rd_data[R_MEM*128 +: 128]),
+        .rd_addr(rd_addr[R_MEM*AW +: AW]), .rd_en(rd_en[R_MEM]), .rd_data(rd_data[R_MEM*128 +: 128]),
         .wr_en(wr_en[W_MEM]), .wr_addr(wr_addr[W_MEM*AW +: AW]), .wr_data(wr_data[W_MEM*128 +: 128]), .wr_be(wr_be[W_MEM*16 +: 16]),
         .m_req_valid(m_req_valid), .m_req_ready(m_req_ready), .m_req_write(m_req_write), .m_req_addr(m_req_addr), .m_req_beats(m_req_beats),
         .m_wdata_valid(m_wdata_valid), .m_wdata_ready(m_wdata_ready), .m_wdata(m_wdata), .m_rdata_valid(m_rdata_valid), .m_rdata(m_rdata));

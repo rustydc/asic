@@ -71,6 +71,9 @@ UNITS = [
     Unit("kv_append", "fabric_kv_append", ("fabric_memory.sv", "fabric_norm.sv") + VEC,
          {"HD": 32, "NKV": 1, "IDIM": 32, "BS": 4, "W": 16, "KV_BITS": 4}, "the append, one head of 32", luts=True),
     Unit("mem_arbiter", "fabric_mem_arbiter", ("fabric_memory.sv", "fabric_norm.sv") + VEC, {"N": 4}, "the memory arbiter, four requesters", luts=True),
+    Unit("vector_buffer", "fabric_vb", ("fabric_sram.sv", "fabric_engine.sv"),
+         {"BYTES": 1 << 16, "NR": 24, "NW": 19, "AW": 16, "NB": 8, "BSH": 13, "RCAP2": 5, "RCAP3": 1, "WCAP2": 2},
+         "the vector buffer's crossbar, 24 reads and 19 writes over eight banks (the banks are macros)"),
     Unit("sequencer", "fabric_sequencer", ("fabric_sequencer.sv",), {"NU": 10, "NE": 4, "DEPTH": 64, "NID": 64},
          "the token sequencer, a 64-step program memory (as logic) and 64 buffer ids", files=(("program.hex", _program_image()),)),
 ]
