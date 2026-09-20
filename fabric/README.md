@@ -1279,25 +1279,6 @@ equivalents are per lane or per row, not the die's; the critical path is
 the number that matters, since a unit's worst stage is the same at any
 lane count.
 
-| Unit | Geometry | NanGate 45: path | NAND2-eq | ASAP7: path | NAND2-eq |
-| --- | --- | ---: | ---: | ---: | ---: |
-| columns | the tile's column datapath, 16 columns | 1.14 ns | 40,360 | 0.73 ns | 45,093 |
-| rmsnorm | the norm, two lanes, with the inverse square root | 4.41 ns | 62,057 | 2.29 ns | 98,674 |
-| conv_silu | the causal conv and SiLU, two lanes | 2.25 ns | 41,215 | 1.72 ns | 63,738 |
-| head_gates | the per-head gates | 2.13 ns | 26,626 | 1.45 ns | 44,225 |
-| delta_state8 | the int8 state engine, four lanes of a 16-row state | 22.93 ns | 120,400 | 11.26 ns | 142,290 |
-| swiglu | SwiGLU, two lanes | 4.07 ns | 25,961 | 2.50 ns | 30,031 |
-| residual | the residual add, four lanes | 2.27 ns | 17,374 | 1.50 ns | 32,638 |
-| rotary_table | the rotary table | 2.48 ns | 14,450 | 1.93 ns | 23,697 |
-| rotary | the rotation, two lanes | 5.71 ns | 34,783 | 5.00 ns | 40,280 |
-| attention | the attention core, one head of 32, two lanes | 59.62 ns | 124,334 | 33.94 ns | 142,530 |
-| index_scan | the index scan, 32 codes | 13.94 ns | 53,214 | 12.73 ns | 22,844 |
-| topk | top-K of eight | 0.71 ns | 6,840 | 0.48 ns | 7,571 |
-| record_reader | the record reader, two records of 32 | 2.42 ns | 11,815 | 3.10 ns | 12,767 |
-| kv_append | the append, one head of 32 | 52.14 ns | 162,998 | 15.52 ns | 188,354 |
-| mem_arbiter | the memory arbiter, four requesters | 0.73 ns | 1,660 | 0.45 ns | 1,476 |
-| sequencer | 64 steps, 64 buffer ids | not mapped | | not mapped | |
-
 Three things about the flow first. Reading a source file elaborates
 every module in it at its default parameters before the top is chosen,
 and the attention core at 256 wide or the state engine at 128 x 128 is
@@ -1312,82 +1293,111 @@ against 18.5 ps for this liberty on an inverter chain): the mapping
 differs, not the transistors. A 28 nm FO4 is 15 to 18 ps, so a unit's 28 nm path is
 roughly its ASAP7 number and its NanGate number times 0.8; the columns
 at 1.14 / 0.73 ns land at 0.6 to 0.9 ns, the 800 MHz clock, as the
-earlier bracket said.
+earlier bracket said. The sequencer is the one unit with no number at
+all: it runs out of memory in yosys, for a reason given at the end.
 
-None of the vector units meets that clock as written, and the reason is
-one pattern plus one artefact. The units were written for function
-against the Python model, and the fixed-point helpers of `fabric_fx.svh`
-(`fx_rnd_shr`, `fx_sat`, `fx_requant`) put a multiply, a variable shift,
-a rounding add and a saturate into one always block, which synthesis
-makes one combinational stage: a ripple through forty to eighty AOI/OAI
-levels on NanGate 45. The columns avoided exactly this (carry-save
-accumulate, the requantizer's multiply and add split over six stages),
-and the vector units need the same treatment. The artefact is unbuffered
-fanout: a flop-driven control net with hundreds or a thousand loads,
-which pre-layout STA charges at tens of nanoseconds and which
-place-and-route buffers to under a nanosecond; the three worst numbers
-in the table are mostly that. The critical stage of each, from the kept
-netlists:
+What a stage may hold is a handful of measured costs. On NanGate 45,
+post-synthesis and without wires, one 16-bit multiply is 1.36 ns, a
+rounding add with its variable shift and its saturate is 1.33 to 1.46 ns,
+a 34-bit add on its own is 0.68, a barrel shift 0.40 and a saturate 0.35.
+A multiply and a requantize in one stage are 1.8 ns and two multiplies in
+series 1.9, which is how the units were written. So the rule they follow
+now is one multiply, or one round with its shift and its saturate, to a
+stage, and the multiply is the floor until it is itself split carry-save
+the way the tile's requantizer is.
 
-* **Norm** (4.4 / 2.3 ns): the drain's last stage, `n1 * g1 * mult` then
-  the shift, round and saturate, two 16-bit multiplies in series and an
-  82-cell path. The fix is the tile's requantizer: multiply, multiply,
-  shift-and-round and saturate as separate stages, four more cycles of
-  drain latency on a unit that already takes the vector's length.
-* **State engine** (22.9 / 11.3 ns): the diff phase, where the exponent
-  `e1` selects the shift of every lane's 64-bit product and the shifted
-  value goes through the round, the subtract from v and the saturate in
-  one cycle. Of the 22.9 ns, 19 ns is three unbuffered nets from that
-  exponent bit (687, 347 and 546 loads: a flop, an inverter and a NAND
-  driving the shifters' select); the remaining 5.6 ns is the multiply,
-  the shift and a 75-level ripple. The fix is a registered one-hot shift
-  decode and the phases split into multiply, shift-and-round, and
-  subtract-and-saturate stages, and the same in the c and y phases and in
-  pass 2's `k * c` update, whose product also feeds a saturate in one
-  cycle.
-* **SwiGLU** (4.1 / 2.5 ns) and **rotary** (5.7 / 5.0 ns): the last
-  multiply-and-requantize stage in SwiGLU; in the rotary the one cycle
-  that selects the pair from the head buffer by a dynamic index, does
-  both multiplies and the rounded shift. Both are the helper pattern.
-* **Conv, gates, residual, rotary table, record reader** (2.1 to 2.5 ns
-  on NanGate, 1.5 to 3.1 on ASAP7): the conv's 64-bit accumulate into
-  the SiLU input, the residual's saturating add, the table's multiply
-  and table index, the reader's unpack; each one stage of pipelining
-  from the clock, or none at 28 nm.
-* **Attention core** (59.6 / 33.9 ns): 56 of the 59.6 ns is three
-  unbuffered nets from the output beat counter (1,282, 277 and 282
-  loads: the output stage selects the accumulators by beat); the logic
-  is 3.5 ns of the multiply-and-shift pattern. The eight-lane geometry
-  took yosys past 5 GB and the container's limit, and at 36 ns and
-  330,000 NAND2 it is also the largest unit by far for what it does: the
-  per-lane 64-bit helpers on the online-softmax update. It needs the
-  helper pattern fixed and the accumulator select turned into a shift
-  register before its number means anything.
-* **Append** (52.1 / 15.5 ns): 50 ns of the 52 is two unbuffered nets
-  (962 and 480 loads) from the beat counter's decode into the block sums'
-  enables; the logic is about 2 ns. A buffer tree, or a registered
-  decode per lane group.
-* **Index scan** (13.9 / 12.7 ns): a genuine logic-depth problem, and
-  the one unit whose ASAP7 number is no better. Each beat's 32 code
-  products are summed in a serial chain of 64-bit adds, a 374-cell
-  ripple from the query codes to the accumulator. The fix is a
-  carry-save tree over the beat's products with the resolve a cycle
-  later, or the sum over two cycles.
-* **Top-K and arbiter** (0.7 / 0.5 ns): fine as they are.
-* **Sequencer**: does not map in memory at 64 steps and 64 ids. The
-  release path indexes the 256-entry tag tables once per done port and
-  per id (40 ports x 6 ids x 256:1 muxes of 8 bits), half a million mux
-  bits before the counters. The design wants one release per cycle from
-  a small completion queue, or per-unit tag tables sized to the unit's
-  engines; either is a one-cycle change to the timing model's release
-  rule.
+The table is before and after that work. Nothing in it changed a result:
+the Python models are untouched, every unit is still bit-exact against
+them, and the 91 tests pass.
 
-The order of work is the fixed-point helpers (one change to
-`fabric_fx.svh`'s users, in the norm, SwiGLU, rotary and state engine
-first), then the index scan's adder tree, then the sequencer's release
-path; the fanout numbers are place-and-route's and want no RTL beyond a
-registered decode. All of it is bit-exact work: the Python models do not
-change, and the testbenches decide.
+| Unit | Geometry | NanGate 45 (ns) | ASAP7 (ns) | NAND2-eq |
+| --- | --- | ---: | ---: | ---: |
+| columns | the tile's column datapath, 16 columns | 1.14 | 0.73 | 40,573 |
+| rmsnorm | the norm, two lanes, with the inverse square root | 4.41 -> 1.75 | 2.29 -> 1.24 | 69,492 |
+| delta_state8 | the int8 state engine, four lanes of a 16-row state | 22.93 -> 2.12 | 11.26 -> 1.31 | 130,970 |
+| conv_silu | the causal conv and SiLU, two lanes | 2.25 | 1.72 | 41,147 |
+| head_gates | the per-head gates | 2.13 -> 2.10 | 1.45 -> 1.43 | 26,666 |
+| swiglu | SwiGLU, two lanes | 4.07 -> 1.90 | 2.50 -> 1.02 | 30,126 |
+| residual | the residual add, four lanes | 2.27 -> 2.16 | 1.50 -> 1.03 | 13,489 |
+| rotary | the rotation, two lanes | 5.71 -> 2.50 | 5.00 -> 1.54 | 29,217 |
+| rotary_table | the rotary table | 2.48 | 1.93 | 14,450 |
+| attention | the attention core, one head of 32, two lanes | 59.62 -> 11.35 | 33.94 -> 29.68 | 139,022 |
+| index_scan | the index scan, 32 codes | 13.94 -> 2.08 | 12.73 -> 2.39 | 13,522 |
+| topk | top-K of eight | 0.71 | 0.48 | 6,840 |
+| record_reader | the record reader, two records of 32 | 2.42 | 3.10 | 11,815 |
+| kv_append | the append, one head of 32 | 52.14 | 15.52 -> 15.89 | 174,028 |
+| mem_arbiter | the memory arbiter, four requesters | 0.73 -> 0.67 | 0.45 -> 0.49 | 1,752 |
+| sequencer | the token sequencer, a 64-step program memory (as logic) and 64 buffer ids | not mapped | not mapped |  |
+
+Four shapes carried the change.
+
+* **A stage per operation.** The fixed-point helpers of `fabric_fx.svh`
+  compute at 64 bits so a chain of multiplies never truncates, which is
+  right, but writing `fx_requant(a * b, mult, shift, 8)` in one clocked
+  statement asks for two multiplies, a variable shift, a rounding add and
+  a saturate between two flops. The same expressions are now cut between
+  the multiplies: the norm's drain is six stages where it was two, SwiGLU
+  nine where it was six, the rotation five where it was two, the inverse
+  square root six where it was five, the state engine's two passes four
+  stages each, and the attention core's score, value update and output
+  path are split the same way.
+* **Constants decoded once.** A requantizer's shift is a command constant
+  and the normalising shift is a vector's, so `2^(shift-1)` is decoded
+  into a register rather than into the path, and each lane takes its own
+  copy of the shift amount through `fabric_const_copy`. One flop driving
+  every lane's shifter select was 555 loads in the norm, and the state
+  engine's exponent was 2.3 ns of its 5.
+* **Trees, not chains.** The index scan summed a beat's 32 code products
+  in a chain of 64-bit adds, 374 cells deep, and the attention core summed
+  a key beat's the same way. Both are balanced trees of narrow adds now:
+  the product of two 4-bit codes needs 9 bits, not 64, and the index scan
+  lost three quarters of its area with its path. The norm's sum of squares
+  was an adder tree across the lanes feeding a 44-bit accumulate; each
+  lane keeps its own sum now and the L sums are added once per vector,
+  which costs L + 2 cycles against the vector's D/L beats.
+* **A table read by port, not by tag.** The sequencer kept each issued
+  step's buffer ids in a 256-entry table indexed by the completion tag.
+  Every done port read it, at each of the issue check's call sites: forty
+  256-to-1 muxes of the whole id set, several times over, which is why it
+  did not map at all. The ids sit per engine port now, which is known at
+  issue, so a completion reads a register.
+
+What is left is of two kinds. The logic-bound units sit between one and
+three nanoseconds on both libraries, against a floor of 1.36 on NanGate
+45 and 0.73 on ASAP7 for one multiply: the residual, the conv,
+the rotary table and the record reader each still carry a round and an
+add, or a table index and a multiply, in one stage, and are one more split
+from that floor. Going below the floor is the tile's own trick, a
+carry-save multiply with its resolve in the next stage, and it is what
+the 800 MHz placeholder needs: at 2 ns a stage the die clocks at 500 MHz,
+not 800.
+
+The other kind is not logic at all. The attention core and the append
+still report 11 and 52 ns on NanGate, and almost all of it is one flop
+driving one net: the attention core's output beat counter selects a slice
+of a 1152-bit accumulator array, 1285 loads, and the append's beat
+counter decodes into the block sums' write enables, 962. Those arrays are
+SRAM in silicon and the counter is an address; as registers they become a
+mux whose select pre-layout STA charges to a single DFF_X1 with no buffer
+tree. The numbers to read for those two are their logic depth, about 4 ns
+and 2 ns, and the flow's next step is to bring the memories in as macros
+rather than to keep contorting the RTL around them.
+
+The sequencer is a third kind: it still does not map, and the id table
+was only half the reason. What is left is the release itself. Up to
+`NU * NE` engines can report done in a cycle, each returning six consumed
+ids and two produced, and each of those decrements one entry of a
+counter array of `NID` buffers. Written as a loop that is a chain of 320
+read-modify-writes of the whole array, which yosys expands to 55,000
+cells and seven gigabytes before it is killed. Flattening it into a
+release count per id, subtracted once, is a decoder per slot and a
+popcount per id, which maps but grows with `NID` (256 in the engine) and
+is not obviously cheaper. The structure that is actually wanted bounds
+the releases per cycle, from a queue, and that changes when a dependent
+step may issue if several engines finish together, so the Python timing
+model has to change with the RTL. That is a design change with its own
+verification, not a rewrite of an expression, which is why it is the
+next item rather than part of this one.
 
 ## What is next
 
@@ -1413,8 +1423,12 @@ change, and the testbenches decide.
    PHY, the token sequencer with its layer programs and the layer engine
    that runs both layers' programs over the real units and over the HPI
    path, above. Open behind them: the simulator's traffic terms brought
-   in line with the map, and the units' pipelining that their synthesis
-   above asks for. The state traffic, the global
+   in line with the map. The units' pipelining that their synthesis asked
+   for is done, above: what is left of it is the sequencer's release
+   path, which needs the timing model changed with it, one more split in
+   the residual, the conv, the rotary table and the record reader, and
+   the memories brought in as macros so the attention core and the append
+   stop reporting their read muxes. The state traffic, the global
    layer's traffic and the stream of tokens are done, above; the next
    memory lever is the index scan's record size, which is the model's,
    and after that the device count.
