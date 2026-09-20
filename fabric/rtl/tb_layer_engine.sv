@@ -159,7 +159,87 @@ module tb_layer_engine #(
         issues = issues + 1;
     end
 
+    // Vector-buffer port demand, for the banking question.  fabric_vb has no
+    // read enable, so a unit's read ports are counted as live from the cycle
+    // it takes a command to the cycle it reports done; the writes are counted
+    // exactly, from wr_en.  cooc is the units' co-occupancy: how many cycles
+    // each pair was live together, which is the interference graph a bank
+    // colouring has to satisfy.
+    localparam int PNU = 10, PNE = 4, PNW = 19;
+    function automatic integer rd_w(input integer u);
+        case (u)
+            0: rd_w = TMAX;                               // tiles
+            1: rd_w = 2;                                  // norm: x and the gain
+            2: rd_w = 2;                                  // conv: x and the history
+            3: rd_w = 2;                                  // gates
+            5: rd_w = 2;                                  // swiglu
+            6: rd_w = 2;                                  // residual
+            default: rd_w = 1;                            // delta, rotary, attn, mem
+        endcase
+    endfunction
+    function automatic integer wr_w(input integer u);
+        wr_w = (u == 2) ? 2 : 1;                          // the conv writes y and the history
+    endfunction
+
+    reg [PNU*PNE-1:0] live = 0;
+    reg [PNU-1:0]     ulive;
+    integer rd_hist [0:63], own_hist [0:63], wr_hist [0:63];
+    integer cooc [0:PNU*PNU-1];
+    integer pstep [0:PNU*PNE-1], pfrom [0:PNU*PNE-1];       // the step each live port holds, and since when
+    integer pcyc = 0, pf, span, nissue = 0, p_i, p_j, p_e, nrd, nown, nwr;
     initial begin
+        for (p_i = 0; p_i < 64; p_i = p_i + 1) begin rd_hist[p_i] = 0; own_hist[p_i] = 0; wr_hist[p_i] = 0; end
+        for (p_i = 0; p_i < PNU*PNU; p_i = p_i + 1) cooc[p_i] = 0;
+    end
+    always @(posedge clk) if (rst_n && running) begin
+        nrd = 0; nown = 0; ulive = 0;
+        for (p_i = 0; p_i < PNU; p_i = p_i + 1)
+            for (p_e = 0; p_e < PNE; p_e = p_e + 1)
+                if (live[p_i*PNE + p_e]) begin
+                    nrd = nrd + rd_w(p_i); nown = nown + wr_w(p_i); ulive[p_i] = 1'b1;
+                end
+        nwr = 0;
+        for (p_i = 0; p_i < PNW; p_i = p_i + 1) if (dut.wr_en[p_i]) nwr = nwr + 1;
+        rd_hist[nrd] = rd_hist[nrd] + 1;
+        own_hist[nown] = own_hist[nown] + 1;
+        wr_hist[nwr] = wr_hist[nwr] + 1;
+        for (p_i = 0; p_i < PNU; p_i = p_i + 1)
+            if (ulive[p_i])
+                for (p_j = 0; p_j < PNU; p_j = p_j + 1)
+                    if (ulive[p_j]) cooc[p_i*PNU + p_j] = cooc[p_i*PNU + p_j] + 1;
+        pcyc = pcyc + 1;
+        for (p_i = 0; p_i < PNU*PNE; p_i = p_i + 1)
+            if (dut.done_valid[p_i] && live[p_i]) begin
+                live[p_i] = 1'b0;
+                $fdisplay(span, "%0d %0d %0d %0d %0d", pstep[p_i], p_i / PNE, p_i % PNE, pfrom[p_i], cycle);
+            end
+        for (p_i = 0; p_i < PNU; p_i = p_i + 1)
+            if (dut.cmd_valid[p_i] && dut.cmd_ready[p_i]) begin
+                live[p_i*PNE + dut.cmd_engine] = 1'b1;
+                pstep[p_i*PNE + dut.cmd_engine] = nissue;
+                pfrom[p_i*PNE + dut.cmd_engine] = cycle;
+                nissue = nissue + 1;
+            end
+    end
+
+    task dump_ports;
+        begin
+            pf = $fopen("ports.txt", "w");
+            $fdisplay(pf, "cycles %0d", pcyc);
+            for (p_i = 0; p_i < 64; p_i = p_i + 1)
+                if (rd_hist[p_i] || own_hist[p_i] || wr_hist[p_i])
+                    $fdisplay(pf, "hist %0d %0d %0d %0d", p_i, rd_hist[p_i], own_hist[p_i], wr_hist[p_i]);
+            for (p_i = 0; p_i < PNU; p_i = p_i + 1) begin
+                $fwrite(pf, "cooc %0d", p_i);
+                for (p_j = 0; p_j < PNU; p_j = p_j + 1) $fwrite(pf, " %0d", cooc[p_i*PNU + p_j]);
+                $fdisplay(pf, "");
+            end
+            $fclose(pf);
+        end
+    endtask
+
+    initial begin
+        span = $fopen("span.txt", "w");
         trace = $fopen("issue.txt", "w");
         repeat (4) @(posedge clk);
         rst_n = 1;
@@ -172,6 +252,8 @@ module tb_layer_engine #(
         while (!done && guard < 4000000) begin @(posedge clk); guard = guard + 1; end
         finished = done;
         $fclose(trace);
+        $fclose(span);
+        dump_ports;
         $writememh("vb_out.hex", dut.u_vb.mem);
         dump = 1; #10;
         if (!finished) $display("FAIL: never finished, %0d of %0d issued", issues, N);
