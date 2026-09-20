@@ -1407,9 +1407,10 @@ now is one multiply, or one round with its shift and its saturate, to a
 stage, and the multiply is the floor until it is itself split carry-save
 the way the tile's requantizer is.
 
-The table is before and after that work. Nothing in it changed a result:
-the Python models are untouched, every unit is still bit-exact against
-them, and the 91 tests pass.
+The table is before and after that work, with the memories as macros and
+the append's lanes (both below) folded in. Nothing in it changed a
+result: the Python models are untouched, every unit is still bit-exact
+against them, and the 105 tests pass.
 
 | Unit | Geometry | NanGate 45 (ns) | ASAP7 (ns) | NAND2-eq |
 | --- | --- | ---: | ---: | ---: |
@@ -1422,12 +1423,13 @@ them, and the 91 tests pass.
 | residual | the residual add, four lanes | 2.27 -> 2.16 | 1.50 -> 1.03 | 13,489 |
 | rotary | the rotation, two lanes | 5.71 -> 2.50 | 5.00 -> 1.54 | 29,217 |
 | rotary_table | the rotary table | 2.48 | 1.93 | 14,450 |
-| attention | the attention core, one head of 32, two lanes | 59.62 -> 11.35 | 33.94 -> 29.68 | 139,022 |
-| index_scan | the index scan, 32 codes | 13.94 -> 2.08 | 12.73 -> 2.39 | 13,522 |
+| attention | the attention core, one head of 32, two lanes | 59.62 -> 11.35 -> 2.38 | 33.94 -> 29.68 -> 1.59 | 90,389 |
+| index_scan | the index scan, 32 codes | 13.94 -> 2.08 | 12.73 -> 2.44 | 13,504 |
 | topk | top-K of eight | 0.71 | 0.48 | 6,840 |
 | record_reader | the record reader, two records of 32 | 2.42 | 3.10 | 11,815 |
-| kv_append | the append, one head of 32 | 52.14 | 15.52 -> 15.89 | 174,028 |
+| kv_append | the append, one head of 32 | 52.14 -> 25.35 -> 4.36 | 15.52 -> 15.39 -> 3.41 | 75,780 |
 | mem_arbiter | the memory arbiter, four requesters | 0.73 -> 0.67 | 0.45 -> 0.49 | 1,752 |
+| vector_buffer | the buffer's crossbar, 24 reads and 19 writes over eight banks | 7.88 | 12.60 | 407,082 |
 | sequencer | the token sequencer, a 64-step program memory (as logic) and 64 buffer ids | not mapped | not mapped |  |
 
 Four shapes carried the change.
@@ -1473,16 +1475,54 @@ carry-save multiply with its resolve in the next stage, and it is what
 the 800 MHz placeholder needs: at 2 ns a stage the die clocks at 500 MHz,
 not 800.
 
-The other kind is not logic at all. The attention core and the append
-still report 11 and 52 ns on NanGate, and almost all of it is one flop
-driving one net: the attention core's output beat counter selects a slice
-of a 1152-bit accumulator array, 1285 loads, and the append's beat
-counter decodes into the block sums' write enables, 962. Those arrays are
-SRAM in silicon and the counter is an address; as registers they become a
+The other kind was not logic at all. The attention core and the append
+reported 11 and 52 ns on NanGate, and almost all of it was one flop
+driving one net: the attention core's output beat counter selected a
+slice of a 1152-bit accumulator array, 1285 loads, and the append's beat
+counter decoded into the block sums' write enables, 962. Those arrays are
+SRAM in silicon and the counter is an address; as registers they became a
 mux whose select pre-layout STA charges to a single DFF_X1 with no buffer
-tree. The numbers to read for those two are their logic depth, about 4 ns
-and 2 ns, and the flow's next step is to bring the memories in as macros
-rather than to keep contorting the RTL around them.
+tree. So they are memories now -- `fabric_sram`, a blackbox to synthesis,
+with `fabric.sram` writing the liberty that gives the timing tools their
+access and setup times. The attention core's scores, gates and output
+accumulators, the append's window and index records and its block sums,
+and the vector buffer's banks are all instances of it. The attention core
+went to 2.38 ns and 1.59, and its area from 139,022 NAND2-eq to 90,389
+with the macros' own 896 counted in; the macro paths, 0.4 ns in and 2.1
+out, are shorter than the logic path that is left, so the number is the
+logic's.
+
+The append did not follow, and the reason was its own. At 25 ns it was
+still ten times the units around it, and the report with fanout said
+where: three nets of 525 to 755 loads, nineteen of the twenty-one
+nanoseconds in them. The append packed a whole beat of the index record
+in one cycle -- `CPB` codes, each a multiply by the record's one
+reciprocal and a variable shift by its one exponent -- and built that
+packer twice, because the first beat and the rest were written as two
+calls. Narrowing the arithmetic from the 64-bit helpers to the widths
+the values need (an int8 plus a byte is ten bits, fifteen of that is
+fourteen, that by a 16-bit reciprocal is thirty) took it to 21.0 ns;
+building each packer once, to 19.3; copying the shared values per group
+of lanes, nothing at all, because each copy still fed four lanes of
+32-bit barrel shifter. What fixed it was lanes, which is what every other
+vector unit here has: `LI` codes a cycle into the beat being held, the
+write side waiting on the packing rather than on the memory request.
+That costs `CPB / LI` cycles a beat -- tens over a token of two hundred
+thousand -- and the unit is 4.36 ns and 3.41, its area 75,780 NAND2-eq
+against 231,267. The path that is left is a real one: forty stages of
+multiply, round and clip, no net over 142 loads.
+
+The vector buffer's crossbar is now measured too, at 7.9 ns on NanGate
+and 12.6 on ASAP7 for 24 read and 19 write ports over eight banks. That
+is the port face as wired, not as asked for -- the measurement below says
+five reads and two writes -- so it is an upper bound on an upper bound,
+and it is the number to beat when the adapters' ports are cut to what the
+engine uses. It had never synthesized at all before: the crossbar's index
+expressions were multiplies by a 32-bit integer, a couple of hundred of
+them, and yosys spends about a quarter of a minute of SAT solving on each
+one looking for resource sharing before the machine runs out of memory.
+Flattening a bank's slots at a power-of-two stride makes every one of
+them a shift and a concatenation instead.
 
 The sequencer is a third kind: it still does not map, and the id table
 was only half the reason. What is left is the release itself. Up to
@@ -1602,15 +1642,16 @@ share, measured.
    that runs both layers' programs over the real units and over the HPI
    path, above. Open behind them: the simulator's traffic terms brought
    in line with the map. The units' pipelining that their synthesis asked
-   for is done, above: what is left of it is the sequencer's release
-   path, which needs the timing model changed with it, one more split in
-   the residual, the conv, the rotary table and the record reader, and
-   the memories brought in as macros so the attention core and the append
-   stop reporting their read muxes. The vector buffer is the other
-   module with no implementation, and it is now measured: four to seven
-   1R1W banks carry every program measured, against 24 read and 19 write
-   ports wired, so the bank falls out of a colouring in `engine.Layout`
-   and the read ports gain the enable a bank needs. The state traffic, the global
+   for is done, above, and so are the memories as macros and the append's
+   lanes: what is left of it is the sequencer's release path, which needs
+   the timing model changed with it, and one more split in the residual,
+   the conv, the rotary table and the record reader. The vector buffer is
+   the other module with no implementation, and it is now measured and
+   banked: four to seven 1R1W banks carry every program measured, against
+   24 read and 19 write ports wired, so the bank falls out of a colouring
+   in `engine.Layout` and the read ports have the enable a bank needs.
+   Its crossbar synthesizes at 7.9 ns for the port face as wired, which
+   is the number cutting the adapters' ports has to beat. The state traffic, the global
    layer's traffic and the stream of tokens are done, above; the next
    memory lever is the index scan's record size, which is the model's,
    and after that the device count.
