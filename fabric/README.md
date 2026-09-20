@@ -1399,6 +1399,83 @@ model has to change with the RTL. That is a design change with its own
 verification, not a rewrite of an expression, which is why it is the
 next item rather than part of this one.
 
+## What the vector buffer's ports are really asked for
+
+`fabric_vb` is the one module in the engine with no implementation. It is
+a flat byte array with `NR` read and `NW` write ports, 24 and 19 at
+`TMAX` of one, each moving 16 bytes at any byte address; at the 9B
+geometry the array is 312 KB. A 312 KB memory with 24 read and 19 write
+ports is not something anyone builds, so what stands there is a
+stand-in, and the question is what it has to become. The port face was
+sized by construction — every adapter got its own ports, and they were
+counted up — so the first thing to know is how many of them a cycle
+actually wants.
+
+`tb_layer_engine` measures it. The writes are exact, from `wr_en`. The
+reads are not: `fabric_vb` has no read enable, so every read port reads
+every cycle and nothing in the RTL says which reads matter. A port is
+therefore counted live from the cycle its unit takes a command to the
+cycle it reports done, which is an upper bound — a unit in a compute
+phase holds ports it is not reading through. The same instrumentation
+writes `span.txt`, every command's real issue and done cycle, so the
+buffers' interference can be built from the engine's own timeline rather
+than from the timing model's schedule, which the engine does not follow.
+
+Two things about the engine had to be got right for the spans to be.
+A unit drops `busy` on the cycle it writes its last beat and reports
+`done` the cycle after, so the controller can hand a port its next
+command before the previous one's completion arrives: a port's commands
+are a queue, not one at a time, and tracking one lost the earlier of
+each such pair. And a step names every buffer it consumes, but a
+one-port unit reads them in turn — the state engine takes its slot, its
+unit vector, the conv output and the gates through a single port — so
+those four cannot collide with each other and must not be edged as if
+they could.
+
+| Program | Cycles | Reads live: peak / median / 99th | Writes: peak | Banks |
+| --- | ---: | ---: | ---: | ---: |
+| 9B recurrent token | 227,255 | 5 / 1 / 3 | 2 | 4 |
+| tiny recurrent token | 1,568 | 5 / 1 / 5 | 2 | 4 |
+| tiny recurrent chunk of 3 | 3,165 | 5 / 2 / 5 | 2 | 7 |
+| tiny recurrent, 2 contexts | 2,131 | 6 / 2 / 6 | 2 | 7 |
+| tiny global token | 1,814 | 4 / 1 / 4 | 2 | 4 |
+| tiny global, 2 contexts | 2,486 | 5 / 2 / 5 | 3 | 6 |
+
+Against 24 read ports and 19 write ports wired. At the real geometry the
+engine asks for at most five of the twenty-four, two of the nineteen,
+and two or fewer reads in 98 percent of its cycles. The last column is a
+greedy colouring of the buffers by the interference the spans show: two
+buffers need different banks if commands that overlap can read them at
+once, or write them at once, and reads and writes to one bank are free
+because a bank is 1R1W. Four banks hold the full-size token's 70
+buffers; the widest shape measured, a chunk of three or a stream of two
+on the tiny geometry, wants seven. The floor under those — the most
+buffers any cycle could touch at once — is three to five, so the greedy
+answer is at or near the optimum and the graph is not adversarial.
+
+Both numbers are upper bounds, in the same direction. A command's ports
+are counted live for its whole span, and two buffers are edged if their
+commands overlap at all, even by a cycle and even if each unit reads its
+buffer in a phase the other is not in. The real demand is lower than
+this, and the measurement is still an order of magnitude under the port
+face.
+
+So the buffer wants to be a handful of 1R1W banks with the bank chosen
+at compile time in `engine.Layout`, which the machine allows because it
+is statically scheduled: the colouring is a property of the program, not
+of an arbiter, and a program that will not colour is a compile error
+rather than a stall. One thing has to be added with the banks. A bank
+cannot serve a read it was not asked for, so the read ports need an
+enable, which today they do not have — and adding it is also what would
+let the reads be measured rather than bounded.
+
+The same run says where the token's time goes, which is not the vector
+units. Of the 9B recurrent token's 227,247 running cycles the memory
+port holds a command for 139,821, the four state engines for 67,520 and
+the tile array for 18,220; the norm, conv, gates, SwiGLU and residual
+together for under 9,000. That is the timing model's 67 percent memory
+share, measured.
+
 ## What is next
 
 1. Detailed routing and a multi-corner pass of the OpenROAD flow above, a
@@ -1428,7 +1505,11 @@ next item rather than part of this one.
    path, which needs the timing model changed with it, one more split in
    the residual, the conv, the rotary table and the record reader, and
    the memories brought in as macros so the attention core and the append
-   stop reporting their read muxes. The state traffic, the global
+   stop reporting their read muxes. The vector buffer is the other
+   module with no implementation, and it is now measured: four to seven
+   1R1W banks carry every program measured, against 24 read and 19 write
+   ports wired, so the bank falls out of a colouring in `engine.Layout`
+   and the read ports gain the enable a bank needs. The state traffic, the global
    layer's traffic and the stream of tokens are done, above; the next
    memory lever is the index scan's record size, which is the model's,
    and after that the device count.
