@@ -259,6 +259,7 @@ def synthesize(liberty: Path | Sequence[Path], *, rows: int = 256, cols: int = 8
             abc_cmd,
             "opt_clean",
             "write_verilog -noattr netlist.v",
+            "write_json design.json",          # the blackbox memories' ports, for fabric.sram
             f"stat {lib_args}",
         ]) + "\n"
         (work / "synth.ys").write_text(script, encoding="utf-8")
@@ -277,6 +278,8 @@ def synthesize(liberty: Path | Sequence[Path], *, rows: int = 256, cols: int = 8
             raise RuntimeError(f"yosys failed:\n{result.stderr[-4000:]}\n{log[-4000:]}")
         if keep_netlist and (work / "netlist.v").exists():
             shutil.copy(work / "netlist.v", keep_netlist)
+        if keep_netlist and (work / "design.json").exists():
+            shutil.copy(work / "design.json", Path(keep_netlist).with_suffix(".json"))
     cells, area, flops = parse_stat(log)
     delays = re.findall(r"Delay\s*=\s*([0-9.]+)\s*ps", log)   # ABC stime, after buffering
     delay = float(delays[-1]) if delays else None
