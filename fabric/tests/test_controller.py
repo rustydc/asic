@@ -152,5 +152,39 @@ class ControllerTest(unittest.TestCase):
         self.assertEqual(len(ctl.generated(b)), 3)
 
 
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
+
+RTL = Path(__file__).parents[1] / "rtl"
+SOURCES = [RTL / name for name in ("fabric_vector.sv", "fabric_controller.sv")]
+
+
+@unittest.skipUnless(shutil.which("iverilog") and shutil.which("vvp"), "iverilog not installed")
+class ControllerRtlTest(unittest.TestCase):
+    """The gateware's arithmetic against the model: the sampler draws the same
+    token from the same lists and word, the CRC is zlib's."""
+
+    def check(self, top: str, emit) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            params = emit(work)
+            args = [f"-P{top}.{name}={value}" for name, value in params.items()]
+            subprocess.run(["iverilog", "-g2012", "-I", str(RTL), "-s", top, "-o", "sim.vvp", *args,
+                            *map(str, SOURCES), str(RTL / f"{top}.sv")], cwd=work, check=True, capture_output=True, text=True)
+            result = subprocess.run(["vvp", "sim.vvp"], cwd=work, check=True, capture_output=True, text=True)
+        self.assertIn("PASS", result.stdout, result.stdout)
+
+    def test_sampler(self) -> None:
+        rng = np.random.default_rng(30)
+        self.check("tb_sampler", lambda d: C.emit_sampler_vectors(d, rng, 32, 40))
+        self.check("tb_sampler", lambda d: C.emit_sampler_vectors(d, rng, 8, 30))
+
+    def test_crc32(self) -> None:
+        rng = np.random.default_rng(31)
+        self.check("tb_crc32", lambda d: C.emit_crc_vectors(d, rng, 24))
+
+
 if __name__ == "__main__":
     unittest.main()

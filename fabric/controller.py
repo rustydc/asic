@@ -445,3 +445,82 @@ class Controller:
     def generated(self, cid: int) -> list[int]:
         ctx = self.contexts[cid]
         return ctx.tokens[ctx.prompt_len:]
+
+
+# --------------------------------------------------------------------------
+# Vectors for the gateware's testbenches
+# --------------------------------------------------------------------------
+
+def _write_params(directory, **params) -> dict:
+    import json
+    (directory / "params.json").write_text(json.dumps(params, indent=2), encoding="utf-8")
+    return params
+
+
+def emit_sampler_vectors(directory, rng: np.random.Generator, k: int, cases: int) -> dict:
+    """``cases`` items for tb_sampler: two lists each, the parameters and the
+    random word, and the token and index the model draws."""
+    from pathlib import Path
+    from fabric import layer as L
+    from fabric.tile import write_hex
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    L.write_luts(directory)
+    lists0, lists1, params, expected = [], [], [], []
+    for c in range(cases):
+        vocab = 2 * k * 4
+        logits = to_fixed(rng.standard_normal(vocab) * rng.uniform(0.5, 6.0))
+        if c % 3 == 1:
+            logits[3] = logits[7]                                   # a tie across the halves' order
+        half = vocab // 2
+        n0, n1 = (k, k) if c % 4 else (rng.integers(1, k + 1), rng.integers(1, k + 1))
+        l0, l1 = head_list(0, logits[:half], int(n0), 0), head_list(1, logits[half:], int(n1), half)
+        temperature = float(np.exp(rng.uniform(np.log(0.2), np.log(4.0))))     # warm enough that the draw matters
+        p = SamplingParams(int(round((1 << FF) / temperature)), int(rng.integers(1, 2 * k + 1)),
+                           0xFFFF if c % 2 else int(rng.integers(1000, 0xFFFF)))
+        rnd = int(rng.integers(0, 1 << 32))
+        rows, merged, _ = merge_lists([l0, l1])
+        token, index = sample(rows, merged, p, rnd)
+        lists0.append(l0)
+        lists1.append(l1)
+        params.append((p, rnd))
+        expected.append((token, index))
+    # Entries as 64-bit words: row in the high half, logit low; a list padded to K with a count word first.
+    def words(hl):
+        out = [len(hl.rows)]
+        for i in range(k):
+            r = int(hl.rows[i]) if i < len(hl.rows) else 0
+            l = int(hl.logits[i]) & 0xFFFFFFFF if i < len(hl.rows) else 0
+            out.append((r << 32) | l)
+        return out
+    write_hex(directory / "list0.hex", [w for hl in lists0 for w in words(hl)], 64)
+    write_hex(directory / "list1.hex", [w for hl in lists1 for w in words(hl)], 64)
+    write_hex(directory / "params.hex", [(p.inv_t << 48) | (p.top_k << 40) | (p.top_p << 24) | 0 for p, _ in params], 64)
+    write_hex(directory / "rnd.hex", [r for _, r in params], 32)
+    write_hex(directory / "expected.hex", [(t << 8) | i for t, i in expected], 40)
+    return _write_params(directory, K=k, CASES=cases)
+
+
+def emit_crc_vectors(directory, rng: np.random.Generator, cases: int) -> dict:
+    """Packets of random items through the CRC: the words, the byte counts,
+    the model's CRC."""
+    from pathlib import Path
+    from fabric.tile import write_hex
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    words, lengths, expected, d = [], [], [], 8
+    for c in range(cases):
+        hidden = rng.integers(-32768, 32767, size=d).astype(np.int16)
+        packet = pack_item(WorkItem(c, c * 7, hidden, c & 7))
+        if c % 2:
+            packet = append_head_list(packet, HeadList(1, np.arange(c % 5 + 1, dtype=np.uint32),
+                                                       rng.integers(-1000, 1000, size=c % 5 + 1).astype(np.int32), c))
+        body = packet[:12] + packet[16:]                            # the CRC is over everything but itself
+        lengths.append(len(body))
+        padded = body + bytes(-len(body) % 4)
+        words += [int.from_bytes(padded[i:i + 4], "little") for i in range(0, len(padded), 4)]
+        expected.append(crc32(body))
+    write_hex(directory / "words.hex", words, 32)
+    write_hex(directory / "lengths.hex", lengths, 16)
+    write_hex(directory / "expected.hex", expected, 32)
+    return _write_params(directory, CASES=cases, WORDS=len(words))
