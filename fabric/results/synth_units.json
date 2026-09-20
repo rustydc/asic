@@ -1680,5 +1680,47 @@
       "AO22x1_ASAP7_75t_R",
       "DFFHQNx1_ASAP7_75t_R"
     ]
+  },
+  {
+    "unit": "kv_append",
+    "library": "nangate45",
+    "top": "fabric_kv_append",
+    "params": {
+      "HD": 32,
+      "NKV": 1,
+      "IDIM": 32,
+      "BS": 4,
+      "W": 16,
+      "KV_BITS": 4
+    },
+    "note": "the append, one head of 32",
+    "cells": 107443,
+    "flops": 4741,
+    "area_um2": 138874.344,
+    "abc_delay_ps": null,
+    "target_ps": 1600,
+    "seconds": 1797.3448958396912,
+    "nand2_equiv": 174028.0,
+    "critical_path_ps": 52139.0,
+    "worst_slack_ps": -50600.16,
+    "max_frequency_mhz": 19.15702940374129,
+    "startpoint": "_211243_",
+    "endpoint": "_211269_",
+    "path_cells": [
+      "ideal",
+      "DFFR_X1",
+      "DFFR_X1",
+      "INV_X1",
+      "NOR4_X1",
+      "NAND2_X1",
+      "NOR2_X1",
+      "OAI22_X1",
+      "NOR4_X1",
+      "NAND2_X1",
+      "AOI21_X1",
+      "OAI21_X1",
+      "OAI21_X1",
+      "DFFR_X1"
+    ]
   }
 ]
