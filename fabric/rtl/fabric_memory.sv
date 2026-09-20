@@ -782,6 +782,18 @@ module fabric_kv_append #(
     wire [5:0]  rc_lz;
     fabric_recip #(.LW(9), .LUT_DIR(LUT_DIR)) u_rc (.clk(clk), .start(rc_start), .l({scale, 1'b0}), .done(rc_done), .r(rc_r), .lz_out(rc_lz));
 
+    // The index record's codes are packed LI a cycle, not a beat a cycle.  A
+    // whole beat was CPB multiplies and CPB variable shifts in one cycle off
+    // one reciprocal, one scale and one shift: nineteen of the append's
+    // twenty-one nanoseconds were three nets of five hundred-odd loads driven
+    // by minimum-size cells, which is what a value read by every lane comes
+    // to.  Lanes are what every other vector unit here has, and they cost
+    // LSTEPS cycles a beat -- tens over a token of two hundred thousand.
+    localparam int LI     = (CPB > 4) ? 4 : CPB;          // codes packed a cycle
+    localparam int LSTEPS = (CPB + LI - 1) / LI;          // cycles a beat
+    reg        ipack;                                     // a beat is being packed
+    reg [7:0]  lane;
+
     localparam [3:0] S_IDLE = 0, S_WIN = 1, S_WIN_DATA = 2, S_BLK = 3, S_BLK_DATA = 4, S_NORM_IN = 5, S_NORM_OUT = 6,
                      S_SCALE = 7, S_CODES = 8, S_IREC = 9, S_IREC_DATA = 10, S_DONE = 11;
     reg [3:0]  state;
@@ -789,7 +801,7 @@ module fabric_kv_append #(
     reg [7:0]  beat;
     reg [7:0]  nbeat;
     wire       block_end = (pos[LOG_BS-1:0] == BS - 1);
-    assign wdata_valid = (state == S_WIN_DATA) || (state == S_BLK_DATA) || (state == S_IREC_DATA);
+    assign wdata_valid = (state == S_WIN_DATA) || (state == S_BLK_DATA) || (state == S_IREC_DATA && !ipack);
     assign wdata       = (state == S_BLK_DATA) ? blk_rdata : wb_q;
 
     function automatic [DW-1:0] rec_beat(input [NKV*HD*8-1:0] kr, input [NKV*HD*8-1:0] vr,
@@ -801,26 +813,26 @@ module fabric_kv_append #(
     // reciprocal is thirty.  Written through the 64-bit helpers it was CPB
     // lanes of a 64 by 64 multiply, twice over, in one cycle -- the same
     // mistake the index scan's chain of 64-bit adds was.
-    function automatic [DW-1:0] idx_beat(input integer bt);
-        integer e, sh;
+    function automatic [LI*4-1:0] idx_lanes(input integer bt, input integer ln);
+        integer e, idx, sh;
         reg signed [9:0]  a;
         reg signed [13:0] b;
         reg signed [31:0] q;
         begin
-            idx_beat = 0;
+            idx_lanes = 0;
             sh = 24 - rc_lz;                      // the round is written out: synthesis will not take
-            if (bt == CB) idx_beat[7:0] = scale;  // fx_rnd_shr's variable shift through a nested call
-            else
-                for (e = 0; e < CPB; e = e + 1)
-                    if (bt * CPB + e < IDIM) begin
-                        a = $signed(unit[(bt*CPB + e)*8 +: 8]) + $signed({2'b0, scale});
-                        b = 14'sd15 * a;
-                        q = $signed(b) * $signed({1'b0, rc_r});
-                        if (sh > 0) q = (q + (32'sd1 <<< (sh - 1))) >>> sh;
-                        if (q < 0) q = 0;
-                        if (q > 15) q = 15;
-                        idx_beat[e*4 +: 4] = q[3:0];
-                    end
+            for (e = 0; e < LI; e = e + 1) begin  // fx_rnd_shr's variable shift through a nested call
+                idx = bt * CPB + ln * LI + e;
+                if (idx < IDIM) begin
+                    a = $signed(unit[idx*8 +: 8]) + $signed({2'b0, scale});
+                    b = 14'sd15 * a;
+                    q = $signed(b) * $signed({1'b0, rc_r});
+                    if (sh > 0) q = (q + (32'sd1 <<< (sh - 1))) >>> sh;
+                    if (q < 0) q = 0;
+                    if (q > 15) q = 15;
+                    idx_lanes[e*4 +: 4] = q[3:0];
+                end
+            end
         end
     endfunction
 
@@ -833,13 +845,20 @@ module fabric_kv_append #(
         if (state == S_BLK) blk_raddr = head * REC_BEATS;
     end
 
-    // The beat to write, formed the cycle before it is wanted.
+    // The beat to write, formed the cycle before it is wanted.  Which beat
+    // that is is a wire, so each packer is built once: written as a call at
+    // the first beat and another at the rest, the index packer was two arrays
+    // of CPB multipliers, and everything they share -- the reciprocal, the
+    // shift, the scale -- was driving twice the gates it needed to.
+    wire [31:0] wb_beat = (state == S_WIN) ? 32'd0 : beat + 1;
     always @(posedge clk) begin
-        if (state == S_WIN)              wb_q <= rec_beat(k_r, v_r, head, 0);
-        if (state == S_CODES && rc_done) wb_q <= idx_beat(0);
-        if (!req_valid && wdata_ready) begin
-            if (state == S_WIN_DATA)  wb_q <= rec_beat(k_r, v_r, head, beat + 1);
-            if (state == S_IREC_DATA) wb_q <= idx_beat(beat + 1);
+        if (state == S_WIN || (state == S_WIN_DATA && !req_valid && wdata_ready))
+            wb_q <= rec_beat(k_r, v_r, head, wb_beat);
+        if (ipack) begin
+            // The last beat of an index record is the scale, and is one lane's
+            // work; the rest are LI codes at a time into the beat being held.
+            if (beat == CB) wb_q <= {{(DW-8){1'b0}}, scale};
+            else wb_q[lane*LI*4 +: LI*4] <= idx_lanes(beat, lane);
         end
     end
 
@@ -847,7 +866,7 @@ module fabric_kv_append #(
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             state <= S_IDLE; head <= 0; beat <= 0; nbeat <= 0; req_valid <= 1'b0; done <= 1'b0;
-            nv_in <= 1'b0; rc_start <= 1'b0;
+            nv_in <= 1'b0; rc_start <= 1'b0; ipack <= 1'b0; lane <= 0;
         end else begin
             done <= 1'b0;
             nv_in <= 1'b0;
@@ -920,18 +939,25 @@ module fabric_kv_append #(
                 end
                 S_CODES: if (rc_done) begin
                     // code = clip(round(15 (u + scale) * r >> (24 - lz)), 0, 15),
-                    // a beat of them at a time (see idx_beat).
+                    // LI of them at a time (see idx_lanes).  The request goes
+                    // out while the first beat is still being packed: the data
+                    // side waits on ipack, not on the request.
                     req_addr <= index_base + (pos_r / BS) * IREC_BYTES;
                     beats_r <= IREC_BEATS;
                     req_valid <= 1'b1;
                     beat <= 0;
+                    ipack <= 1'b1; lane <= 0;
                     state <= S_IREC_DATA;
                 end
                 S_IREC_DATA: begin
                     if (req_valid && req_ready) req_valid <= 1'b0;
-                    if (!req_valid && wdata_ready) begin
+                    if (ipack) begin
+                        lane <= lane + 1'b1;
+                        if (lane == LSTEPS - 1 || beat == CB) begin ipack <= 1'b0; lane <= 0; end
+                    end else if (!req_valid && wdata_ready) begin
                         beat <= beat + 1'b1;
                         if (beat == IREC_BEATS - 1) state <= S_DONE;
+                        else begin ipack <= 1'b1; lane <= 0; end
                     end
                 end
                 S_DONE: begin done <= 1'b1; state <= S_IDLE; end
