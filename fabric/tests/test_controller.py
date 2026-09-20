@@ -158,7 +158,8 @@ import tempfile
 from pathlib import Path
 
 RTL = Path(__file__).parents[1] / "rtl"
-SOURCES = [RTL / name for name in ("fabric_vector.sv", "fabric_controller.sv", "fabric_ring.sv")]
+SOURCES = [RTL / name for name in ("fabric_vector.sv", "fabric_controller.sv", "fabric_ring.sv",
+                                   "fabric_controller_top.sv")]
 
 
 @unittest.skipUnless(shutil.which("iverilog") and shutil.which("vvp"), "iverilog not installed")
@@ -189,6 +190,13 @@ class ControllerRtlTest(unittest.TestCase):
         rng = np.random.default_rng(32)
         self.check("tb_ring", lambda d: C.emit_ring_vectors(d, rng, 12))
         self.check("tb_ring", lambda d: C.emit_ring_vectors(d, rng, 9, d=32))
+
+    def test_datapath_end_to_end(self) -> None:
+        """A request in, the model's packet out, the reply's lists back, the
+        model's token drawn for the slot it belongs to."""
+        rng = np.random.default_rng(33)
+        self.check("tb_controller_top", lambda d: C.emit_top_vectors(d, rng, 8))
+        self.check("tb_controller_top", lambda d: C.emit_top_vectors(d, rng, 6, d=16, k=16))
 
 
 if __name__ == "__main__":

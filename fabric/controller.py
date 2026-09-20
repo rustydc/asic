@@ -558,3 +558,51 @@ def emit_ring_vectors(directory, rng: np.random.Generator, cases: int, d: int = 
     write_hex(directory / "payload.hex", payloads, 32)
     write_hex(directory / "packet.hex", packets, 32)
     return _write_params(directory, CASES=cases, PWORDS=len(payloads), KWORDS=len(packets))
+
+
+def emit_top_vectors(directory, rng: np.random.Generator, cases: int, d: int = 8, k: int = 8) -> dict:
+    """Requests for tb_controller_top: an embedding table, the requests the
+    soft side makes, the packets the model says go out, the replies that come
+    back with the head dies' lists, and the tokens the model draws."""
+    from pathlib import Path
+    from fabric import layer as L
+    from fabric.tile import write_hex
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    L.write_luts(directory)
+    vocab = 64
+    table = EmbeddingTable(rng.integers(-3000, 3000, size=(vocab, d)).astype(np.int16))
+    reqs, outs, reps, tokens, rep_counts = [], [], [], [], []
+    for c in range(cases):
+        token = int(rng.integers(0, vocab))
+        slot = int(rng.integers(0, 1 << 12))
+        position = int(rng.integers(0, 1 << 16))
+        temperature = float(np.exp(rng.uniform(np.log(0.3), np.log(3.0))))
+        p = SamplingParams(int(round((1 << FF) / temperature)), int(rng.integers(1, 2 * k + 1)),
+                           0xFFFF if c % 2 else int(rng.integers(2000, 0xFFFF)))
+        rnd = int(rng.integers(0, 1 << 32))
+        # What goes out: the token's row, at the request's slot and position.
+        item = WorkItem(slot, position, table.lookup(token), FLAG_SAMPLE)
+        outs += [int.from_bytes(pack_item(item)[i:i + 4], "little") for i in range(0, len(pack_item(item)), 4)]
+        # What comes back: some other hidden vector, and the two dies' lists.
+        logits = to_fixed(rng.standard_normal(2 * k * 4) * rng.uniform(0.5, 4.0))
+        half = len(logits) // 2
+        lists = [head_list(0, logits[:half], k, 0), head_list(1, logits[half:], k, half)]
+        reply = pack_item(WorkItem(slot, position, rng.integers(-1000, 1000, size=d).astype(np.int16), FLAG_SAMPLE), lists)
+        reps += [int.from_bytes(reply[i:i + 4], "little") for i in range(0, len(reply), 4)]
+        rep_counts.append(len(reply) // 4)
+        rows, merged, _ = merge_lists(lists)
+        row, index = sample(rows, merged, p, rnd)
+        reqs.append((slot, position, token, p, rnd))
+        tokens.append((row, index, slot))
+    write_hex(directory / "emb.hex", [int(np.uint16(v)) | (int(np.uint16(w)) << 16)
+                                      for row in table.rows for v, w in zip(row[0::2], row[1::2])], 32)
+    write_hex(directory / "req.hex",
+              [(slot) | (pos << 16) | (tok << 48) | (p.inv_t << 56) | (p.top_k << 72) | (p.top_p << 80) | (rnd << 96)
+               for slot, pos, tok, p, rnd in reqs], 128)
+    write_hex(directory / "out.hex", outs, 32)
+    write_hex(directory / "reply.hex", reps, 32)
+    write_hex(directory / "rcount.hex", rep_counts, 16)
+    write_hex(directory / "token.hex", [(row << 24) | (index << 16) | slot for row, index, slot in tokens], 64)
+    return _write_params(directory, D=d, K=k, CASES=cases, EWORDS=vocab * d // 2,
+                         OWORDS=len(outs), RWORDS=len(reps))
