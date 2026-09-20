@@ -39,20 +39,23 @@ module tb_kv_append #(
     reg [31:0]         pos = 0;
     reg [NKV*HD*8-1:0] k_rows = 0, v_rows = 0;
     reg [IDIM*8-1:0]   idx_k = 0;
-    reg [NKV*HD*16-1:0] sk_in = 0, sv_in = 0;               // the running sums, handed back token to token
-    reg [IDIM*16-1:0]   si_in = 0;
-    wire [NKV*HD*16-1:0] sk_out, sv_out;
-    wire [IDIM*16-1:0]   si_out;
+    // The running sums, moved a beat at a time as the engine's memory unit
+    // moves them: streamed in before a token, read back after it.
+    reg [127:0]  sums [0:SUMS_BEATS-1];
+    reg          s_in_valid = 0;
+    reg [15:0]   s_in_addr = 0, s_out_addr = 0;
+    reg [127:0]  s_in_data = 0;
+    wire [127:0] s_out_data;
     wire               done;
     fabric_kv_append #(.DW(DW), .HD(HD), .NKV(NKV), .IDIM(IDIM), .BS(BS), .KV_BITS(KV_BITS), .W(W)) dut (
         .clk(clk), .rst_n(rst_n), .start(start), .pos(pos), .window_base(WINDOW_BASE[31:0]), .block_base(BLOCK_BASE[31:0]),
         .index_base(INDEX_BASE[31:0]), .k_rows(k_rows), .v_rows(v_rows), .idx_k(idx_k),
-        .sum_k_in(sk_in), .sum_v_in(sv_in), .sum_i_in(si_in), .sum_k_out(sk_out), .sum_v_out(sv_out), .sum_i_out(si_out), .done(done),
+        .s_in_valid(s_in_valid), .s_in_addr(s_in_addr), .s_in_data(s_in_data),
+        .s_out_addr(s_out_addr), .s_out_data(s_out_data), .done(done),
         .req_valid(req_valid), .req_ready(req_ready), .req_addr(req_addr), .req_beats(req_beats),
         .wdata_valid(wdata_valid), .wdata_ready(wdata_ready), .wdata(wdata));
 
     integer t, i, errors, guard;
-    reg [SUMS_BEATS*128-1:0] sums_rec;
     reg seen_done = 0;
     always @(posedge clk) if (done) seen_done <= 1;
 
@@ -62,24 +65,35 @@ module tb_kv_append #(
         $readmemh("idx.hex", im);
         $readmemh("expected_mem.hex", expected);
         for (i = 0; i < WORDS; i = i + 1) mem.mem[i] = 0;
+        for (i = 0; i < SUMS_BEATS; i = i + 1) sums[i] = 0;
         errors = 0;
         repeat (2) @(posedge clk);
         rst_n = 1;
         for (t = 0; t < TOKENS; t = t + 1) begin
             @(negedge clk);
-            sk_in = sk_out; sv_in = sv_out; si_in = si_out;
-            start = 1; pos = t; k_rows = km[t]; v_rows = vm[t]; idx_k = im[t];
+            pos = t; k_rows = km[t]; v_rows = vm[t]; idx_k = im[t];
+            for (i = 0; i < SUMS_BEATS; i = i + 1) begin   // the sums in, a beat a cycle
+                s_in_valid = 1; s_in_addr = i; s_in_data = sums[i];
+                @(negedge clk);
+            end
+            s_in_valid = 0;
+            start = 1;
             seen_done = 0;
             @(negedge clk);
             start = 0;
             guard = 0;
             while (!seen_done && guard < 4000) begin @(posedge clk); #1; guard = guard + 1; end
             if (!seen_done) begin $display("FAIL: token %0d never done", t); $finish; end
+            for (i = 0; i < SUMS_BEATS; i = i + 1) begin   // and back out, a beat behind its address
+                s_out_addr = i;
+                @(posedge clk);                           // the memory takes the address
+                @(negedge clk);                           // and answers
+                sums[i] = s_out_data;
+            end
         end
         repeat (4) @(posedge clk);
         // The running sums go back to the context's record, as the engine's memory unit does.
-        sums_rec = {si_out, sv_out, sk_out};
-        for (i = 0; i < SUMS_BEATS; i = i + 1) mem.mem[SUMS_BASE / 16 + i] = sums_rec[i*128 +: 128];
+        for (i = 0; i < SUMS_BEATS; i = i + 1) mem.mem[SUMS_BASE / 16 + i] = sums[i];
         for (i = 0; i < WORDS; i = i + 1)
             if (mem.mem[i] !== expected[i]) begin
                 errors = errors + 1;

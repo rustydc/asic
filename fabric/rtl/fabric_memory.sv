@@ -578,12 +578,15 @@ module fabric_kv_append #(
     input  wire [NKV*HD*8-1:0] k_rows,
     input  wire [NKV*HD*8-1:0] v_rows,
     input  wire [IDIM*8-1:0]   idx_k,
-    input  wire [NKV*HD*16-1:0] sum_k_in,
-    input  wire [NKV*HD*16-1:0] sum_v_in,
-    input  wire [IDIM*16-1:0]  sum_i_in,
-    output wire [NKV*HD*16-1:0] sum_k_out,
-    output wire [NKV*HD*16-1:0] sum_v_out,
-    output wire [IDIM*16-1:0]  sum_i_out,
+    // The block sums are a memory here, and they arrive and leave as the DMA
+    // moves them: a beat in as it reads one, a beat out as it writes one back.
+    // What this replaces was the whole vector on wires, 35 kbit at the 9B
+    // geometry, with every element updated and averaged in one cycle.
+    input  wire                s_in_valid,
+    input  wire [15:0]         s_in_addr,
+    input  wire [DW-1:0]       s_in_data,
+    input  wire [15:0]         s_out_addr,
+    output wire [DW-1:0]       s_out_data,
     output reg                 done,
     output reg                 req_valid,
     input  wire                req_ready,
@@ -610,19 +613,15 @@ module fabric_kv_append #(
     reg [NKV*HD*8-1:0]  k_r, v_r;
     reg [IDIM*8-1:0]    idx_r;
     reg [31:0]          pos_r;
-    reg signed [SUMW-1:0] sum_k [0:NKV*HD-1];
-    reg signed [SUMW-1:0] sum_v [0:NKV*HD-1];
-    reg signed [SUMW-1:0] sum_i [0:IDIM-1];
-    genvar gs;
-    generate
-        for (gs = 0; gs < NKV*HD; gs = gs + 1) begin : g_sk
-            assign sum_k_out[gs*16 +: 16] = {{(16-SUMW){sum_k[gs][SUMW-1]}}, sum_k[gs]};
-            assign sum_v_out[gs*16 +: 16] = {{(16-SUMW){sum_v[gs][SUMW-1]}}, sum_v[gs]};
-        end
-        for (gs = 0; gs < IDIM; gs = gs + 1) begin : g_si
-            assign sum_i_out[gs*16 +: 16] = {{(16-SUMW){sum_i[gs][SUMW-1]}}, sum_i[gs]};
-        end
-    endgenerate
+    localparam int SPB    = DW / 16;                    // sums to a beat
+    localparam int NKSUM  = NKV * HD;                   // the keys' sums, then the values', then the index's
+    localparam int NSUM   = 2 * NKSUM + IDIM;
+    localparam int SBEATS = (NSUM + SPB - 1) / SPB;
+    localparam int BLKW   = NKV * REC_BEATS;            // the block record, a beat to a word
+    localparam int IBARW  = (IDIM + NL - 1) / NL;
+    localparam int SAW    = (SBEATS > 1) ? $clog2(SBEATS) : 1;
+    localparam int BAW    = (BLKW > 1) ? $clog2(BLKW) : 1;
+    localparam int IAW    = (IBARW > 1) ? $clog2(IBARW) : 1;
 
     // The record being written: packed key and value halves of one head.
     // A record is emitted a beat at a time, so only the beat is held: what
@@ -667,15 +666,95 @@ module fabric_kv_append #(
     end
     wire [8:0] unit_absmax = (mtree[MLV][0] > 9'd1) ? mtree[MLV][0] : 9'd1;
 
-    // Block means and index mean as int8 rows.
-    reg [NKV*HD*8-1:0] kbar, vbar;
-    reg [IDIM*8-1:0]   ibar;
+    // The block sums, and the means taken from them.
+    //
+    // A beat of the sums arrives as the DMA reads it: eight sums, and the
+    // eight rows that belong with them are added there and then, so the
+    // update that was NKV*HD adders in one cycle is eight.  A beat lies
+    // wholly inside one of the three regions and, in the first two, inside
+    // one head and one record beat, because HD and NKV*HD are multiples of
+    // eight -- so the means it yields go straight into the block record beat
+    // they belong to, and kbar and vbar never exist.
+    wire [SAW-1:0]  s_rd_addr = s_out_addr[SAW-1:0];
+    wire [DW-1:0]   s_rd_data;
+    reg  [DW-1:0]   s_wr_data;
+    assign s_out_data = block_end ? {DW{1'b0}} : s_rd_data;   // a closed block starts again at zero
+    fabric_sram #(.W(DW), .D(SBEATS), .MB(DW)) u_sums (
+        .clk(clk), .rd_en(1'b1), .rd_addr(s_rd_addr), .rd_data(s_rd_data),
+        .wr_en(s_in_valid), .wr_addr(s_in_addr[SAW-1:0]), .wr_data(s_wr_data), .wr_mask(1'b1));
+
+    reg  [BAW-1:0]  blk_raddr;
+    wire [DW-1:0]   blk_rdata;
+    reg  [DW-1:0]   blk_next;
+    reg  [EPB-1:0]  blk_mask;                           // the codes this beat owns
+    reg  [BAW-1:0]  nidx;
+    wire            blk_we;
+    fabric_sram #(.W(DW), .D(BLKW), .NRD(1), .NWR(1), .MB(KV_BITS)) u_blk (
+        .clk(clk), .rd_en(1'b1), .rd_addr(blk_raddr), .rd_data(blk_rdata),
+        .wr_en(blk_we), .wr_addr(nidx), .wr_data(blk_next), .wr_mask(blk_mask));
+
+    reg  [IAW-1:0]  ibar_raddr;
+    wire [NL*8-1:0] ibar_rdata;
+    reg  [NL*8-1:0] ibar_next;
+    reg  [IAW-1:0]  iidx;
+    wire            ibar_we;
+    fabric_sram #(.W(NL*8), .D(IBARW), .MB(NL*8)) u_ibar (
+        .clk(clk), .rd_en(1'b1), .rd_addr(ibar_raddr), .rd_data(ibar_rdata),
+        .wr_en(ibar_we), .wr_addr(iidx), .wr_data(ibar_next), .wr_mask(1'b1));
+
+    // One arriving beat: the eight sums updated, and if the block closes here,
+    // their means in the shape the record wants them.
+    integer se;
+    reg signed [63:0] sacc, smean;
+    integer sflat, sflat0, srow, shead, swithin, spos;
+    always @* begin
+        // A beat lies wholly in one region, and in the first two wholly in one
+        // head and one record beat, so its word is known before the elements.
+        sflat0 = s_in_addr * SPB;
+        if (sflat0 < NKSUM)
+            nidx = (sflat0 / HD) * REC_BEATS + (sflat0 % HD) / EPB;
+        else if (sflat0 < 2*NKSUM)
+            nidx = ((sflat0 - NKSUM) / HD) * REC_BEATS + HALF_BEATS + ((sflat0 - NKSUM) % HD) / EPB;
+        else
+            nidx = 0;
+        blk_next = 0;
+        blk_mask = 0;
+        ibar_next = 0;
+        iidx = 0;
+        for (se = 0; se < SPB; se = se + 1) begin
+            sflat = sflat0 + se;
+            srow = 0;
+            if (sflat < NKSUM)        srow = $signed(k_rows[sflat*8 +: 8]);
+            else if (sflat < 2*NKSUM) srow = $signed(v_rows[(sflat - NKSUM)*8 +: 8]);
+            else if (sflat < NSUM)    srow = $signed(idx_k[(sflat - 2*NKSUM)*8 +: 8]);
+            sacc = $signed(s_in_data[se*16 +: SUMW]) + srow;
+            s_wr_data[se*16 +: 16] = {{(16-SUMW){sacc[SUMW-1]}}, sacc[SUMW-1:0]};
+            smean = fx_rnd_shr($signed({{(64-SUMW){sacc[SUMW-1]}}, sacc[SUMW-1:0]}), LOG_BS);
+            if (sflat < 2*NKSUM) begin
+                swithin = (sflat < NKSUM) ? (sflat % HD) : ((sflat - NKSUM) % HD);
+                spos    = swithin % EPB;
+                blk_mask[spos] = 1'b1;                 // a beat owns SPB of the word's codes
+                if (KV_BITS == 8) blk_next[spos*8 +: 8] = smean[7:0];
+                else begin
+                    smean = fx_sat(fx_rnd_shr($signed({{56{smean[7]}}, smean[7:0]}), 4), 4);
+                    blk_next[spos*4 +: 4] = smean[3:0];
+                end
+            end else if (sflat < NSUM) begin
+                ibar_next[(sflat - 2*NKSUM) % NL * 8 +: 8] = smean[7:0];
+                iidx = (sflat - 2*NKSUM) / NL;
+            end
+        end
+    end
+    assign blk_we  = s_in_valid && block_end && (s_in_addr * SPB < 2*NKSUM);
+    assign ibar_we = s_in_valid && block_end && (s_in_addr * SPB >= 2*NKSUM) && (s_in_addr * SPB < NSUM);
+
+
     integer j;
     reg signed [63:0] t;
 
     // Index unit vector: the norm unit over the mean, then codes.
     reg             nv_in;
-    reg [NL*8-1:0]  n_x;
+    wire [NL*8-1:0] n_x = ibar_rdata;
     wire            nv_out;
     wire [NL*8-1:0] n_y;
     fabric_rmsnorm #(.D(IDIM), .XW(8), .OW(8), .L(NL), .SW(SW), .LUT_DIR(LUT_DIR)) u_norm (
@@ -695,9 +774,9 @@ module fabric_kv_append #(
     reg [3:0]  head;
     reg [7:0]  beat;
     reg [7:0]  nbeat;
-    reg        block_end;
+    wire       block_end = (pos[LOG_BS-1:0] == BS - 1);
     assign wdata_valid = (state == S_WIN_DATA) || (state == S_BLK_DATA) || (state == S_IREC_DATA);
-    assign wdata       = wb_q;
+    assign wdata       = (state == S_BLK_DATA) ? blk_rdata : wb_q;
 
     function automatic [DW-1:0] rec_beat(input [NKV*HD*8-1:0] kr, input [NKV*HD*8-1:0] vr,
                                          input integer hd, input integer bt);
@@ -722,14 +801,21 @@ module fabric_kv_append #(
         end
     endfunction
 
+    // The block record is read from the memory the means went into, and the
+    // index means from theirs, each addressed a cycle before it is wanted.
+    always @* begin
+        blk_raddr  = head * REC_BEATS + beat;
+        ibar_raddr = nbeat[IAW-1:0];
+        if (state == S_BLK_DATA && !req_valid && wdata_ready) blk_raddr = head * REC_BEATS + beat + 1;
+        if (state == S_BLK) blk_raddr = head * REC_BEATS;
+    end
+
     // The beat to write, formed the cycle before it is wanted.
     always @(posedge clk) begin
         if (state == S_WIN)              wb_q <= rec_beat(k_r, v_r, head, 0);
-        if (state == S_BLK)              wb_q <= rec_beat(kbar, vbar, head, 0);
         if (state == S_CODES && rc_done) wb_q <= idx_beat(0);
         if (!req_valid && wdata_ready) begin
             if (state == S_WIN_DATA)  wb_q <= rec_beat(k_r, v_r, head, beat + 1);
-            if (state == S_BLK_DATA)  wb_q <= rec_beat(kbar, vbar, head, beat + 1);
             if (state == S_IREC_DATA) wb_q <= idx_beat(beat + 1);
         end
     end
@@ -738,9 +824,7 @@ module fabric_kv_append #(
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             state <= S_IDLE; head <= 0; beat <= 0; nbeat <= 0; req_valid <= 1'b0; done <= 1'b0;
-            nv_in <= 1'b0; rc_start <= 1'b0; block_end <= 1'b0;
-            for (j = 0; j < NKV*HD; j = j + 1) begin sum_k[j] = 0; sum_v[j] = 0; end
-            for (j = 0; j < IDIM; j = j + 1) sum_i[j] = 0;
+            nv_in <= 1'b0; rc_start <= 1'b0;
         end else begin
             done <= 1'b0;
             nv_in <= 1'b0;
@@ -748,12 +832,6 @@ module fabric_kv_append #(
             case (state)
                 S_IDLE: if (start) begin
                     k_r <= k_rows; v_r <= v_rows; idx_r <= idx_k; pos_r <= pos;
-                    for (j = 0; j < NKV*HD; j = j + 1) begin
-                        sum_k[j] = $signed(sum_k_in[j*16 +: SUMW]) + $signed(k_rows[j*8 +: 8]);
-                        sum_v[j] = $signed(sum_v_in[j*16 +: SUMW]) + $signed(v_rows[j*8 +: 8]);
-                    end
-                    for (j = 0; j < IDIM; j = j + 1) sum_i[j] = $signed(sum_i_in[j*16 +: SUMW]) + $signed(idx_k[j*8 +: 8]);
-                    block_end <= (pos[LOG_BS-1:0] == BS - 1);
                     head <= 0;
                     state <= S_WIN;
                 end
@@ -772,19 +850,9 @@ module fabric_kv_append #(
                         if (beat == REC_BEATS - 1) begin
                             if (head == NKV - 1) begin
                                 head <= 0;
-                                if (block_end) begin
-                                    // Means of the block.
-                                    for (j = 0; j < NKV*HD; j = j + 1) begin
-                                        t = fx_rnd_shr(sum_k[j], LOG_BS); kbar[j*8 +: 8] <= t[7:0];
-                                        t = fx_rnd_shr(sum_v[j], LOG_BS); vbar[j*8 +: 8] <= t[7:0];
-                                        sum_k[j] = 0; sum_v[j] = 0;
-                                    end
-                                    for (j = 0; j < IDIM; j = j + 1) begin
-                                        t = fx_rnd_shr(sum_i[j], LOG_BS); ibar[j*8 +: 8] <= t[7:0];
-                                        sum_i[j] = 0;
-                                    end
-                                    state <= S_BLK;
-                                end else state <= S_DONE;
+                                // The means were taken as the sums arrived.
+                                if (block_end) state <= S_BLK;
+                                else state <= S_DONE;
                             end else begin
                                 head <= head + 1'b1;
                                 state <= S_WIN;
@@ -810,8 +878,7 @@ module fabric_kv_append #(
                     end
                 end
                 S_NORM_IN: begin
-                    nv_in <= 1'b1;
-                    n_x <= ibar[nbeat*NL*8 +: NL*8];
+                    nv_in <= 1'b1;                        // n_x is the memory's answer to nbeat
                     nbeat <= nbeat + 1'b1;
                     if (nbeat == IDIM / NL - 1) begin nbeat <= 0; state <= S_NORM_OUT; end
                 end

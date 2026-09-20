@@ -1320,31 +1320,31 @@ module fabric_mem_unit #(
     reg [31:0]   mv_maddr;
     reg [AW-1:0] mv_vaddr;
     reg [11:0]   mv_n, mv_i;
-    reg [SUMS_BEATS*128-1:0] sums_vec;
-    wire [SUMS_BEATS*128-1:0] sums_out_vec;
     assign r_req_valid[0]   = mv_req;
     assign r_req_write[0]   = (mv_mode == MV_WR_VB) || (mv_mode == MV_WR_REG);
     assign r_req_addr[0*32 +: 32]  = mv_maddr;
     assign r_req_beats[0*12 +: 12] = mv_n;
     assign r_wdata_valid[0] = mv_present;
-    assign r_wdata[0*DW +: DW] = (mv_mode == MV_WR_REG) ? sums_out_vec[mv_i*128 +: 128] : rd_data;
+    assign r_wdata[0*DW +: DW] = (mv_mode == MV_WR_REG) ? ap_s_out_data : rd_data;
 
     // Requester 1, the append.
     reg [NKV*HD*8-1:0] k_r, v_r;
     reg [IDIM*8-1:0]   idx_r, u_r;
     reg                ap_start;
     wire               ap_done;
-    wire [NKV*HD*16-1:0] sum_k_out, sum_v_out;
-    wire [IDIM*16-1:0]   sum_i_out;
+    // The sums move a beat at a time between the memory and the append's own
+    // memory: the mover reads one, the append adds the rows to it and keeps
+    // it; the mover writes one back, and the append hands it over.
+    wire        ap_s_in_valid = mv_busy && (mv_mode == MV_RD_REG) && r_rdata_valid[0];
+    wire [DW-1:0] ap_s_out_data;
     fabric_kv_append #(.DW(DW), .HD(HD), .NKV(NKV), .IDIM(IDIM), .BS(BS), .KV_BITS(KV_BITS), .W(W), .LUT_DIR(LUT_DIR)) u_append (
         .clk(clk), .rst_n(rst_n), .start(ap_start), .pos(pos), .window_base(ctx_base + WINDOW_OFF), .block_base(ctx_base + BLOCK_OFF),
         .index_base(ctx_base + INDEX_OFF), .k_rows(k_r), .v_rows(v_r), .idx_k(idx_r),
-        .sum_k_in(sums_vec[0 +: NKV*HD*16]), .sum_v_in(sums_vec[NKV*HD*16 +: NKV*HD*16]), .sum_i_in(sums_vec[2*NKV*HD*16 +: IDIM*16]),
-        .sum_k_out(sum_k_out), .sum_v_out(sum_v_out), .sum_i_out(sum_i_out), .done(ap_done),
+        .s_in_valid(ap_s_in_valid), .s_in_addr({{(16-$clog2(SUMS_BEATS+1)){1'b0}}, mv_i[$clog2(SUMS_BEATS+1)-1:0]}), .s_in_data(r_rdata),
+        .s_out_addr({{(16-$clog2(SUMS_BEATS+1)){1'b0}}, mv_i[$clog2(SUMS_BEATS+1)-1:0]}), .s_out_data(ap_s_out_data), .done(ap_done),
         .req_valid(r_req_valid[1]), .req_ready(r_req_ready[1]), .req_addr(r_req_addr[1*32 +: 32]), .req_beats(r_req_beats[1*12 +: 12]),
         .wdata_valid(r_wdata_valid[1]), .wdata_ready(r_wdata_ready[1]), .wdata(r_wdata[1*DW +: DW]));
     assign r_req_write[1] = 1'b1;
-    assign sums_out_vec = {{(SUMS_BEATS*128-SUMS_BITS){1'b0}}, sum_i_out, sum_v_out, sum_k_out};
 
     // Requester 2, the index scan with its top-K.
     reg              sc_start, tk_clear, tk_finish, sc_done_d;
@@ -1468,8 +1468,7 @@ module fabric_mem_unit #(
                         if (mv_i == mv_n - 1) begin mv_busy <= 1'b0; mv_done <= 1'b1; end
                     end
                     MV_RD_REG: if (r_rdata_valid[0]) begin
-                        sums_vec[mv_i*128 +: 128] <= r_rdata;
-                        mv_i <= mv_i + 1'b1;
+                        mv_i <= mv_i + 1'b1;             // the append takes the beat; see ap_s_in_valid
                         if (mv_i == mv_n - 1) begin mv_busy <= 1'b0; mv_done <= 1'b1; end
                     end
                     MV_WR_VB: begin
