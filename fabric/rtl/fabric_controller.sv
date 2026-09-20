@@ -175,9 +175,23 @@ module fabric_crc32 (
                     c = (c >> 1) ^ (32'hEDB88320 & {32{c[0]}});
             end
     end
+    // clear and a word in the same cycle: the word is taken, from the fresh
+    // state, which is what a receiver framing on sop needs.
+    reg [31:0] base;
+    reg [31:0] cc;
+    always @* begin
+        base = clear ? 32'hFFFFFFFF : state;
+        cc = base;
+        for (b = 0; b < 4; b = b + 1)
+            if (b < bytes) begin
+                cc = cc ^ {24'd0, data[b*8 +: 8]};
+                for (i = 0; i < 8; i = i + 1)
+                    cc = (cc >> 1) ^ (32'hEDB88320 & {32{cc[0]}});
+            end
+    end
     always @(posedge clk) begin
-        if (clear) state <= 32'hFFFFFFFF;
-        else if (valid) state <= c;
+        if (clear && !valid) state <= 32'hFFFFFFFF;
+        else if (clear || valid) state <= cc;
     end
     assign crc = ~state;
 endmodule

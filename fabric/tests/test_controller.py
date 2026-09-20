@@ -29,7 +29,7 @@ class PacketTest(unittest.TestCase):
         hidden = rng.integers(-32768, 32767, size=16).astype(np.int16)
         item = C.WorkItem(3, 77, hidden, C.FLAG_SAMPLE | C.FLAG_FIRST)
         packet = C.pack_item(item)
-        self.assertEqual(len(packet), C.HEADER_BYTES + 32)
+        self.assertEqual(len(packet), C.HEADER_BYTES + 32 + C.TRAILER_BYTES)
         back, lists = C.unpack_item(packet, 16)
         self.assertEqual((back.context, back.position, back.flags), (3, 77, item.flags))
         self.assertTrue(np.array_equal(back.hidden, hidden.astype(np.int64)))
@@ -52,7 +52,7 @@ class PacketTest(unittest.TestCase):
         self.assertEqual(lists[1].lse, -5)
         self.assertTrue(np.array_equal(lists[1].rows, l1.rows))
         self.assertTrue(np.array_equal(lists[0].logits, l0.logits))
-        self.assertEqual(len(packet), C.HEADER_BYTES + 32 + 2 * C.LIST_HEADER.size + 5 * C.ENTRY.size)
+        self.assertEqual(len(packet), C.HEADER_BYTES + 32 + 2 * C.LIST_HEADER.size + 5 * C.ENTRY.size + C.TRAILER_BYTES)
 
 
 class MergeTest(unittest.TestCase):
@@ -158,7 +158,7 @@ import tempfile
 from pathlib import Path
 
 RTL = Path(__file__).parents[1] / "rtl"
-SOURCES = [RTL / name for name in ("fabric_vector.sv", "fabric_controller.sv")]
+SOURCES = [RTL / name for name in ("fabric_vector.sv", "fabric_controller.sv", "fabric_ring.sv")]
 
 
 @unittest.skipUnless(shutil.which("iverilog") and shutil.which("vvp"), "iverilog not installed")
@@ -184,6 +184,11 @@ class ControllerRtlTest(unittest.TestCase):
     def test_crc32(self) -> None:
         rng = np.random.default_rng(31)
         self.check("tb_crc32", lambda d: C.emit_crc_vectors(d, rng, 24))
+
+    def test_ring_link(self) -> None:
+        rng = np.random.default_rng(32)
+        self.check("tb_ring", lambda d: C.emit_ring_vectors(d, rng, 12))
+        self.check("tb_ring", lambda d: C.emit_ring_vectors(d, rng, 9, d=32))
 
 
 if __name__ == "__main__":

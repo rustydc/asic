@@ -50,8 +50,12 @@ from fabric.layer import FF, exp_neg_fixed
 # --------------------------------------------------------------------------
 
 KIND_ITEM = 0x57                 # a work item
-HEADER = struct.Struct("<BBHIHHI")   # kind, flags, context, position, length, reserved, crc
-HEADER_BYTES = HEADER.size      # 16, the simulator's packet_overhead_bytes
+# The CRC is a trailer, not a header field, because the link is a stream: a
+# head die appending its list, and the sender of a packet whose payload is
+# 8 KB, would both have to hold the whole thing to fill a header CRC in.
+HEADER = struct.Struct("<BBHIHH")    # kind, flags, context, position, length, reserved
+HEADER_BYTES = HEADER.size      # 12; with the 4-byte trailer, 16 of overhead
+TRAILER_BYTES = 4
 FLAG_SAMPLE = 0x01               # the controller wants a token from this item
 FLAG_FIRST  = 0x02               # first token of a new context in this slot: zero the state
 FLAG_LAST   = 0x04               # the context is done after this item: the slot may be reused
@@ -91,9 +95,8 @@ def pack_item(item: WorkItem, lists: Sequence[HeadList] = ()) -> bytes:
     hidden = np.asarray(item.hidden, dtype="<i2").tobytes()
     tail = b"".join(pack_head_list(hl) for hl in lists)
     payload = hidden + tail
-    head = HEADER.pack(KIND_ITEM, item.flags, item.context, item.position, len(payload), 0, 0)
-    crc = crc32(head[:12] + payload)
-    return head[:12] + struct.pack("<I", crc) + payload
+    head = HEADER.pack(KIND_ITEM, item.flags, item.context, item.position, len(payload), 0)
+    return head + payload + struct.pack("<I", crc32(head + payload))
 
 
 def pack_head_list(hl: HeadList) -> bytes:
@@ -104,19 +107,20 @@ def pack_head_list(hl: HeadList) -> bytes:
 def append_head_list(packet: bytes, hl: HeadList) -> bytes:
     """What a head die does to a passing item: its list on the end, the length
     and the CRC brought up to date, nothing else touched."""
-    kind, flags, context, position, length, _, _ = HEADER.unpack(packet[:HEADER_BYTES])
+    kind, flags, context, position, length, _ = HEADER.unpack(packet[:HEADER_BYTES])
     payload = packet[HEADER_BYTES:HEADER_BYTES + length] + pack_head_list(hl)
-    head = HEADER.pack(kind, flags, context, position, len(payload), 0, 0)
-    return head[:12] + struct.pack("<I", crc32(head[:12] + payload)) + payload
+    head = HEADER.pack(kind, flags, context, position, len(payload), 0)
+    return head + payload + struct.pack("<I", crc32(head + payload))
 
 
 def unpack_item(packet: bytes, d: int) -> tuple[WorkItem, list[HeadList]]:
     """The item and its lists, or a ValueError if the CRC does not hold."""
-    kind, flags, context, position, length, _, crc = HEADER.unpack(packet[:HEADER_BYTES])
+    kind, flags, context, position, length, _ = HEADER.unpack(packet[:HEADER_BYTES])
     payload = packet[HEADER_BYTES:HEADER_BYTES + length]
     if kind != KIND_ITEM:
         raise ValueError(f"not a work item: kind {kind:#x}")
-    if crc32(packet[:12] + payload) != crc:
+    crc, = struct.unpack("<I", packet[HEADER_BYTES + length:HEADER_BYTES + length + TRAILER_BYTES])
+    if crc32(packet[:HEADER_BYTES + length]) != crc:
         raise ValueError("CRC mismatch")
     hidden = np.frombuffer(payload[:2 * d], dtype="<i2").astype(np.int64)
     lists, at = [], 2 * d
@@ -515,7 +519,7 @@ def emit_crc_vectors(directory, rng: np.random.Generator, cases: int) -> dict:
         if c % 2:
             packet = append_head_list(packet, HeadList(1, np.arange(c % 5 + 1, dtype=np.uint32),
                                                        rng.integers(-1000, 1000, size=c % 5 + 1).astype(np.int32), c))
-        body = packet[:12] + packet[16:]                            # the CRC is over everything but itself
+        body = packet[:-TRAILER_BYTES]                              # the CRC is over everything before it
         lengths.append(len(body))
         padded = body + bytes(-len(body) % 4)
         words += [int.from_bytes(padded[i:i + 4], "little") for i in range(0, len(padded), 4)]
@@ -524,3 +528,33 @@ def emit_crc_vectors(directory, rng: np.random.Generator, cases: int) -> dict:
     write_hex(directory / "lengths.hex", lengths, 16)
     write_hex(directory / "expected.hex", expected, 32)
     return _write_params(directory, CASES=cases, WORDS=len(words))
+
+
+def emit_ring_vectors(directory, rng: np.random.Generator, cases: int, d: int = 8) -> dict:
+    """Packets for tb_ring: the header fields and payload words a sender is
+    given, and the words the model says the link carries."""
+    from pathlib import Path
+    from fabric.tile import write_hex
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    heads, payloads, packets, counts = [], [], [], []
+    for c in range(cases):
+        hidden = rng.integers(-32768, 32767, size=d).astype(np.int16)
+        flags = int(rng.integers(0, 8))
+        item = WorkItem(int(rng.integers(0, 1 << 16)), int(rng.integers(0, 1 << 20)), hidden, flags)
+        lists = []
+        for die in range(int(rng.integers(0, 3))):
+            n = int(rng.integers(1, 5))
+            lists.append(HeadList(die, rng.integers(0, 1 << 20, size=n).astype(np.uint32),
+                                  rng.integers(-5000, 5000, size=n).astype(np.int32), int(rng.integers(-1000, 1000))))
+        packet = pack_item(item, lists)
+        payload = packet[HEADER_BYTES:-TRAILER_BYTES]
+        heads.append((KIND_ITEM, flags, item.context, item.position, len(payload)))
+        payloads += [int.from_bytes(payload[i:i + 4], "little") for i in range(0, len(payload), 4)]
+        packets += [int.from_bytes(packet[i:i + 4], "little") for i in range(0, len(packet), 4)]
+        counts.append(len(payload) // 4)
+    write_hex(directory / "hdr.hex",
+              [(k) | (f << 8) | (ctx << 16) | (pos << 32) | (ln << 64) for k, f, ctx, pos, ln in heads], 80)
+    write_hex(directory / "payload.hex", payloads, 32)
+    write_hex(directory / "packet.hex", packets, 32)
+    return _write_params(directory, CASES=cases, PWORDS=len(payloads), KWORDS=len(packets))
