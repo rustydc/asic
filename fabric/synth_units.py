@@ -38,6 +38,14 @@ class Unit:
     params: dict
     note: str
     luts: bool = False
+    files: tuple[tuple[str, str], ...] = ()      # (name, contents) written next to the sources
+
+
+def _program_image(depth: int = 64, seed: int = 1) -> str:
+    """A program memory of random words, so the sequencer's ROM stays a ROM (an empty one is optimized away)."""
+    import random
+    rng = random.Random(seed)
+    return "\n".join(f"{rng.getrandbits(256):064x}" for _ in range(depth)) + "\n"
 
 
 UNITS = [
@@ -64,7 +72,7 @@ UNITS = [
          {"HD": 32, "NKV": 1, "IDIM": 32, "BS": 4, "W": 16, "KV_BITS": 4}, "the append, one head of 32", luts=True),
     Unit("mem_arbiter", "fabric_mem_arbiter", ("fabric_memory.sv", "fabric_norm.sv") + VEC, {"N": 4}, "the memory arbiter, four requesters", luts=True),
     Unit("sequencer", "fabric_sequencer", ("fabric_sequencer.sv",), {"NU": 10, "NE": 4, "DEPTH": 64, "NID": 64},
-         "the token sequencer, a 64-step program memory"),
+         "the token sequencer, a 64-step program memory (as logic) and 64 buffer ids", files=(("program.hex", _program_image()),)),
 ]
 
 
@@ -84,6 +92,9 @@ def run_unit(unit: Unit, lib_name: str, liberty: Path, target_ps: int, sta: Path
         if unit.luts:
             L.write_luts(work)
             data = sorted(work.glob("lut_*.hex"))
+        for name, contents in unit.files:
+            (work / name).write_text(contents)
+            data.append(work / name)
         netlist = (keep / f"{unit.name}_{lib_name}.v") if keep else (work / "netlist.v")
         try:
             synth = synthesize(liberty, top=unit.top, target_ps=target_ps, keep_netlist=netlist,
