@@ -1182,6 +1182,71 @@ at the end of the context; a larger chunk moves the recurrent layer no
 further, the passes being a fifth of it, and the next lever is the
 vector units' lanes.
 
+## The controller
+
+The appliance is a ring of dies behind one FPGA, and the FPGA is a part of
+the product rather than a stage of its development: it terminates PCIe,
+turns a token into the hidden vector that enters the ring, decides which
+context's token goes next, takes the two head dies' lists off the item
+that comes back and draws the next token from them, and keeps the table of
+which context holds which slot of the dies' memories. `controller.py` is
+its model, in the way `sequencer.py` is the token sequencer's, and
+`rtl/fabric_controller.sv` is the part of it that is arithmetic, checked
+against the model bit for bit. The rest -- the scheduler, the slot table,
+the host protocol -- is the FPGA's soft side, and the model is its
+specification.
+
+Three contracts are fixed here that the dies must honour, because they are
+the ring's protocol and not the controller's alone.
+
+* **The packet.** A 16-byte header (kind, flags, the slot, the position, a
+  length, a CRC-32), then the hidden vector as int16 at the residual scale
+  `s_h`, 8 KB for the 9B, then whatever the head dies have appended. A
+  layer die replaces the vector; a head die appends its list and brings
+  the length and the CRC up to date; nothing else on the item is touched.
+* **The head list.** K rows and their logits as signed fixed point of ten
+  fraction bits, in descending order, and the log-sum-exp of the die's
+  whole half of the vocabulary in the same format. The rows are global.
+  Two such lists are one distribution: the union is the global top, and
+  `logaddexp` of the two log-sum-exps is the whole vocabulary's, so a
+  sampled token carries a true log-probability, not one renormalised over
+  the candidates. At K = 32 a list is 264 bytes and two are within the
+  simulator's `head_result_bytes`.
+* **FIRST.** The flag on the first token of a context in a slot another
+  context had. It tells a layer die to start that slot's state from zero
+  rather than from what the slot holds, which is the one thing the
+  controller cannot do from outside the die. The die's sequencer owes a
+  program for it.
+
+The sampler is integer arithmetic on the exponential table the attention
+core already uses, so one LUT serves both. The candidates are weighted by
+`exp(-(max - l) / T)` with `T` carried as its reciprocal in F16, the
+shortest prefix holding `top_p` of the mass is kept, and the draw is
+`(word * total) >> 32` against the cumulative weights: defined on the
+random word rather than on a distribution, so the gateware's generator and
+the model give the same token for the same word. `fabric_sampler` does
+exactly that in about `2K + 2 top_k` cycles from the last entry to the
+token, against the simulator's 500-cycle allowance, and seventy cases at
+two geometries -- warm and cold, with ties, with partial lists, with top-p
+on half -- draw the row and the index the model draws.
+
+The embedding table is the DDR4 behind the FPGA: `vocab x hidden x 2`
+bytes, 2.03 GB for the 9B, one row a lookup. The slot table gives a
+context its own slot if it has one, a free one if any, else the least
+recently used slot whose holder is not in flight, and reports the
+eviction; an evicted context that has more to say starts over from its
+first token with FIRST set, which is the host's to avoid by sizing the
+resident set and the table's to report. The scheduler is round robin over
+the contexts with a token to send, one item into the ring whenever its
+first die is free, so every die works on a different context's token and
+one conversation sees the ring's latency. A prompt goes in a token at a
+time; only the last one's lists are drawn from.
+
+What the controller model does not yet cover: the ring link's framing
+below the packet (the source-synchronous words, the ready/valid, the
+retry on a CRC failure), the management SPI that loads the dies'
+constants, the host's PCIe queue format, and the die's side of FIRST.
+
 ## RTL
 
 `rtl/fabric_tile.sv` is the synthesizable tile with the ROM as a constant
