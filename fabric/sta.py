@@ -23,6 +23,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Sequence
 
+from fabric import sram
+
 
 @dataclass
 class StaResult:
@@ -44,10 +46,9 @@ def run_sta(sta: Path, liberties: Sequence[Path], netlist: Path, *, top: str = "
     netlist = Path(netlist).resolve()
     with tempfile.TemporaryDirectory() as directory:
         work = Path(directory)
-        # OpenSTA's Verilog reader does not accept `wire signed`; yosys emits it for signed nets.
-        cleaned = work / "netlist.v"
-        cleaned.write_text(netlist.read_text(encoding="utf-8").replace("wire signed ", "wire "), encoding="utf-8")
-        netlist = cleaned
+        # OpenSTA's Verilog reader does not accept `wire signed`, which yosys emits
+        # for signed nets, nor the escaped names it gives a parameterised blackbox.
+        netlist = sram.clean_netlist(netlist, work / "netlist.v")
         # The SDC is read after set_cmd_units, so these values are picoseconds.
         io_delay = period_ps * io_delay_frac
         sdc = "\n".join([

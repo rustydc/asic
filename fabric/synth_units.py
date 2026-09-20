@@ -25,6 +25,7 @@ from pathlib import Path
 
 from fabric import layer as L
 from fabric.sta import run_sta
+from fabric import sram
 from fabric.synth import RTL_DIR, nand2_area, synthesize
 
 VEC = ("fabric_sram.sv", "fabric_vector.sv")
@@ -110,9 +111,22 @@ def run_unit(unit: Unit, lib_name: str, liberty: Path, target_ps: int, sta: Path
         nand2 = nand2_area(liberty)
         if nand2:
             out["nand2_equiv"] = synth.area_um2 / nand2
+        # The memories are blackboxes to synthesis; the timing tools get a liberty
+        # for the ones this design has, so their address and data paths are timed.
+        macros, libs = [], [liberty]
+        design = Path(netlist).with_suffix(".json")
+        if design.exists() and lib_name in sram.PROCESSES:
+            macros = sram.macros_from_json(design)
+            if macros:
+                process = sram.PROCESSES[lib_name]
+                libs.append(sram.write_liberty(macros, process, work / "sram.lib"))
+                out["sram"] = sram.inventory(macros, process)
+                out["area_um2"] += out["sram"]["area_um2"]
+                if nand2:
+                    out["nand2_equiv"] = out["area_um2"] / nand2
         if sta is not None and netlist.exists():
             try:
-                timing = run_sta(sta, [liberty], netlist, top=unit.top, period_ps=target_ps)
+                timing = run_sta(sta, libs, netlist, top=unit.top, period_ps=target_ps)
                 out.update(critical_path_ps=timing.critical_path_ps, worst_slack_ps=timing.worst_slack_ps,
                            max_frequency_mhz=timing.max_frequency_mhz, startpoint=timing.startpoint, endpoint=timing.endpoint,
                            path_cells=path_cells(timing.report))

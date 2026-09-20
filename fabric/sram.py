@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -94,6 +95,25 @@ def setup_ps(macro: Macro, process: Process) -> float:
     return process.setup_ps
 
 
+def clean_name(module: str) -> str:
+    """A readable name for a derived blackbox.
+
+    yosys calls it ``$paramod$<hash>\\fabric_sram``, an escaped Verilog
+    identifier that the timing tools will not match against a liberty cell, so
+    the netlist and the liberty are both put into this form instead."""
+    match = re.search(r"\$paramod\$([0-9a-f]+)\\(\w+)", module)
+    return f"{match.group(2)}_{match.group(1)[:8]}" if match else module
+
+
+def clean_netlist(source: Path, target: Path) -> Path:
+    """The netlist with the memories' escaped names replaced by clean ones, and
+    yosys's ``wire signed``, which OpenSTA's reader does not take, removed."""
+    text = Path(source).read_text(encoding="utf-8").replace("wire signed ", "wire ")
+    text = re.sub(r"\\(\$paramod\$[0-9a-f]+\\\w+)\s", lambda m: clean_name(m.group(1)) + " ", text)
+    Path(target).write_text(text, encoding="utf-8")
+    return Path(target)
+
+
 def macros_from_json(path: Path, name: str = "fabric_sram") -> list[Macro]:
     """The design's memories, from yosys's elaborated modules: a blackbox keeps
     its ports, and the widths say what the parameters were."""
@@ -108,7 +128,7 @@ def macros_from_json(path: Path, name: str = "fabric_sram") -> list[Macro]:
         width = ports.get("rd_data", 0) // reads
         addr = ports.get("rd_addr", 1) // reads
         mask = ports.get("wr_mask", 1) // writes
-        out.append(Macro(module, width, 1 << addr, reads, writes, max(1, width // max(mask, 1))))
+        out.append(Macro(clean_name(module), width, 1 << addr, reads, writes, max(1, width // max(mask, 1))))
     return sorted(out, key=lambda m: m.module)
 
 
@@ -141,8 +161,8 @@ def _cell(macro: Macro, process: Process) -> str:
             f"""            timing () {{
                 related_pin : "clk";
                 timing_type : {kind};
-                rise_constraint (scalar) {{ values ("{value}"); }}
-                fall_constraint (scalar) {{ values ("{value}"); }}
+                rise_constraint (mem_constraint) {{ index_1 ("0.0"); index_2 ("0.0"); values ("{value}"); }}
+                fall_constraint (mem_constraint) {{ index_1 ("0.0"); index_2 ("0.0"); values ("{value}"); }}
             }}
 """
             for kind, value in (("setup_rising", f"{setup:.1f}"), ("hold_rising", f"{hold:.1f}")))
@@ -151,10 +171,10 @@ def _cell(macro: Macro, process: Process) -> str:
     out_arc = f"""            timing () {{
                 related_pin : "clk";
                 timing_type : rising_edge;
-                cell_rise (scalar) {{ values ("{access:.1f}"); }}
-                cell_fall (scalar) {{ values ("{access:.1f}"); }}
-                rise_transition (scalar) {{ values ("20.0"); }}
-                fall_transition (scalar) {{ values ("20.0"); }}
+                cell_rise (mem_delay) {{ index_1 ("0.0"); index_2 ("0.0"); values ("{access:.1f}"); }}
+                cell_fall (mem_delay) {{ index_1 ("0.0"); index_2 ("0.0"); values ("{access:.1f}"); }}
+                rise_transition (mem_delay) {{ index_1 ("0.0"); index_2 ("0.0"); values ("20.0"); }}
+                fall_transition (mem_delay) {{ index_1 ("0.0"); index_2 ("0.0"); values ("20.0"); }}
             }}
 """
     widths = sorted({macro.width * macro.read_ports, macro.width * macro.write_ports,
@@ -186,9 +206,17 @@ def write_liberty(macros: Sequence[Macro], process: Process, path: Path) -> Path
     nom_temperature : 25.0;
     nom_process : 1.0;
     default_max_transition : 200.0;
-    lu_table_template (scalar) {{
-        variable_1 : total_output_net_capacitance;
+    lu_table_template (mem_delay) {{
+        variable_1 : input_net_transition;
+        variable_2 : total_output_net_capacitance;
         index_1 ("0.0");
+        index_2 ("0.0");
+    }}
+    lu_table_template (mem_constraint) {{
+        variable_1 : related_pin_transition;
+        variable_2 : constrained_pin_transition;
+        index_1 ("0.0");
+        index_2 ("0.0");
     }}
 {body}}}
 """, encoding="utf-8")
