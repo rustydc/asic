@@ -46,6 +46,167 @@ def _refs(value) -> list[str]:
 PAGE_BEATS = 1 << S.MEM_PAGE_SHIFT
 
 
+# --------------------------------------------------------------------------
+# Banking the vector buffer
+# --------------------------------------------------------------------------
+
+def live_together(steps: list[S.Step]) -> list[set[int]]:
+    """For each step, the later steps that can be in flight with it.
+
+    The controller issues in program order, so step *j* runs beside step *i*
+    only if every step between them could issue while *i* was running: one
+    that waits for *i*, directly or through another step, or that wants the
+    engine *i* is on, stops *j* and everything after it.  This is the
+    relation the buffers' banking has to survive, and it does not depend on
+    how long any unit takes, which is why it can be decided here rather than
+    read off a simulation."""
+    after: list[set[int]] = []
+    deep: list[set[int]] = []
+    for i, step in enumerate(steps):
+        d = set(step.deps)
+        for k in step.deps:
+            d |= deep[k]
+        deep.append(d)
+    for i, step in enumerate(steps):
+        port, live = (step.unit, step.engine), set()
+        for j in range(i + 1, len(steps)):
+            if i in deep[j] or (steps[j].unit, steps[j].engine) == port:
+                break
+            live.add(j)
+        after.append(live)
+    return after
+
+
+# Which vector buffer each of an adapter's ports holds while it runs a
+# command.  The two-port units take one operand each -- and for the gates and
+# SwiGLU both operands are one buffer at two offsets, which is two reads of one
+# bank that no assignment can separate -- while the pass adapter takes a port
+# per token of a chunk, all of the same buffer.  Every other unit has a single
+# port that visits the command's buffers in turn, so its own reads never
+# collide.  These follow rtl/fabric_engine.sv's address assignments.
+RD_FIELDS = {"norm": ("src", "a2"), "conv": ("src", "a2"), "gates": ("src", "a2"),
+             "swiglu": ("src", "a2"), "residual": ("src", "a2")}
+WR_FIELDS = {"conv": ("dst", "a3")}
+
+
+def _vb_ref(ops: dict, field: str) -> str | None:
+    names = [n for n in _refs(ops.get(field)) if not n.startswith(S.MEM_PREFIX)]
+    return names[0] if names else None
+
+
+def ports(step: S.Step, chunk: int = 1) -> tuple[list[str], list[str], list[str], list[str]]:
+    """A step's ports: the buffers its fixed read ports hold, the buffers its
+    one shared read port visits, and the same for writes."""
+    ops = step.ops or {}
+    if step.unit == "tiles":
+        rd_fixed, rd_shared = [_vb_ref(ops, "src")] * chunk, []
+    elif step.unit in RD_FIELDS:
+        rd_fixed, rd_shared = [_vb_ref(ops, f) for f in RD_FIELDS[step.unit]], []
+    else:
+        rd_fixed, rd_shared = [], [n for n in step.src if not n.startswith(S.MEM_PREFIX)]
+    if step.unit in WR_FIELDS:
+        wr_fixed, wr_shared = [_vb_ref(ops, f) for f in WR_FIELDS[step.unit]], []
+    else:
+        wr_fixed = []
+        wr_shared = [S._plain(n) for n in step.dst if not S._plain(n).startswith(S.MEM_PREFIX)]
+        own = _vb_ref(ops, "dst")                    # the memory unit's append writes back
+        if own and own not in wr_shared:
+            wr_shared.append(own)
+    return ([n for n in rd_fixed if n], rd_shared, [n for n in wr_fixed if n], wr_shared)
+
+
+def bank_conflicts(steps: list[S.Step], chunk: int = 1) -> dict[str, set[str]]:
+    """Buffers that cannot share a bank.
+
+    A bank has one write port, so two buffers written at once want different
+    banks, and a read and a write of one bank in a cycle are free.  Reads are
+    not a colouring question alone: two ports may want one buffer, which no
+    assignment can separate, so the read ports are counted per bank afterwards
+    by ``bank_reads`` rather than forbidden here."""
+    graph: dict[str, set[str]] = {}
+
+    def edge(a: str, b: str) -> None:
+        graph.setdefault(a, set())
+        graph.setdefault(b, set())
+        if a != b:
+            graph[a].add(b)
+            graph[b].add(a)
+
+    for step in steps:
+        rf, rs, wf, ws = ports(step, chunk)
+        for n in rf + rs + wf + ws:
+            graph.setdefault(n, set())
+        for group in (rf, wf):                       # a unit's own ports are concurrent
+            for a in range(len(group)):
+                for b in range(a + 1, len(group)):
+                    edge(group[a], group[b])
+    live = live_together(steps)
+    for i, step in enumerate(steps):
+        rf, rs, wf, ws = ports(step, chunk)
+        for j in live[i]:
+            rf2, rs2, wf2, ws2 = ports(steps[j], chunk)
+            for a in rf + rs:
+                for b in rf2 + rs2:
+                    edge(a, b)
+            for a in wf + ws:
+                for b in wf2 + ws2:
+                    edge(a, b)
+    return graph
+
+
+def colour_banks(graph: dict[str, set[str]], sizes=None) -> dict[str, int]:
+    """A bank per buffer, largest degree first, and among the banks a buffer
+    may take, the one holding the fewest bytes: the banks are one memory
+    each and the widest sets the address stride, so a balanced colouring is
+    a smaller buffer.  Greedy is within a bank of the floor on every program
+    measured, and the assignment is checked in the RTL, so a better
+    colouring would buy nothing but a smaller number."""
+    order = sorted(graph, key=lambda n: (-len(graph[n]), n))
+    at: dict[str, int] = {}
+    for name in order:                                   # first for the number of banks
+        used = {at[m] for m in graph[name] if m in at}
+        at[name] = next(b for b in range(len(used) + 1) if b not in used)
+    banks = max(at.values()) + 1 if at else 1
+    at, load = {}, {b: 0 for b in range(banks)}           # then for the balance, over that many
+    for name in order:
+        used = {at[m] for m in graph[name] if m in at}
+        free = [b for b in load if b not in used]
+        if not free:                                      # balance can cost a bank; take it
+            free = [len(load)]
+            load[free[0]] = 0
+        at[name] = min(free, key=lambda b: (load[b], b))
+        load[at[name]] += sizes(name) if sizes else 1
+    return at
+
+
+def bank_reads(steps: list[S.Step], at: dict[str, int], chunk: int = 1) -> list[int]:
+    """Read ports each bank needs: the most its buffers are asked for at
+    once, over every set of steps that may be in flight together.  A fixed
+    port charges the bank of the buffer it holds; a shared port charges one
+    read to any bank its command's buffers are in, since which one it is on a
+    given cycle is not known here.  More than one read is wanted only where
+    two ports meet on one bank -- the pass output the gates take two slices
+    of, or that the rotary and the attention read together -- which no
+    assignment of buffers to banks can undo."""
+    need = [1] * (max(at.values()) + 1 if at else 1)
+    live = live_together(steps)
+    for i in range(len(steps)):
+        run = [i]
+        for j in sorted(live[i]):
+            if all(j in live[k] for k in run):
+                run.append(j)                            # a set that may all be in flight at once
+        banks: dict[int, int] = {}
+        for k in run:
+            rf, rs, _wf, _ws = ports(steps[k], chunk)
+            for name in rf:
+                banks[at[name]] = banks.get(at[name], 0) + 1
+            for b in {at[n] for n in rs}:                # the one shared port, wherever it is
+                banks[b] = banks.get(b, 0) + 1
+        for b, n in banks.items():
+            need[b] = max(need[b], n)
+    return need
+
+
 class Layout:
     """Addresses of a program's buffers: vector-buffer names to byte
     offsets and memory-image names (``m_...``) to beat addresses, in order
@@ -53,26 +214,55 @@ class Layout:
     page-aligned in memory.  A stream's names carry their token suffix;
     sizes are looked up by the plain name."""
 
-    def __init__(self, steps: list[S.Step], sizes: dict[str, int]) -> None:
-        self.sizes = sizes
+    def __init__(self, steps: list[S.Step], sizes: dict[str, int], chunk: int = 1) -> None:
+        self.sizes, self.chunk = sizes, chunk
         self.vb: dict[str, int] = {}
         self.mem: dict[str, int] = {}
-        vb_next = mem_next = 0
+        names: list[str] = []
+        mem_next = 0
         for step in steps:
             for value in (step.ops or {}).values():
                 for name in _refs(value):
-                    beats = -(-self.size(name) // BEAT)
                     if name.startswith(S.MEM_PREFIX):
                         if name not in self.mem:
+                            beats = -(-self.size(name) // BEAT)
                             self.mem[name] = mem_next
                             mem_next += -(-beats // PAGE_BEATS) * PAGE_BEATS
-                    elif name not in self.vb:
-                        self.vb[name] = vb_next
-                        vb_next += beats * BEAT
-        self.vb_bytes, self.mem_beats = vb_next, mem_next
+                    elif name not in names:
+                        names.append(name)
+        self.mem_beats = mem_next
+        self._place(steps, names)
+
+    def _place(self, steps: list[S.Step], names: list[str]) -> None:
+        """The vector buffer in banks: each buffer takes one, and a buffer's
+        bank is the high bits of its address, so an adapter's byte address
+        carries it and no port needs a bank field of its own.  The banks are
+        the same size, since the stride has to be a shift, and the colouring
+        balances them so that size is the largest bank and not the sum."""
+        self.bank = colour_banks(bank_conflicts(steps, self.chunk), lambda n: -(-self.size(n) // BEAT) * BEAT)
+        for name in names:                               # a buffer no step's operands reach still needs a bank
+            self.bank.setdefault(name, 0)
+        self.banks = max(self.bank.values()) + 1 if self.bank else 1
+        self.bank_reads = bank_reads(steps, self.bank, self.chunk)
+        assert max(self.bank_reads) <= 3, f"a bank wants {max(self.bank_reads)} read ports"
+        fill = [0] * self.banks
+        for name in names:
+            b = self.bank[name]
+            self.vb[name] = b, fill[b]                   # resolved once the stride is known
+            fill[b] += -(-self.size(name) // BEAT) * BEAT
+        self.bank_shift = max(1, max(fill, default=1) - 1).bit_length()
+        self.bank_bytes = 1 << self.bank_shift
+        self.vb = {n: (b << self.bank_shift) + off for n, (b, off) in self.vb.items()}
+        self.vb_bytes = self.banks << self.bank_shift
 
     def size(self, name: str) -> int:
         return self.sizes[name.split("@")[0]]
+
+    def read_cap_mask(self, ports: int) -> int:
+        """The banks that need at least ``ports`` read ports, as a bit mask
+        for the RTL's check."""
+        assert self.banks <= 64, f"{self.banks} banks, the mask holds 64"
+        return sum(1 << b for b, n in enumerate(self.bank_reads) if n >= ports)
 
     def address(self, name: str) -> int:
         return self.mem[name] if name.startswith(S.MEM_PREFIX) else self.vb[name]
@@ -254,7 +444,7 @@ class EngineRun:
         self.chunk = xs[0].shape[0] if np.ndim(xs[0]) == 2 else 1          # tokens per pass: the residual's shape says
         lay = S.recurrent_layout(cfg, spec, mm, self.chunk) if self.recurrent else S.global_layout(cfg, spec, mm, self.chunk)
         _LAYOUTS[id(c)] = lay
-        self.layout = Layout(steps, lay["sizes"])
+        self.layout = Layout(steps, lay["sizes"], self.chunk)
         self.suffixes = sorted({"" if "@" not in key else "@" + key.split("@")[1] for key in inputs})
         # Images: the vector buffer holds each token's x, the memory its context.
         vb = bytearray(self.layout.vb_bytes)
@@ -302,6 +492,8 @@ class EngineRun:
                        "MODEL_TILES": int(model_tiles), "AW": max(16, (max(self.layout.vb_bytes, 1) - 1).bit_length() + 1),
                        "WB": spec.weight_bits, "ACC": spec.acc_bits, "SB": spec.scale_bits, "SHB": spec.shift_bits, "SW": sw,
                        "YSH": L.ysh_for(self.hk), "VB_BYTES": self.layout.vb_bytes, "MEM_BEATS": self.layout.mem_beats,
+                       "VB_BANKS": self.layout.banks, "VB_BANK_SHIFT": self.layout.bank_shift,
+                       "VB_RCAP2": self.layout.read_cap_mask(2), "VB_RCAP3": self.layout.read_cap_mask(3),
                        "SCHEDULE_CYCLES": S.schedule(steps).cycles, **hpi_params}
         (directory / "params.json").write_text(json.dumps(self.params))
 
@@ -350,4 +542,24 @@ class EngineRun:
                     problems.append(f"state{sfx} head {h}: {int((rows != self.expected['s_mem' + sfx][h]).sum())} elements differ")
                 if tuple(scale) != tuple(int(v) for v in self.expected["scale_mem" + sfx][h]):
                     problems.append(f"scale{sfx} head {h}: {scale} expected {tuple(self.expected['scale_mem' + sfx][h])}")
+        problems += self.check_banks(directory)
+        return problems
+
+    def check_banks(self, directory: Path) -> list[str]:
+        """What each bank was really asked for against what the colouring
+        gave it.  Over is a broken run and the RTL says so itself; under is
+        only the analysis being careful, which it is entitled to be."""
+        path = directory / "ports.txt"
+        if not path.exists():
+            return []
+        problems = []
+        for line in path.read_text().splitlines():
+            f = line.split()
+            if f[0] != "bank":
+                continue
+            b, reads, writes = (int(v) for v in f[1:4])
+            if reads > self.layout.bank_reads[b]:
+                problems.append(f"bank {b}: {reads} reads at once, the colouring gave it {self.layout.bank_reads[b]}")
+            if writes > 1:
+                problems.append(f"bank {b}: {writes} writes at once")
         return problems

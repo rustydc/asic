@@ -41,9 +41,14 @@ module fabric_vb #(
     parameter int NR    = 1,
     parameter int NW    = 1,
     parameter int AW    = 16,
+    parameter int NB    = 1,       // banks; a bank is one write port and RCAP reads
+    parameter int BSH   = 12,      // a bank's own address bits: bank b holds [b << BSH, (b+1) << BSH)
+    parameter [63:0] RCAP2 = 0,    // banks that need a second read port
+    parameter [63:0] RCAP3 = 0,    // and a third
     parameter     INIT_FILE = ""
 ) (
     input  wire              clk,
+    input  wire [NR-1:0]     rd_en,
     input  wire [NR*AW-1:0]  rd_addr,
     output reg  [NR*128-1:0] rd_data,
     input  wire [NW-1:0]     wr_en,
@@ -51,8 +56,16 @@ module fabric_vb #(
     input  wire [NW*128-1:0] wr_data,
     input  wire [NW*16-1:0]  wr_be
 );
+    // The array is the banks: a buffer lives wholly in one, and a buffer's
+    // bank is the high bits of its address, so an adapter's byte address
+    // carries it and no port needs a bank field of its own.  What a bank
+    // cannot do is serve two reads of different addresses, or two writes, in
+    // a cycle.  `fabric.engine.Layout` colours the buffers so that never
+    // happens; the counts below are that colouring put to the engine rather
+    // than taken on trust, and a flat array answers the reads because, when
+    // the colouring holds, banks and a flat array answer alike.
     reg [7:0] mem [0:BYTES-1];
-    integer i, p, b;
+    integer i, p, q, b;
     initial begin
         if (INIT_FILE != "") $readmemh(INIT_FILE, mem);
         else for (i = 0; i < BYTES; i = i + 1) mem[i] = 8'd0;
@@ -61,8 +74,42 @@ module fabric_vb #(
         integer k;
         for (k = 0; k < 16; k = k + 1) rd16[k*8 +: 8] = (a + k < BYTES) ? mem[a + k] : 8'd0;
     endfunction
+    function automatic integer bank_of(input [AW-1:0] a);
+        bank_of = (AW > BSH) ? (a >> BSH) : 0;
+    endfunction
+    function automatic integer cap_of(input integer bb);
+        cap_of = 1 + (RCAP2[bb] ? 1 : 0) + (RCAP3[bb] ? 1 : 0);
+    endfunction
+
+    integer nrd [0:NB-1], nwr [0:NB-1];          // this cycle
+    integer max_rd [0:NB-1], max_wr [0:NB-1];    // over the run, for the report
+    reg dup;
+    initial for (i = 0; i < NB; i = i + 1) begin max_rd[i] = 0; max_wr[i] = 0; end
     always @(posedge clk) begin
-        for (p = 0; p < NR; p = p + 1) rd_data[p*128 +: 128] <= rd16(rd_addr[p*AW +: AW]);
+        for (b = 0; b < NB; b = b + 1) begin nrd[b] = 0; nwr[b] = 0; end
+        for (p = 0; p < NR; p = p + 1)
+            if (rd_en[p]) begin
+                dup = 1'b0;                      // ports on one address share a read
+                for (q = 0; q < p; q = q + 1)
+                    if (rd_en[q] && rd_addr[q*AW +: AW] == rd_addr[p*AW +: AW]) dup = 1'b1;
+                if (!dup) begin
+                    b = bank_of(rd_addr[p*AW +: AW]);
+                    nrd[b] = nrd[b] + 1;
+                    if (nrd[b] > max_rd[b]) max_rd[b] = nrd[b];
+                    if (nrd[b] > cap_of(b)) $display("FAIL: bank %0d asked for %0d reads by port %0d, it has %0d", b, nrd[b], p, cap_of(b));
+                end
+            end
+        for (p = 0; p < NW; p = p + 1)
+            if (wr_en[p]) begin
+                b = bank_of(wr_addr[p*AW +: AW]);
+                nwr[b] = nwr[b] + 1;
+                if (nwr[b] > max_wr[b]) max_wr[b] = nwr[b];
+                if (nwr[b] > 1) $display("FAIL: bank %0d asked for %0d writes, it has one", b, nwr[b]);
+            end
+        // A bank answers only what it was asked for: an enable that is too
+        // narrow shows up as x in the unit that wanted the beat, as one that
+        // is too wide shows up in the counts above.
+        for (p = 0; p < NR; p = p + 1) rd_data[p*128 +: 128] <= rd_en[p] ? rd16(rd_addr[p*AW +: AW]) : {128{1'bx}};
         for (p = 0; p < NW; p = p + 1)
             if (wr_en[p])
                 for (b = 0; b < 16; b = b + 1)
@@ -99,6 +146,7 @@ module fabric_norm_adapter #(
     output reg  [7:0]    done_tag,
     output wire [AW-1:0] rd_addr_x,
     output wire [AW-1:0] rd_addr_g,
+    output wire          rd_en_g,        // the gain is a vector only for a gated norm; else the port is idle
     input  wire [127:0]  rd_data_x,
     input  wire [127:0]  rd_data_g,
     output reg           wr_en,
@@ -119,6 +167,7 @@ module fabric_norm_adapter #(
     assign cmd_ready = !busy;
     assign rd_addr_x = src + (int16 ? i * 2 * NL : i * NL);
     assign rd_addr_g = gaddr + i * NL;
+    assign rd_en_g   = busy && gated;
 
     // Front pipeline: address (1), data (2), gain requantized (2), silu (3..6); x waits alongside.
     reg             v1, v2, v3, v4, v5, v6;
@@ -1413,6 +1462,10 @@ module fabric_layer_engine #(
     parameter int YSH  = 9,
     parameter int VB_BYTES = 4096,
     parameter int AW   = 24,                    // vector-buffer address bits
+    parameter int VB_BANKS = 1,                 // and its banks, from the program's colouring
+    parameter int VB_BANK_SHIFT = 12,
+    parameter [63:0] VB_RCAP2 = 0,
+    parameter [63:0] VB_RCAP3 = 0,
     parameter     VB_FILE   = "vb_init.hex",
     parameter     PROG_FILE = "program.hex",
     parameter     LUT_DIR   = "./"
@@ -1462,8 +1515,36 @@ module fabric_layer_engine #(
     wire [NW*AW-1:0]  wr_addr;
     wire [NW*128-1:0] wr_data;
     wire [NW*16-1:0]  wr_be;
-    fabric_vb #(.BYTES(VB_BYTES), .NR(NR), .NW(NW), .AW(AW), .INIT_FILE(VB_FILE)) u_vb (
-        .clk(clk), .rd_addr(rd_addr), .rd_data(rd_data), .wr_en(wr_en), .wr_addr(wr_addr), .wr_data(wr_data), .wr_be(wr_be));
+    // A read port is asking only while its adapter holds a command: the
+    // address it presents at any other time is the last one it used, and a
+    // bank must not be charged for it.  `cmd_ready` is the adapter idle, so
+    // its complement is the enable, and the cycle a command is taken the
+    // address is still the previous command's -- the first beat's address
+    // is registered at that edge and read the cycle after, inside the busy.
+    wire [NR-1:0] rd_en;
+    wire [1:0]    norm_gain_en;
+    assign rd_en[R_TILES +: TMAX]  = {TMAX{!ready_tiles}};
+    assign rd_en[R_CONV +: 2]      = {2{!ready_conv}};
+    assign rd_en[R_GATES +: 2]     = {2{!ready_gates}};
+    assign rd_en[R_SWIGLU +: 2]    = {2{!ready_swiglu}};
+    assign rd_en[R_RESIDUAL +: 2]  = {2{!ready_residual}};
+    assign rd_en[R_MEM]            = !ready_mem;
+    genvar ge;
+    generate
+        for (ge = 0; ge < 2; ge = ge + 1) begin : g_en2
+            assign rd_en[R_NORM + 2*ge]     = !ready_norm[ge];
+            assign rd_en[R_NORM + 2*ge + 1] = norm_gain_en[ge];
+            assign rd_en[R_ROTARY + ge]      = !ready_rotary[ge];
+        end
+        for (ge = 0; ge < NE; ge = ge + 1) begin : g_en4
+            assign rd_en[R_DELTA + ge] = !ready_delta[ge];
+            assign rd_en[R_ATTN + ge]  = !ready_attn[ge];
+        end
+    endgenerate
+
+    fabric_vb #(.BYTES(VB_BYTES), .NR(NR), .NW(NW), .AW(AW), .NB(VB_BANKS), .BSH(VB_BANK_SHIFT),
+                .RCAP2(VB_RCAP2), .RCAP3(VB_RCAP3), .INIT_FILE(VB_FILE)) u_vb (
+        .clk(clk), .rd_en(rd_en), .rd_addr(rd_addr), .rd_data(rd_data), .wr_en(wr_en), .wr_addr(wr_addr), .wr_data(wr_data), .wr_be(wr_be));
 
     wire [NE-1:0] ready_norm, ready_delta, ready_rotary, ready_attn;
     wire ready_tiles, ready_conv, ready_gates, ready_swiglu, ready_residual, ready_mem;
@@ -1495,7 +1576,7 @@ module fabric_layer_engine #(
                 .clk(clk), .rst_n(rst_n), .cmd_valid(cmd_valid[U_NORM] && cmd_engine == e), .cmd_len(cmd_len), .cmd_src(cmd_src),
                 .cmd_dst(cmd_dst), .cmd_a2(cmd_a2), .cmd_a3(cmd_a3), .cmd_arg(cmd_arg), .cmd_tag(cmd_tag), .cmd_ready(ready_norm[e]),
                 .done_valid(done_valid[U_NORM*NE + e]), .done_tag(done_tag[(U_NORM*NE + e)*8 +: 8]),
-                .rd_addr_x(rd_addr[(R_NORM + 2*e)*AW +: AW]), .rd_addr_g(rd_addr[(R_NORM + 2*e + 1)*AW +: AW]),
+                .rd_addr_x(rd_addr[(R_NORM + 2*e)*AW +: AW]), .rd_addr_g(rd_addr[(R_NORM + 2*e + 1)*AW +: AW]), .rd_en_g(norm_gain_en[e]),
                 .rd_data_x(rd_data[(R_NORM + 2*e)*128 +: 128]), .rd_data_g(rd_data[(R_NORM + 2*e + 1)*128 +: 128]),
                 .wr_en(wr_en[W_NORM + e]), .wr_addr(wr_addr[(W_NORM + e)*AW +: AW]), .wr_data(wr_data[(W_NORM + e)*128 +: 128]),
                 .wr_be(wr_be[(W_NORM + e)*16 +: 16]));

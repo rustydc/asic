@@ -78,6 +78,15 @@ HIST_REC = 4                 # bytes per channel of the conv history in the vect
 SLOT_HEADER = BEAT           # the state slot: one beat of scale, exponent, peak, saturated count, then the rows
 MEM_RD, MEM_WR = 0, 1        # the memory unit's operations (arg[3:0]): memory to vector buffer, vector buffer to memory
 ADDR_BITS = 30               # the program word's address operands (src, dst, a2, a3)
+# Vector-buffer ports each adapter has.  A step names every buffer it consumes,
+# but a one-port unit reads them in turn -- the state engine takes its slot, its
+# unit vector, the conv output and the gates through one port -- so those cannot
+# want the same bank in the same cycle.  These must match ``R_*`` and ``W_*`` in
+# rtl/fabric_engine.sv.
+RD_PORTS = {"tiles": 1, "norm": 2, "conv": 2, "gates": 2, "delta": 1,
+            "swiglu": 2, "residual": 2, "rotary": 1, "attn": 1, "mem": 1}
+WR_PORTS = {"tiles": 1, "norm": 1, "conv": 2, "gates": 1, "delta": 1,
+            "swiglu": 1, "residual": 1, "rotary": 1, "attn": 1, "mem": 1}
 MEM_APPEND, MEM_SCAN, MEM_ROWS = 2, 3, 4   # the global layer's: append the token, scan the index, stream a head's rows
 MEM_PAGE_SHIFT = 7           # a memory page (the map's alignment) in beats: the context base travels as a page number
 ROT_TABLE, ROT_HEAD = 0, 1   # the rotary unit's operations (arg[3:0]); arg[7:4] the head kind, 0 q and 1 k
