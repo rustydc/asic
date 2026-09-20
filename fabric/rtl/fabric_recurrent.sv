@@ -417,6 +417,9 @@ module fabric_delta_state8 #(
     reg [V*8-1:0]  rowd;
     reg [KW-1:0]   id;
     reg signed [63:0] tr, tn, dl, pr, mag, nsat;
+    // The per-element arrays are written with blocking assignments inside the
+    // lane loops (each element reads and writes only itself, in one phase), so
+    // that Verilator keeps the loops as loops instead of unrolling 128 lanes.
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             phase <= 3'd0; wr <= 0; rd <= 0; va <= 1'b0; vd <= 1'b0; row_out_valid <= 1'b0; peak_acc <= 0;
@@ -428,7 +431,7 @@ module fabric_delta_state8 #(
                 // The peak runs since the last rescale; a rescale this token (decided in the same edge) restarts it.
                 peak_acc <= (((({16'd0, g_in} * {16'd0, decay} + 32'd32768) >> 16) < 32'd32768) || sat_in) ? 8'd0 : peak_in;
                 nsat_acc <= 0;
-                for (j = 0; j < V; j = j + 1) begin pred_acc[j] <= 0; y_acc[j] <= 0; end
+                for (j = 0; j < V; j = j + 1) begin pred_acc[j] = 0; y_acc[j] = 0; end
             end
             if (phase == 3'd0 && row_in_valid) begin va <= 1'b1; rowa <= row_in; ia <= wr; wr <= wr + 1'b1; end
             // Pass 1 stage B: rescale if due, keep, accumulate pred.
@@ -436,24 +439,24 @@ module fabric_delta_state8 #(
                 for (j = 0; j < V; j = j + 1) begin
                     tr = rescale ? fx_sat(fx_rnd_shr($signed(rowa[j*8 +: 8]) * $signed({48'b0, gren}), 16 - de), 8)
                                  : $signed(rowa[j*8 +: 8]);
-                    t_mem[ia][j*8 +: 8] <= tr[7:0];
-                    pred_acc[j] <= pred_acc[j] + $signed(k_r[ia*8 +: 8]) * $signed(tr[7:0]);
+                    t_mem[ia][j*8 +: 8] = tr[7:0];
+                    pred_acc[j] = pred_acc[j] + $signed(k_r[ia*8 +: 8]) * $signed(tr[7:0]);
                 end
                 if (ia == K - 1) phase <= 3'd1;
             end
             if (phase == 3'd1 && r_ready) begin
                 for (j = 0; j < V; j = j + 1) begin
                     pr = fx_rnd_shr(pred_acc[j] * $signed({48'b0, g1}), 23 + e1);
-                    diff[j] <= fx_sat($signed({{56{v_r[j*8+7]}}, v_r[j*8 +: 8]}) - pr, 16);
+                    diff[j] = fx_sat($signed({{56{v_r[j*8+7]}}, v_r[j*8 +: 8]}) - pr, 16);
                 end
                 phase <= 3'd2;
             end
             if (phase == 3'd2) begin
-                for (j = 0; j < V; j = j + 1) bd[j] <= $signed({48'b0, b_r}) * diff[j];
+                for (j = 0; j < V; j = j + 1) bd[j] = $signed({48'b0, b_r}) * diff[j];
                 phase <= 3'd3;
             end
             if (phase == 3'd3) begin
-                for (j = 0; j < V; j = j + 1) c[j] <= fx_rnd_shr(bd[j] * $signed({47'b0, r}), 24 - e1);
+                for (j = 0; j < V; j = j + 1) c[j] = fx_rnd_shr(bd[j] * $signed({47'b0, r}), 24 - e1);
                 phase <= 3'd4; rd <= 0;
             end
             if (phase == 3'd4) begin
@@ -466,7 +469,7 @@ module fabric_delta_state8 #(
                     dl = fx_rnd_shr($signed(k_r[id*8 +: 8]) * c[j], 14);
                     tn = fx_sat($signed(rowd[j*8 +: 8]) + dl, 8);
                     row_out[j*8 +: 8] <= tn[7:0];
-                    y_acc[j] <= y_acc[j] + $signed(q_r[id*8 +: 8]) * $signed(tn[7:0]);
+                    y_acc[j] = y_acc[j] + $signed(q_r[id*8 +: 8]) * $signed(tn[7:0]);
                     if ((tn < 0 ? -tn : tn) > mag) mag = (tn < 0 ? -tn : tn);
                     if ((tn < 0 ? -tn : tn) >= 127) nsat = nsat + 1;
                 end

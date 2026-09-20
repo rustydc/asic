@@ -671,8 +671,8 @@ module fabric_kv_append #(
         if (!rst_n) begin
             state <= S_IDLE; head <= 0; beat <= 0; nbeat <= 0; req_valid <= 1'b0; done <= 1'b0;
             nv_in <= 1'b0; rc_start <= 1'b0; block_end <= 1'b0;
-            for (j = 0; j < NKV*HD; j = j + 1) begin sum_k[j] <= 0; sum_v[j] <= 0; end
-            for (j = 0; j < IDIM; j = j + 1) sum_i[j] <= 0;
+            for (j = 0; j < NKV*HD; j = j + 1) begin sum_k[j] = 0; sum_v[j] = 0; end
+            for (j = 0; j < IDIM; j = j + 1) sum_i[j] = 0;
         end else begin
             done <= 1'b0;
             nv_in <= 1'b0;
@@ -681,10 +681,10 @@ module fabric_kv_append #(
                 S_IDLE: if (start) begin
                     k_r <= k_rows; v_r <= v_rows; idx_r <= idx_k; pos_r <= pos;
                     for (j = 0; j < NKV*HD; j = j + 1) begin
-                        sum_k[j] <= $signed(sum_k_in[j*16 +: SUMW]) + $signed(k_rows[j*8 +: 8]);
-                        sum_v[j] <= $signed(sum_v_in[j*16 +: SUMW]) + $signed(v_rows[j*8 +: 8]);
+                        sum_k[j] = $signed(sum_k_in[j*16 +: SUMW]) + $signed(k_rows[j*8 +: 8]);
+                        sum_v[j] = $signed(sum_v_in[j*16 +: SUMW]) + $signed(v_rows[j*8 +: 8]);
                     end
-                    for (j = 0; j < IDIM; j = j + 1) sum_i[j] <= $signed(sum_i_in[j*16 +: SUMW]) + $signed(idx_k[j*8 +: 8]);
+                    for (j = 0; j < IDIM; j = j + 1) sum_i[j] = $signed(sum_i_in[j*16 +: SUMW]) + $signed(idx_k[j*8 +: 8]);
                     block_end <= (pos[LOG_BS-1:0] == BS - 1);
                     head <= 0;
                     state <= S_WIN;
@@ -713,11 +713,11 @@ module fabric_kv_append #(
                                     for (j = 0; j < NKV*HD; j = j + 1) begin
                                         t = fx_rnd_shr(sum_k[j], LOG_BS); kbar[j*8 +: 8] <= t[7:0];
                                         t = fx_rnd_shr(sum_v[j], LOG_BS); vbar[j*8 +: 8] <= t[7:0];
-                                        sum_k[j] <= 0; sum_v[j] <= 0;
+                                        sum_k[j] = 0; sum_v[j] = 0;
                                     end
                                     for (j = 0; j < IDIM; j = j + 1) begin
                                         t = fx_rnd_shr(sum_i[j], LOG_BS); ibar[j*8 +: 8] <= t[7:0];
-                                        sum_i[j] <= 0;
+                                        sum_i[j] = 0;
                                     end
                                     state <= S_BLK;
                                 end else state <= S_DONE;
