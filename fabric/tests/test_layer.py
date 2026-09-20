@@ -11,7 +11,7 @@ from fabric import layer as L
 from fabric.tile import TileSpec
 
 RTL = Path(__file__).parents[1] / "rtl"
-SOURCES = [RTL / name for name in ("fabric_vector.sv", "fabric_norm.sv", "fabric_recurrent.sv", "fabric_ffn.sv",
+SOURCES = [RTL / name for name in ("fabric_sram.sv", "fabric_vector.sv", "fabric_norm.sv", "fabric_recurrent.sv", "fabric_ffn.sv",
                                    "fabric_attention.sv")]
 
 

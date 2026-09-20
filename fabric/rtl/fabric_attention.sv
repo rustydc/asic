@@ -207,9 +207,21 @@ module fabric_attention #(
     localparam int GW    = $clog2(G) + 1;
     localparam int OW    = 36;
 
-    reg [HD*8-1:0]  q_mem [0:G-1];
-    reg [HD*8-1:0]  gate_mem [0:G-1];
-    reg [OW*HD-1:0] o_mem [0:G-1];
+    // A head's query, its gate and its running output are memories, one beat
+    // to a word: BEATS words of L bytes for the first two and of L
+    // accumulators for the third.  Their addresses are presented a cycle
+    // ahead -- the beat a memory is asked for is the beat that will arrive,
+    // not the one that has -- so the data lands where the arrays put it and
+    // nothing downstream moves.
+    localparam int QW = L * 8, OWW = L * OW;
+    wire [QW-1:0]  q_rd [0:G-1];
+    wire [QW-1:0]  gate_rd [0:G-1];
+    wire [OWW-1:0] o_rd [0:G-1];
+    wire [QW-1:0]  q_wd, gate_wd;
+    reg  [G*OWW-1:0] o_wd;
+    wire [G-1:0]   q_we, gate_we;
+    reg            o_we;
+    reg            o_seen;                // the first record has written every beat
     reg signed [31:0] score [0:G-1];
     reg signed [31:0] m_r [0:G-1];
     reg               m_valid [0:G-1];
@@ -245,7 +257,7 @@ module fabric_attention #(
             for (l = 0; l < LPP; l = l + 1) begin
                 ctree[g][0][l] = 0;
                 if (l < L)
-                    ctree[g][0][l] = $signed(q_mem[g][(beat*L + l)*8 +: 8]) * $signed(in_data[l*8 +: 8]);
+                    ctree[g][0][l] = $signed(q_rd[g][l*8 +: 8]) * $signed(in_data[l*8 +: 8]);
             end
             for (clv = 1; clv <= LLV; clv = clv + 1)
                 for (l = 0; l < (LPP >> clv); l = l + 1)
@@ -309,12 +321,43 @@ module fabric_attention #(
     reg [BW-1:0]         vbeat;
     reg [GW-1:0] ohead;
     reg [BW-1:0] obeat;
+    reg [BW-1:0] o_waddr;
     reg [3:0]    drain;
     reg          out_go;
+
+    // The beat each memory is asked for: the one that will arrive, not the one
+    // that has.  A memory answers a cycle later, so an address that tracked
+    // `beat` would always be a beat behind.
+    wire         beat_last = (beat == BEATS - 1);
+    wire [BW-1:0] bnext = (start || (state == S_APPLY && exp_v[0])) ? {BW{1'b0}}
+                        : (in_valid && in_ready) ? (beat_last ? {BW{1'b0}} : beat + 1'b1)
+                        : beat;
+    wire [BW-1:0] onext = (state == S_RECIP) ? {BW{1'b0}}
+                        : (obeat == BEATS - 1) ? {BW{1'b0}} : obeat + 1'b1;
+    wire          outing = (state == S_OUT) || (state == S_RECIP);
+    wire [BW-1:0] oaddr  = outing ? onext : bnext;
+    assign q_wd    = in_data;
+    assign gate_wd = in_data;
+    genvar gm;
+    generate
+        for (gm = 0; gm < G; gm = gm + 1) begin : g_mem
+            assign q_we[gm]    = in_valid && in_ready && (state == S_ACCEPT) && (in_kind == 2'd0) && (head == gm);
+            assign gate_we[gm] = in_valid && in_ready && (state == S_ACCEPT) && (in_kind == 2'd1) && (head == gm);
+            fabric_sram #(.W(QW), .D(BEATS), .MB(QW)) u_q (
+                .clk(clk), .rd_en(1'b1), .rd_addr(bnext[$clog2(BEATS)-1:0]), .rd_data(q_rd[gm]),
+                .wr_en(q_we[gm]), .wr_addr(beat[$clog2(BEATS)-1:0]), .wr_data(q_wd), .wr_mask(1'b1));
+            fabric_sram #(.W(QW), .D(BEATS), .MB(QW)) u_gate (
+                .clk(clk), .rd_en(1'b1), .rd_addr(onext[$clog2(BEATS)-1:0]), .rd_data(gate_rd[gm]),
+                .wr_en(gate_we[gm]), .wr_addr(beat[$clog2(BEATS)-1:0]), .wr_data(gate_wd), .wr_mask(1'b1));
+            fabric_sram #(.W(OWW), .D(BEATS), .MB(OWW)) u_o (
+                .clk(clk), .rd_en(1'b1), .rd_addr(oaddr[$clog2(BEATS)-1:0]), .rd_data(o_rd[gm]),
+                .wr_en(o_we), .wr_addr(o_waddr[$clog2(BEATS)-1:0]), .wr_data(o_wd[gm*OWW +: OWW]), .wr_mask(1'b1));
+        end
+    endgenerate
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             state <= S_ACCEPT; beat <= 0; head <= 0; exp_go <= 1'b0; rc_start <= 1'b0; done <= 1'b0;
-            ov1 <= 1'b0; out_go <= 1'b0; ohead <= 0; obeat <= 0; drain <= 0; vv <= 1'b0;
+            ov1 <= 1'b0; out_go <= 1'b0; ohead <= 0; obeat <= 0; drain <= 0; vv <= 1'b0; o_we <= 1'b0; o_seen <= 1'b0;
             for (g = 0; g < G; g = g + 1) begin m_valid[g] <= 1'b0; l_r[g] <= 0; score[g] <= 0; end
         end else begin
             exp_go <= 1'b0;
@@ -323,17 +366,22 @@ module fabric_attention #(
             ov1 <= 1'b0;
             // The value update's second half, before the state machine below
             // forms the next beat's products.
-            if (vv)
+            o_we <= 1'b0;
+            if (vv) begin
                 for (g = 0; g < G; g = g + 1)
                     for (l = 0; l < L; l = l + 1) begin
                         ow = fx_rnd_shr(va[g][l], 16) + $signed({{39{vb[g][l][24]}}, vb[g][l]});
-                        o_mem[g][(vbeat*L + l)*OW +: OW] <= ow[OW-1:0];
+                        o_wd[(g*L + l)*OW +: OW] <= ow[OW-1:0];
                     end
+                o_we <= 1'b1;
+                o_waddr <= vbeat;
+                if (vbeat == BEATS - 1) o_seen <= 1'b1;   // every beat written: the memory may be read
+            end
             vv <= 1'b0;
             if (start) begin
-                state <= S_ACCEPT; beat <= 0; head <= 0;
+                state <= S_ACCEPT; beat <= 0; head <= 0; o_seen <= 1'b0;
                 for (g = 0; g < G; g = g + 1) begin
-                    m_valid[g] <= 1'b0; l_r[g] <= 0; score[g] <= 0; o_mem[g] <= 0;
+                    m_valid[g] <= 1'b0; l_r[g] <= 0; score[g] <= 0;
                 end
             end
             case (state)
@@ -342,8 +390,7 @@ module fabric_attention #(
                         state <= S_RECIP; ohead <= 0; rc_l <= l_r[0]; rc_start <= 1'b1;
                     end else if (in_valid) begin
                         case (in_kind)
-                            2'd0: q_mem[head][beat*L*8 +: L*8]    <= in_data;
-                            2'd1: gate_mem[head][beat*L*8 +: L*8] <= in_data;
+                            2'd0, 2'd1: ;                     // the memories take them; see q_we and gate_we
                             2'd2: for (g = 0; g < G; g = g + 1) score[g] <= score[g] + {{(32-CW2){contrib[g][CW2-1]}}, contrib[g]};
                             default: ;
                         endcase
@@ -407,7 +454,7 @@ module fabric_attention #(
                         // so the read and the write never meet.
                         for (g = 0; g < G; g = g + 1)
                             for (l = 0; l < L; l = l + 1) begin
-                                va[g][l] <= $signed(o_mem[g][(beat*L + l)*OW +: OW]) * $signed({{(OW+1){1'b0}}, f_r[g]});
+                                va[g][l] <= $signed(o_seen ? o_rd[g][l*OW +: OW] : {OW{1'b0}}) * $signed({{(OW+1){1'b0}}, f_r[g]});
                                 vb[g][l] <= $signed({9'b0, p_r[g]}) * $signed(in_data[l*8 +: 8]);
                             end
                         vv    <= 1'b1;
@@ -430,8 +477,8 @@ module fabric_attention #(
                     // One beat per cycle into the output pipeline.
                     ov1 <= 1'b1;
                     for (l = 0; l < L; l = l + 1) begin
-                        wm1[l] <= $signed(o_mem[ohead][(obeat*L + l)*OW +: OW]) * $signed({{(OW+1){1'b0}}, r_hold});
-                        gm1[l] <= $signed(gate_mem[ohead][(obeat*L + l)*8 +: 8]) * $signed({8'b0, mult_gate});
+                        wm1[l] <= $signed(o_seen ? o_rd[ohead][l*OW +: OW] : {OW{1'b0}}) * $signed({{(OW+1){1'b0}}, r_hold});
+                        gm1[l] <= $signed(gate_rd[ohead][l*8 +: 8]) * $signed({8'b0, mult_gate});
                     end
                     if (obeat == BEATS - 1) begin
                         if (ohead == G - 1) begin state <= S_DONE; drain <= 0; end

@@ -27,7 +27,7 @@ from fabric import layer as L
 from fabric.sta import run_sta
 from fabric.synth import RTL_DIR, nand2_area, synthesize
 
-VEC = ("fabric_vector.sv",)
+VEC = ("fabric_sram.sv", "fabric_vector.sv")
 
 
 @dataclass(frozen=True)

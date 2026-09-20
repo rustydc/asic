@@ -11,7 +11,7 @@ from fabric import memory as M
 from fabric.tile import TileSpec
 
 RTL = Path(__file__).parents[1] / "rtl"
-SOURCES = [RTL / name for name in ("fabric_vector.sv", "fabric_norm.sv", "fabric_recurrent.sv", "fabric_ffn.sv",
+SOURCES = [RTL / name for name in ("fabric_sram.sv", "fabric_vector.sv", "fabric_norm.sv", "fabric_recurrent.sv", "fabric_ffn.sv",
                                    "fabric_attention.sv", "fabric_memory.sv")]
 
 SMALL = dict(kv_heads=2, head_dim=64, local_window=16, block=4, context_tokens=64, index_dim=32, v_heads=2, k_dim=16,
