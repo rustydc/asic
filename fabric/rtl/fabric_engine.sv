@@ -1410,6 +1410,23 @@ module fabric_mem_unit #(
     end
     assign rd_en = ld_on || (mv_busy && mv_mode == MV_WR_VB);
 
+    // The query's largest magnitude, as a balanced tree rather than a chain of
+    // compare-selects as long as the vector.
+    localparam int ULV = $clog2(IDIM), UPP = 1 << ULV;
+    reg [8:0] utree [0:ULV][0:UPP-1];
+    integer ul, uc;
+    always @* begin
+        for (uc = 0; uc < UPP; uc = uc + 1) begin
+            utree[0][uc] = 9'd1;
+            if (uc < IDIM)
+                utree[0][uc] = u_r[uc*8+7] ? (9'd256 - {1'b0, u_r[uc*8 +: 8]}) : {1'b0, u_r[uc*8 +: 8]};
+        end
+        for (ul = 1; ul <= ULV; ul = ul + 1)
+            for (uc = 0; uc < (UPP >> ul); uc = uc + 1)
+                utree[ul][uc] = (utree[ul-1][2*uc] > utree[ul-1][2*uc+1]) ? utree[ul-1][2*uc] : utree[ul-1][2*uc+1];
+    end
+    wire [8:0] u_absmax = (utree[ULV][0] > 9'd1) ? utree[ULV][0] : 9'd1;
+
     localparam [4:0] S_IDLE = 0, S_MV = 1, S_DONE = 2,
                      S_AP_LOAD = 3, S_AP_SUMS_RD = 4, S_AP_START = 5, S_AP_WAIT = 6, S_AP_SUMS_WR = 7,
                      S_SC_LOAD = 8, S_SC_SCALE = 9, S_SC_RECIP = 10, S_SC_CODES = 11, S_SC_RUN = 12, S_SC_COLLECT = 13, S_SC_WRITE = 14,
@@ -1511,12 +1528,7 @@ module fabric_mem_unit #(
                 // Scan: the query's codes, then the scan and the top-K, then the selection.
                 S_SC_LOAD: if (!ld_on && !ldv) state <= S_SC_SCALE;
                 S_SC_SCALE: begin
-                    mx = 1;
-                    for (j = 0; j < IDIM; j = j + 1) begin
-                        if ($signed(u_r[j*8 +: 8]) > mx) mx = $signed(u_r[j*8 +: 8]);
-                        if (-$signed(u_r[j*8 +: 8]) > mx) mx = -$signed(u_r[j*8 +: 8]);
-                    end
-                    scale <= mx[7:0]; rc_start <= 1'b1; state <= S_SC_RECIP;
+                    scale <= u_absmax[7:0]; rc_start <= 1'b1; state <= S_SC_RECIP;
                 end
                 S_SC_RECIP: if (rc_done) begin
                     for (j = 0; j < IDIM; j = j + 1) begin

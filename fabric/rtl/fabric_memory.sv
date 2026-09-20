@@ -625,8 +625,11 @@ module fabric_kv_append #(
     endgenerate
 
     // The record being written: packed key and value halves of one head.
-    reg [REC_BEATS*DW-1:0] rec;
-    reg [IREC_BEATS*DW-1:0] irec;
+    // A record is emitted a beat at a time, so only the beat is held: what
+    // this replaces was the whole record in flops, packed in one cycle by
+    // HALF_BEATS packers, and read out by a beat counter that had to decode
+    // into every beat's write enables.
+    reg [DW-1:0] wb_q;
     reg [11:0] beats_r;
     assign req_beats = beats_r;
 
@@ -694,7 +697,40 @@ module fabric_kv_append #(
     reg [7:0]  nbeat;
     reg        block_end;
     assign wdata_valid = (state == S_WIN_DATA) || (state == S_BLK_DATA) || (state == S_IREC_DATA);
-    assign wdata       = (state == S_IREC_DATA) ? irec[beat*DW +: DW] : rec[beat*DW +: DW];
+    assign wdata       = wb_q;
+
+    function automatic [DW-1:0] rec_beat(input [NKV*HD*8-1:0] kr, input [NKV*HD*8-1:0] vr,
+                                         input integer hd, input integer bt);
+        rec_beat = (bt < HALF_BEATS) ? pack_beat(kr, hd, bt) : pack_beat(vr, hd, bt - HALF_BEATS);
+    endfunction
+    function automatic [DW-1:0] idx_beat(input integer bt);
+        integer e;
+        reg signed [63:0] q;
+        begin
+            idx_beat = 0;
+            if (bt == CB) idx_beat[7:0] = scale;
+            else
+                for (e = 0; e < CPB; e = e + 1)
+                    if (bt * CPB + e < IDIM) begin
+                        q = fx_rnd_shr(64'sd15 * ($signed(unit[(bt*CPB + e)*8 +: 8]) + $signed({56'b0, scale})) * $signed({47'b0, rc_r}), 24 - rc_lz);
+                        if (q < 0) q = 0;
+                        if (q > 15) q = 15;
+                        idx_beat[e*4 +: 4] = q[3:0];
+                    end
+        end
+    endfunction
+
+    // The beat to write, formed the cycle before it is wanted.
+    always @(posedge clk) begin
+        if (state == S_WIN)              wb_q <= rec_beat(k_r, v_r, head, 0);
+        if (state == S_BLK)              wb_q <= rec_beat(kbar, vbar, head, 0);
+        if (state == S_CODES && rc_done) wb_q <= idx_beat(0);
+        if (!req_valid && wdata_ready) begin
+            if (state == S_WIN_DATA)  wb_q <= rec_beat(k_r, v_r, head, beat + 1);
+            if (state == S_BLK_DATA)  wb_q <= rec_beat(kbar, vbar, head, beat + 1);
+            if (state == S_IREC_DATA) wb_q <= idx_beat(beat + 1);
+        end
+    end
 
     integer b, e;
     always @(posedge clk or negedge rst_n) begin
@@ -720,11 +756,7 @@ module fabric_kv_append #(
                     state <= S_WIN;
                 end
                 S_WIN: begin
-                    // Window record of this head.
-                    for (b = 0; b < HALF_BEATS; b = b + 1) begin
-                        rec[b*DW +: DW] <= pack_beat(k_r, head, b);
-                        rec[(HALF_BEATS + b)*DW +: DW] <= pack_beat(v_r, head, b);
-                    end
+                    // Window record of this head, a beat at a time.
                     req_addr <= window_base + (head * W + (pos_r % W)) * REC_BYTES;
                     beats_r <= REC_BEATS;
                     req_valid <= 1'b1;
@@ -759,10 +791,6 @@ module fabric_kv_append #(
                     end
                 end
                 S_BLK: begin
-                    for (b = 0; b < HALF_BEATS; b = b + 1) begin
-                        rec[b*DW +: DW] <= pack_beat(kbar, head, b);
-                        rec[(HALF_BEATS + b)*DW +: DW] <= pack_beat(vbar, head, b);
-                    end
                     req_addr <= block_base + ((pos_r / BS) * NKV + head) * REC_BYTES;
                     beats_r <= REC_BEATS;
                     req_valid <= 1'b1;
@@ -799,15 +827,8 @@ module fabric_kv_append #(
                     state <= S_CODES;
                 end
                 S_CODES: if (rc_done) begin
-                    // code = clip(round(15 (u + scale) * r >> (24 - lz)), 0, 15)
-                    irec <= 0;
-                    for (j = 0; j < IDIM; j = j + 1) begin
-                        t = fx_rnd_shr(64'sd15 * ($signed(unit[j*8 +: 8]) + $signed({56'b0, scale})) * $signed({47'b0, rc_r}), 24 - rc_lz);
-                        if (t < 0) t = 0;
-                        if (t > 15) t = 15;
-                        irec[j*4 +: 4] <= t[3:0];
-                    end
-                    irec[CB*DW +: 8] <= scale;
+                    // code = clip(round(15 (u + scale) * r >> (24 - lz)), 0, 15),
+                    // a beat of them at a time (see idx_beat).
                     req_addr <= index_base + (pos_r / BS) * IREC_BYTES;
                     beats_r <= IREC_BEATS;
                     req_valid <= 1'b1;
