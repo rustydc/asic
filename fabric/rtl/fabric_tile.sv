@@ -141,6 +141,7 @@ module fabric_columns #(
     output wire [T*COLS*AB-1:0]     q_out,      // requantized outputs, valid when q_valid, token-major
     output wire                     q_valid     // pulses a few cycles after the T*COLS-cycle walk
 );
+    /*verilator hier_block*/           // one compiled block for every tile under Verilator --hierarchical
     localparam int CYCLES = ROWS / P;
     localparam int CW     = $clog2(CYCLES);
     localparam int ROWW   = COLS * WB;
@@ -515,6 +516,7 @@ module fabric_columns_model #(
     output reg  [T*COLS*AB-1:0]     q_out,
     output reg                      q_valid
 );
+    /*verilator hier_block*/           // one compiled block for every tile under Verilator --hierarchical
     localparam int CYCLES = ROWS / P;
     localparam int CW     = $clog2(CYCLES);
     localparam int NA     = T * COLS;
