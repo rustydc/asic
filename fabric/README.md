@@ -1209,11 +1209,20 @@ memory model or the HPI path behind the port. Verilator 5 runs the
 engine too (`--binary --timing`, the vector buffer's array writes made
 blocking for it): the tiny one-token case is bit-exact and cycle-exact
 with Icarus and simulates in under a second against Icarus's 44 s. The
-full-size engine, 834 tiles and the 128 x 128 state engines, takes
-Verilator's elaboration past 9.8 GB (the loop-unroll limits raised for
-the full-size loops), more than this container has; a hierarchical
-build with the tile as a block, its ROM image named by an index port
-instead of a hierarchical `$readmemh` from the top, is the way to it.
+full-size engine, 834 tiles and the 128 x 128 state engines, is another
+matter. Flat, Verilator's elaboration passes 9.8 GB, more than this
+container has. With the column modules marked `hier_block` and
+`--hierarchical` (the top's parameters in a wrapper module, since the
+`-G` flags reach the child; the executable linked by hand, since
+`--main` reaches it too) the tile compiles once and elaboration fits,
+but the top's generated C++ runs to 64 MB a file and g++ needs more than
+9 GB on one of them even at `-O0`. The size is the unrolled loops: the
+state engine's and the append's loops over 128 and 1,024 elements write
+arrays with non-blocking assignments, which Verilator can only unroll,
+and raising its unroll limit for them unrolls every loop in the design.
+Making those array writes blocking (each element reads and writes only
+itself) lets the loops stay loops, which is the next step for a
+full-size Verilator run.
 
 `rtl/fabric_memory.sv` holds the memory side: the behavioural
 `fabric_mem_model` for the testbenches, `fabric_mem_arbiter`,
