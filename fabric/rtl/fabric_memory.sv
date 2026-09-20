@@ -647,6 +647,23 @@ module fabric_kv_append #(
         end
     endfunction
 
+    // The unit vector's largest magnitude, as a balanced tree: the chain of
+    // compare-selects this replaces was IDIM deep, all of it in one cycle.
+    localparam int MLV = $clog2(IDIM), MPP = 1 << MLV;
+    reg [8:0] mtree [0:MLV][0:MPP-1];
+    integer ml, mc;
+    always @* begin
+        for (mc = 0; mc < MPP; mc = mc + 1) begin
+            mtree[0][mc] = 9'd1;
+            if (mc < IDIM)
+                mtree[0][mc] = unit[mc*8+7] ? (9'd256 - {1'b0, unit[mc*8 +: 8]}) : {1'b0, unit[mc*8 +: 8]};
+        end
+        for (ml = 1; ml <= MLV; ml = ml + 1)
+            for (mc = 0; mc < (MPP >> ml); mc = mc + 1)
+                mtree[ml][mc] = (mtree[ml-1][2*mc] > mtree[ml-1][2*mc+1]) ? mtree[ml-1][2*mc] : mtree[ml-1][2*mc+1];
+    end
+    wire [8:0] unit_absmax = (mtree[MLV][0] > 9'd1) ? mtree[MLV][0] : 9'd1;
+
     // Block means and index mean as int8 rows.
     reg [NKV*HD*8-1:0] kbar, vbar;
     reg [IDIM*8-1:0]   ibar;
@@ -777,12 +794,7 @@ module fabric_kv_append #(
                 end
                 S_SCALE: begin
                     // scale = max |u|, at least 1; then its reciprocal.
-                    t = 1;
-                    for (j = 0; j < IDIM; j = j + 1) begin
-                        if ($signed(unit[j*8 +: 8]) > t) t = $signed(unit[j*8 +: 8]);
-                        if (-$signed(unit[j*8 +: 8]) > t) t = -$signed(unit[j*8 +: 8]);
-                    end
-                    scale <= t[7:0];
+                    scale <= unit_absmax[7:0];
                     rc_start <= 1'b1;
                     state <= S_CODES;
                 end
