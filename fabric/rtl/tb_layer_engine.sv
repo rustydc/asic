@@ -155,6 +155,7 @@ module tb_layer_engine #(
     always @(posedge clk) if (|(dut.cmd_valid & dut.cmd_ready)) begin
         if (issues == 0) t0 = cycle;
         $fdisplay(trace, "%0d %0d %0d %0d", issues, dut.cmd_tag, cycle, dut.u_seq.cur_unit);
+        $fflush(trace);                                    // a full-size run takes hours: the trace is its progress
         issues = issues + 1;
     end
 
