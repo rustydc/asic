@@ -1268,8 +1268,9 @@ and the word is held until the link takes it; a real part is read in bursts
 and that is where the burst goes.
 
 Mapped by yosys at the 9B geometry, 4096 elements and lists of 32, the
-datapath is about 20K LUT4 and 9K flip-flops on an ECP5 -- a corner of a
-45 or an 85, and small on an Artix-7 -- which leaves the part for what
+datapath is 17,916 LUT4 and 9,069 flip-flops on an ECP5, and 10,865 LUTs
+and 18,264 flip-flops on an Artix-7 -- a corner of an ECP5-45, and inside
+an XC7A35 with room -- which leaves the part for what
 else has to live on it: the PCIe endpoint, the DDR4 controller for the
 embedding table, the ring's physical layer and the soft side. The
 sampler's candidate arrays map to flip-flops rather than block RAM at

@@ -8,5 +8,14 @@
     "luts": 17916,
     "multipliers": 9,
     "flops": 9069
+  },
+  {
+    "family": "xilinx",
+    "d": 4096,
+    "k": 32,
+    "cells": 13501,
+    "multipliers": 18,
+    "flops": 18264,
+    "luts": 10865
   }
 ]
