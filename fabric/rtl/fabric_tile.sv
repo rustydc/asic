@@ -532,6 +532,7 @@ module fabric_columns_model #(
     assign cycle   = cycle_r;
     integer t, b, c;
     reg signed [63:0] a, prod;
+    reg signed [31:0] mac;      // the accumulate at 32 bits: two 12-bit products on a 24-bit accumulator, exact in ACC bits
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             busy <= 1'b0; cycle_r <= 0; done <= 1'b0; vA <= 1'b0; vB <= 1'b0; q_valid <= 1'b0; walk <= 0; walking <= 1'b0;
@@ -546,10 +547,10 @@ module fabric_columns_model #(
                 if (cycle_r == CYCLES - 1) busy <= 1'b0;
                 for (t = 0; t < T; t = t + 1)
                     for (c = 0; c < COLS; c = c + 1) begin
-                        a = $signed(acc[t*COLS + c]);
+                        mac = $signed(acc[t*COLS + c]);
                         for (b = 0; b < P; b = b + 1)
-                            a = a + $signed(x_data[(t*P + b)*AB +: AB]) * $signed(rom_words[b*ROWW + c*WB +: WB]);
-                        acc[t*COLS + c] <= a[ACC-1:0];
+                            mac = mac + $signed(x_data[(t*P + b)*AB +: AB]) * $signed(rom_words[b*ROWW + c*WB +: WB]);
+                        acc[t*COLS + c] <= mac[ACC-1:0];
                     end
             end
             // The requantizer walk: everything resolved at done, published NA + 7 cycles later.
