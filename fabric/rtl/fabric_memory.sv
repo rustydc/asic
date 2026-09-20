@@ -388,16 +388,29 @@ module fabric_index_scan #(
     wire [RW-1:0]    want = (left > RPB) ? RPB[RW-1:0] : left[RW-1:0];
     assign req_addr  = base + blk * REC;
     assign req_beats = want * (CB + 1);
-    // Partial dot product of this beat's codes.
-    integer c;
-    reg signed [63:0] part;
+    // Partial dot product of this beat's codes.  Each factor is in [-15, 15]
+    // and each product in [-225, 225], so the beat's sum needs 14 bits, not
+    // 64; the sum is a balanced tree, since a chain of CPB adds is CPB carry
+    // chains deep and ABC cannot restructure them.
+    localparam int PWID = 16;
+    localparam int LV   = $clog2(CPB);
+    localparam int CPP  = 1 << LV;                         // the tree's width, CPB padded
+    integer c, lv;
+    reg signed [PWID-1:0] tree [0:LV][0:CPP-1];
     always @* begin
-        part = 0;
-        for (c = 0; c < CPB; c = c + 1)
-            if (beat * CPB + c < IDIM)
-                part = part + (2 * $signed({1'b0, q_codes[(beat*CPB + c)*4 +: 4]}) - 64'sd15)
-                             * (2 * $signed({1'b0, rdata[c*4 +: 4]}) - 64'sd15);
+        // An assignment, not a conditional expression: an unsigned zero in the
+        // other arm would make the whole expression unsigned.
+        for (c = 0; c < CPP; c = c + 1) begin
+            tree[0][c] = 0;
+            if (c < CPB && beat * CPB + c < IDIM)
+                tree[0][c] = (2 * $signed({1'b0, q_codes[(beat*CPB + c)*4 +: 4]}) - 16'sd15)
+                             * (2 * $signed({1'b0, rdata[c*4 +: 4]}) - 16'sd15);
+        end
+        for (lv = 1; lv <= LV; lv = lv + 1)
+            for (c = 0; c < (CPP >> lv); c = c + 1)
+                tree[lv][c] = tree[lv-1][2*c] + tree[lv-1][2*c+1];
     end
+    wire signed [PWID-1:0] part = tree[LV][0];
     wire signed [63:0] final_score = acc * $signed({56'b0, rdata[7:0]});
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -416,7 +429,7 @@ module fabric_index_scan #(
                 end
                 if (inflight && rdata_valid) begin
                     if (beat < CB) begin
-                        acc <= acc + part[31:0];
+                        acc <= acc + {{(32-PWID){part[PWID-1]}}, part};
                         beat <= beat + 1'b1;
                     end else begin
                         cand_valid <= 1'b1; cand_id <= blk; cand_score <= final_score[31:0];

@@ -11,6 +11,24 @@
 `include "fabric_fx.svh"
 
 // ---------------------------------------------------------------------------
+// One registered copy of a value a lane needs.  A shift amount shared by L
+// lanes drives every lane's shifter select, hundreds of loads from one flop;
+// a copy per lane divides that by L for a handful of flops.  Its own
+// hierarchy, so synthesis cannot merge the copies back into one net (the
+// tile's fabric_strobe_copy does the same for a one-bit strobe).
+// ---------------------------------------------------------------------------
+(* keep_hierarchy *)
+module fabric_const_copy #(
+    parameter int W = 6
+) (
+    input  wire         clk,
+    input  wire [W-1:0] d,
+    output reg  [W-1:0] q
+);
+    always @(posedge clk) q <= d;
+endmodule
+
+// ---------------------------------------------------------------------------
 // Table with linear interpolation: 2^IB + 1 entries of W bits, an index of
 // IB bits and FB fraction bits.  y = T[i] + ((T[i+1] - T[i]) * f + 2^(FB-1)) >> FB.
 // Latency 2.
@@ -158,7 +176,7 @@ endmodule
 // Inverse square root of an SW-bit unsigned (SW even, ss >= 1):
 //   1/sqrt(ss) = r * 2^(a/2 - 15 - SW/2), r in Q1.15 (17 bits), a even.
 // A table seed over the normalised operand and one Newton step.  Sequential:
-// start, then done 5 cycles later.
+// start, then done 6 cycles later (one multiply to a stage).
 // ---------------------------------------------------------------------------
 module fabric_rsqrt #(
     parameter int SW = 44,
@@ -188,12 +206,13 @@ module fabric_rsqrt #(
     wire [SW-1:0] sh  = ss << a_w;
     reg  [15:0]   m1;
     reg  [6:0]    a1;
-    reg           v1, v2, v3, v4;
-    reg  [15:0]   m2, m3, m4;
-    reg  [6:0]    a2, a3, a4;
-    reg  [16:0]   r0_2, r0_3, r0_4;
+    reg           v1, v2, v3, v4, v5;
+    reg  [15:0]   m2, m3;
+    reg  [6:0]    a2, a3, a4, a5;
+    reg  [16:0]   r0_2, r0_3, r0_4, r0_5;
     reg  [33:0]   sq3;
-    reg  signed [63:0] u4;
+    reg  [49:0]   p4;
+    reg  signed [63:0] u5;
     always @(posedge clk) begin
         v1 <= start;
         m1 <= sh[SW-1:SW-16];
@@ -204,13 +223,16 @@ module fabric_rsqrt #(
         // S3: r0^2.
         v3 <= v2; m3 <= m2; a3 <= a2; r0_3 <= r0_2;
         sq3 <= r0_2 * r0_2;
-        // S4: u = 3 - M r0^2 in Q2.30.
+        // S4: M r0^2, the multiply on its own.
         v4 <= v3; a4 <= a3; r0_4 <= r0_3;
-        u4 <= (64'sd3 <<< 30) - (($signed({48'b0, m3}) * $signed({30'b0, sq3})) >>> 16);
-        // S5: r1 = r0 (3 - M r0^2) / 2.
-        done <= v4;
-        r    <= ($signed({47'b0, r0_4}) * u4) >>> 31;
-        a    <= a4;
+        p4 <= m3 * sq3;
+        // S5: u = 3 - M r0^2 in Q2.30.
+        v5 <= v4; a5 <= a4; r0_5 <= r0_4;
+        u5 <= (64'sd3 <<< 30) - ($signed({14'b0, p4}) >>> 16);
+        // S6: r1 = r0 (3 - M r0^2) / 2.
+        done <= v5;
+        r    <= ($signed({47'b0, r0_5}) * u5) >>> 31;
+        a    <= a5;
     end
 endmodule
 

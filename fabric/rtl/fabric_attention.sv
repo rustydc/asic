@@ -60,8 +60,8 @@ endmodule
 // ---------------------------------------------------------------------------
 // Rotate the first R elements of an int16 head vector of HD elements as
 // pairs (i, i + R/2), then requantize every element to int8.  The head
-// streams in L per beat, is buffered, and streams out L per beat two
-// cycles after the last input beat.
+// streams in L per beat, is buffered, and streams out L per beat five
+// cycles after the last input beat (one multiply to a stage).
 //   y1 = sat16((x1 cos - x2 sin + 2^14) >> 15)
 //   y2 = sat16((x2 cos + x1 sin + 2^14) >> 15)
 //   out = sat8((y * mult + 2^(shift-1)) >> shift)
@@ -106,39 +106,56 @@ module fabric_rotary #(
             end
         end
     end
-    // P1: rotate the beat's elements.
-    reg            v1;
-    reg [L*16-1:0] y1;
-    integer l, e, p;
-    reg signed [63:0] x1, x2, s, c, t;
+    // P1 picks the beat's pair and its sine and cosine, P2 multiplies, P3
+    // combines and rounds, P4 and P5 requantize: one multiply, or one round
+    // with its saturate, to a stage.  Both halves of a rotated pair read the
+    // same two elements and the same table entry, so the half only chooses
+    // which is multiplied by the cosine and whether the terms add.
+    reg            v1, v2, v3, v4;
+    reg [L*16-1:0] ca1, sa1, cs1, sn1, pt1;
+    reg [L-1:0]    rot1, add1;
+    reg [L-1:0]    rot2, add2, rot3;
+    reg [L*16-1:0] pt2, pt3;
+    reg [L*16-1:0] cs2, sn2;
+    reg signed [31:0] pa2 [0:L-1];
+    reg signed [31:0] pb2 [0:L-1];
+    reg [L*16-1:0] y3;
+    reg signed [31:0] pm4 [0:L-1];
+    integer l, e, pp;
+    reg signed [32:0] comb;
     always @(posedge clk) begin
         v1 <= rd_valid;
         for (l = 0; l < L; l = l + 1) begin
-            e = rd_addr * L + l;
-            if (e < H) begin
-                x1 = $signed(buffer[e*16 +: 16]);
-                x2 = $signed(buffer[(e + H)*16 +: 16]);
-                s  = $signed(sin_tab[e*16 +: 16]);
-                c  = $signed(cos_tab[e*16 +: 16]);
-                t  = fx_sat(fx_rnd_shr(x1 * c - x2 * s, 15), 16);
-            end else if (e < R) begin
-                p  = e - H;
-                x1 = $signed(buffer[p*16 +: 16]);
-                x2 = $signed(buffer[e*16 +: 16]);
-                s  = $signed(sin_tab[p*16 +: 16]);
-                c  = $signed(cos_tab[p*16 +: 16]);
-                t  = fx_sat(fx_rnd_shr(x2 * c + x1 * s, 15), 16);
-            end else begin
-                t  = $signed(buffer[e*16 +: 16]);
-            end
-            y1[l*16 +: 16] <= t[15:0];
+            e  = rd_addr * L + l;
+            pp = (e < H) ? e : (e - H);
+            rot1[l] <= (e < R);
+            add1[l] <= (e >= H);                       // the second half adds its terms
+            ca1[l*16 +: 16] <= (e < H) ? buffer[pp*16 +: 16] : buffer[(pp + H)*16 +: 16];
+            sa1[l*16 +: 16] <= (e < H) ? buffer[(pp + H)*16 +: 16] : buffer[pp*16 +: 16];
+            cs1[l*16 +: 16] <= cos_tab[pp*16 +: 16];
+            sn1[l*16 +: 16] <= sin_tab[pp*16 +: 16];
+            pt1[l*16 +: 16] <= buffer[e*16 +: 16];
         end
-    end
-    // P2: requantize.
-    always @(posedge clk) begin
-        out_valid <= v1;
+        // P2: the two products.
+        v2 <= v1; rot2 <= rot1; add2 <= add1; pt2 <= pt1;
+        for (l = 0; l < L; l = l + 1) begin
+            pa2[l] <= $signed(ca1[l*16 +: 16]) * $signed(cs1[l*16 +: 16]);
+            pb2[l] <= $signed(sa1[l*16 +: 16]) * $signed(sn1[l*16 +: 16]);
+        end
+        // P3: combine, round and saturate, or pass the element through.
+        v3 <= v2; rot3 <= rot2; pt3 <= pt2;
+        for (l = 0; l < L; l = l + 1) begin
+            comb = add2[l] ? ($signed({pa2[l][31], pa2[l]}) + $signed({pb2[l][31], pb2[l]}))
+                           : ($signed({pa2[l][31], pa2[l]}) - $signed({pb2[l][31], pb2[l]}));
+            y3[l*16 +: 16] <= rot2[l] ? fx_sat(fx_rnd_shr(comb, 15), 16) : pt2[l*16 +: 16];
+        end
+        // P4 and P5: the output requantizer.
+        v4 <= v3;
         for (l = 0; l < L; l = l + 1)
-            out_y[l*8 +: 8] <= fx_requant($signed(y1[l*16 +: 16]), mult, shift, 8);
+            pm4[l] <= $signed(y3[l*16 +: 16]) * $signed({16'b0, mult});
+        out_valid <= v4;
+        for (l = 0; l < L; l = l + 1)
+            out_y[l*8 +: 8] <= fx_sat(fx_rnd_shr(pm4[l], shift), 8);
     end
 endmodule
 
@@ -204,21 +221,43 @@ module fabric_attention #(
     reg [BW-1:0] beat;
     reg [GW-1:0] head;
     // State.
-    localparam [2:0] S_ACCEPT = 3'd0, S_EXP = 3'd1, S_APPLY = 3'd2, S_VALUE = 3'd3,
-                     S_RECIP = 3'd4, S_OUT = 3'd5, S_DONE = 3'd6;
-    reg [2:0] state;
+    localparam [3:0] S_ACCEPT = 4'd0, S_EXP = 4'd1, S_APPLY = 4'd2, S_VALUE = 4'd3,
+                     S_RECIP = 4'd4, S_OUT = 4'd5, S_DONE = 4'd6, S_EXP2 = 4'd7;
+    reg [3:0] state;
+    reg signed [47:0] sm [0:G-1];
     assign in_ready = (state == S_ACCEPT) || (state == S_VALUE);
 
-    // Score contribution of a key beat for every head.
-    integer g, l;
-    reg signed [63:0] contrib [0:G-1];
+    // Score contribution of a key beat for every head.  The products of two
+    // int8s need 16 bits and their sum over the beat needs 16 + log2(L), so
+    // the tree is narrow, and balanced: a chain of L adds is L carry chains
+    // deep and ABC cannot restructure them.
+    localparam int CW2 = 16 + $clog2(L) + 1;
+    localparam int LLV = $clog2(L);
+    localparam int LPP = 1 << LLV;
+    integer g, l, clv;
+    reg signed [CW2-1:0] ctree [0:G-1][0:LLV][0:LPP-1];
+    wire signed [CW2-1:0] contrib [0:G-1];
     always @* begin
         for (g = 0; g < G; g = g + 1) begin
-            contrib[g] = 0;
-            for (l = 0; l < L; l = l + 1)
-                contrib[g] = contrib[g] + $signed(q_mem[g][(beat*L + l)*8 +: 8]) * $signed(in_data[l*8 +: 8]);
+            // An assignment, not a conditional expression: an unsigned zero in
+            // the other arm would make the whole expression unsigned and the
+            // negative products would extend with zeros.
+            for (l = 0; l < LPP; l = l + 1) begin
+                ctree[g][0][l] = 0;
+                if (l < L)
+                    ctree[g][0][l] = $signed(q_mem[g][(beat*L + l)*8 +: 8]) * $signed(in_data[l*8 +: 8]);
+            end
+            for (clv = 1; clv <= LLV; clv = clv + 1)
+                for (l = 0; l < (LPP >> clv); l = l + 1)
+                    ctree[g][clv][l] = ctree[g][clv-1][2*l] + ctree[g][clv-1][2*l+1];
         end
     end
+    genvar gc;
+    generate
+        for (gc = 0; gc < G; gc = gc + 1) begin : g_contrib
+            assign contrib[gc] = ctree[gc][LLV][0];
+        end
+    endgenerate
 
     // Exponentials: one fabric_exp_neg per head, fed in S_EXP.
     reg  [21:0] d_in [0:G-1];
@@ -243,34 +282,54 @@ module fabric_attention #(
     reg [16:0] r_hold;
     reg [5:0]  lz_hold;
 
-    // Output pipeline: O1 w and tg, O2..O4 sigmoid, O5 out.
-    reg            ov1;
-    reg [L*16-1:0] w1;
-    reg [L*16-1:0] tg1;
-    wire [L-1:0]    sgv;
-    wire [L*16-1:0] sg4;
+    // Output pipeline: O1 the two products, O2 their round and saturate,
+    // O3..O5 the sigmoid, then the gate's product, the scale's and the
+    // output's round.  One multiply, or one round with its saturate, to a
+    // stage.
+    reg                ov1, ov2;
+    reg signed [OW+17:0] wm1 [0:L-1];
+    reg signed [23:0]  gm1 [0:L-1];
+    reg [L*16-1:0]     w2;
+    reg [L*16-1:0]     tg2;
+    wire [L-1:0]       sgv;
+    wire [L*16-1:0]    sg5;
     generate
         for (gg = 0; gg < L; gg = gg + 1) begin : g_sig
-            fabric_sigmoid #(.LUT_DIR(LUT_DIR)) u_sg (.clk(clk), .valid_in(ov1), .t(tg1[gg*16 +: 16]), .valid_out(sgv[gg]), .y(sg4[gg*16 +: 16]));
+            fabric_sigmoid #(.LUT_DIR(LUT_DIR)) u_sg (.clk(clk), .valid_in(ov2), .t(tg2[gg*16 +: 16]), .valid_out(sgv[gg]), .y(sg5[gg*16 +: 16]));
         end
     endgenerate
-    reg [L*16-1:0] w2, w3, w4;
-    always @(posedge clk) begin w2 <= w1; w3 <= w2; w4 <= w3; end
+    reg [L*16-1:0] w3, w4, w5;
+    always @(posedge clk) begin w3 <= w2; w4 <= w3; w5 <= w4; end
 
     reg signed [63:0] sc, dd, ow, tmp;
+    // The value update's two products, applied the cycle after they are formed.
+    reg signed [OW+17:0] va [0:G-1][0:L-1];
+    reg signed [24:0]    vb [0:G-1][0:L-1];
+    reg                  vv;
+    reg [BW-1:0]         vbeat;
     reg [GW-1:0] ohead;
     reg [BW-1:0] obeat;
+    reg [3:0]    drain;
     reg          out_go;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             state <= S_ACCEPT; beat <= 0; head <= 0; exp_go <= 1'b0; rc_start <= 1'b0; done <= 1'b0;
-            ov1 <= 1'b0; out_go <= 1'b0; ohead <= 0; obeat <= 0;
+            ov1 <= 1'b0; out_go <= 1'b0; ohead <= 0; obeat <= 0; drain <= 0; vv <= 1'b0;
             for (g = 0; g < G; g = g + 1) begin m_valid[g] <= 1'b0; l_r[g] <= 0; score[g] <= 0; end
         end else begin
             exp_go <= 1'b0;
             rc_start <= 1'b0;
             done <= 1'b0;
             ov1 <= 1'b0;
+            // The value update's second half, before the state machine below
+            // forms the next beat's products.
+            if (vv)
+                for (g = 0; g < G; g = g + 1)
+                    for (l = 0; l < L; l = l + 1) begin
+                        ow = fx_rnd_shr(va[g][l], 16) + $signed({{39{vb[g][l][24]}}, vb[g][l]});
+                        o_mem[g][(vbeat*L + l)*OW +: OW] <= ow[OW-1:0];
+                    end
+            vv <= 1'b0;
             if (start) begin
                 state <= S_ACCEPT; beat <= 0; head <= 0;
                 for (g = 0; g < G; g = g + 1) begin
@@ -285,7 +344,7 @@ module fabric_attention #(
                         case (in_kind)
                             2'd0: q_mem[head][beat*L*8 +: L*8]    <= in_data;
                             2'd1: gate_mem[head][beat*L*8 +: L*8] <= in_data;
-                            2'd2: for (g = 0; g < G; g = g + 1) score[g] <= score[g] + contrib[g][31:0];
+                            2'd2: for (g = 0; g < G; g = g + 1) score[g] <= score[g] + {{(32-CW2){contrib[g][CW2-1]}}, contrib[g]};
                             default: ;
                         endcase
                         if (beat == BEATS - 1) begin
@@ -298,9 +357,15 @@ module fabric_attention #(
                     end
                 end
                 S_EXP: begin
-                    // The score is complete: requantize, compare with the maximum, launch the exponentials.
+                    // The score is complete: its scale is a stage of its own.
+                    for (g = 0; g < G; g = g + 1)
+                        sm[g] <= $signed({{16{score[g][31]}}, score[g]}) * $signed({32'b0, mult_s});
+                    state <= S_EXP2;
+                end
+                S_EXP2: begin
+                    // Round it, compare with the maximum, launch the exponentials.
                     for (g = 0; g < G; g = g + 1) begin
-                        sc = fx_rnd_shr($signed({{32{score[g][31]}}, score[g]}) * $signed({48'b0, mult_s}), sh_s);
+                        sc = fx_rnd_shr(sm[g], sh_s);
                         if (!m_valid[g] || sc > $signed({{32{m_r[g][31]}}, m_r[g]})) begin
                             newmax[g] <= 1'b1;
                             dd = m_valid[g] ? (sc - $signed({{32{m_r[g][31]}}, m_r[g]})) : 64'sd0;
@@ -337,12 +402,16 @@ module fabric_attention #(
                 end
                 S_VALUE: begin
                     if (in_valid) begin
+                        // The two products here, their round and add a cycle
+                        // later: consecutive beats touch different elements,
+                        // so the read and the write never meet.
                         for (g = 0; g < G; g = g + 1)
                             for (l = 0; l < L; l = l + 1) begin
-                                ow = fx_rnd_shr($signed(o_mem[g][(beat*L + l)*OW +: OW]) * $signed({48'b0, f_r[g]}), 16)
-                                     + $signed({48'b0, p_r[g]}) * $signed(in_data[l*8 +: 8]);
-                                o_mem[g][(beat*L + l)*OW +: OW] <= ow[OW-1:0];
+                                va[g][l] <= $signed(o_mem[g][(beat*L + l)*OW +: OW]) * $signed({{(OW+1){1'b0}}, f_r[g]});
+                                vb[g][l] <= $signed({9'b0, p_r[g]}) * $signed(in_data[l*8 +: 8]);
                             end
+                        vv    <= 1'b1;
+                        vbeat <= beat;
                         if (beat == BEATS - 1) begin
                             beat <= 0;
                             state <= S_ACCEPT;
@@ -361,11 +430,11 @@ module fabric_attention #(
                     // One beat per cycle into the output pipeline.
                     ov1 <= 1'b1;
                     for (l = 0; l < L; l = l + 1) begin
-                        w1[l*16 +: 16]  <= fx_sat(fx_rnd_shr($signed(o_mem[ohead][(obeat*L + l)*OW +: OW]) * $signed({47'b0, r_hold}), 7 + LW - lz_hold), 16);
-                        tg1[l*16 +: 16] <= fx_requant($signed(gate_mem[ohead][(obeat*L + l)*8 +: 8]), mult_gate, sh_gate, 16);
+                        wm1[l] <= $signed(o_mem[ohead][(obeat*L + l)*OW +: OW]) * $signed({{(OW+1){1'b0}}, r_hold});
+                        gm1[l] <= $signed(gate_mem[ohead][(obeat*L + l)*8 +: 8]) * $signed({8'b0, mult_gate});
                     end
                     if (obeat == BEATS - 1) begin
-                        if (ohead == G - 1) state <= S_DONE;
+                        if (ohead == G - 1) begin state <= S_DONE; drain <= 0; end
                         else begin
                             ohead <= ohead + 1'b1;
                             rc_l <= l_r[ohead + 1];
@@ -377,19 +446,37 @@ module fabric_attention #(
                     end
                 end
                 S_DONE: begin
-                    // Let the output pipeline drain before done.
-                    obeat <= obeat + 1'b1;
-                    if (obeat == 7) begin done <= 1'b1; state <= S_ACCEPT; obeat <= 0; end
+                    // Let the output pipeline drain before done: O1, O2, the
+                    // sigmoid's three and the three after it.  Its own
+                    // counter, since obeat only spans a head's beats.
+                    drain <= drain + 1'b1;
+                    if (drain == 4'd11) begin done <= 1'b1; state <= S_ACCEPT; obeat <= 0; drain <= 0; end
                 end
                 default: state <= S_ACCEPT;
             endcase
         end
     end
-    // O5: gate and requantize.
+    // O2: the products' round and saturate.  O6 and O7: the gate's product
+    // and the output scale's, O8 the output's round.
+    reg               o6v, o7v;
+    reg signed [33:0] og6 [0:L-1];
+    reg signed [55:0] oq7 [0:L-1];
+    integer ol;
     always @(posedge clk) begin
-        out_valid <= sgv[0];
-        for (l = 0; l < L; l = l + 1)
-            out_data[l*8 +: 8] <= fx_requant($signed(w4[l*16 +: 16]) * $signed({48'b0, sg4[l*16 +: 16]}), mult_o, sh_o, 8);
+        ov2 <= ov1;
+        for (ol = 0; ol < L; ol = ol + 1) begin
+            w2[ol*16 +: 16]  <= fx_sat(fx_rnd_shr(wm1[ol], 7 + LW - lz_hold), 16);
+            tg2[ol*16 +: 16] <= fx_sat(fx_rnd_shr(gm1[ol], sh_gate), 16);
+        end
+        o6v <= sgv[0];
+        for (ol = 0; ol < L; ol = ol + 1)
+            og6[ol] <= $signed({{18{w5[ol*16+15]}}, w5[ol*16 +: 16]}) * $signed({18'b0, sg5[ol*16 +: 16]});
+        o7v <= o6v;
+        for (ol = 0; ol < L; ol = ol + 1)
+            oq7[ol] <= $signed({{22{og6[ol][33]}}, og6[ol]}) * $signed({40'b0, mult_o});
+        out_valid <= o7v;
+        for (ol = 0; ol < L; ol = ol + 1)
+            out_data[ol*8 +: 8] <= fx_sat(fx_rnd_shr(oq7[ol], sh_o), 8);
     end
 endmodule
 

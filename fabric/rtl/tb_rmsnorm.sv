@@ -60,6 +60,17 @@ module tb_rmsnorm #(
         end
     endtask
 
+    // The unit's latency is its own business (fill, reduce, inverse square
+    // root, drain); wait for the beats, not for a cycle count.
+    integer guard;
+    task wait_for(input integer target);
+        begin
+            guard = 0;
+            while (got < target && guard < 20000) begin @(posedge clk); guard = guard + 1; end
+            repeat (4) @(posedge clk);
+        end
+    endtask
+
     initial begin
         $readmemh("x.hex", xmem);
         $readmemh("gain.hex", gmem);
@@ -68,9 +79,9 @@ module tb_rmsnorm #(
         repeat (2) @(posedge clk);
         rst_n = 1;
         send_vector;
-        repeat (BEATS + 20) @(posedge clk);
+        wait_for(BEATS);
         send_vector;
-        repeat (BEATS + 20) @(posedge clk);
+        wait_for(2 * BEATS);
         if (got != 2 * BEATS) $display("FAIL: %0d output beats, expected %0d", got, 2 * BEATS);
         else if (errors == 0) $display("PASS: %0d elements twice", D);
         else $display("FAIL: %0d mismatches", errors);

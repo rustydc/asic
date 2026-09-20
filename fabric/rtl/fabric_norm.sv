@@ -10,7 +10,10 @@
 // input beat.  sqrt(D) is in mult; with mult = 1 and shift = 7 the unit is
 // an L2 normaliser emitting an int8 unit vector.
 //
-// Latency: D/L input beats, 7 cycles, then D/L output beats.  A vector
+// Latency: D/L input beats, 7 cycles, then D/L output beats, the first
+// 6 cycles after the drain starts (the drain is pipelined a multiply to a
+// stage; out_valid carries the beats, so the length is the adapter's only
+// contract).  A vector
 // shorter than D is normalised over its first n_beats beats (D/L at most):
 // the result does not depend on SW beyond it being wide enough, so one
 // unit serves the residual norm, the unit norms and the gated norm.
@@ -48,51 +51,104 @@ module fabric_rmsnorm #(
     reg [BW-1:0]   wr;
     reg [SW-1:0]   ss;
 
-    // Sum of the beat's squares (a plain adder here; carry-save in silicon).
-    reg signed [63:0] beat_sq;
+    // Fill pipeline: F1 squares the beat's elements, F2 adds each lane's
+    // square into that lane's own running sum.  One multiply and one add to a
+    // stage, and a sum per lane so no adder tree stands between them; the L
+    // sums are added together once per vector in the reduce phase, which
+    // costs L + 2 cycles against the vector's D/L beats.  Wrapping at SW bits
+    // is associative, so the total is the one the model accumulates.
+    localparam int PW = 2 * XW;
+    reg [SW-1:0]   ssk [0:L-1];
+    reg [L*PW-1:0] sq1;
+    reg            f1;
     integer i;
-    always @* begin
-        beat_sq = 0;
-        for (i = 0; i < L; i = i + 1)
-            beat_sq = beat_sq + $signed(in_x[i*XW +: XW]) * $signed(in_x[i*XW +: XW]);
-    end
 
-    // Phases: 0 fill, 1 rsqrt in flight, 2 drain.
+    // Phases: 0 fill, 1 reduce, 2 rsqrt in flight, 3 drain.
     reg [1:0]  phase;
     reg        rs_start;
     wire       rs_done;
     wire [16:0] r_w;
     wire [6:0]  a_w;
     reg  [16:0] r;
-    reg  [6:0]  a;
+    // The normalising shift and its rounding constant, decoded once per
+    // vector when the inverse square root lands: the exponent would otherwise
+    // drive every lane's shifter select through a subtract and a decoder,
+    // which is the drain's longest path.
+    reg  [5:0]  sh_u;
+    reg  signed [XW+17:0] rnd_r;
+    // The output requantizer's shift is a command constant, stable for the
+    // whole vector; its rounding constant is registered for the same reason.
+    reg  signed [47:0] ornd_r;
+    always @(posedge clk) ornd_r <= (shift == 0) ? 48'sd0 : (48'sd1 <<< (shift - 1));
+    // A copy of each shift amount per lane: one flop driving every lane's
+    // shifter select is hundreds of loads, and the rounding constants' bits
+    // fan out only L ways.
+    wire [5:0]  sh_l [0:L-1];
+    wire [5:0]  osh_l [0:L-1];
+    wire [16:0] r_l [0:L-1];
+    genvar gl;
+    generate
+        for (gl = 0; gl < L; gl = gl + 1) begin : g_sh
+            fabric_const_copy #(.W(6))  u_sh  (.clk(clk), .d(sh_u),  .q(sh_l[gl]));
+            fabric_const_copy #(.W(6))  u_osh (.clk(clk), .d(shift), .q(osh_l[gl]));
+            fabric_const_copy #(.W(17)) u_r   (.clk(clk), .d(r),     .q(r_l[gl]));
+        end
+    endgenerate
     wire [SW-1:0] ss_eps = ss + eps;
     wire [SW-1:0] ss_in  = (ss_eps == 0) ? {{(SW-1){1'b0}}, 1'b1} : ss_eps;
     fabric_rsqrt #(.SW(SW), .LUT_DIR(LUT_DIR)) rsq (.clk(clk), .start(rs_start), .ss(ss_in), .done(rs_done), .r(r_w), .a(a_w));
 
     reg [BW-1:0] rd, rd_addr;
     reg          rd_valid;
+    reg [$clog2(L+2):0] red;
+    integer      sh_next;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            phase <= 2'd0; wr <= 0; ss <= 0; rs_start <= 1'b0; rd <= 0; rd_valid <= 1'b0;
+            phase <= 2'd0; wr <= 0; ss <= 0; rs_start <= 1'b0; rd <= 0; rd_valid <= 1'b0; sh_u <= 0; rnd_r <= 0;
+            f1 <= 1'b0; red <= 0;
+            for (i = 0; i < L; i = i + 1) ssk[i] <= 0;
         end else begin
             rs_start <= 1'b0;
             rd_valid <= 1'b0;
+            // F1 then F2, running whatever the phase: the last beat's square
+            // lands two cycles after it arrives, which the reduce waits out.
+            f1 <= (phase == 2'd0) && in_valid;
+            for (i = 0; i < L; i = i + 1)
+                sq1[i*PW +: PW] <= $signed(in_x[i*XW +: XW]) * $signed(in_x[i*XW +: XW]);
+            if (f1)
+                for (i = 0; i < L; i = i + 1)
+                    ssk[i] <= ssk[i] + {{(SW-PW){1'b0}}, sq1[i*PW +: PW]};
             case (phase)
                 2'd0: if (in_valid) begin
                     xmem[wr] <= in_x;
                     gmem[wr] <= in_gain;
-                    ss <= ss + beat_sq[SW-1:0];
                     wr <= wr + 1'b1;
                     if (wr == n_beats - 1) begin
                         phase <= 2'd1;
-                        rs_start <= 1'b1;
+                        red <= 0;
+                        ss <= 0;
                     end
                 end
                 2'd1: begin
+                    // Two cycles for the squares to land, then one lane's sum
+                    // a cycle; each is cleared as it is taken.
+                    red <= red + 1'b1;
+                    if (red >= 2) begin
+                        ss <= ss + ssk[red - 2];
+                        ssk[red - 2] <= 0;
+                        if (red == L + 1) begin
+                            phase <= 2'd2;
+                            rs_start <= 1'b1;
+                        end
+                    end
+                end
+                2'd2: begin
                     if (rs_done) begin
                         r <= r_w;
-                        a <= a_w;
-                        phase <= 2'd2;
+                        sh_next = 1 + SW / 2 - a_w / 2;
+                        sh_u  <= (sh_next > 0) ? sh_next[5:0] : 6'd0;
+                        rnd_r <= (sh_next > 0) ? (1 <<< (sh_next - 1)) : 0;
+                        phase <= 2'd3;
                         rd <= 0;
                     end
                 end
@@ -103,23 +159,30 @@ module fabric_rmsnorm #(
                     if (rd == n_beats - 1) begin
                         phase <= 2'd0;
                         wr <= 0;
-                        ss <= 0;
                     end
                 end
             endcase
         end
     end
-    // The start pulse is registered with the last beat's sum, so the
-    // square-root unit samples the complete ss.
+    // The start pulse is registered with the last lane sum, so the square
+    // root unit samples the complete ss.
 
-    // Drain pipeline: P0 read, P1 n, P2 y.
+    // Drain pipeline: P0 read, P1 x * r, P2 normalise, P3 n * gain,
+    // P4 * mult, P5 round, P6 shift and saturate.  One multiply is the clock's floor (1.4 ns
+    // on NanGate 45 post-synthesis), and a round with its shift and saturate
+    // costs the same again, so no stage holds two of them: the arithmetic is
+    // the same expressions as the model's, cut between the multiplies.
+    localparam int MW = XW + 18;                 // x * r
+    localparam int NG = 16 + GW;                 // n * gain
+    localparam int QW = NG + 16;                 // that * mult
     reg [L*XW-1:0] x0;
-    reg [L*GW-1:0] g0;
-    reg            v0, v1;
-    reg [L*16-1:0] n1;
-    reg [L*GW-1:0] g1;
-    integer sh;
-    always @* sh = 1 + SW / 2 - a / 2;
+    reg [L*GW-1:0] g0, g1, g2;
+    reg            v0, v1, v2, v3, v4, v5;
+    reg signed [MW-1:0] m1 [0:L-1];
+    reg [L*16-1:0] n2;
+    reg signed [NG-1:0] p3 [0:L-1];
+    reg signed [QW-1:0] q4 [0:L-1];
+    reg signed [QW-1:0] s5 [0:L-1];
     integer k;
     always @(posedge clk) begin
         v0 <= rd_valid;
@@ -128,10 +191,23 @@ module fabric_rmsnorm #(
         v1 <= v0;
         g1 <= g0;
         for (k = 0; k < L; k = k + 1)
-            n1[k*16 +: 16] <= fx_sat(fx_rnd_shr($signed(x0[k*XW +: XW]) * $signed({47'b0, r}), sh), 16);
-        out_valid <= v1;
+            m1[k] <= $signed({{(MW-XW){x0[k*XW+XW-1]}}, x0[k*XW +: XW]}) * $signed({{(MW-17){1'b0}}, r_l[k]});
+        v2 <= v1;
+        g2 <= g1;
         for (k = 0; k < L; k = k + 1)
-            out_y[k*OW +: OW] <= fx_requant($signed(n1[k*16 +: 16]) * $signed(g1[k*GW +: GW]), mult, shift, OW);
+            n2[k*16 +: 16] <= fx_sat((m1[k] + rnd_r) >>> sh_l[k], 16);
+        v3 <= v2;
+        for (k = 0; k < L; k = k + 1)
+            p3[k] <= $signed({{(NG-16){n2[k*16+15]}}, n2[k*16 +: 16]}) * $signed({{(NG-GW){g2[k*GW+GW-1]}}, g2[k*GW +: GW]});
+        v4 <= v3;
+        for (k = 0; k < L; k = k + 1)
+            q4[k] <= $signed({{(QW-NG){p3[k][NG-1]}}, p3[k]}) * $signed({{(QW-16){1'b0}}, mult});
+        v5 <= v4;
+        for (k = 0; k < L; k = k + 1)
+            s5[k] <= q4[k] + ornd_r;
+        out_valid <= v5;
+        for (k = 0; k < L; k = k + 1)
+            out_y[k*OW +: OW] <= fx_sat(s5[k] >>> osh_l[k], OW);
     end
 endmodule
 

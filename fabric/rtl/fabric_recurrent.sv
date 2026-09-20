@@ -354,14 +354,42 @@ module fabric_delta_state8 #(
     reg signed [3:0] de;
     reg [V*8-1:0]  t_mem [0:K-1];
     reg [KW-1:0]   wr, rd;
-    reg [2:0]      phase;            // 0 pass 1, 1 diff, 2 beta*diff, 3 c, 4 pass 2, 5 y
+    reg [3:0]      phase;            // 0 pass 1, 1 pred, 2 diff, 3 beta*diff, 4 c*r, 5 c, 6 pass 2, 7 y, 8 reduce
     reg signed [31:0] pred_acc [0:V-1];
     reg signed [31:0] y_acc [0:V-1];
+    reg signed [47:0] pm [0:V-1];
+    reg signed [47:0] ym [0:V-1];   // the y stage's own, so no stage reads another's write
     reg signed [15:0] diff [0:V-1];
     reg signed [31:0] bd [0:V-1];
+    reg signed [49:0] cm [0:V-1];
     reg signed [24:0] c [0:V-1];
     reg [7:0]      peak_acc;
     reg [15:0]     nsat_acc;
+    // The shifts are the exponent's, fixed for the token: decoded once, with
+    // a copy of each amount per lane so one flop does not drive every lane's
+    // shifter select.  All of them are positive over the exponent's range.
+    reg [5:0]      shp, shc, shy, shr_;
+    reg signed [47:0] rndp;
+    reg signed [49:0] rndc;
+    reg signed [47:0] rndy;
+    reg signed [23:0] rndr;
+    wire [5:0] shp_l [0:V-1];
+    wire [5:0] shc_l [0:V-1];
+    wire [5:0] shy_l [0:V-1];
+    wire [5:0] shr_l [0:V-1];
+    // The scale multiplies every lane's accumulator, twice over; a copy per
+    // lane keeps that off one flop's fanout, as for the shift amounts.
+    wire [15:0] g1_l [0:V-1];
+    genvar gv;
+    generate
+        for (gv = 0; gv < V; gv = gv + 1) begin : g_sh
+            fabric_const_copy #(.W(6))  u_p (.clk(clk), .d(shp),  .q(shp_l[gv]));
+            fabric_const_copy #(.W(6))  u_c (.clk(clk), .d(shc),  .q(shc_l[gv]));
+            fabric_const_copy #(.W(6))  u_y (.clk(clk), .d(shy),  .q(shy_l[gv]));
+            fabric_const_copy #(.W(6))  u_r (.clk(clk), .d(shr_), .q(shr_l[gv]));
+            fabric_const_copy #(.W(16)) u_g (.clk(clk), .d(g1),   .q(g1_l[gv]));
+        end
+    endgenerate
     wire           sat_in = ({16'd0, nsat_in} > ((K * V) >> SAT_SHIFT));
 
     // The scale the cycle after start (gren keeps the unclamped value the
@@ -374,16 +402,24 @@ module fabric_delta_state8 #(
     reg [16:0] quo;
     reg [5:0]  dstep;
     integer j;
+    reg signed [7:0] e1f;
+    reg signed [3:0] de_w;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             g1 <= 0; gren <= 0; e1 <= 0; rescale <= 1'b0; de <= 0; g1_ready <= 1'b0; g_out <= 0; e_out <= 0;
             dividing <= 1'b0; r_ready <= 1'b0; rem <= 0; quo <= 0; dstep <= 0;
+            shp <= 0; shc <= 0; shy <= 0; shr_ <= 0; rndp <= 0; rndc <= 0; rndy <= 0; rndr <= 0;
         end else begin
             g1_ready <= start;
             if (start) begin
                 gprod = ({16'd0, g_in} * {16'd0, decay} + 32'd32768) >> 16;
                 saturated = sat_in;
                 gren <= gprod[15:0];
+                de_w = (gprod < 32'd32768 || saturated)
+                       ? ((saturated && $signed(e_in) > E_MIN) ? -4'sd1
+                          : ((!saturated && ({24'd0, peak_in} <= PEAK_GROW) && $signed(e_in) < E_MAX) ? 4'sd1 : 4'sd0))
+                       : 4'sd0;
+                shr_ <= 16 - de_w;   rndr <= 24'sd1 <<< (15 - de_w);
                 if (gprod < 32'd32768 || saturated) begin
                     rescale <= 1'b1;
                     if (saturated && $signed(e_in) > E_MIN) de <= -4'sd1;
@@ -398,6 +434,10 @@ module fabric_delta_state8 #(
             if (g1_ready) begin
                 if (rescale) e1 <= e1 + {{4{de[3]}}, de};
                 g_out <= g1; e_out <= rescale ? e1 + {{4{de[3]}}, de} : e1;
+                e1f = rescale ? e1 + {{4{de[3]}}, de} : e1;
+                shp  <= 23 + e1f;        rndp <= 48'sd1  <<< (22 + e1f);
+                shc  <= 24 - e1f;        rndc <= 50'sd1  <<< (23 - e1f);
+                shy  <= YSH + 8 + e1f;   rndy <= 48'sd1  <<< (YSH + 7 + e1f);
                 rem <= 0; quo <= 0; dstep <= 0; dividing <= 1'b1; r_ready <= 1'b0;
             end else if (dividing) begin
                 rem_next = {rem[31:0], dstep == 6'd0};                    // the dividend 2^31, top bit first
@@ -410,89 +450,182 @@ module fabric_delta_state8 #(
     end
     wire [16:0] r = quo;
 
-    reg            va;
-    reg [V*8-1:0]  rowa;
-    reg [KW-1:0]   ia;
-    reg            vd;
-    reg [V*8-1:0]  rowd;
-    reg [KW-1:0]   id;
+    // Pass 1 is A1 latch, A2 rescale product, A3 rescale and keep, A4 the
+    // key's product, then the accumulate; pass 2 is B1 read, B2 the update's
+    // product, B3 the saturating add, B4 the query's product, then the
+    // accumulate.  One multiply, or one round with its saturate, to a stage.
+    // The per-lane arrays are written with blocking assignments so Verilator
+    // keeps the lane loops as loops, which makes the order of the stages in
+    // this block significant: they are written newest first, so each reads
+    // the previous cycle's value of the stage before it.
+    localparam int G1N = (V + 7) / 8;
+    localparam int G2N = (G1N + 7) / 8;
+    reg            va1, va2, va3, va4;
+    reg [V*8-1:0]  rowa1, rowa2;
+    reg [KW-1:0]   ia1, ia2, ia3, ia4;
+    reg signed [23:0] rs2 [0:V-1];
+    reg [V*8-1:0]  tr3;
+    reg signed [15:0] kp4 [0:V-1];
+    reg            vd1, vd2, vd3, vd4;
+    reg [V*8-1:0]  rowd1, rowd2;
+    reg [KW-1:0]   id1, id2, id3, id4;
+    reg signed [32:0] dm2 [0:V-1];
+    reg [V*8-1:0]  tn3;
+    reg signed [15:0] ym4 [0:V-1];
+    reg [7:0]      pk [0:V-1];
+    reg [15:0]     ns [0:V-1];
+    reg [7:0]      pk_a [0:G1N-1];
+    reg [15:0]     ns_a [0:G1N-1];
+    reg [7:0]      pk_b [0:G2N-1];
+    reg [15:0]     ns_b [0:G2N-1];
+    reg [2:0]      tail;
     reg signed [63:0] tr, tn, dl, pr, mag, nsat;
+    integer        gg, jj;
     // The per-element arrays are written with blocking assignments inside the
     // lane loops (each element reads and writes only itself, in one phase), so
     // that Verilator keeps the loops as loops instead of unrolling 128 lanes.
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            phase <= 3'd0; wr <= 0; rd <= 0; va <= 1'b0; vd <= 1'b0; row_out_valid <= 1'b0; peak_acc <= 0;
+            phase <= 4'd0; wr <= 0; rd <= 0; row_out_valid <= 1'b0; peak_acc <= 0; y_valid <= 1'b0;
+            va1 <= 1'b0; va2 <= 1'b0; va3 <= 1'b0; va4 <= 1'b0;
+            vd1 <= 1'b0; vd2 <= 1'b0; vd3 <= 1'b0; vd4 <= 1'b0; tail <= 0;
         end else begin
-            va <= 1'b0; vd <= 1'b0; row_out_valid <= 1'b0;
+            va1 <= 1'b0; vd1 <= 1'b0; row_out_valid <= 1'b0; y_valid <= 1'b0;
+
+            // ---- the tail: y and the reduction of the per-lane peak and
+            // saturated counts, newest stage first.
+            if (phase == 4'd7) begin
+                tail <= tail + 1'b1;
+                if (tail == 3'd4) begin
+                    y_valid <= 1'b1;
+                    phase <= 4'd0;
+                end
+                if (tail == 3'd3) begin
+                    mag = {56'd0, peak_acc};
+                    nsat = 0;
+                    for (gg = 0; gg < G2N; gg = gg + 1) begin
+                        if ({56'd0, pk_b[gg]} > mag) mag = {56'd0, pk_b[gg]};
+                        nsat = nsat + {48'd0, ns_b[gg]};
+                    end
+                    peak_acc <= mag[7:0];  peak_out <= mag[7:0];
+                    nsat_acc <= nsat[15:0]; nsat_out <= nsat[15:0];
+                end
+                if (tail == 3'd1)
+                    for (j = 0; j < V; j = j + 1)
+                        y[j*16 +: 16] <= fx_sat((ym[j] + rndy) >>> shy_l[j], 16);
+                if (tail == 3'd2)
+                    for (gg = 0; gg < G2N; gg = gg + 1) begin
+                        pk_b[gg] = 0; ns_b[gg] = 0;
+                        for (jj = 0; jj < 8; jj = jj + 1)
+                            if (gg * 8 + jj < G1N) begin
+                                if (pk_a[gg*8 + jj] > pk_b[gg]) pk_b[gg] = pk_a[gg*8 + jj];
+                                ns_b[gg] = ns_b[gg] + ns_a[gg*8 + jj];
+                            end
+                    end
+                if (tail == 3'd1)
+                    for (gg = 0; gg < G1N; gg = gg + 1) begin
+                        pk_a[gg] = 0; ns_a[gg] = 0;
+                        for (jj = 0; jj < 8; jj = jj + 1)
+                            if (gg * 8 + jj < V) begin
+                                if (pk[gg*8 + jj] > pk_a[gg]) pk_a[gg] = pk[gg*8 + jj];
+                                ns_a[gg] = ns_a[gg] + ns[gg*8 + jj];
+                            end
+                    end
+                if (tail == 3'd0)
+                    for (j = 0; j < V; j = j + 1) ym[j] = y_acc[j] * $signed({16'b0, g1_l[j]});
+            end
+
+            // ---- pass 2, newest stage first.
+            if (vd4) begin
+                for (j = 0; j < V; j = j + 1) y_acc[j] = y_acc[j] + ym4[j];
+                if (id4 == K - 1) begin phase <= 4'd7; tail <= 0; end
+            end
+            vd4 <= vd3; id4 <= id3;
+            if (vd3) begin
+                for (j = 0; j < V; j = j + 1) begin
+                    ym4[j] = $signed(q_r[id3*8 +: 8]) * $signed(tn3[j*8 +: 8]);
+                    tn = $signed({{56{tn3[j*8+7]}}, tn3[j*8 +: 8]});
+                    mag = (tn < 0) ? -tn : tn;
+                    if (mag[7:0] > pk[j]) pk[j] = mag[7:0];
+                    if (mag >= 127) ns[j] = ns[j] + 1'b1;
+                end
+            end
+            vd3 <= vd2; id3 <= id2;
+            if (vd2) begin
+                for (j = 0; j < V; j = j + 1) begin
+                    dl = fx_rnd_shr(dm2[j], 14);
+                    tn = fx_sat($signed({{56{rowd2[j*8+7]}}, rowd2[j*8 +: 8]}) + dl, 8);
+                    tn3[j*8 +: 8] = tn[7:0];
+                    row_out[j*8 +: 8] <= tn[7:0];
+                end
+                row_out_valid <= 1'b1;
+            end
+            vd2 <= vd1; id2 <= id1; rowd2 <= rowd1;
+            if (vd1)
+                for (j = 0; j < V; j = j + 1) dm2[j] = $signed(k_r[id1*8 +: 8]) * c[j];
+            if (phase == 4'd6) begin
+                vd1 <= 1'b1; rowd1 <= t_mem[rd]; id1 <= rd; rd <= rd + 1'b1;
+                if (rd == K - 1) phase <= 4'd0;          // the pipeline carries the rest
+            end
+
+            // ---- the phases between the passes, newest first.
+            if (phase == 4'd5) begin
+                for (j = 0; j < V; j = j + 1) c[j] = (cm[j] + rndc) >>> shc_l[j];
+                phase <= 4'd6; rd <= 0;
+            end
+            if (phase == 4'd4) begin
+                for (j = 0; j < V; j = j + 1) cm[j] = bd[j] * $signed({33'b0, r});
+                phase <= 4'd5;
+            end
+            if (phase == 4'd3) begin
+                for (j = 0; j < V; j = j + 1) bd[j] = $signed({16'b0, b_r}) * diff[j];
+                phase <= 4'd4;
+            end
+            if (phase == 4'd2) begin
+                for (j = 0; j < V; j = j + 1) begin
+                    pr = (pm[j] + rndp) >>> shp_l[j];
+                    diff[j] = fx_sat($signed({{56{v_r[j*8+7]}}, v_r[j*8 +: 8]}) - pr, 16);
+                end
+                phase <= 4'd3;
+            end
+            if (phase == 4'd1 && r_ready) begin
+                for (j = 0; j < V; j = j + 1) pm[j] = pred_acc[j] * $signed({16'b0, g1_l[j]});
+                phase <= 4'd2;
+            end
+
+            // ---- pass 1, newest stage first.
+            if (va4) begin
+                for (j = 0; j < V; j = j + 1) pred_acc[j] = pred_acc[j] + {{16{kp4[j][15]}}, kp4[j]};
+                if (ia4 == K - 1) phase <= 4'd1;
+            end
+            va4 <= va3; ia4 <= ia3;
+            if (va3) begin
+                t_mem[ia3] <= tr3;
+                for (j = 0; j < V; j = j + 1) kp4[j] = $signed(k_r[ia3*8 +: 8]) * $signed(tr3[j*8 +: 8]);
+            end
+            va3 <= va2; ia3 <= ia2;
+            if (va2)
+                for (j = 0; j < V; j = j + 1) begin
+                    tr = rescale ? fx_sat((rs2[j] + rndr) >>> shr_, 8)
+                                 : $signed({{56{rowa2[j*8+7]}}, rowa2[j*8 +: 8]});
+                    tr3[j*8 +: 8] = tr[7:0];
+                end
+            va2 <= va1; ia2 <= ia1; rowa2 <= rowa1;
+            if (va1)
+                for (j = 0; j < V; j = j + 1) rs2[j] = $signed(rowa1[j*8 +: 8]) * $signed({8'b0, gren});
+            if (phase == 4'd0 && row_in_valid) begin va1 <= 1'b1; rowa1 <= row_in; ia1 <= wr; wr <= wr + 1'b1; end
+
             if (start) begin
                 q_r <= q; k_r <= k; v_r <= v; b_r <= beta;
-                phase <= 3'd0; wr <= 0; rd <= 0;
+                phase <= 4'd0; wr <= 0; rd <= 0; tail <= 0;
+                va1 <= 1'b0; va2 <= 1'b0; va3 <= 1'b0; va4 <= 1'b0;
+                vd1 <= 1'b0; vd2 <= 1'b0; vd3 <= 1'b0; vd4 <= 1'b0;
                 // The peak runs since the last rescale; a rescale this token (decided in the same edge) restarts it.
                 peak_acc <= (((({16'd0, g_in} * {16'd0, decay} + 32'd32768) >> 16) < 32'd32768) || sat_in) ? 8'd0 : peak_in;
                 nsat_acc <= 0;
-                for (j = 0; j < V; j = j + 1) begin pred_acc[j] = 0; y_acc[j] = 0; end
-            end
-            if (phase == 3'd0 && row_in_valid) begin va <= 1'b1; rowa <= row_in; ia <= wr; wr <= wr + 1'b1; end
-            // Pass 1 stage B: rescale if due, keep, accumulate pred.
-            if (va) begin
-                for (j = 0; j < V; j = j + 1) begin
-                    tr = rescale ? fx_sat(fx_rnd_shr($signed(rowa[j*8 +: 8]) * $signed({48'b0, gren}), 16 - de), 8)
-                                 : $signed(rowa[j*8 +: 8]);
-                    t_mem[ia][j*8 +: 8] = tr[7:0];
-                    pred_acc[j] = pred_acc[j] + $signed(k_r[ia*8 +: 8]) * $signed(tr[7:0]);
-                end
-                if (ia == K - 1) phase <= 3'd1;
-            end
-            if (phase == 3'd1 && r_ready) begin
-                for (j = 0; j < V; j = j + 1) begin
-                    pr = fx_rnd_shr(pred_acc[j] * $signed({48'b0, g1}), 23 + e1);
-                    diff[j] = fx_sat($signed({{56{v_r[j*8+7]}}, v_r[j*8 +: 8]}) - pr, 16);
-                end
-                phase <= 3'd2;
-            end
-            if (phase == 3'd2) begin
-                for (j = 0; j < V; j = j + 1) bd[j] = $signed({48'b0, b_r}) * diff[j];
-                phase <= 3'd3;
-            end
-            if (phase == 3'd3) begin
-                for (j = 0; j < V; j = j + 1) c[j] = fx_rnd_shr(bd[j] * $signed({47'b0, r}), 24 - e1);
-                phase <= 3'd4; rd <= 0;
-            end
-            if (phase == 3'd4) begin
-                vd <= 1'b1; rowd <= t_mem[rd]; id <= rd; rd <= rd + 1'b1;
-                if (rd == K - 1) phase <= 3'd5;
-            end
-            if (vd) begin
-                mag = peak_acc; nsat = nsat_acc;
-                for (j = 0; j < V; j = j + 1) begin
-                    dl = fx_rnd_shr($signed(k_r[id*8 +: 8]) * c[j], 14);
-                    tn = fx_sat($signed(rowd[j*8 +: 8]) + dl, 8);
-                    row_out[j*8 +: 8] <= tn[7:0];
-                    y_acc[j] = y_acc[j] + $signed(q_r[id*8 +: 8]) * $signed(tn[7:0]);
-                    if ((tn < 0 ? -tn : tn) > mag) mag = (tn < 0 ? -tn : tn);
-                    if ((tn < 0 ? -tn : tn) >= 127) nsat = nsat + 1;
-                end
-                peak_acc <= mag[7:0]; nsat_acc <= nsat[15:0];
-                row_out_valid <= 1'b1;
+                for (j = 0; j < V; j = j + 1) begin pred_acc[j] = 0; y_acc[j] = 0; pk[j] = 0; ns[j] = 0; end
             end
         end
-    end
-    reg y_pending;
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) y_pending <= 1'b0;
-        else        y_pending <= vd && (id == K - 1);
-    end
-    always @(posedge clk) begin
-        if (y_pending) begin
-            for (j = 0; j < V; j = j + 1)
-                y[j*16 +: 16] <= fx_sat(fx_rnd_shr(y_acc[j] * $signed({48'b0, g1}), YSH + 8 + e1), 16);
-            peak_out <= peak_acc; nsat_out <= nsat_acc;
-        end
-    end
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) y_valid <= 1'b0;
-        else        y_valid <= y_pending;
     end
 endmodule
 

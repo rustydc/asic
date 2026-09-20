@@ -77,10 +77,17 @@ module fabric_sequencer #(
         for (gi = 0; gi < NP; gi = gi + 1) begin : g_p assign cur_p[gi] = cur[IDB + 8*NC + 8*gi +: 8]; end
     endgenerate
 
-    // The ids of every issued step, by tag, for the release at completion.
-    reg [NC*8-1:0] tab_c [0:255];
-    reg [NP*8-1:0] tab_p [0:255];
+    // The ids of the command each engine is running, for the release at
+    // completion.  Held per engine port rather than per tag: a table of 256
+    // entries read by every done port's tag is forty 256-to-1 muxes of the
+    // whole id set, repeated at each of the issue check's call sites, which
+    // does not map.  The port is known at issue, so the release reads a
+    // register.  The tag still marks the step live, so a program longer than
+    // 256 steps cannot have two of the same tag in flight.
+    reg [NC*8-1:0] slot_c [0:NU*NE-1];
+    reg [NP*8-1:0] slot_p [0:NU*NE-1];
     reg [255:0]    tab_live;
+    wire [$clog2(NU*NE)-1:0] cur_port = cur_unit * NE + cmd_engine;
 
     // Outstanding writers and readers per buffer.  The issue check sees the
     // head step's ids with this cycle's releases forwarded; the counters
@@ -96,7 +103,7 @@ module fabric_sequencer #(
             for (q = 0; q < NU * NE; q = q + 1)
                 if (done_valid[q])
                     for (j = 0; j < NP; j = j + 1)
-                        if (tab_p[done_tag[q*8 +: 8]][j*8 +: 8] == buf_id) released_wr = released_wr + 1'b1;
+                        if (slot_p[q][j*8 +: 8] == buf_id) released_wr = released_wr + 1'b1;
         end
     endfunction
     function automatic [CW-1:0] released_rd(input [7:0] buf_id);      // completions this cycle that consumed buf_id
@@ -106,7 +113,7 @@ module fabric_sequencer #(
             for (q = 0; q < NU * NE; q = q + 1)
                 if (done_valid[q])
                     for (j = 0; j < NC; j = j + 1)
-                        if (tab_c[done_tag[q*8 +: 8]][j*8 +: 8] == buf_id) released_rd = released_rd + 1'b1;
+                        if (slot_c[q][j*8 +: 8] == buf_id) released_rd = released_rd + 1'b1;
         end
     endfunction
 
@@ -145,9 +152,9 @@ module fabric_sequencer #(
                     if (done_valid[p]) begin
                         tg = done_tag[p*8 +: 8];
                         for (k = 0; k < NC; k = k + 1)
-                            if (tab_c[tg][k*8 +: 8] != 8'hFF) rd_cnt[tab_c[tg][k*8 +: 8]] = rd_cnt[tab_c[tg][k*8 +: 8]] - 1'b1;
+                            if (slot_c[p][k*8 +: 8] != 8'hFF) rd_cnt[slot_c[p][k*8 +: 8]] = rd_cnt[slot_c[p][k*8 +: 8]] - 1'b1;
                         for (k = 0; k < NP; k = k + 1)
-                            if (tab_p[tg][k*8 +: 8] != 8'hFF) wr_cnt[tab_p[tg][k*8 +: 8]] = wr_cnt[tab_p[tg][k*8 +: 8]] - 1'b1;
+                            if (slot_p[p][k*8 +: 8] != 8'hFF) wr_cnt[slot_p[p][k*8 +: 8]] = wr_cnt[slot_p[p][k*8 +: 8]] - 1'b1;
                         tab_live[tg] <= 1'b0;
                     end
                 end
@@ -157,8 +164,8 @@ module fabric_sequencer #(
                         if (cur_c[k] != 8'hFF) rd_cnt[cur_c[k]] = rd_cnt[cur_c[k]] + 1'b1;
                     for (k = 0; k < NP; k = k + 1)
                         if (cur_p[k] != 8'hFF) wr_cnt[cur_p[k]] = wr_cnt[cur_p[k]] + 1'b1;
-                    tab_c[pc[7:0]] <= cur[IDB +: NC*8];
-                    tab_p[pc[7:0]] <= cur[IDB + 8*NC +: NP*8];
+                    slot_c[cur_port] <= cur[IDB +: NC*8];
+                    slot_p[cur_port] <= cur[IDB + 8*NC +: NP*8];
                     tab_live[pc[7:0]] <= 1'b1;
                     pc <= pc + 1'b1;
                     if (cur_last || pc + 1 == n_steps) finishing <= 1'b1;
