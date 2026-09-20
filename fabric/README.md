@@ -1205,7 +1205,15 @@ units; `rtl/fabric_engine.sv` the layer engine (the vector buffer, an
 adapter per unit, the memory unit with its arbiter and the top), with
 `tb_layer_engine` running both layers' programs of `fabric.engine` over
 the real units against the integer model and the memory model, with the
-memory model or the HPI path behind the port.
+memory model or the HPI path behind the port. Verilator 5 runs the
+engine too (`--binary --timing`, the vector buffer's array writes made
+blocking for it): the tiny one-token case is bit-exact and cycle-exact
+with Icarus and simulates in under a second against Icarus's 44 s. The
+full-size engine, 834 tiles and the 128 x 128 state engines, takes
+Verilator's elaboration past 9.8 GB (the loop-unroll limits raised for
+the full-size loops), more than this container has; a hierarchical
+build with the tile as a block, its ROM image named by an index port
+instead of a hierarchical `$readmemh` from the top, is the way to it.
 
 `rtl/fabric_memory.sv` holds the memory side: the behavioural
 `fabric_mem_model` for the testbenches, `fabric_mem_arbiter`,
