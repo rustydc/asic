@@ -1,0 +1,447 @@
+"""The controller: what the FPGA at the head of the ring does.
+
+The appliance is a ring of dies behind one FPGA.  A work item -- one token
+of one context: its hidden vector, the context's slot and the position --
+enters the ring at the first layer die and comes back from the last head
+die with two partial top-k lists appended, one from each half of the LM
+head.  Everything between a host's request and the next token it gets is
+the controller's: the embedding of the token into the hidden vector, the
+packet that carries it, which context goes next, the merge of the two lists
+and the draw from them, and the table that says which context holds which
+slot in the dies' memories.  This module is the model of that, the way
+``sequencer.py`` is the model of the token sequencer: the gateware will be
+checked against it bit for bit where it is arithmetic (the sampler, the
+CRC, the packet) and step for step where it is control (the scheduler).
+
+Three contracts are fixed here that the dies must honour, since they are
+the ring's protocol rather than the controller's alone:
+
+* the packet: a 16-byte header, the hidden vector as int16 at the residual
+  scale, and, after the head dies, their lists, all under one CRC-32;
+* the head list: K candidates of (row, logit) with the logit a signed
+  fixed-point value of ``LOGIT_FRAC`` fraction bits, and the log-sum-exp of
+  the die's whole half in the same format, so the two halves can be merged
+  into one distribution;
+* the FIRST flag: the first token of a context in a slot that another
+  context had, which tells a layer die to start that slot's state from
+  zero rather than from what the slot holds.
+
+The sampler is integer arithmetic on the exponential table the attention
+core already uses (``layer.exp_neg_fixed``), so the same LUT serves both,
+and the draw is defined on the random word, not on a distribution, so the
+gateware's generator and this model give the same token for the same word.
+"""
+
+from __future__ import annotations
+
+import math
+import struct
+import zlib
+from collections import OrderedDict, deque
+from dataclasses import dataclass, field
+from typing import Callable, Sequence
+
+import numpy as np
+
+from fabric.layer import FF, exp_neg_fixed
+
+# --------------------------------------------------------------------------
+# The packet
+# --------------------------------------------------------------------------
+
+KIND_ITEM = 0x57                 # a work item
+HEADER = struct.Struct("<BBHIHHI")   # kind, flags, context, position, length, reserved, crc
+HEADER_BYTES = HEADER.size      # 16, the simulator's packet_overhead_bytes
+FLAG_SAMPLE = 0x01               # the controller wants a token from this item
+FLAG_FIRST  = 0x02               # first token of a new context in this slot: zero the state
+FLAG_LAST   = 0x04               # the context is done after this item: the slot may be reused
+
+LOGIT_FRAC = FF                  # logits and log-sum-exps: signed, 2^-10 per LSB
+LIST_HEADER = struct.Struct("<BBbBi")   # die, k, reserved, reserved, lse
+ENTRY = struct.Struct("<Ii")            # row, logit
+
+
+@dataclass(frozen=True)
+class WorkItem:
+    context: int
+    position: int
+    hidden: np.ndarray               # int16, the residual at scale s_h
+    flags: int = 0
+
+
+@dataclass(frozen=True)
+class HeadList:
+    """One head die's answer: its K best rows and the log-sum-exp of all of
+    its rows, both as fixed point with LOGIT_FRAC fraction bits.  ``rows``
+    are global row numbers: die d's local row r is r + d * rows_per_die."""
+    die: int
+    rows: np.ndarray                 # uint32
+    logits: np.ndarray               # int32
+    lse: int
+
+
+def crc32(data: bytes) -> int:
+    """The Ethernet CRC-32, as zlib computes it."""
+    return zlib.crc32(data) & 0xFFFFFFFF
+
+
+def pack_item(item: WorkItem, lists: Sequence[HeadList] = ()) -> bytes:
+    """A work item as it travels the ring: header, hidden vector, and the
+    lists the head dies have appended so far."""
+    hidden = np.asarray(item.hidden, dtype="<i2").tobytes()
+    tail = b"".join(pack_head_list(hl) for hl in lists)
+    payload = hidden + tail
+    head = HEADER.pack(KIND_ITEM, item.flags, item.context, item.position, len(payload), 0, 0)
+    crc = crc32(head[:12] + payload)
+    return head[:12] + struct.pack("<I", crc) + payload
+
+
+def pack_head_list(hl: HeadList) -> bytes:
+    body = LIST_HEADER.pack(hl.die, len(hl.rows), 0, 0, int(hl.lse))
+    return body + b"".join(ENTRY.pack(int(r), int(l)) for r, l in zip(hl.rows, hl.logits))
+
+
+def append_head_list(packet: bytes, hl: HeadList) -> bytes:
+    """What a head die does to a passing item: its list on the end, the length
+    and the CRC brought up to date, nothing else touched."""
+    kind, flags, context, position, length, _, _ = HEADER.unpack(packet[:HEADER_BYTES])
+    payload = packet[HEADER_BYTES:HEADER_BYTES + length] + pack_head_list(hl)
+    head = HEADER.pack(kind, flags, context, position, len(payload), 0, 0)
+    return head[:12] + struct.pack("<I", crc32(head[:12] + payload)) + payload
+
+
+def unpack_item(packet: bytes, d: int) -> tuple[WorkItem, list[HeadList]]:
+    """The item and its lists, or a ValueError if the CRC does not hold."""
+    kind, flags, context, position, length, _, crc = HEADER.unpack(packet[:HEADER_BYTES])
+    payload = packet[HEADER_BYTES:HEADER_BYTES + length]
+    if kind != KIND_ITEM:
+        raise ValueError(f"not a work item: kind {kind:#x}")
+    if crc32(packet[:12] + payload) != crc:
+        raise ValueError("CRC mismatch")
+    hidden = np.frombuffer(payload[:2 * d], dtype="<i2").astype(np.int64)
+    lists, at = [], 2 * d
+    while at < len(payload):
+        die, k, _, _, lse = LIST_HEADER.unpack(payload[at:at + LIST_HEADER.size])
+        at += LIST_HEADER.size
+        entries = [ENTRY.unpack(payload[at + i * ENTRY.size:at + (i + 1) * ENTRY.size]) for i in range(k)]
+        at += k * ENTRY.size
+        lists.append(HeadList(die, np.array([e[0] for e in entries], dtype=np.uint32),
+                              np.array([e[1] for e in entries], dtype=np.int32), lse))
+    return WorkItem(context, position, hidden, flags), lists
+
+
+# --------------------------------------------------------------------------
+# The head die's arithmetic, so a model of one can be exact
+# --------------------------------------------------------------------------
+
+def to_fixed(x) -> np.ndarray:
+    """Float logits to the list's fixed point."""
+    return np.rint(np.asarray(x, dtype=np.float64) * (1 << LOGIT_FRAC)).astype(np.int64)
+
+
+def lse_fixed(logits_fixed: np.ndarray) -> int:
+    """log-sum-exp of fixed-point logits, in the same fixed point."""
+    x = np.asarray(logits_fixed, dtype=np.float64) / (1 << LOGIT_FRAC)
+    m = float(x.max())
+    return int(round((m + math.log(np.exp(x - m).sum())) * (1 << LOGIT_FRAC)))
+
+
+def head_list(die: int, logits_fixed: np.ndarray, k: int, row_base: int = 0) -> HeadList:
+    """What a head die returns for its half: the K largest, rows made global."""
+    order = np.argsort(-logits_fixed, kind="stable")[:k]
+    return HeadList(die, (order + row_base).astype(np.uint32), logits_fixed[order].astype(np.int32),
+                    lse_fixed(logits_fixed))
+
+
+# --------------------------------------------------------------------------
+# Merge and sample
+# --------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class SamplingParams:
+    """Temperature as the reciprocal in F16 (``inv_t = 2^FF / T``); top_k the
+    candidates kept; top_p in U16 (65535 is all of them).  Integers, because
+    the gateware takes them as such."""
+    inv_t: int = 1 << FF
+    top_k: int = 32
+    top_p: int = 0xFFFF
+
+    @staticmethod
+    def of(temperature: float = 1.0, top_k: int = 32, top_p: float = 1.0) -> "SamplingParams":
+        return SamplingParams(int(round((1 << FF) / max(temperature, 1e-6))), top_k, min(0xFFFF, int(top_p * 0xFFFF)))
+
+
+def merge_lists(lists: Sequence[HeadList]) -> tuple[np.ndarray, np.ndarray, int]:
+    """The union of the head dies' candidates in descending order, and the
+    log-sum-exp of the whole vocabulary from the halves' own."""
+    rows = np.concatenate([hl.rows.astype(np.int64) for hl in lists])
+    logits = np.concatenate([hl.logits.astype(np.int64) for hl in lists])
+    order = np.lexsort((rows, -logits))                     # by logit descending, rows to break ties
+    lses = [hl.lse / (1 << LOGIT_FRAC) for hl in lists]
+    m = max(lses)
+    total = int(round((m + math.log(sum(math.exp(v - m) for v in lses))) * (1 << LOGIT_FRAC)))
+    return rows[order], logits[order], total
+
+
+def weights(logits_desc: np.ndarray, inv_t: int) -> np.ndarray:
+    """Unnormalised softmax weights over candidates in descending order:
+    ``exp(-(max - l) / T)`` through the F16 exponential table, U16 each."""
+    l = np.asarray(logits_desc, dtype=np.int64)
+    t = ((l[0] - l) * int(inv_t)) >> FF                    # F16, >= 0
+    return exp_neg_fixed(t).astype(np.int64)
+
+
+def sample(rows_desc: np.ndarray, logits_desc: np.ndarray, params: SamplingParams, rnd: int) -> tuple[int, int]:
+    """The token, and the index among the candidates it came from.
+
+    ``rnd`` is a 32-bit word; the draw is ``(rnd * total) >> 32`` over the
+    cumulative weights of the candidates top-p keeps, which is what the
+    gateware does with a multiplier and a scan, so the same word gives the
+    same token here and there."""
+    k = min(params.top_k, len(rows_desc))
+    w = weights(logits_desc[:k], params.inv_t)
+    cum = np.cumsum(w)
+    total = int(cum[-1])
+    if total == 0:                                          # every weight underflowed but the first, which cannot: guard anyway
+        return int(rows_desc[0]), 0
+    keep = k
+    if params.top_p < 0xFFFF:                               # the shortest prefix holding top_p of the mass
+        keep = int(np.searchsorted(cum * 0x10000, params.top_p * total, side="left")) + 1
+        keep = max(1, min(keep, k))
+    total = int(cum[keep - 1])
+    r = ((int(rnd) & 0xFFFFFFFF) * total) >> 32
+    i = int(np.searchsorted(cum[:keep], r, side="right"))
+    return int(rows_desc[i]), i
+
+
+def logprob(logit_fixed: int, lse_total_fixed: int) -> float:
+    """The sampled token's log-probability under the full softmax, for scoring."""
+    return (int(logit_fixed) - int(lse_total_fixed)) / (1 << LOGIT_FRAC)
+
+
+# --------------------------------------------------------------------------
+# The embedding table
+# --------------------------------------------------------------------------
+
+class EmbeddingTable:
+    """Token to hidden vector, int16 at the residual scale: the DDR4 behind the
+    FPGA, ``vocab x hidden x 2`` bytes (2.03 GB for the 9B), one row a lookup."""
+
+    def __init__(self, rows: np.ndarray) -> None:
+        self.rows = np.asarray(rows, dtype=np.int16)
+
+    @classmethod
+    def quantize(cls, weight: np.ndarray, s_h: float) -> "EmbeddingTable":
+        q = np.clip(np.rint(np.asarray(weight, dtype=np.float64) / s_h), -32768, 32767)
+        return cls(q.astype(np.int16))
+
+    @property
+    def vocab(self) -> int:
+        return self.rows.shape[0]
+
+    @property
+    def hidden(self) -> int:
+        return self.rows.shape[1]
+
+    @property
+    def nbytes(self) -> int:
+        return self.rows.nbytes
+
+    def lookup(self, token: int) -> np.ndarray:
+        return self.rows[int(token)].astype(np.int64)
+
+
+# --------------------------------------------------------------------------
+# Contexts and their slots
+# --------------------------------------------------------------------------
+
+@dataclass
+class Context:
+    id: int
+    tokens: list[int]                # the prompt, then what was generated
+    prompt_len: int
+    max_new: int
+    params: SamplingParams
+    slot: int | None = None
+    next_pos: int = 0                # the next position to inject
+    in_flight: bool = False
+    fresh: bool = True               # the slot has not seen this context yet
+    done: bool = False
+    logprobs: list[float] = field(default_factory=list)
+    seed: int = 0
+
+
+class ContextTable:
+    """Which context holds which slot of the dies' memories.  A slot is one
+    resident context's state on every die; there are as many as the memory
+    map gives.  Allocation takes a free slot, then the least recently used
+    idle one, whose context is evicted: its next token, if it has one, will
+    have to start over, which is the host's problem to avoid and the table's
+    to report."""
+
+    def __init__(self, slots: int) -> None:
+        self.slots = slots
+        self.holder: dict[int, int] = {}                 # slot -> context id
+        self.lru: OrderedDict[int, None] = OrderedDict()  # slots by last use, oldest first
+        self.evicted: list[tuple[int, int]] = []          # (context, slot)
+
+    def acquire(self, ctx: int, busy: Callable[[int], bool]) -> int | None:
+        """A slot for ``ctx``: its own if it has one, else a free one, else the
+        oldest whose holder is not in flight.  None if every slot is busy."""
+        for slot, holder in self.holder.items():
+            if holder == ctx:
+                self.lru.move_to_end(slot)
+                return slot
+        free = [s for s in range(self.slots) if s not in self.holder]
+        if free:
+            slot = free[0]
+        else:
+            slot = next((s for s in self.lru if not busy(self.holder[s])), None)
+            if slot is None:
+                return None
+            self.evicted.append((self.holder[slot], slot))
+        self.holder[slot] = ctx
+        self.lru[slot] = None
+        self.lru.move_to_end(slot)
+        return slot
+
+    def release(self, ctx: int) -> None:
+        for slot, holder in list(self.holder.items()):
+            if holder == ctx:
+                del self.holder[slot]
+                self.lru.pop(slot, None)
+
+
+# --------------------------------------------------------------------------
+# The ring, as the controller sees it
+# --------------------------------------------------------------------------
+
+class Ring:
+    """A pipeline of dies, one item each, advancing a stage per step: the
+    layer dies transform the hidden vector, the head dies append their lists.
+    ``layer`` and ``head`` are the dies' models, so a test can be exact."""
+
+    def __init__(self, n_layer_dies: int, layer: Callable[[WorkItem], np.ndarray],
+                 heads: Sequence[Callable[[WorkItem], HeadList]]) -> None:
+        self.layer, self.heads = layer, list(heads)
+        self.stages: list[bytes | None] = [None] * (n_layer_dies + len(heads))
+        self.n_layer = n_layer_dies
+
+    @property
+    def free(self) -> bool:
+        return self.stages[0] is None
+
+    def inject(self, packet: bytes) -> None:
+        assert self.free
+        self.stages[0] = packet
+
+    def step(self, d: int) -> bytes | None:
+        """Every item one die on; the one leaving the last head die comes back."""
+        out = self.stages[-1]
+        for i in range(len(self.stages) - 1, 0, -1):
+            self.stages[i] = self.stages[i - 1]
+        self.stages[0] = None
+        for i, packet in enumerate(self.stages):
+            if packet is None:
+                continue
+            item, lists = unpack_item(packet, d)
+            if i < self.n_layer:
+                self.stages[i] = pack_item(WorkItem(item.context, item.position, self.layer(item), item.flags), lists)
+            else:
+                self.stages[i] = append_head_list(packet, self.heads[i - self.n_layer](item))
+        return out
+
+
+# --------------------------------------------------------------------------
+# The controller
+# --------------------------------------------------------------------------
+
+class Controller:
+    """Requests in, tokens out.  Each step injects one item if the ring's first
+    die is free and some context has a token to send -- round robin over the
+    contexts, so every die works on a different context's token and one
+    conversation sees the ring's latency -- and takes the item leaving the
+    ring: a prompt token's lists are dropped, a sampled one's are merged and
+    drawn from, the token appended, and the context goes back in the queue."""
+
+    def __init__(self, embedding: EmbeddingTable, ring: Ring, slots: int, seed: int = 1) -> None:
+        self.embedding, self.ring, self.table = embedding, ring, ContextTable(slots)
+        self.contexts: dict[int, Context] = {}
+        self.queue: deque[int] = deque()
+        self.rng = np.random.default_rng(seed)
+        self.next_id = 0
+        self.steps = 0
+
+    def submit(self, prompt: Sequence[int], max_new: int, params: SamplingParams = SamplingParams()) -> int:
+        ctx = Context(self.next_id, list(prompt), len(prompt), max_new, params)
+        self.contexts[ctx.id] = ctx
+        self.queue.append(ctx.id)
+        self.next_id += 1
+        return ctx.id
+
+    def _busy(self, ctx: int) -> bool:
+        return self.contexts[ctx].in_flight
+
+    def _inject(self) -> bool:
+        for _ in range(len(self.queue)):
+            cid = self.queue.popleft()
+            ctx = self.contexts[cid]
+            if ctx.done or ctx.in_flight:
+                self.queue.append(cid)
+                continue
+            slot = self.table.acquire(cid, self._busy)
+            if slot is None:
+                self.queue.appendleft(cid)                  # it keeps its turn: else the holder always goes first
+                return False
+            if ctx.slot is not None and ctx.slot != slot:
+                ctx.fresh, ctx.next_pos = True, 0            # evicted meanwhile: start over
+            if ctx.fresh:
+                ctx.next_pos = 0
+            ctx.slot = slot
+            pos = ctx.next_pos
+            flags = 0
+            if ctx.fresh:
+                flags |= FLAG_FIRST
+            if pos >= ctx.prompt_len - 1:
+                flags |= FLAG_SAMPLE
+            item = WorkItem(slot, pos, self.embedding.lookup(ctx.tokens[pos]), flags)
+            self.ring.inject(pack_item(item))
+            ctx.in_flight, ctx.fresh = True, False
+            self.queue.append(cid)
+            return True
+        return False
+
+    def _retire(self, packet: bytes) -> None:
+        item, lists = unpack_item(packet, self.embedding.hidden)
+        cid = self.table.holder.get(item.context)
+        ctx = self.contexts[cid]
+        ctx.in_flight = False
+        ctx.next_pos = item.position + 1
+        if item.flags & FLAG_SAMPLE:
+            rows, logits, total = merge_lists(lists)
+            rnd = int(self.rng.integers(0, 1 << 32))
+            token, i = sample(rows, logits, ctx.params, rnd)
+            ctx.tokens.append(token)
+            ctx.logprobs.append(logprob(int(logits[i]), total))
+            if len(ctx.tokens) - ctx.prompt_len >= ctx.max_new:
+                ctx.done = True
+                self.table.release(cid)
+
+    def step(self) -> None:
+        out = self.ring.step(self.embedding.hidden)
+        if out is not None:
+            self._retire(out)
+        if self.ring.free:
+            self._inject()
+        self.steps += 1
+
+    def run(self, max_steps: int = 100_000) -> None:
+        for _ in range(max_steps):
+            if all(c.done for c in self.contexts.values()) and all(s is None for s in self.ring.stages):
+                return
+            self.step()
+        raise RuntimeError("the ring did not drain")
+
+    def generated(self, cid: int) -> list[int]:
+        ctx = self.contexts[cid]
+        return ctx.tokens[ctx.prompt_len:]
