@@ -253,8 +253,12 @@ module fabric_pass_adapter #(
     endgenerate
 
     wire [NT-1:0]    q_valid_t, start_t;
-    wire [NT*PW-1:0] psum_out_flat;
-    wire [NT*QW-1:0] q_out_flat;
+    // One net per tile, not one flat vector of NT slices: a flat vector driven
+    // in NT pieces is a chain of concatenations in Icarus, and every slice
+    // update at the end of a pass would re-propagate the whole vector through
+    // it, which at 834 tiles is hours of simulation for one pass.
+    wire [PW-1:0]    psum_out_t [0:NT-1];
+    wire [QW-1:0]    q_out_t    [0:NT-1];
     genvar gt, gc;
     generate
         for (gt = 0; gt < NT; gt = gt + 1) begin : g_tile
@@ -265,12 +269,12 @@ module fabric_pass_adapter #(
                 assign shift_w[gc*SHB +: SHB] = shift_all[gt*COLS + gc];
             end
             wire [11:0]   chain   = tab[gt][19:8];
-            wire [PW-1:0] psum_in = (chain == 12'hFFF) ? {PW{1'b0}} : psum_out_flat[chain*PW +: PW];
+            wire [PW-1:0] psum_in = (chain == 12'hFFF) ? {PW{1'b0}} : psum_out_t[chain];
             assign start_t[gt] = (state == S_START) && (tab[gt][3:0] == pass[3:0]) && (tab[gt][7:4] == rb[3:0]);
             fabric_tile #(.ROWS(ROWS), .COLS(COLS), .WB(WB), .AB(AB), .P(P), .ACC(ACC), .SB(SB), .SHB(SHB), .T(TMAX), .MODEL(MODEL_TILES), .ROM_FILE("")) u_tile (
                 .clk(clk), .rst_n(rst_n), .start(start_t[gt]), .psum_in(psum_in), .x_valid(xv), .x_data(x_data),
-                .mult(mult_w), .shift(shift_w), .x_ready(), .done(), .psum_out(psum_out_flat[gt*PW +: PW]),
-                .q_out(q_out_flat[gt*QW +: QW]), .q_valid(q_valid_t[gt]));
+                .mult(mult_w), .shift(shift_w), .x_ready(), .done(), .psum_out(psum_out_t[gt]),
+                .q_out(q_out_t[gt]), .q_valid(q_valid_t[gt]));
             initial $readmemh($sformatf("tile_%0d.hex", gt), u_tile.rom.rom);
         end
     endgenerate
@@ -281,13 +285,15 @@ module fabric_pass_adapter #(
     wire [7:0]    nbytes  = cur[29:22];
     wire [4:0]    beats   = (nbytes + 15) / 16;
     reg  [VW-1:0] vec;
+    wire [PW-1:0] psum_cur = psum_out_t[t];
+    wire [QW-1:0] q_cur    = q_out_t[t];
     integer c;
     always @* begin
         vec = {VW{1'b0}};
         if (cur[21]) begin
             for (c = 0; c < COLS; c = c + 1)
-                vec[c*32 +: 32] = {{(32-ACC){psum_out_flat[t*PW + (tok*COLS + c)*ACC + ACC - 1]}}, psum_out_flat[t*PW + (tok*COLS + c)*ACC +: ACC]};
-        end else vec[COLS*AB-1:0] = q_out_flat[t*QW + tok*COLS*AB +: COLS*AB];
+                vec[c*32 +: 32] = {{(32-ACC){psum_cur[(tok*COLS + c)*ACC + ACC - 1]}}, psum_cur[(tok*COLS + c)*ACC +: ACC]};
+        end else vec[COLS*AB-1:0] = q_cur[tok*COLS*AB +: COLS*AB];
     end
     wire [8:0]  remaining = nbytes - j * 16;
     wire [15:0] be_w      = (remaining >= 16) ? 16'hFFFF : ((16'd1 << remaining[3:0]) - 1'b1);
