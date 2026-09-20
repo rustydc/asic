@@ -1053,6 +1053,24 @@ buffers are 312 KB for the recurrent layer and 1.2 MB for the global
 (the four heads' window rows are most of it), against the 64 KB the first
 16-bit fields allowed.
 
+The full-size run is `FullSizeEngineTest` (set `FABRIC_FULL_SIZE=1`):
+layer 0 of the 9B at random initialisation, calibrated on three tokens,
+the second token of a running context through the engine at the
+design's own geometry, 4096 wide, 834 tiles of 4096 x 64 with the
+behavioural columns, 32 heads of 128 x 128 state. It passes bit for bit
+(the residual out, the state and its scales, the history) in 227,013
+engine cycles for the 173-step program, against the timing model's
+84,764: the same 2.7x as the tiny geometry, and for the same reason,
+the adapters at 8 lanes and a beat a cycle against the model's 64-lane
+units. Getting it to run at all was a simulator lesson: the pass adapter
+gathered the tiles' outputs into two flat vectors of 1.28 Mbit and
+427 kbit driven in 834 slices, which Icarus builds as a chain of 834
+concatenations and re-propagates whole on every slice update, so the
+first pass alone took over an hour at 194 tiles and over three at 834,
+quadratic in the tile count, and the token would have been days. With
+one net per tile the token simulates in 19 minutes, setup included, and
+the flushed issue trace (`issue.txt`) shows a long run's progress.
+
 Two units changed to serve every shape from one instance: the norm takes
 its beat count at run time (its result does not depend on the width of
 the sum of squares beyond it being wide enough, so one 96-wide instance
@@ -1221,10 +1239,10 @@ The state engine's and the append's loops over 128 and 1,024 elements
 wrote their arrays with non-blocking assignments, which Verilator can
 only unroll; those writes are blocking now (each element reads and
 writes only itself, in one phase) so the loops stay loops, but the files
-are the same size with them kept, so the bulk is the top itself, the
-pass adapter's logic over 834 tiles and the buffer's ports. A machine
-with the memory, or the pass adapter's per-tile logic moved into the
-tile block, is what the full-size Verilator run needs.
+were the same size with them kept, so the bulk was the top itself: the
+pass adapter's flat per-tile vectors, since replaced by per-tile nets
+for Icarus's sake (the layer engine section), which is untried under
+Verilator and may be what its build needed too.
 
 `rtl/fabric_memory.sv` holds the memory side: the behavioural
 `fabric_mem_model` for the testbenches, `fabric_mem_arbiter`,
