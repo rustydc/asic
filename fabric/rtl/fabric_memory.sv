@@ -633,16 +633,21 @@ module fabric_kv_append #(
     assign req_beats = beats_r;
 
     // Packing of an int8 vector into a half: element e at bit KV_BITS*e.
+    // An int8 rounded down to four bits: nine bits carries the round and the
+    // saturation is a compare, where the 64-bit helpers were a lane each of
+    // 64-bit adder and shifter.
     function automatic [DW-1:0] pack_beat(input [NKV*HD*8-1:0] rows, input integer head, input integer b);
         integer e;
-        reg signed [63:0] q;
+        reg signed [8:0] q;
         begin
             pack_beat = 0;
             for (e = 0; e < EPB; e = e + 1)
                 if (b * EPB + e < HD) begin
                     if (KV_BITS == 8) pack_beat[e*8 +: 8] = rows[(head*HD + b*EPB + e)*8 +: 8];
                     else begin
-                        q = fx_sat(fx_rnd_shr($signed(rows[(head*HD + b*EPB + e)*8 +: 8]), 4), 4);
+                        q = ($signed(rows[(head*HD + b*EPB + e)*8 +: 8]) + 9'sd8) >>> 4;
+                        if (q > 9'sd7) q = 9'sd7;
+                        if (q < -9'sd8) q = -9'sd8;
                         pack_beat[e*4 +: 4] = q[3:0];
                     end
                 end
@@ -704,9 +709,15 @@ module fabric_kv_append #(
 
     // One arriving beat: the eight sums updated, and if the block closes here,
     // their means in the shape the record wants them.
+    // The sums are SUMW bits and their means a byte, so a round needs one bit
+    // more than the sum and a code nine, not sixty-four apiece across SPB lanes.
+    localparam [SUMW:0] HALF_BS = BS >> 1;      // the round the mean adds before its shift
     integer se;
-    reg signed [63:0] sacc, smean;
-    integer sflat, sflat0, srow, shead, swithin, spos;
+    reg signed [SUMW:0]   sacc, srnd;
+    reg signed [8:0]      smean;
+    reg signed [7:0]      srow;                 // one row's element, and signed: a
+                                                // part-select of an integer is not
+    integer sflat, sflat0, shead, swithin, spos;
     always @* begin
         // A beat lies wholly in one region, and in the first two wholly in one
         // head and one record beat, so its word is known before the elements.
@@ -729,14 +740,17 @@ module fabric_kv_append #(
             else if (sflat < NSUM)    srow = $signed(idx_k[(sflat - 2*NKSUM)*8 +: 8]);
             sacc = $signed(s_in_data[se*16 +: SUMW]) + srow;
             s_wr_data[se*16 +: 16] = {{(16-SUMW){sacc[SUMW-1]}}, sacc[SUMW-1:0]};
-            smean = fx_rnd_shr($signed({{(64-SUMW){sacc[SUMW-1]}}, sacc[SUMW-1:0]}), LOG_BS);
+            srnd  = $signed(sacc[SUMW-1:0]) + $signed(HALF_BS);
+            smean = srnd >>> LOG_BS;
             if (sflat < 2*NKSUM) begin
                 swithin = (sflat < NKSUM) ? (sflat % HD) : ((sflat - NKSUM) % HD);
                 spos    = swithin % EPB;
                 blk_mask[spos] = 1'b1;                 // a beat owns SPB of the word's codes
                 if (KV_BITS == 8) blk_next[spos*8 +: 8] = smean[7:0];
                 else begin
-                    smean = fx_sat(fx_rnd_shr($signed({{56{smean[7]}}, smean[7:0]}), 4), 4);
+                    smean = ($signed(smean[7:0]) + 9'sd8) >>> 4;
+                    if (smean > 9'sd7) smean = 9'sd7;
+                    if (smean < -9'sd8) smean = -9'sd8;
                     blk_next[spos*4 +: 4] = smean[3:0];
                 end
             end else if (sflat < NSUM) begin
@@ -782,9 +796,16 @@ module fabric_kv_append #(
                                          input integer hd, input integer bt);
         rec_beat = (bt < HALF_BEATS) ? pack_beat(kr, hd, bt) : pack_beat(vr, hd, bt - HALF_BEATS);
     endfunction
+    // The widths the values actually need.  An int8 plus an unsigned byte is
+    // ten bits, fifteen times that is fourteen, and that by the 16-bit
+    // reciprocal is thirty.  Written through the 64-bit helpers it was CPB
+    // lanes of a 64 by 64 multiply, twice over, in one cycle -- the same
+    // mistake the index scan's chain of 64-bit adds was.
     function automatic [DW-1:0] idx_beat(input integer bt);
         integer e, sh;
-        reg signed [63:0] q;
+        reg signed [9:0]  a;
+        reg signed [13:0] b;
+        reg signed [31:0] q;
         begin
             idx_beat = 0;
             sh = 24 - rc_lz;                      // the round is written out: synthesis will not take
@@ -792,8 +813,10 @@ module fabric_kv_append #(
             else
                 for (e = 0; e < CPB; e = e + 1)
                     if (bt * CPB + e < IDIM) begin
-                        q = 64'sd15 * ($signed(unit[(bt*CPB + e)*8 +: 8]) + $signed({56'b0, scale})) * $signed({47'b0, rc_r});
-                        if (sh > 0) q = (q + (64'sd1 <<< (sh - 1))) >>> sh;
+                        a = $signed(unit[(bt*CPB + e)*8 +: 8]) + $signed({2'b0, scale});
+                        b = 14'sd15 * a;
+                        q = $signed(b) * $signed({1'b0, rc_r});
+                        if (sh > 0) q = (q + (32'sd1 <<< (sh - 1))) >>> sh;
                         if (q < 0) q = 0;
                         if (q > 15) q = 15;
                         idx_beat[e*4 +: 4] = q[3:0];
