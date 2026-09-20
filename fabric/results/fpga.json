@@ -1,0 +1,12 @@
+[
+  {
+    "family": "ecp5",
+    "d": 4096,
+    "k": 32,
+    "cells": 36977,
+    "block_rams": 2,
+    "luts": 17916,
+    "multipliers": 9,
+    "flops": 9069
+  }
+]

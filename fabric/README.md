@@ -1242,10 +1242,45 @@ first die is free, so every die works on a different context's token and
 one conversation sees the ring's latency. A prompt goes in a token at a
 time; only the last one's lists are drawn from.
 
-What the controller model does not yet cover: the ring link's framing
-below the packet (the source-synchronous words, the ready/valid, the
-retry on a CRC failure), the management SPI that loads the dies'
-constants, the host's PCIe queue format, and the die's side of FIRST.
+### The link and the datapath
+
+`rtl/fabric_ring.sv` is both ends of every link in the appliance, the
+controller to the first die and each die to the next: 32-bit words with
+ready/valid, the first word of a packet marked by `sop`, and the CRC last.
+`fabric_ring_tx` turns a header and a payload stream into the packet, and
+`fabric_ring_rx` turns one back and says whether the CRC held.
+
+Building them moved the CRC out of the header and into a trailer. With it
+in the header a sender must know the whole packet before it can send the
+fourth word, which for an 8 KB hidden vector means holding all of it, and
+a head die appending its list would have to hold the packet twice over. As
+a trailer both are a stream: accumulate while forwarding, emit the CRC
+last. The header is 12 bytes now and the trailer 4, so the overhead is the
+16 bytes the simulator already assumed.
+
+`rtl/fabric_controller_top.sv` is the three pieces together and is what has
+to be gateware, because it is a stream: a request fetches the token's row
+of the embedding table and sends it as the payload; the packet that comes
+back has its hidden vector skipped, its lists parsed out into the sampler
+and the token drawn for the slot it belongs to. The embedding fetch takes
+three cycles a word, since the table answers the cycle after its address
+and the word is held until the link takes it; a real part is read in bursts
+and that is where the burst goes.
+
+Mapped by yosys at the 9B geometry, 4096 elements and lists of 32, the
+datapath is about 20K LUT4 and 9K flip-flops on an ECP5 -- a corner of a
+45 or an 85, and small on an Artix-7 -- which leaves the part for what
+else has to live on it: the PCIe endpoint, the DDR4 controller for the
+embedding table, the ring's physical layer and the soft side. The
+sampler's candidate arrays map to flip-flops rather than block RAM at
+these depths, which is most of the register count and the first thing to
+change if the part is tight. `fabric.fpga` runs that measurement.
+
+What is not covered yet: the ring's physical layer below the words (the
+source-synchronous clocking, the retry on a CRC failure), the management
+SPI that loads the dies' constants, the host's PCIe queue format, and the
+die's side of FIRST, which wants a sequencer program that starts a slot's
+state from zero.
 
 ## RTL
 
