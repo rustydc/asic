@@ -179,32 +179,43 @@ def colour_banks(graph: dict[str, set[str]], sizes=None) -> dict[str, int]:
     return at
 
 
-def bank_reads(steps: list[S.Step], at: dict[str, int], chunk: int = 1) -> list[int]:
-    """Read ports each bank needs: the most its buffers are asked for at
-    once, over every set of steps that may be in flight together.  A fixed
-    port charges the bank of the buffer it holds; a shared port charges one
-    read to any bank its command's buffers are in, since which one it is on a
-    given cycle is not known here.  More than one read is wanted only where
-    two ports meet on one bank -- the pass output the gates take two slices
-    of, or that the rotary and the attention read together -- which no
-    assignment of buffers to banks can undo."""
-    need = [1] * (max(at.values()) + 1 if at else 1)
+def bank_ports(steps: list[S.Step], at: dict[str, int], chunk: int = 1) -> tuple[list[int], list[int]]:
+    """Read and write ports each bank needs: the most its buffers are asked
+    for at once, over every set of steps that may be in flight together.  A
+    fixed port charges the bank of the buffer it holds; a shared port charges
+    one access to any bank its command's buffers are in, since which one it is
+    on a given cycle is not known here.
+
+    More than one is wanted only where two ports meet on one buffer, which no
+    assignment of buffers to banks can undo.  Reading, that is the pass output
+    the gates take two slices of.  Writing, it is a vector several engines
+    contribute to at once -- the rotary heads' keys, the attention heads'
+    output -- where each writes its own slice of one buffer."""
+    nb = max(at.values()) + 1 if at else 1
+    reads, writes = [1] * nb, [1] * nb
     live = live_together(steps)
     for i in range(len(steps)):
         run = [i]
         for j in sorted(live[i]):
             if all(j in live[k] for k in run):
                 run.append(j)                            # a set that may all be in flight at once
-        banks: dict[int, int] = {}
+        rb: dict[int, int] = {}
+        wb: dict[int, int] = {}
         for k in run:
-            rf, rs, _wf, _ws = ports(steps[k], chunk)
+            rf, rs, wf, ws = ports(steps[k], chunk)
             for name in rf:
-                banks[at[name]] = banks.get(at[name], 0) + 1
+                rb[at[name]] = rb.get(at[name], 0) + 1
             for b in {at[n] for n in rs}:                # the one shared port, wherever it is
-                banks[b] = banks.get(b, 0) + 1
-        for b, n in banks.items():
-            need[b] = max(need[b], n)
-    return need
+                rb[b] = rb.get(b, 0) + 1
+            for name in wf:
+                wb[at[name]] = wb.get(at[name], 0) + 1
+            for b in {at[n] for n in ws}:
+                wb[b] = wb.get(b, 0) + 1
+        for b, n in rb.items():
+            reads[b] = max(reads[b], n)
+        for b, n in wb.items():
+            writes[b] = max(writes[b], n)
+    return reads, writes
 
 
 class Layout:
@@ -243,8 +254,7 @@ class Layout:
         for name in names:                               # a buffer no step's operands reach still needs a bank
             self.bank.setdefault(name, 0)
         self.banks = max(self.bank.values()) + 1 if self.bank else 1
-        self.bank_reads = bank_reads(steps, self.bank, self.chunk)
-        assert max(self.bank_reads) <= 3, f"a bank wants {max(self.bank_reads)} read ports"
+        self.bank_reads, self.bank_writes = bank_ports(steps, self.bank, self.chunk)
         fill = [0] * self.banks
         for name in names:
             b = self.bank[name]
@@ -258,11 +268,12 @@ class Layout:
     def size(self, name: str) -> int:
         return self.sizes[name.split("@")[0]]
 
-    def read_cap_mask(self, ports: int) -> int:
-        """The banks that need at least ``ports`` read ports, as a bit mask
-        for the RTL's check."""
+    def cap_mask(self, need: list[int], ports: int) -> int:
+        """The banks that need at least ``ports`` of a kind, as a bit mask for
+        the RTL's check."""
         assert self.banks <= 64, f"{self.banks} banks, the mask holds 64"
-        return sum(1 << b for b, n in enumerate(self.bank_reads) if n >= ports)
+        assert max(need) <= 3, f"a bank wants {max(need)} ports of one kind"
+        return sum(1 << b for b, n in enumerate(need) if n >= ports)
 
     def address(self, name: str) -> int:
         return self.mem[name] if name.startswith(S.MEM_PREFIX) else self.vb[name]
@@ -493,7 +504,9 @@ class EngineRun:
                        "WB": spec.weight_bits, "ACC": spec.acc_bits, "SB": spec.scale_bits, "SHB": spec.shift_bits, "SW": sw,
                        "YSH": L.ysh_for(self.hk), "VB_BYTES": self.layout.vb_bytes, "MEM_BEATS": self.layout.mem_beats,
                        "VB_BANKS": self.layout.banks, "VB_BANK_SHIFT": self.layout.bank_shift,
-                       "VB_RCAP2": self.layout.read_cap_mask(2), "VB_RCAP3": self.layout.read_cap_mask(3),
+                       "VB_RCAP2": self.layout.cap_mask(self.layout.bank_reads, 2),
+                       "VB_RCAP3": self.layout.cap_mask(self.layout.bank_reads, 3),
+                       "VB_WCAP2": self.layout.cap_mask(self.layout.bank_writes, 2),
                        "SCHEDULE_CYCLES": S.schedule(steps).cycles, **hpi_params}
         (directory / "params.json").write_text(json.dumps(self.params))
 
@@ -560,6 +573,6 @@ class EngineRun:
             b, reads, writes = (int(v) for v in f[1:4])
             if reads > self.layout.bank_reads[b]:
                 problems.append(f"bank {b}: {reads} reads at once, the colouring gave it {self.layout.bank_reads[b]}")
-            if writes > 1:
-                problems.append(f"bank {b}: {writes} writes at once")
+            if writes > self.layout.bank_writes[b]:
+                problems.append(f"bank {b}: {writes} writes at once, the colouring gave it {self.layout.bank_writes[b]}")
         return problems

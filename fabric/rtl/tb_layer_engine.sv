@@ -54,6 +54,7 @@ module tb_layer_engine #(
     parameter int VB_BANK_SHIFT = 12,
     parameter [63:0] VB_RCAP2 = 0,
     parameter [63:0] VB_RCAP3 = 0,
+    parameter [63:0] VB_WCAP2 = 0,
     parameter int AW        = 24,
     parameter int MEM_BEATS = 128,
     parameter int SCHEDULE_CYCLES = 0,
@@ -79,7 +80,7 @@ module tb_layer_engine #(
                           .W(W), .BS(BS), .TOP(TOP), .KV_BITS(KV_BITS), .REC_BYTES(REC_BYTES), .RPB(RPB), .MAXR(MAXR),
                           .WINDOW_OFF(WINDOW_OFF), .BLOCK_OFF(BLOCK_OFF), .INDEX_OFF(INDEX_OFF), .SUMS_OFF(SUMS_OFF), .ATT_L(ATT_L),
                           .ROWS(ROWS), .COLS(COLS), .P(P), .NT(NT), .TMAX(TMAX), .MODEL_TILES(MODEL_TILES), .WB(WB), .ACC(ACC), .SB(SB), .SHB(SHB), .SW(SW), .YSH(YSH), .VB_BYTES(VB_BYTES), .AW(AW),
-                          .VB_BANKS(VB_BANKS), .VB_BANK_SHIFT(VB_BANK_SHIFT), .VB_RCAP2(VB_RCAP2), .VB_RCAP3(VB_RCAP3)) dut (
+                          .VB_BANKS(VB_BANKS), .VB_BANK_SHIFT(VB_BANK_SHIFT), .VB_RCAP2(VB_RCAP2), .VB_RCAP3(VB_RCAP3), .VB_WCAP2(VB_WCAP2)) dut (
         .clk(clk), .rst_n(rst_n), .start(start), .n_steps(N[15:0]), .running(running), .done(done),
         .m_req_valid(req_valid), .m_req_ready(req_ready), .m_req_write(req_write), .m_req_addr(req_addr), .m_req_beats(req_beats),
         .m_wdata_valid(wdata_valid), .m_wdata_ready(wdata_ready), .m_wdata(wdata), .m_rdata_valid(rdata_valid), .m_rdata(rdata));

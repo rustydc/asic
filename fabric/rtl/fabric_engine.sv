@@ -45,6 +45,7 @@ module fabric_vb #(
     parameter int BSH   = 12,      // a bank's own address bits: bank b holds [b << BSH, (b+1) << BSH)
     parameter [63:0] RCAP2 = 0,    // banks that need a second read port
     parameter [63:0] RCAP3 = 0,    // and a third
+    parameter [63:0] WCAP2 = 0,    // banks a pair of engines contribute to at once
     parameter     INIT_FILE = ""
 ) (
     input  wire              clk,
@@ -80,6 +81,9 @@ module fabric_vb #(
     function automatic integer cap_of(input integer bb);
         cap_of = 1 + (RCAP2[bb] ? 1 : 0) + (RCAP3[bb] ? 1 : 0);
     endfunction
+    function automatic integer wcap_of(input integer bb);
+        wcap_of = 1 + (WCAP2[bb] ? 1 : 0);
+    endfunction
 
     integer nrd [0:NB-1], nwr [0:NB-1];          // this cycle
     integer max_rd [0:NB-1], max_wr [0:NB-1];    // over the run, for the report
@@ -104,7 +108,7 @@ module fabric_vb #(
                 b = bank_of(wr_addr[p*AW +: AW]);
                 nwr[b] = nwr[b] + 1;
                 if (nwr[b] > max_wr[b]) max_wr[b] = nwr[b];
-                if (nwr[b] > 1) $display("FAIL: bank %0d asked for %0d writes, it has one", b, nwr[b]);
+                if (nwr[b] > wcap_of(b)) $display("FAIL: bank %0d asked for %0d writes, it has %0d", b, nwr[b], wcap_of(b));
             end
         // A bank answers only what it was asked for: an enable that is too
         // narrow shows up as x in the unit that wanted the beat, as one that
@@ -1466,6 +1470,7 @@ module fabric_layer_engine #(
     parameter int VB_BANK_SHIFT = 12,
     parameter [63:0] VB_RCAP2 = 0,
     parameter [63:0] VB_RCAP3 = 0,
+    parameter [63:0] VB_WCAP2 = 0,
     parameter     VB_FILE   = "vb_init.hex",
     parameter     PROG_FILE = "program.hex",
     parameter     LUT_DIR   = "./"
@@ -1543,7 +1548,7 @@ module fabric_layer_engine #(
     endgenerate
 
     fabric_vb #(.BYTES(VB_BYTES), .NR(NR), .NW(NW), .AW(AW), .NB(VB_BANKS), .BSH(VB_BANK_SHIFT),
-                .RCAP2(VB_RCAP2), .RCAP3(VB_RCAP3), .INIT_FILE(VB_FILE)) u_vb (
+                .RCAP2(VB_RCAP2), .RCAP3(VB_RCAP3), .WCAP2(VB_WCAP2), .INIT_FILE(VB_FILE)) u_vb (
         .clk(clk), .rd_en(rd_en), .rd_addr(rd_addr), .rd_data(rd_data), .wr_en(wr_en), .wr_addr(wr_addr), .wr_data(wr_data), .wr_be(wr_be));
 
     wire [NE-1:0] ready_norm, ready_delta, ready_rotary, ready_attn;
