@@ -1215,14 +1215,16 @@ container has. With the column modules marked `hier_block` and
 `--hierarchical` (the top's parameters in a wrapper module, since the
 `-G` flags reach the child; the executable linked by hand, since
 `--main` reaches it too) the tile compiles once and elaboration fits,
-but the top's generated C++ runs to 64 MB a file and g++ needs more than
-9 GB on one of them even at `-O0`. The size is the unrolled loops: the
-state engine's and the append's loops over 128 and 1,024 elements write
-arrays with non-blocking assignments, which Verilator can only unroll,
-and raising its unroll limit for them unrolls every loop in the design.
-Making those array writes blocking (each element reads and writes only
-itself) lets the loops stay loops, which is the next step for a
-full-size Verilator run.
+but the top's generated C++ runs to 65 MB a file and g++ needs more than
+9 GB on one of them even at `-O0`, which this container does not have.
+The state engine's and the append's loops over 128 and 1,024 elements
+wrote their arrays with non-blocking assignments, which Verilator can
+only unroll; those writes are blocking now (each element reads and
+writes only itself, in one phase) so the loops stay loops, but the files
+are the same size with them kept, so the bulk is the top itself, the
+pass adapter's logic over 834 tiles and the buffer's ports. A machine
+with the memory, or the pass adapter's per-tile logic moved into the
+tile block, is what the full-size Verilator run needs.
 
 `rtl/fabric_memory.sv` holds the memory side: the behavioural
 `fabric_mem_model` for the testbenches, `fabric_mem_arbiter`,
