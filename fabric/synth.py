@@ -252,7 +252,7 @@ def synthesize(liberty: Path | Sequence[Path], *, rows: int = 256, cols: int = 8
             # -defer: elaborate only the top's tree at its parameters; the other modules in the
             # files at their defaults (a 256-wide attention core, a 128 x 128 state) are gigabytes.
             *[f"read_verilog -sv -defer {path.name}" for path in sources],
-            f"chparam {chparam} {top}",
+            *([f"chparam {chparam} {top}"] if chparam else []),   # a module with no parameters takes none
             f"hierarchy -check -top {top}",
             f"synth -top {top} -flatten",
             f"dfflibmap {lib_args}",
@@ -291,6 +291,13 @@ def synthesize(liberty: Path | Sequence[Path], *, rows: int = 256, cols: int = 8
 
 def parse_stat(log: str) -> tuple[int, float, int]:
     section = log[log.rfind("Printing statistics"):] if "Printing statistics" in log else log
+    # A design with a kept hierarchy has one block per module; the top's block
+    # is the whole design (yosys counts its instances' area into it), so take
+    # that one and not the first module yosys happens to print.
+    top = re.search(r"Chip area for top module", section)
+    if top:
+        start = section.rfind("===", 0, top.start())
+        section = section[start if start >= 0 else 0:]
     cells_match = re.search(r"Number of cells:\s+(\d+)", section)
     area_match = re.search(r"Chip area for (?:top )?module.*?:\s+([0-9.]+)", section)
     if not cells_match or not area_match:
