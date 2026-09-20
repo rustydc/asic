@@ -704,15 +704,17 @@ module fabric_kv_append #(
         rec_beat = (bt < HALF_BEATS) ? pack_beat(kr, hd, bt) : pack_beat(vr, hd, bt - HALF_BEATS);
     endfunction
     function automatic [DW-1:0] idx_beat(input integer bt);
-        integer e;
+        integer e, sh;
         reg signed [63:0] q;
         begin
             idx_beat = 0;
-            if (bt == CB) idx_beat[7:0] = scale;
+            sh = 24 - rc_lz;                      // the round is written out: synthesis will not take
+            if (bt == CB) idx_beat[7:0] = scale;  // fx_rnd_shr's variable shift through a nested call
             else
                 for (e = 0; e < CPB; e = e + 1)
                     if (bt * CPB + e < IDIM) begin
-                        q = fx_rnd_shr(64'sd15 * ($signed(unit[(bt*CPB + e)*8 +: 8]) + $signed({56'b0, scale})) * $signed({47'b0, rc_r}), 24 - rc_lz);
+                        q = 64'sd15 * ($signed(unit[(bt*CPB + e)*8 +: 8]) + $signed({56'b0, scale})) * $signed({47'b0, rc_r});
+                        if (sh > 0) q = (q + (64'sd1 <<< (sh - 1))) >>> sh;
                         if (q < 0) q = 0;
                         if (q > 15) q = 15;
                         idx_beat[e*4 +: 4] = q[3:0];
