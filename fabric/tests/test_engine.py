@@ -1,4 +1,5 @@
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -67,6 +68,32 @@ class LayoutTest(unittest.TestCase):
         self.assertIn("x@1", lay2.vb)
         self.assertEqual(len([n for n in lay2.vb if n.startswith("s_slot")]), 4)
         self.assertEqual(len(lay2.mem), 2 * len(lay.mem))
+
+
+class PortMapTest(unittest.TestCase):
+    """The crossbar's port face is folded in Python and wired in Verilog, and
+    the fold is only sound if the two number the ports the same way.  Reading
+    the numbering out of the RTL rather than restating it is the point: a port
+    map that has drifted folds two live ports onto one."""
+
+    def rtl_ports(self, prefix: str, tmax: int) -> dict[str, int]:
+        text = (RTL / "fabric_engine.sv").read_text()
+        names: dict[str, int] = {"TMAX": tmax}
+        for statement in re.findall(r"localparam int (" + prefix + r"_NORM\b.*?);", text, re.S):
+            for assignment in statement.split(","):
+                name, expression = assignment.split("=", 1)
+                names[name.strip()] = eval(expression.strip(), {"__builtins__": {}}, names)  # noqa: S307 - our own RTL
+        return names
+
+    def test_the_port_map_is_the_one_the_rtl_wires(self) -> None:
+        for chunk in (1, 2, 3):
+            for prefix, table, total_name in (("R", E.RD_PORT_MAP, "NR"), ("W", E.WR_PORT_MAP, "NW")):
+                rtl = self.rtl_ports(prefix, chunk)
+                index, total = E._port_index(table, chunk)
+                self.assertEqual(total, rtl[total_name], (prefix, chunk))
+                for unit, _, _ in table:
+                    name = f"{prefix}_{'SWIGLU' if unit == 'swiglu' else unit.upper()}"
+                    self.assertEqual(index[(unit, 0, 0)], rtl[name], (name, chunk))
 
 
 @unittest.skipUnless(shutil.which("iverilog") and shutil.which("vvp"), "iverilog not installed")

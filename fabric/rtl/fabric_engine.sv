@@ -46,6 +46,18 @@ module fabric_vb #(
     parameter [63:0] RCAP2 = 0,    // banks that need a second read port
     parameter [63:0] RCAP3 = 0,    // and a third
     parameter [63:0] WCAP2 = 0,    // banks a pair of engines contribute to at once
+    // The crossbar each logical port folds onto.  The port face is sized by
+    // construction -- every adapter operand has one -- but the controller
+    // issues in order, so most of them can never be asking at once, and
+    // `fabric.engine.port_colours` says which may share.  Four bits a port,
+    // sixteen ports to a word.  NPR = NR and the identity map is the face
+    // itself, which is what the checks below are written against.
+    parameter int NPR   = NR,
+    parameter int NPW   = NW,
+    parameter [63:0] RMAP0 = 64'hFEDCBA9876543210,
+    parameter [63:0] RMAP1 = 64'hFEDCBA9876543210,
+    parameter [63:0] WMAP0 = 64'hFEDCBA9876543210,
+    parameter [63:0] WMAP1 = 64'hFEDCBA9876543210,
     parameter     INIT_FILE = ""
 ) (
     input  wire              clk,
@@ -97,15 +109,65 @@ module fabric_vb #(
     function automatic integer wcap_of(input integer bb);
         wcap_of = 1 + (WCAP2[bb] ? 1 : 0);
     endfunction
+    function automatic integer rmap_of(input integer i);
+        rmap_of = (i < 16) ? RMAP0[i*4 +: 4] : RMAP1[(i-16)*4 +: 4];
+    endfunction
+    function automatic integer wmap_of(input integer i);
+        wmap_of = (i < 16) ? WMAP0[i*4 +: 4] : WMAP1[(i-16)*4 +: 4];
+    endfunction
+
+    // The fold: the logical ports' addresses or'd onto the crossbar port they
+    // share.  Sharers are never enabled together, so an or is a mux, and the
+    // answer goes back on one set of wires that all of them read.  Everything
+    // below -- the allocator, the banks' slots, the beat that comes back -- is
+    // then NPR and NPW wide rather than NR and NW.
+    reg [NPR-1:0]     p_en;
+    reg [NPR*AW-1:0]  p_addr;
+    reg [NPW-1:0]     q_en;
+    reg [NPW*AW-1:0]  q_addr;
+    reg [NPW*128-1:0] q_data;
+    reg [NPW*16-1:0]  q_be;
+    integer fi;
+    always @(*) begin
+        p_en = 0; p_addr = 0;
+        for (fi = 0; fi < NR; fi = fi + 1)
+            if (rd_en[fi]) begin
+                p_en[rmap_of(fi)] = 1'b1;
+                p_addr[rmap_of(fi)*AW +: AW] = p_addr[rmap_of(fi)*AW +: AW] | rd_addr[fi*AW +: AW];
+            end
+        q_en = 0; q_addr = 0; q_data = 0; q_be = 0;
+        for (fi = 0; fi < NW; fi = fi + 1)
+            if (wr_en[fi]) begin
+                q_en[wmap_of(fi)] = 1'b1;
+                q_addr[wmap_of(fi)*AW +: AW]   = q_addr[wmap_of(fi)*AW +: AW]   | wr_addr[fi*AW +: AW];
+                q_data[wmap_of(fi)*128 +: 128] = q_data[wmap_of(fi)*128 +: 128] | wr_data[fi*128 +: 128];
+                q_be[wmap_of(fi)*16 +: 16]     = q_be[wmap_of(fi)*16 +: 16]     | wr_be[fi*16 +: 16];
+            end
+    end
+`ifndef FABRIC_SYNTH
+    integer fj;
+    always @(posedge clk) begin
+        for (fi = 0; fi < NR; fi = fi + 1)
+            for (fj = 0; fj < NR; fj = fj + 1)
+                if (fj < fi && rd_en[fi] && rd_en[fj] && rmap_of(fi) == rmap_of(fj))
+                    $display("FAIL: read ports %0d and %0d share crossbar port %0d and are both asking",
+                             fj, fi, rmap_of(fi));
+        for (fi = 0; fi < NW; fi = fi + 1)
+            for (fj = 0; fj < NW; fj = fj + 1)
+                if (fj < fi && wr_en[fi] && wr_en[fj] && wmap_of(fi) == wmap_of(fj))
+                    $display("FAIL: write ports %0d and %0d share crossbar port %0d and are both asking",
+                             fj, fi, wmap_of(fi));
+    end
+`endif
 
     // Which of a bank's ports each access takes.  Reads on one address share a
     // port, which is what lets two units stream the same beat of one buffer.
     integer      rn [0:NB-1];
     reg [AW-1:0] ra [0:NB*RPOT-1];
     reg          rv [0:NB*RPOT-1];
-    reg [1:0]    r_slot [0:NR-1];
-    reg [BB-1:0] r_bank [0:NR-1];
-    reg          r_got [0:NR-1];
+    reg [1:0]    r_slot [0:NPR-1];
+    reg [BB-1:0] r_bank [0:NPR-1];
+    reg          r_got [0:NPR-1];
     integer      wn [0:NB-1];
     reg [AW-1:0] wa [0:NB*WPOT-1];
     reg [127:0]  wd [0:NB*WPOT-1];
@@ -119,12 +181,12 @@ module fabric_vb #(
     // bank, how many such ports come before each of them, and for a port that
     // is not first, the slot of the one it matched.  All three are compares
     // and counts over the ports, of logarithmic depth.
-    reg [NR-1:0]   r_use, r_first;
-    reg [1:0]      r_pre [0:NR-1];                       // slot if first: distinct addresses before it
-    reg [1:0]      r_ix  [0:NR-1];                       // the slot it actually takes
-    reg [NW-1:0]   w_use;
-    reg [1:0]      w_pre [0:NW-1];
-    reg [BB-1:0]   w_bank [0:NW-1];
+    reg [NPR-1:0]  r_use, r_first;
+    reg [1:0]      r_pre [0:NPR-1];                      // slot if first: distinct addresses before it
+    reg [1:0]      r_ix  [0:NPR-1];                      // the slot it actually takes
+    reg [NPW-1:0]  w_use;
+    reg [1:0]      w_pre [0:NPW-1];
+    reg [BB-1:0]   w_bank [0:NPW-1];
     integer i, j, b, s, n;
 `ifndef FABRIC_SYNTH
     integer      max_rd [0:NB-1], max_wr [0:NB-1];       // over the run, for the report
@@ -135,41 +197,41 @@ module fabric_vb #(
         // Reads: which ports are asking, and which of them names its address
         // first in its bank.  A later port with the same address shares that
         // port's slot, which is what lets two units stream one buffer.
-        for (i = 0; i < NR; i = i + 1) begin
-            r_bank[i] = bank_of(rd_addr[i*AW +: AW]);
-            r_use[i]  = rd_en[i] && (^rd_addr[i*AW +: AW] !== 1'bx);
+        for (i = 0; i < NPR; i = i + 1) begin
+            r_bank[i] = bank_of(p_addr[i*AW +: AW]);
+            r_use[i]  = p_en[i] && (^p_addr[i*AW +: AW] !== 1'bx);
         end
-        for (i = 0; i < NR; i = i + 1) begin
+        for (i = 0; i < NPR; i = i + 1) begin
             r_first[i] = r_use[i];
-            for (j = 0; j < NR; j = j + 1)
+            for (j = 0; j < NPR; j = j + 1)
                 if (j < i && r_use[j] && r_bank[j] == r_bank[i]
-                    && rd_addr[j*AW +: AW] == rd_addr[i*AW +: AW]) r_first[i] = 1'b0;
+                    && p_addr[j*AW +: AW] == p_addr[i*AW +: AW]) r_first[i] = 1'b0;
         end
-        for (i = 0; i < NR; i = i + 1) begin
+        for (i = 0; i < NPR; i = i + 1) begin
             n = 0;                                        // distinct addresses of this bank before i
-            for (j = 0; j < NR; j = j + 1)
+            for (j = 0; j < NPR; j = j + 1)
                 if (j < i && r_first[j] && r_bank[j] == r_bank[i] && n < RMAX) n = n + 1;
             r_pre[i] = n[1:0];
         end
-        for (i = 0; i < NR; i = i + 1) begin
+        for (i = 0; i < NPR; i = i + 1) begin
             r_ix[i] = r_pre[i];                           // and a sharer takes the slot it matched
             if (!r_first[i])
-                for (j = 0; j < NR; j = j + 1)
+                for (j = 0; j < NPR; j = j + 1)
                     if (j < i && r_first[j] && r_bank[j] == r_bank[i]
-                        && rd_addr[j*AW +: AW] == rd_addr[i*AW +: AW]) r_ix[i] = r_pre[j];
+                        && p_addr[j*AW +: AW] == p_addr[i*AW +: AW]) r_ix[i] = r_pre[j];
             r_slot[i] = r_ix[i];
             r_got[i]  = r_use[i] && (r_ix[i] < RMAX);
         end
         for (b = 0; b < NB; b = b + 1) begin
             rn[b] = 0;
-            for (i = 0; i < NR; i = i + 1)
+            for (i = 0; i < NPR; i = i + 1)
                 if (r_first[i] && r_bank[i] == b) rn[b] = rn[b] + 1;
             for (s = 0; s < RPOT; s = s + 1) begin
                 ra[(b << RSH) + s] = 0;
                 rv[(b << RSH) + s] = 1'b0;
-                for (i = 0; i < NR; i = i + 1)            // one-hot: one port owns a slot
+                for (i = 0; i < NPR; i = i + 1)            // one-hot: one port owns a slot
                     if (r_first[i] && r_bank[i] == b && r_pre[i] == s && s < RMAX) begin
-                        ra[(b << RSH) + s] = ra[(b << RSH) + s] | rd_addr[i*AW +: AW];
+                        ra[(b << RSH) + s] = ra[(b << RSH) + s] | p_addr[i*AW +: AW];
                         rv[(b << RSH) + s] = 1'b1;
                     end
             end
@@ -177,30 +239,30 @@ module fabric_vb #(
         // Writes: no sharing, so a port's slot is how many of its bank come
         // before it.  A bank asked for more than it has is still counted, so
         // the check below sees it.
-        for (i = 0; i < NW; i = i + 1) begin
-            w_bank[i] = bank_of(wr_addr[i*AW +: AW]);
-            w_use[i]  = wr_en[i];
+        for (i = 0; i < NPW; i = i + 1) begin
+            w_bank[i] = bank_of(q_addr[i*AW +: AW]);
+            w_use[i]  = q_en[i];
         end
-        for (i = 0; i < NW; i = i + 1) begin
+        for (i = 0; i < NPW; i = i + 1) begin
             n = 0;
-            for (j = 0; j < NW; j = j + 1)
+            for (j = 0; j < NPW; j = j + 1)
                 if (j < i && w_use[j] && w_bank[j] == w_bank[i] && n < WMAX) n = n + 1;
             w_pre[i] = n[1:0];
         end
         for (b = 0; b < NB; b = b + 1) begin
             wn[b] = 0;
-            for (i = 0; i < NW; i = i + 1)
+            for (i = 0; i < NPW; i = i + 1)
                 if (w_use[i] && w_bank[i] == b) wn[b] = wn[b] + 1;
             for (s = 0; s < WPOT; s = s + 1) begin
                 wa[(b << WSH) + s] = 0;
                 wd[(b << WSH) + s] = 0;
                 wm[(b << WSH) + s] = 0;
                 wv[(b << WSH) + s] = 1'b0;
-                for (i = 0; i < NW; i = i + 1)
+                for (i = 0; i < NPW; i = i + 1)
                     if (w_use[i] && w_bank[i] == b && w_pre[i] == s && s < WMAX) begin
-                        wa[(b << WSH) + s] = wa[(b << WSH) + s] | wr_addr[i*AW +: AW];
-                        wd[(b << WSH) + s] = wd[(b << WSH) + s] | wr_data[i*128 +: 128];
-                        wm[(b << WSH) + s] = wm[(b << WSH) + s] | wr_be[i*16 +: 16];
+                        wa[(b << WSH) + s] = wa[(b << WSH) + s] | q_addr[i*AW +: AW];
+                        wd[(b << WSH) + s] = wd[(b << WSH) + s] | q_data[i*128 +: 128];
+                        wm[(b << WSH) + s] = wm[(b << WSH) + s] | q_be[i*16 +: 16];
                         wv[(b << WSH) + s] = 1'b1;
                     end
             end
@@ -216,10 +278,10 @@ module fabric_vb #(
             if (rn[b] > cap_of(b))  $display("FAIL: bank %0d asked for %0d reads, it has %0d", b, rn[b], cap_of(b));
             if (wn[b] > wcap_of(b)) $display("FAIL: bank %0d asked for %0d writes, it has %0d", b, wn[b], wcap_of(b));
         end
-        for (i = 0; i < NR; i = i + 1)
-            if (rd_en[i] && !r_got[i]) begin
-                if (^rd_addr[i*AW +: AW] === 1'bx) $display("FAIL: read port %0d is enabled on an unknown address", i);
-                else $display("FAIL: read port %0d got no port of bank %0d", i, r_bank[i]);
+        for (i = 0; i < NPR; i = i + 1)
+            if (p_en[i] && !r_got[i]) begin
+                if (^p_addr[i*AW +: AW] === 1'bx) $display("FAIL: crossbar read port %0d is enabled on an unknown address", i);
+                else $display("FAIL: crossbar read port %0d got no port of bank %0d", i, r_bank[i]);
             end
     end
 `endif
@@ -276,29 +338,35 @@ module fabric_vb #(
 
     // The beat a port asked for, a cycle later: its two words in address order,
     // shifted down to the byte it started at.
-    reg [1:0]    slot_q [0:NR-1];
-    reg [BB-1:0] bank_q [0:NR-1];
-    reg [3:0]    off_q [0:NR-1];
-    reg          odd_q_sel [0:NR-1];
-    reg          en_q [0:NR-1];
+    reg [1:0]    slot_q [0:NPR-1];
+    reg [BB-1:0] bank_q [0:NPR-1];
+    reg [3:0]    off_q [0:NPR-1];
+    reg          odd_q_sel [0:NPR-1];
+    reg          en_q [0:NPR-1];
+    reg [NPR*128-1:0] p_data;
     reg [255:0]  win;
     reg [SB-1:0] sel;                                   // the bank's slot, flattened
     always @(posedge clk)
-        for (i = 0; i < NR; i = i + 1) begin
+        for (i = 0; i < NPR; i = i + 1) begin
             slot_q[i] <= r_slot[i];
             bank_q[i] <= r_bank[i];
-            off_q[i] <= rd_addr[i*AW +: 4];
-            odd_q_sel[i] <= rd_addr[i*AW + 4];
-            en_q[i] <= rd_en[i] && r_got[i];
+            off_q[i] <= p_addr[i*AW +: 4];
+            odd_q_sel[i] <= p_addr[i*AW + 4];
+            en_q[i] <= p_en[i] && r_got[i];
         end
     always @(*)
-        for (j = 0; j < NR; j = j + 1) begin
+        for (j = 0; j < NPR; j = j + 1) begin
             // The word offsets are concatenations, not products: see RSH above.
             sel = (bank_q[j] << RSH) + slot_q[j];
             win = odd_q_sel[j] ? {even_q[{sel, 7'd0} +: 128], odd_q[{sel, 7'd0} +: 128]}
                                : {odd_q[{sel, 7'd0} +: 128], even_q[{sel, 7'd0} +: 128]};
-            rd_data[j*128 +: 128] = en_q[j] ? win[{1'b0, off_q[j], 3'd0} +: 128] : {128{1'bx}};
+            p_data[j*128 +: 128] = en_q[j] ? win[{1'b0, off_q[j], 3'd0} +: 128] : {128{1'bx}};
         end
+    // Every logical port that folded onto a crossbar port reads its answer:
+    // wires, since at most one of them asked for it.
+    always @(*)
+        for (j = 0; j < NR; j = j + 1)
+            rd_data[j*128 +: 128] = p_data[rmap_of(j)*128 +: 128];
 
 `ifndef FABRIC_SYNTH
     // The image in and out.  The memories hold it in words, the file in bytes,
@@ -326,6 +394,40 @@ module fabric_vb #(
                     end
         end
     endgenerate
+
+    // A shadow of the buffer, kept from the logical ports, so that a read's
+    // answer can be checked against what the writes put there.  Simulation
+    // only, and only to find where the fold goes wrong.
+    reg [7:0]        shadow [0:BYTES-1];
+    reg [NR-1:0]     sh_en;
+    reg [NR*AW-1:0]  sh_addr;
+    integer          si, sk, sbad;
+    reg [127:0]      sexp;
+    initial begin
+        sbad = 0;
+        for (si = 0; si < BYTES; si = si + 1) shadow[si] = 8'd0;
+        #1;
+        if (INIT_FILE != "") for (si = 0; si < BYTES; si = si + 1) shadow[si] = mem[si];
+    end
+    always @(posedge clk) begin
+        for (si = 0; si < NR; si = si + 1) begin
+            if (sh_en[si] && sbad < 8) begin
+                for (sk = 0; sk < 16; sk = sk + 1)
+                    sexp[sk*8 +: 8] = shadow[(sh_addr[si*AW +: AW] + sk) % BYTES];
+                if (rd_data[si*128 +: 128] !== sexp) begin
+                    sbad = sbad + 1;
+                    $display("SHADOW: read port %0d (crossbar %0d) addr %h got %h expected %h",
+                             si, rmap_of(si), sh_addr[si*AW +: AW], rd_data[si*128 +: 128], sexp);
+                end
+            end
+        end
+        sh_en <= rd_en; sh_addr <= rd_addr;
+        for (si = 0; si < NW; si = si + 1)
+            if (wr_en[si])
+                for (sk = 0; sk < 16; sk = sk + 1)
+                    if (wr_be[si*16 + sk])
+                        shadow[(wr_addr[si*AW +: AW] + sk) % BYTES] = wr_data[si*128 + sk*8 +: 8];
+    end
 `endif
 endmodule
 
@@ -1691,6 +1793,12 @@ module fabric_layer_engine #(
     parameter [63:0] VB_RCAP2 = 0,
     parameter [63:0] VB_RCAP3 = 0,
     parameter [63:0] VB_WCAP2 = 0,
+    parameter int VB_NPR = 24,                  // crossbar ports the logical ones fold onto
+    parameter int VB_NPW = 19,
+    parameter [63:0] VB_RMAP0 = 64'hFEDCBA9876543210,
+    parameter [63:0] VB_RMAP1 = 64'hFEDCBA9876543210,
+    parameter [63:0] VB_WMAP0 = 64'hFEDCBA9876543210,
+    parameter [63:0] VB_WMAP1 = 64'hFEDCBA9876543210,
     parameter     VB_FILE   = "vb_init.hex",
     parameter     PROG_FILE = "program.hex",
     parameter     LUT_DIR   = "./"
@@ -1768,7 +1876,9 @@ module fabric_layer_engine #(
     endgenerate
 
     fabric_vb #(.BYTES(VB_BYTES), .NR(NR), .NW(NW), .AW(AW), .NB(VB_BANKS), .BSH(VB_BANK_SHIFT),
-                .RCAP2(VB_RCAP2), .RCAP3(VB_RCAP3), .WCAP2(VB_WCAP2), .INIT_FILE(VB_FILE)) u_vb (
+                .RCAP2(VB_RCAP2), .RCAP3(VB_RCAP3), .WCAP2(VB_WCAP2),
+                .NPR(VB_NPR), .NPW(VB_NPW), .RMAP0(VB_RMAP0), .RMAP1(VB_RMAP1),
+                .WMAP0(VB_WMAP0), .WMAP1(VB_WMAP1), .INIT_FILE(VB_FILE)) u_vb (
         .clk(clk), .rd_en(rd_en), .rd_addr(rd_addr), .rd_data(rd_data), .wr_en(wr_en), .wr_addr(wr_addr), .wr_data(wr_data), .wr_be(wr_be));
 
     wire [NE-1:0] ready_norm, ready_delta, ready_rotary, ready_attn;

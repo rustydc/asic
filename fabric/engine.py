@@ -115,6 +115,86 @@ def ports(step: S.Step, chunk: int = 1) -> tuple[list[str], list[str], list[str]
     return ([n for n in rd_fixed if n], rd_shared, [n for n in wr_fixed if n], wr_shared)
 
 
+# The crossbar's logical read and write ports, in the order rtl/fabric_engine.sv
+# wires them: unit -> (ports per engine, engines).  ``None`` ports is a port
+# per token of a chunk: the pass adapter reads one row per token at once
+# (`R_CONV = R_TILES + TMAX` in the RTL), so every read port after it moves
+# when the chunk does.  It writes its result a beat at a time, through one
+# port, so the write side does not move.
+RD_PORT_MAP = (("norm", 2, 2), ("tiles", None, 1), ("conv", 2, 1), ("gates", 2, 1), ("delta", 1, 4),
+               ("swiglu", 2, 1), ("residual", 2, 1), ("mem", 1, 1), ("rotary", 1, 2), ("attn", 1, 4))
+WR_PORT_MAP = (("norm", 1, 2), ("tiles", 1, 1), ("conv", 2, 1), ("gates", 1, 1), ("delta", 1, 4),
+               ("swiglu", 1, 1), ("residual", 1, 1), ("mem", 1, 1), ("rotary", 1, 2), ("attn", 1, 4))
+
+
+def _port_index(table, chunk: int = 1) -> tuple[dict, int]:
+    index, base = {}, 0
+    for unit, per, engines in table:
+        if per is None:
+            per = chunk
+        for engine in range(engines):
+            for k in range(per):
+                index[(unit, engine, k)] = base + engine * per + k
+        base += per * engines
+    return index, base
+
+
+def port_colours(programs: list[S.Step] | list[list[S.Step]], write: bool = False, chunk: int = 1) -> tuple[list[int], int]:
+    """Which crossbar port each of the engine's logical ports may share.
+
+    The face is sized by construction -- every adapter operand got a port of
+    its own, 26 reads and 19 writes at a chunk of three -- but the controller
+    issues in order, so most of them can never be asking at once.  Two logical
+    ports may share a crossbar port when no command of one can be in flight
+    with a command of the other; a port an adapter reads beside its own never can.
+    That is the same relation the banks are coloured by, over ports instead of
+    buffers, and it is what makes the crossbar a fraction of the face: the
+    fold is an or of the sharers' addresses, and the answer comes back on one
+    set of wires that all of them read.
+
+    Several programs may be given, and the face then survives all of them:
+    the conflicts are their union, which is what an engine built for more
+    than one program shape needs."""
+    shapes = programs if programs and isinstance(programs[0], list) else [programs]
+    index, total = _port_index(WR_PORT_MAP if write else RD_PORT_MAP, chunk)
+    conflict: dict[int, set[int]] = {p: set() for p in range(total)}
+
+    def edge(a: int, b: int) -> None:
+        if a != b:
+            conflict[a].add(b)
+            conflict[b].add(a)
+
+    def used(step: S.Step) -> list[int]:
+        # A write port is asserted on the beat it writes, so a command that
+        # writes no buffer of the vector buffer never holds one.  A read port
+        # is the adapter's busy line (`rd_en = !ready` in the RTL), so a
+        # command holds it for its whole run even when it reads nothing --
+        # the rotary's table pass is one -- and the colouring has to say so.
+        rf, rs, wf, ws = ports(step, chunk)
+        if write and not (wf or ws):
+            return []
+        fixed = wf if write else rf
+        n = len(fixed) if fixed else 1
+        return [index[(step.unit, step.engine, k)] for k in range(n) if (step.unit, step.engine, k) in index]
+
+    for steps in shapes:
+        live = live_together(steps)
+        for i, step in enumerate(steps):
+            for a in used(step):
+                for j in live[i]:
+                    for b in used(steps[j]):
+                        edge(a, b)
+    for (unit, engine, _), a in index.items():           # an adapter's own ports are asked for together
+        for (unit2, engine2, _), b in index.items():
+            if unit == unit2 and engine == engine2:
+                edge(a, b)
+    colour: dict[int, int] = {}
+    for p in sorted(range(total), key=lambda q: -len(conflict[q])):
+        taken = {colour[q] for q in conflict[p] if q in colour}
+        colour[p] = next(c for c in range(total) if c not in taken)
+    return [colour[p] for p in range(total)], max(colour.values()) + 1
+
+
 def bank_conflicts(steps: list[S.Step], chunk: int = 1) -> dict[str, set[str]]:
     """Buffers that cannot share a bank.
 
@@ -454,6 +534,21 @@ def _consts(directory: Path, c, cfg, sw: int) -> None:
     write_hex(directory / "residual_consts.hex", [c.res_mult | (c.res_shift << 16), f.res_mult | (f.res_shift << 16)] + [0] * 14, 22)
 
 
+def port_params(programs: list[S.Step] | list[list[S.Step]], chunk: int = 1) -> dict:
+    """The crossbar's port face: how many ports it needs and which one each of
+    the engine's logical ports folds onto, four bits each."""
+    out = {}
+    for kind, write in (("R", False), ("W", True)):
+        colours, count = port_colours(programs, write=write, chunk=chunk)
+        out[f"VB_NP{kind}"] = count
+        for half in (0, 1):
+            word = 0
+            for k, c in enumerate(colours[half*16:(half+1)*16]):
+                word |= c << (4 * k)
+            out[f"VB_{kind}MAP{half}"] = word
+    return out
+
+
 class EngineRun:
     """One run of a layer on the engine: the files in ``directory``, the
     testbench parameters and the expected results.  ``inputs`` are
@@ -526,6 +621,7 @@ class EngineRun:
                        "VB_RCAP2": self.layout.cap_mask(self.layout.bank_reads, 2),
                        "VB_RCAP3": self.layout.cap_mask(self.layout.bank_reads, 3),
                        "VB_WCAP2": self.layout.cap_mask(self.layout.bank_writes, 2),
+                       **port_params(steps, self.chunk),
                        "SCHEDULE_CYCLES": S.schedule(steps).cycles, **hpi_params}
         (directory / "params.json").write_text(json.dumps(self.params))
 
