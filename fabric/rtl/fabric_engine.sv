@@ -54,6 +54,7 @@ module fabric_vb #(
     // itself, which is what the checks below are written against.
     parameter int NPR   = NR,
     parameter int NPW   = NW,
+    parameter int RGRP  = 16,               // copies of a read port's select, one per slice of its answer
     parameter [63:0] RMAP0 = 64'hFEDCBA9876543210,
     parameter [63:0] RMAP1 = 64'hFEDCBA9876543210,
     parameter [63:0] WMAP0 = 64'hFEDCBA9876543210,
@@ -94,6 +95,7 @@ module fabric_vb #(
     localparam int WSH  = (WMAX > 1) ? $clog2(WMAX) : 0;
     localparam int WPOT = 1 << WSH;
     localparam int SB   = (NB*RPOT > 1) ? $clog2(NB*RPOT) : 1;
+    localparam int RGW  = 128 / RGRP;                   // bits of the answer a select copy carries
     localparam int WPB  = (1 << BSH) / 16;              // sixteen-byte words in a bank
     localparam int HALF = (WPB > 1) ? WPB / 2 : 1;      // words in each of its halves
     localparam int HW   = (HALF > 1) ? $clog2(HALF) : 1;
@@ -338,30 +340,40 @@ module fabric_vb #(
 
     // The beat a port asked for, a cycle later: its two words in address order,
     // shifted down to the byte it started at.
-    reg [1:0]    slot_q [0:NPR-1];
-    reg [BB-1:0] bank_q [0:NPR-1];
-    reg [3:0]    off_q [0:NPR-1];
-    reg          odd_q_sel [0:NPR-1];
-    reg          en_q [0:NPR-1];
+    // A port's answer is a mux over every bank's slots, then a shift down to
+    // the byte it started at, and both are selected by a handful of bits
+    // against the whole 256-bit window.  Held once a port, the bank bit drove
+    // 1,793 loads and seven of this module's eight nanoseconds: it is a
+    // register at the edge of the combinational cone, so the mapper buffers
+    // the mux but not what drives it.  Each slice of the answer therefore
+    // keeps its own copy of the select, which is the same thing the norm, the
+    // rotary and the state engine do with their constants.
     reg [NPR*128-1:0] p_data;
-    reg [255:0]  win;
-    reg [SB-1:0] sel;                                   // the bank's slot, flattened
-    always @(posedge clk)
-        for (i = 0; i < NPR; i = i + 1) begin
-            slot_q[i] <= r_slot[i];
-            bank_q[i] <= r_bank[i];
-            off_q[i] <= p_addr[i*AW +: 4];
-            odd_q_sel[i] <= p_addr[i*AW + 4];
-            en_q[i] <= p_en[i] && r_got[i];
+    genvar gp, gg;
+    generate
+        for (gp = 0; gp < NPR; gp = gp + 1) begin : g_read
+            wire [SB-1:0] sel_w = (r_bank[gp] << RSH) + r_slot[gp];   // a concatenation: see RSH
+            wire [3:0]    off_w = p_addr[gp*AW +: 4];
+            wire          odd_w = p_addr[gp*AW + 4];
+            wire          en_w  = p_en[gp] && r_got[gp];
+            wire [255:0]  win;                          // the two words in address order
+            for (gg = 0; gg < RGRP; gg = gg + 1) begin : g_slice
+                reg [SB-1:0] sel_l;
+                reg [3:0]    off_l;
+                reg          odd_l, en_l;
+                always @(posedge clk) begin
+                    sel_l <= sel_w; off_l <= off_w; odd_l <= odd_w; en_l <= en_w;
+                end
+                wire [RGW-1:0] e = even_q[{sel_l, 7'd0} + gg*RGW +: RGW];
+                wire [RGW-1:0] o = odd_q [{sel_l, 7'd0} + gg*RGW +: RGW];
+                assign win[gg*RGW +: RGW]       = odd_l ? o : e;
+                assign win[128 + gg*RGW +: RGW] = odd_l ? e : o;
+                always @(*)
+                    p_data[gp*128 + gg*RGW +: RGW] = en_l ? win[{1'b0, off_l, 3'd0} + gg*RGW +: RGW]
+                                                          : {RGW{1'bx}};
+            end
         end
-    always @(*)
-        for (j = 0; j < NPR; j = j + 1) begin
-            // The word offsets are concatenations, not products: see RSH above.
-            sel = (bank_q[j] << RSH) + slot_q[j];
-            win = odd_q_sel[j] ? {even_q[{sel, 7'd0} +: 128], odd_q[{sel, 7'd0} +: 128]}
-                               : {odd_q[{sel, 7'd0} +: 128], even_q[{sel, 7'd0} +: 128]};
-            p_data[j*128 +: 128] = en_q[j] ? win[{1'b0, off_q[j], 3'd0} +: 128] : {128{1'bx}};
-        end
+    endgenerate
     // Every logical port that folded onto a crossbar port reads its answer:
     // wires, since at most one of them asked for it.
     always @(*)
