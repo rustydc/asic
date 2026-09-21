@@ -394,40 +394,6 @@ module fabric_vb #(
                     end
         end
     endgenerate
-
-    // A shadow of the buffer, kept from the logical ports, so that a read's
-    // answer can be checked against what the writes put there.  Simulation
-    // only, and only to find where the fold goes wrong.
-    reg [7:0]        shadow [0:BYTES-1];
-    reg [NR-1:0]     sh_en;
-    reg [NR*AW-1:0]  sh_addr;
-    integer          si, sk, sbad;
-    reg [127:0]      sexp;
-    initial begin
-        sbad = 0;
-        for (si = 0; si < BYTES; si = si + 1) shadow[si] = 8'd0;
-        #1;
-        if (INIT_FILE != "") for (si = 0; si < BYTES; si = si + 1) shadow[si] = mem[si];
-    end
-    always @(posedge clk) begin
-        for (si = 0; si < NR; si = si + 1) begin
-            if (sh_en[si] && sbad < 8) begin
-                for (sk = 0; sk < 16; sk = sk + 1)
-                    sexp[sk*8 +: 8] = shadow[(sh_addr[si*AW +: AW] + sk) % BYTES];
-                if (rd_data[si*128 +: 128] !== sexp) begin
-                    sbad = sbad + 1;
-                    $display("SHADOW: read port %0d (crossbar %0d) addr %h got %h expected %h",
-                             si, rmap_of(si), sh_addr[si*AW +: AW], rd_data[si*128 +: 128], sexp);
-                end
-            end
-        end
-        sh_en <= rd_en; sh_addr <= rd_addr;
-        for (si = 0; si < NW; si = si + 1)
-            if (wr_en[si])
-                for (sk = 0; sk < 16; sk = sk + 1)
-                    if (wr_be[si*16 + sk])
-                        shadow[(wr_addr[si*AW +: AW] + sk) % BYTES] = wr_data[si*128 + sk*8 +: 8];
-    end
 `endif
 endmodule
 
