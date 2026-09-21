@@ -1429,7 +1429,7 @@ against them, and the 105 tests pass.
 | record_reader | the record reader, two records of 32 | 2.42 -> 0.94 | 3.10 -> 0.49 | 2,220 |
 | kv_append | the append, one head of 32 | 52.14 -> 4.36 -> 1.88 | 15.52 -> 3.41 -> 2.68 | 63,943 |
 | mem_arbiter | the memory arbiter, four requesters | 0.73 -> 0.67 | 0.45 -> 0.49 | 1,752 |
-| vector_buffer | the buffer's crossbar, 24 reads and 19 writes over eight banks | 7.88 | 12.60 | 407,082 |
+| vector_buffer | the buffer's crossbar, 26 reads and 19 writes folded onto 11 and 8, over eight banks | 7.88 | 12.60 -> 7.81 | 407,082 -> 278,031 |
 | sequencer | the token sequencer, a 64-step program memory (as logic) and 64 buffer ids | not mapped -> 2.79 | not mapped -> 2.24 | 62,241 |
 
 Four shapes carried the change.
@@ -1706,6 +1706,36 @@ cannot serve a read it was not asked for, so the read ports need an
 enable, which today they do not have — and adding it is also what would
 let the reads be measured rather than bounded.
 
+### Folding the port face
+
+The measurement above says how many ports a cycle wants. The fold says
+which of the wired ones may be the same port: two logical ports can
+share a crossbar port when no command of one can be in flight with a
+command of the other, which is `live_together` again — the relation the
+banks are already coloured by — read over ports instead of buffers. An
+adapter's own ports always conflict, because it asks for them together.
+Colouring that graph over every program shape (a token, a chunk of
+three, a stream of two, both layers) folds 26 read ports onto 11 and 19
+write ports onto 8. The map goes to the RTL as four bits a port; the
+crossbar ors the sharers' addresses and hands one set of read wires back
+to all of them. 407,082 NAND2-eq to 278,031, and on ASAP7 12.60 ns to
+7.81. The NanGate path does not move, and would not: at 7.88 ns it is
+the per-port readback mux — a bank-and-slot select bit driving 1,793
+loads with no buffer tree — and that mux is per port and the same size
+whatever the port count is.
+
+Two things about the face had to be got right, and both were wrong
+first. The pass adapter reads a row per token of a chunk but writes its
+result through one port, so only the read side moves with `TMAX`;
+shifting the write side too gave the two rotary engines' writes one
+crossbar port and or'd two live writes together. And a read port is the
+adapter's busy line rather than a read — the rotary's table pass reads
+nothing and still holds its port for its whole command — so a step that
+names no buffer still claims one. Both are what a port map restated in
+two languages invites, so the numbering is read out of the RTL's own
+localparams and checked against the Python's (`PortMapTest`), and the
+crossbar reports two sharers asking in one cycle.
+
 The same run says where the token's time goes, which is not the vector
 units. Of the 9B recurrent token's 227,247 running cycles the memory
 port holds a command for 139,821, the four state engines for 67,520 and
@@ -1747,10 +1777,12 @@ share, measured.
    applied to the norm, the state engine and the attention core. The vector buffer is
    the other module with no implementation, and it is now measured and
    banked: four to seven 1R1W banks carry every program measured, against
-   24 read and 19 write ports wired, so the bank falls out of a colouring
+   26 read and 19 write ports wired, so the bank falls out of a colouring
    in `engine.Layout` and the read ports have the enable a bank needs.
-   Its crossbar synthesizes at 7.9 ns for the port face as wired, which
-   is the number cutting the adapters' ports has to beat. The state traffic, the global
+   The same colouring over the ports folds those 26 and 19 onto 11 and 8,
+   which is a third of its area and half its ASAP7 path. What is left is
+   its 7.9 ns on NanGate, and that is one select bit against 1,793 loads
+   in a flow with no buffer tree rather than depth. The state traffic, the global
    layer's traffic and the stream of tokens are done, above; the next
    memory lever is the index scan's record size, which is the model's,
    and after that the device count.
