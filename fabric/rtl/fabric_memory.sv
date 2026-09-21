@@ -489,7 +489,16 @@ module fabric_record_reader #(
     localparam int BW         = $clog2(REC_BEATS) + 1;
     localparam int OW         = $clog2(OUT_BEATS) + 1;
     localparam int RW         = $clog2(MAXR) + 1;
-    reg [2*HD*8-1:0] recs [0:MAXR-1];                      // unpacked key then value, per record of the request
+    // The records are a memory, not a register array.  Read as registers,
+    // "record rrec, beat ob" is one mux over MAXR * 2 * HD bytes whose first
+    // select bit drives five hundred loads -- two of the unit's two and a half
+    // nanoseconds -- and in silicon this is a small SRAM anyway.  Its word is
+    // the beat that arrives, so a write is a word; a beat out is L of the
+    // word's bytes, and the address leads the data by a cycle.
+    localparam int MW         = EPB * 8;                   // memory word: one unpacked beat
+    localparam int OPW        = (EPB > L) ? EPB / L : 1;   // out beats a word holds
+    localparam int MD         = MAXR * REC_BEATS;
+    localparam int MAW        = (MD > 1) ? $clog2(MD) : 1;
     reg              busy, inflight, emitting;
     reg [BW-1:0]     beat;
     reg [OW-1:0]     ob;
@@ -505,6 +514,25 @@ module fabric_record_reader #(
     end
     wire out_fire = out_valid && out_ready;
     wire have_rec = (wrec != rrec);                        // a filled record awaits emission
+    // The beat the memory is asked for is the one that will be wanted: the
+    // next if this cycle takes a word, the first if emission starts here.
+    // Each half of a record starts at a word of its own -- HD need not be a
+    // whole number of beats (24 elements of 8 bits is a beat and a half), and
+    // the beats that arrive are what the halves are padded to.
+    localparam int HB2 = OUT_BEATS / 2;                    // out beats in a half
+    wire            take   = emitting && (!out_valid || out_fire);
+    wire            begins = busy && !emitting && !out_valid && have_rec;
+    wire [OW-1:0]   ob_a   = begins ? {OW{1'b0}}
+                                    : ((take && ob != OUT_BEATS - 1) ? ob + 1'b1 : ob);
+    wire            hi_a   = (ob_a >= HB2);
+    wire [OW-1:0]   eo_a   = hi_a ? (ob_a - HB2[OW-1:0]) : ob_a;
+    wire [MAW-1:0]  rd_w   = (rrec * REC_BEATS + (hi_a ? HALF_BEATS : 0) + (eo_a * L) / EPB);
+    wire [OW-1:0]   eo     = (ob >= HB2) ? (ob - HB2[OW-1:0]) : ob;
+    wire [MAW-1:0]  wr_w   = (wrec * REC_BEATS + beat);
+    wire [MW-1:0]   rec_q;
+    fabric_sram #(.W(MW), .D(MD), .NRD(1), .NWR(1), .MB(MW)) u_recs (
+        .clk(clk), .rd_en(1'b1), .rd_addr(rd_w), .rd_data(rec_q),
+        .wr_en(inflight && rdata_valid), .wr_addr(wr_w), .wr_data(unpacked), .wr_mask(1'b1));
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             busy <= 1'b0; inflight <= 1'b0; emitting <= 1'b0; beat <= 0; ob <= 0; count <= 0; wrec <= 0; rrec <= 0;
@@ -517,9 +545,7 @@ module fabric_record_reader #(
             end
             if (req_valid && req_ready) begin req_valid <= 1'b0; inflight <= 1'b1; end
             if (inflight && rdata_valid) begin
-                // Beat b of half h of record wrec lands at element h*HD + b*EPB.
-                if (beat < HALF_BEATS) recs[wrec][(beat*EPB)*8 +: EPB*8] <= unpacked;
-                else                   recs[wrec][(HD + (beat - HALF_BEATS)*EPB)*8 +: EPB*8] <= unpacked;
+                // Beat b of record wrec is word wrec*REC_BEATS + b.
                 if (beat == REC_BEATS - 1) begin
                     beat <= 0; wrec <= wrec + 1'b1;
                     if (wrec == count - 1) inflight <= 1'b0;
@@ -529,7 +555,7 @@ module fabric_record_reader #(
                 if (!out_valid || out_fire) begin
                     out_valid <= 1'b1;
                     out_kind  <= (ob < OUT_BEATS / 2) ? 2'd2 : 2'd3;
-                    out_data  <= recs[rrec][ob*L*8 +: L*8];
+                    out_data  <= rec_q[((eo % OPW) * L * 8) +: L*8];
                     ob <= ob + 1'b1;
                     if (ob == OUT_BEATS - 1) emitting <= 1'b0;
                 end

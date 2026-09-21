@@ -9,7 +9,7 @@
 // sin and cos of pos * inv_freq[j] for the R/2 rotary frequencies of one
 // position: the product in Q0.32 turns keeps its fraction, whose top 16
 // bits index the sine table (cos is sin a quarter turn on).  start, then
-// done after R/2 + 3 cycles; the tables stay valid until the next start.
+// done after R/2 + 4 cycles; the tables stay valid until the next start.
 // ---------------------------------------------------------------------------
 module fabric_rotary_table #(
     parameter int R = 64,
@@ -28,16 +28,20 @@ module fabric_rotary_table #(
     localparam int JW = $clog2(H) + 1;
     reg          busy;
     reg [JW-1:0] j;
-    wire [63:0]  prod = pos * inv_freq[j*32 +: 32];
-    wire [15:0]  turn = prod[31:16];
-    reg          v1, v2, v3;
-    reg [JW-1:0] j1, j2, j3;
+    // The turn is the fraction of a revolution, so only bits 31:16 of the
+    // product are wanted and the upper half of the multiplier is not built.
+    // It is a stage of its own: the multiply and then the table's own index,
+    // read and interpolation in one cycle were two multiplies and a table.
+    wire [31:0]  prod = pos * inv_freq[j*32 +: 32];
+    reg  [15:0]  turn;
+    reg          v0, v1, v2;
+    reg [JW-1:0] j0, j1, j2;
     wire [15:0]  s_w, c_w;
     fabric_lut #(.IB(10), .FB(6), .W(16), .FILE({LUT_DIR, "lut_sin.hex"})) u_sin (.clk(clk), .u(turn), .y(s_w));
     fabric_lut #(.IB(10), .FB(6), .W(16), .FILE({LUT_DIR, "lut_sin.hex"})) u_cos (.clk(clk), .u(turn + 16'h4000), .y(c_w));
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            busy <= 1'b0; j <= 0; v1 <= 1'b0; v2 <= 1'b0; v3 <= 1'b0; done <= 1'b0;
+            busy <= 1'b0; j <= 0; v0 <= 1'b0; v1 <= 1'b0; v2 <= 1'b0; done <= 1'b0;
         end else begin
             done <= 1'b0;
             if (start) begin busy <= 1'b1; j <= 0; end
@@ -45,9 +49,10 @@ module fabric_rotary_table #(
                 j <= j + 1'b1;
                 if (j == H - 1) busy <= 1'b0;
             end
-            v1 <= busy; j1 <= j;
+            turn <= prod[31:16];
+            v0 <= busy; j0 <= j;
+            v1 <= v0;   j1 <= j0;
             v2 <= v1;   j2 <= j1;
-            v3 <= v2;   j3 <= j2;
             if (v2) begin
                 sin_tab[j2*16 +: 16] <= s_w;
                 cos_tab[j2*16 +: 16] <= c_w;

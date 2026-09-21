@@ -60,7 +60,7 @@ UNITS = [
     Unit("conv_silu", "fabric_conv_silu", VEC + ("fabric_recurrent.sv",), {"K": 4, "L": 2}, "the causal conv and SiLU, two lanes", luts=True),
     Unit("head_gates", "fabric_head_gates", VEC + ("fabric_recurrent.sv",), {"ACC": 24}, "the per-head gates", luts=True),
     Unit("swiglu", "fabric_swiglu", VEC + ("fabric_ffn.sv",), {"L": 2}, "SwiGLU, two lanes", luts=True),
-    Unit("residual", "fabric_residual", ("fabric_ffn.sv",), {"L": 4}, "the residual add, four lanes"),
+    Unit("residual", "fabric_residual", VEC + ("fabric_ffn.sv",), {"L": 4}, "the residual add, four lanes"),
     Unit("rotary", "fabric_rotary", ("fabric_attention.sv",), {"HD": 32, "R": 16, "L": 2}, "the rotation, two lanes"),
     Unit("rotary_table", "fabric_rotary_table", VEC + ("fabric_attention.sv",), {"R": 16}, "the rotary table", luts=True),
     Unit("attention", "fabric_attention", VEC + ("fabric_attention.sv",), {"HD": 32, "G": 1, "L": 2, "LW": 28},

@@ -84,20 +84,34 @@ module fabric_residual #(
     output reg             out_valid,
     output reg  [L*16-1:0] out_h
 );
-    // The scale's multiply, then the round and the saturating add.
-    reg            v1;
-    reg [L*24-1:0] p1;
-    reg [L*16-1:0] h1;
+    // The scale's multiply, then the round, then the saturating add: one
+    // operation a stage.  The round and the add together were a variable
+    // shift, a 24-bit add and a saturate between two flops, and the shift
+    // came straight off the command's input pin, so each lane takes its own
+    // registered copy of it as the norm and the state engine do.
+    reg            v1, v2;
+    reg [L*24-1:0] p1, p2;
+    reg [L*16-1:0] h1, h2;
+    wire [5:0]     sh_l [0:L-1];
+    genvar gl;
+    generate
+        for (gl = 0; gl < L; gl = gl + 1) begin : g_sh
+            fabric_const_copy #(.W(6)) u_sh (.clk(clk), .d(shift), .q(sh_l[gl]));
+        end
+    endgenerate
     integer c;
     always @(posedge clk) begin
         v1 <= in_valid;
         h1 <= in_h;
         for (c = 0; c < L; c = c + 1)
             p1[c*24 +: 24] <= $signed(in_y[c*8 +: 8]) * $signed({8'b0, mult});
-        out_valid <= v1;
+        v2 <= v1;
+        h2 <= h1;
         for (c = 0; c < L; c = c + 1)
-            out_h[c*16 +: 16] <= fx_sat($signed(h1[c*16 +: 16])
-                                        + fx_rnd_shr($signed(p1[c*24 +: 24]), shift), 16);
+            p2[c*24 +: 24] <= fx_rnd_shr($signed(p1[c*24 +: 24]), sh_l[c]);
+        out_valid <= v2;
+        for (c = 0; c < L; c = c + 1)
+            out_h[c*16 +: 16] <= fx_sat($signed(h2[c*16 +: 16]) + $signed(p2[c*24 +: 24]), 16);
     end
 endmodule
 

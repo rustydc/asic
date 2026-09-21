@@ -9,7 +9,7 @@
 // Depthwise causal convolution of K taps and SiLU, L channels per beat.
 // The beat carries the channel's new int8 sample, its K-1 previous samples
 // (oldest first), its int8 taps and its constants; it returns the int8
-// output and the shifted history.  Latency 7.
+// output and the shifted history.  Latency 9.
 // ---------------------------------------------------------------------------
 module fabric_conv_silu #(
     parameter int K = 4,
@@ -30,14 +30,20 @@ module fabric_conv_silu #(
     output reg  [L*(K-1)*8-1:0] out_hist
 );
     localparam int HW = (K - 1) * 8;
+    // The taps are K products of two int8s, which is 16 bits and K of them
+    // 16 + log2(K), not the 64 the helpers compute at: written wide they were
+    // a chain of 64-bit adds, the mistake the index scan and the append had.
+    localparam int AW_  = 16 + ((K > 1) ? $clog2(K) : 1);
+    localparam int PW1_ = AW_ + 17;            // the F16 requantize's product: the taps by a 16-bit mult
+    localparam int PW2_ = 16 + 17;             // the int8 one's: an int16 by a 16-bit mult
     // S1: accumulate the taps, shift the history.
     reg                 v1;
-    reg signed [63:0]   acc1 [0:L-1];
+    reg signed [AW_-1:0] acc1 [0:L-1];
     reg [L*HW-1:0]      hist1;
     reg [L*16-1:0]      mi1, mo1;
     reg [L*6-1:0]       si1, so1;
     integer c, j;
-    reg signed [63:0] acc;
+    reg signed [AW_-1:0] acc;
     always @(posedge clk) begin
         v1 <= in_valid;
         for (c = 0; c < L; c = c + 1) begin
@@ -51,41 +57,56 @@ module fabric_conv_silu #(
         end
         mi1 <= mult_in; si1 <= sh_in; mo1 <= mult_out; so1 <= sh_out;
     end
-    // S2: to F16.
-    reg            v2;
-    reg [L*16-1:0] t2;
-    reg [L*HW-1:0] hist2;
-    reg [L*16-1:0] mo2;
-    reg [L*6-1:0]  so2;
+    // S2: the F16 requantize's multiply.  S3: its round and saturate.  One
+    // multiply, or one round with its shift and its saturate, to a stage.
+    reg                  v2, v3;
+    reg signed [PW1_-1:0] q2 [0:L-1];
+    reg [L*16-1:0]       t3;
+    reg [L*HW-1:0]       hist2, hist3;
+    reg [L*16-1:0]       mo2b, mo3b;
+    reg [L*6-1:0]        so2b, so3b, si2;
     always @(posedge clk) begin
         v2 <= v1;
         for (c = 0; c < L; c = c + 1)
-            t2[c*16 +: 16] <= fx_requant(acc1[c], mi1[c*16 +: 16], si1[c*6 +: 6], 16);
-        hist2 <= hist1; mo2 <= mo1; so2 <= so1;
+            q2[c] <= $signed(acc1[c]) * $signed({1'b0, mi1[c*16 +: 16]});
+        si2 <= si1;
+        hist2 <= hist1; mo2b <= mo1; so2b <= so1;
+        v3 <= v2;
+        for (c = 0; c < L; c = c + 1)
+            t3[c*16 +: 16] <= fx_sat(fx_rnd_shr($signed({{(64-PW1_){q2[c][PW1_-1]}}, q2[c]}), si2[c*6 +: 6]), 16);
+        hist3 <= hist2; mo3b <= mo2b; so3b <= so2b;
     end
-    // S3..S6: SiLU per lane; the history and constants wait four cycles.
+    // S4..S7: SiLU per lane; the history and constants wait four cycles.
     wire [L-1:0]    sv;
     wire [L*16-1:0] s6;
     genvar g;
     generate
         for (g = 0; g < L; g = g + 1) begin : g_silu
-            fabric_silu #(.LUT_DIR(LUT_DIR)) u_silu (.clk(clk), .valid_in(v2), .t(t2[g*16 +: 16]), .valid_out(sv[g]), .y(s6[g*16 +: 16]));
+            fabric_silu #(.LUT_DIR(LUT_DIR)) u_silu (.clk(clk), .valid_in(v3), .t(t3[g*16 +: 16]), .valid_out(sv[g]), .y(s6[g*16 +: 16]));
         end
     endgenerate
-    reg [L*HW-1:0] hist3, hist4, hist5, hist6;
-    reg [L*16-1:0] mo3, mo4, mo5, mo6;
-    reg [L*6-1:0]  so3, so4, so5, so6;
+    reg [L*HW-1:0] hist4, hist5, hist6, hist7;
+    reg [L*16-1:0] mo4, mo5, mo6, mo7;
+    reg [L*6-1:0]  so4, so5, so6, so7;
     always @(posedge clk) begin
-        hist3 <= hist2; hist4 <= hist3; hist5 <= hist4; hist6 <= hist5;
-        mo3 <= mo2; mo4 <= mo3; mo5 <= mo4; mo6 <= mo5;
-        so3 <= so2; so4 <= so3; so5 <= so4; so6 <= so5;
+        hist4 <= hist3; hist5 <= hist4; hist6 <= hist5; hist7 <= hist6;
+        mo4 <= mo3b; mo5 <= mo4; mo6 <= mo5; mo7 <= mo6;
+        so4 <= so3b; so5 <= so4; so6 <= so5; so7 <= so6;
     end
-    // S7: to int8.
+    // S8: the int8 requantize's multiply.  S9: its round and saturate.
+    reg                  v8;
+    reg signed [PW2_-1:0] q8 [0:L-1];
+    reg [L*HW-1:0]       hist8;
+    reg [L*6-1:0]        so8;
     always @(posedge clk) begin
-        out_valid <= sv[0];
-        out_hist  <= hist6;
+        v8 <= sv[0];
         for (c = 0; c < L; c = c + 1)
-            out_y[c*8 +: 8] <= fx_requant($signed(s6[c*16 +: 16]), mo6[c*16 +: 16], so6[c*6 +: 6], 8);
+            q8[c] <= $signed(s6[c*16 +: 16]) * $signed({1'b0, mo7[c*16 +: 16]});
+        hist8 <= hist7; so8 <= so7;
+        out_valid <= v8;
+        out_hist  <= hist8;
+        for (c = 0; c < L; c = c + 1)
+            out_y[c*8 +: 8] <= fx_sat(fx_rnd_shr($signed({{(64-PW2_){q8[c][PW2_-1]}}, q8[c]}), so8[c*6 +: 6]), 8);
     end
 endmodule
 
