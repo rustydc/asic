@@ -68,6 +68,8 @@ UNITS: dict[str, tuple[int, int]] = {   # name -> (id, engines)
     "tiles": (0, 1), "norm": (1, 2), "conv": (2, 1), "gates": (3, 1), "delta": (4, 4),
     "swiglu": (5, 1), "residual": (6, 1), "rotary": (7, 2), "attn": (8, 4), "mem": (9, 1),
 }
+NE = max(engines for _, engines in UNITS.values())    # engine ports a unit has in the controller's port map
+RELEASES = 1                 # completions the controller drains a cycle (rtl/fabric_sequencer.sv NREL)
 SHARED_PREFIX = "s_slot"     # buffers shared by every token in flight: the state engines' slots
 MEM_PREFIX = "m_"            # names of buffers in the memory image (the rest live in the vector buffer)
 
@@ -104,14 +106,15 @@ class Timing:
     l_norm: int = 16
     norm_latency: int = 7
     l_conv: int = 8
-    conv_latency: int = 7
+    conv_latency: int = 9            # taps, two requantizes of two stages each, SiLU
     gates_latency: int = 9
     delta_latency: int = 6           # row out follows row in by K + 4; two passes over K rows
     l_vec: int = 8                   # swiglu, residual, rotary, silu
     swiglu_latency: int = 6
-    residual_latency: int = 1
+    residual_latency: int = 2           # multiply, round, saturating add
     silu_latency: int = 4
     rotary_latency: int = 3
+    rotary_table_latency: int = 4    # the turn's multiply, then the table's index, read and interpolation
     l_attn: int = 64
     attn_exp_stall: int = 4          # in_ready drops after a key row
     attn_out_latency: int = 12
@@ -506,7 +509,7 @@ def global_program(cfg, c: L.GlobalConsts | None, spec: TileSpec, mm: MemoryMap,
     add("pass.qkv", "tiles", ("A",), ("P1",), t.tile_pass(d), qkv,
         ops=operands(src=("A", 0), dst=("P1", 0), arg=[(0, 0), (8, -(-d // spec.rows)), (16, T)], a2=d, a3=p1))
     for i in range(T):
-        add(tok("rotary.table", i), "rotary", (), (_contrib("rot", chunk),), rd // 2 + t.rotary_latency,
+        add(tok("rotary.table", i), "rotary", (), (_contrib("rot", chunk),), rd // 2 + t.rotary_table_latency,
             lambda e, i=i: put(e, "rot", i, L.rotary_table_int(pos + i, c.inv_freq)),
             ops=operands(dst=("rot", i * 2 * rd), arg=ROT_TABLE, a3=pos + i, len=rd // 2))
         add(tok("norm.index_q", i), "norm", ("P1",), (_contrib("iq", chunk),), t.norm(idim),
@@ -714,6 +717,7 @@ class Schedule:
     issue: list[int]
     end: list[int]
     steps: list[Step]
+    release: list[int] = dataclasses.field(default_factory=list)   # the cycle each step's buffers came back
 
     @property
     def cycles(self) -> int:
@@ -735,20 +739,58 @@ class Schedule:
         return "\n".join(lines)
 
 
-def schedule(steps: list[Step]) -> Schedule:
-    """In-order list scheduling: a step issues at the earliest cycle after
-    the previous issue that is past the end of each dependency and of the
-    engine's previous step."""
-    issue, end = [0] * len(steps), [0] * len(steps)
-    free: dict[tuple[str, int], int] = {}
-    for i, step in enumerate(steps):
-        t0 = issue[i - 1] + 1 if i else 0
-        for d in step.deps:
-            t0 = max(t0, end[d] + 1)
-        t0 = max(t0, free.get((step.unit, step.engine), 0))
-        issue[i], end[i] = t0, t0 + step.cycles
-        free[(step.unit, step.engine)] = end[i] + 1          # an engine finishing at e takes its next command at e + 1
-    return Schedule(issue, end, steps)
+def schedule(steps: list[Step], releases: int = RELEASES) -> Schedule:
+    """The controller's issue rules, cycle for cycle (rtl/fabric_sequencer.sv).
+
+    In program order: the head step issues at the earliest cycle after the
+    previous issue at which every dependency's buffers have been released
+    and the addressed engine is free.  A unit that stops working at cycle
+    ``e`` reports done at ``e + 1``, and the controller *drains* at most
+    ``releases`` completions a cycle, lowest engine port first, forwarding
+    the cycle's drains into the same cycle's issue check -- so with nothing
+    else waiting a step issues one cycle after its last dependency ended,
+    which is what an unbounded release gave.  A port whose release has not
+    drained holds the buffers it must return and can be given no new
+    command, which is what makes the bound safe.
+
+    The loop steps from event to event rather than cycle by cycle: state
+    changes only when a unit reports done, when a held release drains, or
+    when the head step issues.
+    """
+    n = len(steps)
+    issue, end = [0] * n, [0] * n
+    release: list[int | None] = [None] * n                   # the cycle each step's buffers came back
+    port_of = [UNITS[s.unit][0] * NE + s.engine for s in steps]
+    running: dict[int, int] = {}                             # engine port -> the step on it
+    pending: dict[int, int] = {}                             # engine port -> a step whose release is held
+    cycle, i = 0, 0
+    while i < n or running or pending:
+        # A unit that ended at cycle - 1 reports done now; the drains this
+        # cycle are the lowest ports of what is held and what just arrived.
+        want = dict(pending)
+        for port, s in list(running.items()):
+            if end[s] + 1 == cycle:
+                want[port] = s
+                del running[port]
+        for port in sorted(want)[:releases]:
+            release[want.pop(port)] = cycle
+        pending = want
+        if (i < n and (i == 0 or cycle > issue[i - 1])
+                and port_of[i] not in pending and port_of[i] not in running
+                and all(release[d] is not None and release[d] <= cycle for d in steps[i].deps)):
+            issue[i], end[i] = cycle, cycle + steps[i].cycles
+            running[port_of[i]] = i
+            i += 1
+        # The next cycle anything can happen: a drain, a completion, or --
+        # when the head waits only on its turn -- the cycle after the last issue.
+        ahead = [cycle + 1] if pending else []
+        if running:
+            ahead.append(min(end[s] for s in running.values()) + 1)
+        if (i < n and port_of[i] not in pending and port_of[i] not in running
+                and all(release[d] is not None for d in steps[i].deps)):
+            ahead.append(cycle + 1 if i == 0 else issue[i - 1] + 1)
+        cycle = min(ahead) if ahead else cycle + 1
+    return Schedule(issue, end, steps, [r if r is not None else 0 for r in release])
 
 
 def token_interval(program: list[Step], tokens: int = 3) -> int:

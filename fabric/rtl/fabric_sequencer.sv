@@ -11,14 +11,25 @@
 // every consumed buffer has no outstanding writer, every produced buffer
 // no outstanding reader and (for a write, not a contribution) no
 // outstanding writer, and the unit reports the addressed engine free.  On
-// issue the step's ids are counted and remembered under its tag; a unit
-// returns the tag on its engine's done port and the counts are released,
-// forwarded into the same cycle's issue check.
+// issue the step's ids are remembered against its engine port and counted;
+// a unit returns the tag on its engine's done port and the counts are
+// released, forwarded into the same cycle's issue check.
 //
-// Timing, which fabric/sequencer.py reproduces: a step issues at the
-// earliest cycle that is after the previous issue, one cycle after the
-// last of its dependencies completed, and one cycle after the engine last
-// completed.
+// The release is bounded.  Taking every completion in a cycle means every
+// engine port's ids may decrement the same counter, which is NU*NE*(NC+NP)
+// read-modify-writes of the whole counter array chained in one cycle --
+// 55,000 cells and seven gigabytes before yosys is killed, and the reason
+// this module did not map.  So NREL completions drain a cycle, lowest
+// engine port first, and a port whose release has not drained can be given
+// no new command: it still holds the buffers it must return.  Nothing else
+// is needed to make the bound safe, because the ids live with the port.
+//
+// Timing, which fabric/sequencer.py reproduces cycle for cycle: a step
+// issues at the earliest cycle that is after the previous issue, at or
+// after the cycle its last dependency's release drained, and at or after
+// the cycle its engine reported free.  A drain with nothing held is the
+// cycle the completion arrives, which is one cycle after the unit's last
+// working cycle, so an unheld release is what it always was.
 
 `timescale 1ns/1ps
 `default_nettype none
@@ -29,6 +40,7 @@ module fabric_sequencer #(
     parameter int DEPTH     = 1024,             // program steps at most
     parameter int NID       = 256,              // buffer ids
     parameter int CW        = 6,                // counter width: outstanding writers or readers of one buffer
+    parameter int NREL      = 1,                // completions drained a cycle (fabric.sequencer.RELEASES)
     parameter     PROG_FILE = "program.hex"
 ) (
     input  wire                 clk,
@@ -84,36 +96,81 @@ module fabric_sequencer #(
     // does not map.  The port is known at issue, so the release reads a
     // register.  The tag still marks the step live, so a program longer than
     // 256 steps cannot have two of the same tag in flight.
-    reg [NC*8-1:0] slot_c [0:NU*NE-1];
-    reg [NP*8-1:0] slot_p [0:NU*NE-1];
+    localparam int NPORT = NU * NE;
+    reg [NC*8-1:0] slot_c [0:NPORT-1];
+    reg [NP*8-1:0] slot_p [0:NPORT-1];
+    reg [7:0]      slot_tag [0:NPORT-1];
     reg [255:0]    tab_live;
-    wire [$clog2(NU*NE)-1:0] cur_port = cur_unit * NE + cmd_engine;
+    wire [$clog2(NPORT)-1:0] cur_port = cur_unit * NE + cmd_engine;
+
+    // Which completions drain this cycle: the NREL lowest ports of what a
+    // unit is reporting now and what an earlier cycle could not take.  The
+    // ids come out with them, so the rest of the module sees NREL releases
+    // rather than NPORT of them, and a held port's slot is not overwritten
+    // because a held port is not given a command.
+    reg [NPORT-1:0]      pend;
+    wire [NPORT-1:0]     want_rel = done_valid | pend;
+    reg  [NPORT-1:0]     rel_now;
+    reg  [NREL-1:0]      rel_en;
+    reg  [NREL*NC*8-1:0] rel_c;                   // consumed and produced ids at the
+    reg  [NREL*NC*8-1:0] rel_p;                   // same stride, so one scan serves both
+    reg  [NREL*8-1:0]    rel_tag;
+    // "The lowest port still to drain" is x & -x, not a scan.  Written as a
+    // scan it is NPORT stages of "nothing found yet", each selecting that
+    // port's ids, which is a chain of forty gates of fanout sixty -- 15 of the
+    // module's 21 nanoseconds.  One-hot, the select is an or of masks, which
+    // is associative and comes out of synthesis as a tree.
+    reg [NPORT-1:0] remaining, one;
+    reg [NC*8-1:0]  sel_c;
+    reg [NP*8-1:0]  sel_p;
+    reg [7:0]       sel_tag;
+    integer q, r;
+    always @* begin
+        rel_now = 0;
+        rel_en  = 0;
+        rel_c   = {(NREL*NC){8'hFF}};
+        rel_p   = {(NREL*NC){8'hFF}};
+        rel_tag = 0;
+        remaining = want_rel;
+        for (r = 0; r < NREL; r = r + 1) begin
+            one = remaining & (~remaining + {{(NPORT-1){1'b0}}, 1'b1});
+            sel_c = 0; sel_p = 0; sel_tag = 0;
+            for (q = 0; q < NPORT; q = q + 1) begin
+                sel_c   = sel_c   | (slot_c[q]   & {(NC*8){one[q]}});
+                sel_p   = sel_p   | (slot_p[q]   & {(NP*8){one[q]}});
+                sel_tag = sel_tag | (slot_tag[q] & {8{one[q]}});
+            end
+            if (|one) begin
+                rel_en[r] = 1'b1;
+                rel_c[r*NC*8 +: NC*8] = sel_c;
+                rel_p[r*NC*8 +: NP*8] = sel_p;
+                rel_tag[r*8 +: 8]     = sel_tag;
+            end
+            rel_now   = rel_now | one;
+            remaining = remaining & ~one;
+        end
+    end
+    wire [NPORT-1:0] held = want_rel & ~rel_now;
 
     // Outstanding writers and readers per buffer.  The issue check sees the
-    // head step's ids with this cycle's releases forwarded; the counters
-    // themselves are updated by the releases and then the issue.
+    // head step's ids with this cycle's drains forwarded; the counters
+    // themselves are updated by the drains and then the issue.
     reg [CW-1:0] wr_cnt [0:NID-1];
     reg [CW-1:0] rd_cnt [0:NID-1];
-    integer p, k, m, id;
+    integer p, k, m, id, x;
 
-    function automatic [CW-1:0] released_wr(input [7:0] buf_id);      // completions this cycle that produced buf_id
-        integer q, j;
+    // The drained ids travel as arguments, not as a reference to rel_c and
+    // rel_p: what a function reads is not in an always @* block's sensitivity,
+    // only what it is passed, and a stale deps_ok deadlocks.
+    function automatic [CW-1:0] released(input [7:0] buf_id, input integer n,
+                                         input [NREL-1:0] en, input [NREL*NC*8-1:0] ids);
+        integer y, j;
         begin
-            released_wr = 0;
-            for (q = 0; q < NU * NE; q = q + 1)
-                if (done_valid[q])
-                    for (j = 0; j < NP; j = j + 1)
-                        if (slot_p[q][j*8 +: 8] == buf_id) released_wr = released_wr + 1'b1;
-        end
-    endfunction
-    function automatic [CW-1:0] released_rd(input [7:0] buf_id);      // completions this cycle that consumed buf_id
-        integer q, j;
-        begin
-            released_rd = 0;
-            for (q = 0; q < NU * NE; q = q + 1)
-                if (done_valid[q])
+            released = 0;
+            for (y = 0; y < NREL; y = y + 1)
+                if (en[y])
                     for (j = 0; j < NC; j = j + 1)
-                        if (slot_c[q][j*8 +: 8] == buf_id) released_rd = released_rd + 1'b1;
+                        if (j < n && ids[(y*NC + j)*8 +: 8] == buf_id) released = released + 1'b1;
         end
     endfunction
 
@@ -122,42 +179,47 @@ module fabric_sequencer #(
     always @* begin
         deps_ok = 1'b1;
         for (k = 0; k < NC; k = k + 1)
-            if (cur_c[k] != 8'hFF && wr_cnt[cur_c[k]] != released_wr(cur_c[k])) deps_ok = 1'b0;
+            if (cur_c[k] != 8'hFF && wr_cnt[cur_c[k]] != released(cur_c[k], NP, rel_en, rel_p)) deps_ok = 1'b0;
         for (k = 0; k < NP; k = k + 1)
-            if (cur_p[k] != 8'hFF && (rd_cnt[cur_p[k]] != released_rd(cur_p[k])
-                                      || (!cur_contrib[k] && wr_cnt[cur_p[k]] != released_wr(cur_p[k])))) deps_ok = 1'b0;
+            if (cur_p[k] != 8'hFF && (rd_cnt[cur_p[k]] != released(cur_p[k], NC, rel_en, rel_c)
+                                      || (!cur_contrib[k] && wr_cnt[cur_p[k]] != released(cur_p[k], NP, rel_en, rel_p)))) deps_ok = 1'b0;
         n_done_now = 0;
-        for (p = 0; p < NU * NE; p = p + 1) if (done_valid[p]) n_done_now = n_done_now + 1'b1;
+        for (p = 0; p < NPORT; p = p + 1) if (done_valid[p]) n_done_now = n_done_now + 1'b1;
     end
 
     reg  [9:0]  outstanding;
     reg         finishing;
-    wire        want  = running && !finishing && deps_ok && !tab_live[pc[7:0]];
+    wire        want  = running && !finishing && deps_ok && !tab_live[pc[7:0]] && !held[cur_port];
     assign cmd_valid = want ? (1 << cur_unit) : 0;
     wire        issue = want && cmd_ready[cur_unit];
 
-    reg [7:0] tg;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            pc <= 0; running <= 1'b0; done <= 1'b0; outstanding <= 0; finishing <= 1'b0; tab_live <= 0;
+            pc <= 0; running <= 1'b0; done <= 1'b0; outstanding <= 0; finishing <= 1'b0; tab_live <= 0; pend <= 0;
             for (id = 0; id < NID; id = id + 1) begin wr_cnt[id] = 0; rd_cnt[id] = 0; end
         end else begin
             done <= 1'b0;
             if (start && !running) begin
-                pc <= 0; running <= 1'b1; outstanding <= 0; finishing <= 1'b0; tab_live <= 0;
+                pc <= 0; running <= 1'b1; outstanding <= 0; finishing <= 1'b0; tab_live <= 0; pend <= 0;
                 for (id = 0; id < NID; id = id + 1) begin wr_cnt[id] = 0; rd_cnt[id] = 0; end
-            end else if (running) begin
-                // Releases: each completion returns its buffers.
-                for (p = 0; p < NU * NE; p = p + 1) begin
-                    if (done_valid[p]) begin
-                        tg = done_tag[p*8 +: 8];
+            end else begin
+                // Not gated on `running`: when it is low nothing issues and no
+                // unit is busy, so none of this moves anyway, and the gate cost
+                // more than everything else here -- one flop's enable reaching
+                // every counter and every live bit was 835 loads, and the three
+                // gates behind it were 42 of the module's 43 nanoseconds.
+                // The drains: NREL completions return their buffers; the rest wait.
+                pend <= held;
+                for (x = 0; x < NREL; x = x + 1)
+                    if (rel_en[x]) begin
                         for (k = 0; k < NC; k = k + 1)
-                            if (slot_c[p][k*8 +: 8] != 8'hFF) rd_cnt[slot_c[p][k*8 +: 8]] = rd_cnt[slot_c[p][k*8 +: 8]] - 1'b1;
+                            if (rel_c[x*NC*8 + k*8 +: 8] != 8'hFF)
+                                rd_cnt[rel_c[x*NC*8 + k*8 +: 8]] = rd_cnt[rel_c[x*NC*8 + k*8 +: 8]] - 1'b1;
                         for (k = 0; k < NP; k = k + 1)
-                            if (slot_p[p][k*8 +: 8] != 8'hFF) wr_cnt[slot_p[p][k*8 +: 8]] = wr_cnt[slot_p[p][k*8 +: 8]] - 1'b1;
-                        tab_live[tg] <= 1'b0;
+                            if (rel_p[x*NC*8 + k*8 +: 8] != 8'hFF)
+                                wr_cnt[rel_p[x*NC*8 + k*8 +: 8]] = wr_cnt[rel_p[x*NC*8 + k*8 +: 8]] - 1'b1;
+                        tab_live[rel_tag[x*8 +: 8]] <= 1'b0;
                     end
-                end
                 outstanding <= outstanding + {9'd0, issue} - {2'd0, n_done_now};
                 if (issue) begin
                     for (k = 0; k < NC; k = k + 1)
@@ -166,16 +228,27 @@ module fabric_sequencer #(
                         if (cur_p[k] != 8'hFF) wr_cnt[cur_p[k]] = wr_cnt[cur_p[k]] + 1'b1;
                     slot_c[cur_port] <= cur[IDB +: NC*8];
                     slot_p[cur_port] <= cur[IDB + 8*NC +: NP*8];
+                    slot_tag[cur_port] <= pc[7:0];
                     tab_live[pc[7:0]] <= 1'b1;
                     pc <= pc + 1'b1;
                     if (cur_last || pc + 1 == n_steps) finishing <= 1'b1;
                 end
-                if (finishing && outstanding == n_done_now) begin
+                if (running && finishing && outstanding == n_done_now && held == 0) begin
                     running <= 1'b0; done <= 1'b1;
                 end
             end
         end
     end
+
+`ifndef FABRIC_SYNTH
+    // The port's own record of the command and the tag the unit returns are
+    // the same command: the release reads the register, not the reply.
+    always @(posedge clk)
+        if (rst_n && running)
+            for (m = 0; m < NPORT; m = m + 1)
+                if (done_valid[m] && done_tag[m*8 +: 8] !== slot_tag[m])
+                    $display("FAIL: port %0d returned tag %0d, it was given %0d", m, done_tag[m*8 +: 8], slot_tag[m]);
+`endif
 endmodule
 
 `default_nettype wire
