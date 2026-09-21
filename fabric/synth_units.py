@@ -51,7 +51,7 @@ def _program_image(depth: int = 64, seed: int = 1) -> str:
 
 
 UNITS = [
-    Unit("columns", "fabric_columns", ("fabric_tile.sv",), {"ROWS": 256, "COLS": 16, "WB": 4, "AB": 8, "P": 2, "ACC": 24},
+    Unit("columns", "fabric_columns", VEC + ("fabric_tile.sv",), {"ROWS": 256, "COLS": 16, "WB": 4, "AB": 8, "P": 2, "ACC": 24},
          "the tile's column datapath, 16 columns"),
     Unit("rmsnorm", "fabric_rmsnorm", VEC + ("fabric_norm.sv",), {"D": 64, "XW": 16, "OW": 8, "L": 2, "SW": 44},
          "the norm, two lanes, with the inverse square root", luts=True),

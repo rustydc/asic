@@ -26,8 +26,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Sequence
 
-RTL = Path(__file__).parent / "rtl" / "fabric_tile.sv"
 RTL_DIR = Path(__file__).parent / "rtl"
+RTL = [RTL_DIR / name for name in ("fabric_sram.sv", "fabric_vector.sv", "fabric_tile.sv")]   # the column datapath and the primitives it is built on
 
 
 @dataclass
@@ -226,7 +226,7 @@ def synthesize(liberty: Path | Sequence[Path], *, rows: int = 256, cols: int = 8
     if params is None:
         params = {"ROWS": rows, "COLS": cols, "WB": weight_bits, "AB": act_bits, "P": rows_per_cycle, "ACC": acc_bits}
     chparam = " ".join(f"-set {name} {value}" for name, value in params.items())
-    sources = [RTL] if sources is None else [Path(p) for p in sources]
+    sources = list(RTL) if sources is None else [Path(p) for p in sources]
     with tempfile.TemporaryDirectory() as directory:
         work = Path(directory)
         # yowasp runs in a sandbox rooted at the working directory; copy inputs next to the script.

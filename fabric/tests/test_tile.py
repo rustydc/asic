@@ -127,8 +127,8 @@ class RtlTest(unittest.TestCase):
                 ("ROWS", spec.rows), ("COLS", spec.cols), ("WB", spec.weight_bits), ("AB", spec.act_bits),
                 ("P", spec.rows_per_cycle), ("ACC", spec.acc_bits), ("SB", spec.scale_bits), ("SHB", spec.shift_bits), ("T", tokens),
                 ("MODEL", model))]
-            subprocess.run(["iverilog", "-g2012", "-o", "sim.vvp", *params,
-                            str(RTL / "fabric_tile.sv"), str(RTL / "tb_fabric_tile.sv")],
+            subprocess.run(["iverilog", "-g2012", "-I", str(RTL), "-o", "sim.vvp", *params,
+                            str(RTL / "fabric_sram.sv"), str(RTL / "fabric_vector.sv"), str(RTL / "fabric_tile.sv"), str(RTL / "tb_fabric_tile.sv")],
                            cwd=work, check=True, capture_output=True, text=True)
             result = subprocess.run(["vvp", "sim.vvp"], cwd=work, check=True, capture_output=True, text=True)
         return result.stdout

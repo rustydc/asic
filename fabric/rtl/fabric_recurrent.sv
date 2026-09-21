@@ -114,7 +114,7 @@ endmodule
 // Per-head gates from the fabric's raw accumulators of in_proj_a and in_proj_b:
 //   beta  = sigmoid(b * mult_b >> sh_b)
 //   decay = exp(-A * softplus(a * mult_a >> sh_a + dt_bias))
-// One head per beat, A in Q6.10, dt_bias in F16, both results U16.  Latency 9.
+// One head per beat, A in Q6.10, dt_bias in F16, both results U16.  Latency 10.
 // ---------------------------------------------------------------------------
 module fabric_head_gates #(
     parameter int ACC = 24,
@@ -134,28 +134,59 @@ module fabric_head_gates #(
     output wire [15:0]           decay,
     output wire [15:0]           beta
 );
-    // S1: both to F16.
+    // S1: both products, carry-save, with each one's rounding constant folded
+    // into the same tree.  Both accumulators arrive on input pins straight
+    // from the fabric, and a 24 by 16 multiply with its round, its shift and
+    // its saturate between two flops was the whole of this unit's 2.10 ns:
+    // nine XORs of the product's carry chain and the shifter behind them.
+    // The resolve belongs to S2 and the saturates to S3.  The shift must be
+    // narrower than PW, which every compiled constant is.
+    localparam int PW = ACC + 17;                     // ACC by 16 bits, exactly
+    wire [PW-1:0] one_pw = {{(PW-1){1'b0}}, 1'b1};
+    wire [PW-1:0] rnd_a  = (sh_a == 0) ? {PW{1'b0}} : (one_pw << (sh_a - 1'b1));
+    wire [PW-1:0] rnd_b  = (sh_b == 0) ? {PW{1'b0}} : (one_pw << (sh_b - 1'b1));
+    wire [PW-1:0] as_w, ac_w, bs_w, bc_w;
+    fabric_mul_cs #(.AW(ACC), .BW(16), .PW(PW)) u_ma (.a(a_acc), .b(mult_a), .addend(rnd_a), .s(as_w), .c(ac_w));
+    fabric_mul_cs #(.AW(ACC), .BW(16), .PW(PW)) u_mb (.a(b_acc), .b(mult_b), .addend(rnd_b), .s(bs_w), .c(bc_w));
+
     reg               v1;
-    reg signed [15:0] ta1, tb1, dt1;
+    reg [PW-1:0]      as1, acy1, bs1, bcy1;
+    reg [5:0]         sha1, shb1;
+    reg signed [15:0] dt1;
     reg [15:0]        ac1;
     always @(posedge clk) begin
-        v1  <= in_valid;
-        ta1 <= fx_requant(a_acc, mult_a, sh_a, 16);
-        tb1 <= fx_requant(b_acc, mult_b, sh_b, 16);
-        dt1 <= dt_bias;
-        ac1 <= a_coef;
+        v1   <= in_valid;
+        as1  <= as_w;  acy1 <= ac_w;
+        bs1  <= bs_w;  bcy1 <= bc_w;
+        sha1 <= sh_a;  shb1 <= sh_b;
+        dt1  <= dt_bias;
+        ac1  <= a_coef;
     end
-    // S2: dt_bias.
+    // S2: resolve each pair and shift.
+    reg                 v1b;
+    reg signed [PW-1:0] pa1, pb1;
+    reg signed [15:0]   dt1b;
+    reg [15:0]          ac1b;
+    always @(posedge clk) begin
+        v1b  <= v1;
+        pa1  <= ($signed(as1) + $signed({acy1[PW-2:0], 1'b0})) >>> sha1;
+        pb1  <= ($signed(bs1) + $signed({bcy1[PW-2:0], 1'b0})) >>> shb1;
+        dt1b <= dt1;
+        ac1b <= ac1;
+    end
+    // S3: saturate, then dt_bias -- the requantize's saturate and the bias's
+    // are both kept, so the arithmetic is the model's.
     reg               v2;
     reg signed [15:0] ta2, tb2;
     reg [15:0]        ac2;
     always @(posedge clk) begin
-        v2  <= v1;
-        ta2 <= fx_sat($signed({{48{ta1[15]}}, ta1}) + $signed({{48{dt1[15]}}, dt1}), 16);
-        tb2 <= tb1;
-        ac2 <= ac1;
+        v2  <= v1b;
+        ta2 <= fx_sat(fx_sat($signed({{(64-PW){pa1[PW-1]}}, pa1}), 16)
+                      + $signed({{48{dt1b[15]}}, dt1b}), 16);
+        tb2 <= fx_sat($signed({{(64-PW){pb1[PW-1]}}, pb1}), 16);
+        ac2 <= ac1b;
     end
-    // S3..S5: softplus and sigmoid side by side.
+    // S4..S6: softplus and sigmoid side by side.
     wire        spv, sgv;
     wire [15:0] sp5, sg5;
     fabric_softplus #(.LUT_DIR(LUT_DIR)) u_sp (.clk(clk), .valid_in(v2), .t(ta2), .valid_out(spv), .y(sp5));
@@ -382,7 +413,12 @@ module fabric_delta_state8 #(
     reg signed [47:0] ym [0:V-1];   // the y stage's own, so no stage reads another's write
     reg signed [15:0] diff [0:V-1];
     reg signed [31:0] bd [0:V-1];
-    reg signed [49:0] cm [0:V-1];
+    // The rescale's product is left carry-save: bd by the 17-bit reciprocal
+    // was a 32 by 17 multiply in one phase, and its carry chain was this
+    // unit's critical path (the quotient's bits into cm).  The phase that
+    // follows already adds and shifts, so it resolves the pair there for the
+    // add it was doing anyway -- the rounding constant rides in the tree.
+    reg signed [49:0] cms [0:V-1], cmc [0:V-1];
     reg signed [24:0] c [0:V-1];
     reg [7:0]      peak_acc;
     reg [15:0]     nsat_acc;
@@ -401,8 +437,13 @@ module fabric_delta_state8 #(
     // The scale multiplies every lane's accumulator, twice over; a copy per
     // lane keeps that off one flop's fanout, as for the shift amounts.
     wire [15:0] g1_l [0:V-1];
+    wire [V*50-1:0] cms_w, cmc_w;
     genvar gv;
     generate
+        for (gv = 0; gv < V; gv = gv + 1) begin : g_cmul
+            fabric_mul_cs #(.AW(32), .BW(17), .PW(50)) u_c (
+                .a(bd[gv]), .b(r), .addend(rndc), .s(cms_w[gv*50 +: 50]), .c(cmc_w[gv*50 +: 50]));
+        end
         for (gv = 0; gv < V; gv = gv + 1) begin : g_sh
             fabric_const_copy #(.W(6))  u_p (.clk(clk), .d(shp),  .q(shp_l[gv]));
             fabric_const_copy #(.W(6))  u_c (.clk(clk), .d(shc),  .q(shc_l[gv]));
@@ -591,11 +632,15 @@ module fabric_delta_state8 #(
 
             // ---- the phases between the passes, newest first.
             if (phase == 4'd5) begin
-                for (j = 0; j < V; j = j + 1) c[j] = (cm[j] + rndc) >>> shc_l[j];
+                for (j = 0; j < V; j = j + 1)
+                    c[j] = ($signed(cms[j]) + $signed({cmc[j][48:0], 1'b0})) >>> shc_l[j];
                 phase <= 4'd6; rd <= 0;
             end
             if (phase == 4'd4) begin
-                for (j = 0; j < V; j = j + 1) cm[j] = bd[j] * $signed({33'b0, r});
+                for (j = 0; j < V; j = j + 1) begin
+                    cms[j] = cms_w[j*50 +: 50];
+                    cmc[j] = cmc_w[j*50 +: 50];
+                end
                 phase <= 4'd5;
             end
             if (phase == 4'd3) begin

@@ -68,48 +68,8 @@ module fabric_strobe_copy (
     end
 endmodule
 
-// ---------------------------------------------------------------------------
-// Carry-save reduction of N operands to a (sum, carry) pair: value = s + 2c.
-// Each layer turns groups of three operands into two; depth is logarithmic.
-// ---------------------------------------------------------------------------
-module fabric_csa_tree #(
-    parameter int N = 3,
-    parameter int W = 41
-) (
-    input  wire [N*W-1:0] ops,
-    output wire [W-1:0]   s,
-    output wire [W-1:0]   c
-);
-    generate
-        if (N == 1) begin : g_one
-            assign s = ops[W-1:0];
-            assign c = {W{1'b0}};
-        end else if (N == 2) begin : g_two
-            wire [W-1:0] a = ops[W-1:0];
-            wire [W-1:0] b = ops[2*W-1:W];
-            assign s = a ^ b;
-            assign c = a & b;
-        end else begin : g_layer
-            localparam int G = N / 3;
-            localparam int R = N % 3;
-            localparam int M = 2 * G + R;
-            wire [M*W-1:0] next;
-            genvar i;
-            for (i = 0; i < G; i = i + 1) begin : g_csa
-                wire [W-1:0] a = ops[(3*i)*W +: W];
-                wire [W-1:0] b = ops[(3*i+1)*W +: W];
-                wire [W-1:0] d = ops[(3*i+2)*W +: W];
-                wire [W-1:0] cy = (a & b) | (a & d) | (b & d);
-                assign next[(2*i)*W +: W]   = a ^ b ^ d;
-                assign next[(2*i+1)*W +: W] = {cy[W-2:0], 1'b0};   // carry at weight 2, as a plain operand
-            end
-            for (i = 0; i < R; i = i + 1) begin : g_pass
-                assign next[(2*G+i)*W +: W] = ops[(3*G+i)*W +: W];
-            end
-            fabric_csa_tree #(.N(M), .W(W)) sub (.ops(next), .s(s), .c(c));
-        end
-    endgenerate
-endmodule
+// fabric_csa_tree, which every carry chain here is built on, is in
+// fabric_vector.sv: the vector units want the same primitive.
 
 // ---------------------------------------------------------------------------
 // Column datapath and pass control.

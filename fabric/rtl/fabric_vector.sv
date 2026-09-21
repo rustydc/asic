@@ -29,6 +29,90 @@ module fabric_const_copy #(
 endmodule
 
 // ---------------------------------------------------------------------------
+// Carry-save reduction of N operands to a (sum, carry) pair: value = s + 2c.
+// Each layer turns groups of three operands into two; depth is logarithmic.
+// The tile's column datapath is built on this (fabric_tile.sv); it lives here
+// because the vector units want it for the same reason.
+// ---------------------------------------------------------------------------
+module fabric_csa_tree #(
+    parameter int N = 3,
+    parameter int W = 41
+) (
+    input  wire [N*W-1:0] ops,
+    output wire [W-1:0]   s,
+    output wire [W-1:0]   c
+);
+    generate
+        if (N == 1) begin : g_one
+            assign s = ops[W-1:0];
+            assign c = {W{1'b0}};
+        end else if (N == 2) begin : g_two
+            wire [W-1:0] a = ops[W-1:0];
+            wire [W-1:0] b = ops[2*W-1:W];
+            assign s = a ^ b;
+            assign c = a & b;
+        end else begin : g_layer
+            localparam int G = N / 3;
+            localparam int R = N % 3;
+            localparam int M = 2 * G + R;
+            wire [M*W-1:0] next;
+            genvar i;
+            for (i = 0; i < G; i = i + 1) begin : g_csa
+                wire [W-1:0] a = ops[(3*i)*W +: W];
+                wire [W-1:0] b = ops[(3*i+1)*W +: W];
+                wire [W-1:0] d = ops[(3*i+2)*W +: W];
+                wire [W-1:0] cy = (a & b) | (a & d) | (b & d);
+                assign next[(2*i)*W +: W]   = a ^ b ^ d;
+                assign next[(2*i+1)*W +: W] = {cy[W-2:0], 1'b0};   // carry at weight 2, as a plain operand
+            end
+            for (i = 0; i < R; i = i + 1) begin : g_pass
+                assign next[(2*G+i)*W +: W] = ops[(3*G+i)*W +: W];
+            end
+            fabric_csa_tree #(.N(M), .W(W)) sub (.ops(next), .s(s), .c(c));
+        end
+    endgenerate
+endmodule
+
+// ---------------------------------------------------------------------------
+// A signed multiplicand by an unsigned multiplier, left in carry-save form:
+// value = s + 2c, and nothing along the way propagates a carry.  Whatever the
+// stage was going to add to the product -- a rounding constant, a bias --
+// goes in as ADD more operands of the same tree for the price of a layer.
+//
+// A multiply written as `a * b` is a partial-product tree *and* a final
+// carry-propagate add of PW bits, and that add is most of its delay: it is
+// the floor the vector units sit on.  Split here, the tree is one stage and
+// the resolve belongs to the next, where it shares a stage with whatever
+// followed it -- which is the tile's own arrangement (fabric_tile.sv, stages
+// M and A1..A3).  The caller resolves with a plain `s + {c, 1'b0}`.
+// ---------------------------------------------------------------------------
+module fabric_mul_cs #(
+    parameter int AW  = 24,          // multiplicand bits, signed
+    parameter int BW  = 16,          // multiplier bits, unsigned
+    parameter int PW  = 41,          // product width: AW + BW + 1 is exact
+    parameter int ADD = 1            // extra operands added into the tree
+) (
+    input  wire signed [AW-1:0] a,
+    input  wire [BW-1:0]        b,
+    input  wire [ADD*PW-1:0]    addend,
+    output wire [PW-1:0]        s,
+    output wire [PW-1:0]        c
+);
+    wire [PW-1:0] ax = {{(PW-AW){a[AW-1]}}, a};
+    wire [(BW+ADD)*PW-1:0] ops;
+    genvar i;
+    generate
+        for (i = 0; i < BW; i = i + 1) begin : g_pp
+            assign ops[i*PW +: PW] = b[i] ? (ax <<< i) : {PW{1'b0}};
+        end
+        for (i = 0; i < ADD; i = i + 1) begin : g_add
+            assign ops[(BW + i)*PW +: PW] = addend[i*PW +: PW];
+        end
+    endgenerate
+    fabric_csa_tree #(.N(BW + ADD), .W(PW)) u_tree (.ops(ops), .s(s), .c(c));
+endmodule
+
+// ---------------------------------------------------------------------------
 // Table with linear interpolation: 2^IB + 1 entries of W bits, an index of
 // IB bits and FB fraction bits.  y = T[i] + ((T[i+1] - T[i]) * f + 2^(FB-1)) >> FB.
 // Latency 2.
@@ -43,6 +127,13 @@ module fabric_lut #(
     input  wire [IB+FB-1:0] u,
     output reg  [W-1:0]    y
 );
+    // The table stays an array of constants rather than a memory macro, which
+    // is the one place in this design where that is the right answer: a sine
+    // or a sigmoid is smooth, so synthesis folds 2^IB entries into a fraction
+    // of the logic their bits would suggest, where an SRAM of the same bits is
+    // paid for in full.  Made macros, the tables cost the head gates 23,190
+    // NAND2-eq -> 153,257 and the rotary table 15,493 -> 51,422, and both got
+    // slower by the macro's access time.
     reg [W-1:0] t [0:(1<<IB)];
     initial begin
         if (FILE != "") $readmemh(FILE, t);

@@ -107,7 +107,7 @@ class Timing:
     norm_latency: int = 7
     l_conv: int = 8
     conv_latency: int = 9            # taps, two requantizes of two stages each, SiLU
-    gates_latency: int = 9
+    gates_latency: int = 10          # the requantizes carry-save, resolved and saturated after
     delta_latency: int = 6           # row out follows row in by K + 4; two passes over K rows
     l_vec: int = 8                   # swiglu, residual, rotary, silu
     swiglu_latency: int = 6
