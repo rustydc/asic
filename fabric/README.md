@@ -1414,16 +1414,16 @@ against them, and the 105 tests pass.
 
 | Unit | Geometry | NanGate 45 (ns) | ASAP7 (ns) | NAND2-eq |
 | --- | --- | ---: | ---: | ---: |
-| columns | the tile's column datapath, 16 columns | 1.14 | 0.73 | 40,573 |
-| rmsnorm | the norm, two lanes, with the inverse square root | 4.41 -> 1.75 | 2.29 -> 1.24 | 69,492 |
-| delta_state8 | the int8 state engine, four lanes of a 16-row state | 22.93 -> 2.12 | 11.26 -> 1.31 | 130,970 |
-| conv_silu | the causal conv and SiLU, two lanes | 2.25 -> 2.06 | 1.72 -> 1.22 | 39,510 |
-| head_gates | the per-head gates | 2.13 -> 2.10 | 1.45 -> 1.43 | 26,666 |
+| columns | the tile's column datapath, 16 columns | 1.12 | 0.74 | 40,590 |
+| rmsnorm | the norm, two lanes, with the inverse square root | 4.41 -> 1.72 | 2.29 -> 1.21 | 69,454 |
+| delta_state8 | the int8 state engine, four lanes of a 16-row state | 22.93 -> 2.03 | 11.26 -> 1.27 | 133,994 |
+| conv_silu | the causal conv and SiLU, two lanes | 2.25 -> 2.07 | 1.72 -> 1.22 | 39,513 |
+| head_gates | the per-head gates | 2.13 -> 1.58 | 1.45 -> 1.40 | 24,704 |
 | swiglu | SwiGLU, two lanes | 4.07 -> 1.90 | 2.50 -> 1.02 | 30,126 |
 | residual | the residual add, four lanes | 2.27 -> 2.16 -> 1.53 | 1.50 -> 1.03 -> 0.89 | 12,182 |
 | rotary | the rotation, two lanes | 5.71 -> 2.50 | 5.00 -> 1.54 | 29,217 |
 | rotary_table | the rotary table | 2.48 -> 2.13 | 1.93 -> 1.59 | 15,344 |
-| attention | the attention core, one head of 32, two lanes | 59.62 -> 11.35 -> 2.38 | 33.94 -> 29.68 -> 1.59 | 90,389 |
+| attention | the attention core, one head of 32, two lanes | 59.62 -> 11.35 -> 2.41 | 33.94 -> 29.68 -> 1.49 | 90,462 |
 | index_scan | the index scan, 32 codes | 13.94 -> 2.08 | 12.73 -> 2.44 | 13,504 |
 | topk | top-K of eight | 0.71 | 0.48 | 6,840 |
 | record_reader | the record reader, two records of 32 | 2.42 -> 0.94 | 3.10 -> 0.49 | 2,220 |
@@ -1479,12 +1479,39 @@ computed the turn and then indexed, read and interpolated the sine table
 in one cycle, and since only bits 31:16 of the product are wanted, the
 upper half of its multiplier is no longer built either (2.13 and 1.59).
 
-What is left of that kind is the units at 2.1 to 2.5 ns that are already
-one multiply a stage -- the norm, the state engine, the attention core,
-the gates, the rotation. Going below the floor is the tile's own trick, a
-carry-save multiply with its resolve in the next stage, and it is what
-the 800 MHz placeholder needs: at 2 ns a stage the die clocks at 500 MHz,
-not 800.
+Below that floor is the tile's own trick. A multiply written `a * b` is a
+partial-product tree *and* a carry-propagate add of the whole product, and
+that add is most of its delay, so the tree goes in one stage and the
+resolve in the next, where it shares a stage with whatever followed it.
+`fabric_csa_tree` moved out of fabric_tile.sv to the vector library for
+that, with a `fabric_mul_cs` around it that also takes whatever the stage
+was going to add to the product -- a rounding constant, a bias -- as more
+operands of the same tree, for the price of a layer.
+
+Two units wanted it. The **head gates** took both accumulators on input
+pins straight from the fabric and put a 24 by 16 multiply, its round, its
+shift and its saturate between two flops: 2.10 -> 1.58 ns, and smaller
+with it. The **state engine** multiplied a 32-bit difference by the 17-bit
+reciprocal in one phase, and the quotient's bits through that carry chain
+were its critical path; the phase after already adds a rounding constant
+and shifts, so it resolves the pair there and the constant rides in the
+tree: 2.12 -> 2.03.
+
+Two places it does not pay, measured rather than assumed. Carry-saving the
+interpolated table's second stage is bit-exact and removes two of its four
+carries, but it reshuffles what ABC does with the table's own constants
+and the head gates went to 2.31 ns for no gain anywhere. And the tables
+are the one array here that should *not* be a macro: a sine or a sigmoid
+is smooth, so synthesis folds 2^IB entries into a fraction of the logic
+their bits suggest, where an SRAM is paid for in full -- as macros they
+cost the head gates 23,190 NAND2-eq -> 153,257 and the rotary table
+15,493 -> 51,422, and both got slower by the macro's access time.
+
+What is left of that kind is the units still at 2.0 to 2.5 ns -- the
+rotation, the attention core, the rotary table, the conv, the state engine
+-- where what is left is a table's decode or a barrel shifter rather than
+a multiply's carry. The 800 MHz placeholder still needs them: at 2 ns a
+stage the die clocks at 500 MHz, not 800.
 
 The other kind was not logic at all. The attention core and the append
 reported 11 and 52 ns on NanGate, and almost all of it was one flop
