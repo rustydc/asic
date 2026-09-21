@@ -1430,7 +1430,7 @@ against them, and the 105 tests pass.
 | kv_append | the append, one head of 32 | 52.14 -> 4.36 -> 1.88 | 15.52 -> 3.41 -> 2.68 | 63,943 |
 | mem_arbiter | the memory arbiter, four requesters | 0.73 -> 0.67 | 0.45 -> 0.49 | 1,752 |
 | vector_buffer | the buffer's crossbar, 26 reads and 19 writes folded onto 11 and 8, over eight banks | 7.88 | 12.60 -> 7.81 | 407,082 -> 278,031 |
-| sequencer | the token sequencer, a 64-step program memory (as logic) and 64 buffer ids | not mapped -> 2.79 | not mapped -> 2.24 | 62,241 |
+| sequencer | the token sequencer, a 64-step program memory (as logic) and 64 buffer ids | not mapped -> 2.81 | not mapped -> 2.10 | 62,925 |
 
 Four shapes carried the change.
 
@@ -1635,6 +1635,24 @@ cycles. It costs one cycle in 1,033 on the one program measured where two
 engines ever finish together, and nothing at all at the 9B geometry: over
 every program measured, at most two steps end in the same cycle and
 almost always one.
+
+The ids living with the port is also what says a port may hold only one
+command. A unit drops its ready on the cycle it writes its last beat and
+reports done the cycle after, so the controller was handing a port its
+next command before the previous one's completion arrived — and that
+completion then released the newer command's buffers, which the newer
+command was still reading. This is stated elsewhere in this document,
+because it is why the span instrumentation below tracks two commands a
+port rather than one; the release path had not followed. A port with a
+command outstanding is now given no second one, unless its completion
+drains in the same cycle, which is free because the drain reads the
+register the issue writes. A queue two deep would keep the overlap and
+cost nothing in cycles, and was tried: 62,241 -> 94,871 NAND2-eq for the
+doubled id registers, against 684 and twelve cycles in 3,838 for the one
+bit a port. The check that caught it is in the RTL, and had been firing
+for as long as it had existed — `run_engine` asserts the run passed
+before it checks the results, and the second assertion never prints the
+simulator's output.
 
 ## What the vector buffer's ports are really asked for
 
