@@ -151,6 +151,18 @@ class Timing:
     append_latency: int = 58
     append_index_latency: int = 34   # the block's index projection, its codes and its record
     port_bytes_per_cycle: float = 16e9 / 800e6   # sixteen devices at 250 MHz DDR x16 against the core clock
+    # The memory behind the port.  ``devices`` of 0 is the testbench's own
+    # model, a beat a cycle after a short latency, which is what the engine
+    # tests run against and what the constants above are measured on.  With
+    # devices it is the HPI path: the stripe map sends each ``stripe_beats``
+    # of a transfer to the next device, so a transfer short of a stripe gets
+    # one device however many there are, and each device's chunk is a burst
+    # of its own -- a command, the read latency and the gap before the next.
+    devices: int = 0
+    stripe_beats: int = hpi.STRIPE_BYTES // BEAT
+    burst_clocks: int = 20           # a burst's command, latency and tCPH, at 250 MHz
+    beat_clocks: int = 4             # x16 DDR: four clocks to a sixteen-byte beat
+    ctrl_ratio: float = 800.0 / 250.0
 
     def beats(self, n: int) -> int:
         return -(-n // self.lanes)
@@ -186,8 +198,22 @@ class Timing:
         return (self.attn_start_latency + 4 * group * beats
                 + rows * (4 * beats + self.attn_row_stall) + group * beats + self.attn_out_latency)
 
-    def port(self, requests: int, beats: int, write: bool = False) -> int:
-        return requests * self.port_request + beats * (self.port_write_beat if write else self.port_read_beat)
+    def transfer(self, beats: int) -> int:
+        """Core cycles the memory needs for one transfer of ``beats``.
+
+        With the testbench's model that is a beat a cycle.  Over the HPI
+        devices the stripe map cuts the transfer into ``stripe_beats``
+        chunks and hands them round the devices, so the chunks of different
+        devices go at once and a device's own chunks go in turn.  Aggregate
+        only: the beat mover's writes are posted, so a write command looks
+        almost free and the read after it pays, and no per-command number
+        here means anything on that path."""
+        if not self.devices:
+            return beats
+        chunks = max(1, -(-beats // self.stripe_beats))
+        per_device = -(-chunks // min(self.devices, chunks))
+        in_chunk = min(beats, self.stripe_beats)
+        return int(per_device * (self.burst_clocks + self.beat_clocks * in_chunk) * self.ctrl_ratio)
 
     def move(self, beats: int, write: bool) -> int:
         """The beat mover: memory to the vector buffer, or back."""

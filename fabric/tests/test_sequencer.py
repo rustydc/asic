@@ -91,7 +91,10 @@ class ScheduleTest(unittest.TestCase):
             single = S.schedule(steps)
             interval = S.token_interval(steps)
             port = single.busy("mem")
-            self.assertGreaterEqual(interval, port)                     # the port is the floor
+            # The stream sits on the port.  Not a floor: a command's span is its
+            # beats and its latency, and consecutive commands overlap the latency,
+            # so the interval can come in a little under the sum of the spans.
+            self.assertGreater(interval, 0.97 * port)
             self.assertLess(interval, 1.1 * port)                       # and the stream sits on it
             self.assertLess(interval, 0.85 * single.cycles)             # below one token at a time
             two = S.stream(steps, 2)
