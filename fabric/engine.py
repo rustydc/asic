@@ -32,6 +32,7 @@ from fabric.memory import BEAT, MemoryMap
 from fabric.tile import TileSpec, compile_matrix, write_hex
 
 NPASS = 4                    # the recurrent layer's passes: in_proj, out_proj, gate_up, down
+ATT_L = 8                    # rtl/fabric_engine.sv's ATT_L: the attention cores' and record reader's lanes
 TAB_BITS = 56                # a pass-table entry
 
 
@@ -466,7 +467,7 @@ def _write_rom(path: Path, words: np.ndarray, spec: TileSpec) -> None:
                   spec.cols * spec.weight_bits)
 
 
-def _tiles(directory: Path, c, spec: TileSpec) -> int:
+def _tiles(directory: Path, c, cfg, spec: TileSpec) -> int:
     """The tile ROM images, the flat requantizer tables and the pass table; returns the tile count."""
     mult, shift, table = [], [], []
     t = 0
@@ -486,6 +487,10 @@ def _tiles(directory: Path, c, spec: TileSpec) -> int:
                 assert nbytes < 256 and dst_off < (1 << 24) and cm.row_blocks < 16
                 table.append(p | (tile.row_block << 4) | (chain << 8) | (int(last) << 20) | (int(raw) << 21) | (nbytes << 22) | (dst_off << 30))
                 t += 1
+    # The timing model works the same array out from the config alone, and a
+    # pass's cost is partly the array's size, so the two must agree.
+    assert t == sum(-(-i // spec.rows) * -(-o // spec.cols)
+                    for p in S.pass_matrices(cfg, isinstance(c, L.RecurrentConsts)) for i, o, _ in p), t
     assert t < 0xFFF
     write_hex(directory / "tiles_mult.hex", mult, spec.scale_bits)
     write_hex(directory / "tiles_shift.hex", shift, spec.shift_bits)
@@ -603,7 +608,7 @@ class EngineRun:
         # The program and everything the units load.
         L.write_luts(directory)
         write_hex(directory / "program.hex", S.encode(steps, self.layout), 256)
-        nt = _tiles(directory, c, spec)
+        nt = _tiles(directory, c, cfg, spec)
         sw = L.sw_for(16, d)
         _consts(directory, c, cfg, sw)
         regions = mm.regions()
@@ -612,7 +617,7 @@ class EngineRun:
                        "RD": cfg.rotary_dim, "IDIM": cfg.index_dim, "W": mm.local_window, "BS": mm.block, "TOP": cfg.top_blocks,
                        "KV_BITS": mm.kv_bits, "REC_BYTES": mm.kv_record_bytes, "RPB": mm.index_burst_records, "MAXR": mm.window_burst_records,
                        "WINDOW_OFF": regions["window0"][0], "BLOCK_OFF": regions["blocks0"][0], "INDEX_OFF": regions["index0"][0],
-                       "SUMS_OFF": regions["sums0"][0], "ATT_L": 8,
+                       "SUMS_OFF": regions["sums0"][0], "ATT_L": ATT_L,
                        "ROWS": spec.rows, "COLS": spec.cols, "P": spec.rows_per_cycle, "NT": nt, "TMAX": self.chunk,
                        "MODEL_TILES": int(model_tiles), "AW": max(16, (max(self.layout.vb_bytes, 1) - 1).bit_length() + 1),
                        "WB": spec.weight_bits, "ACC": spec.acc_bits, "SB": spec.scale_bits, "SHB": spec.shift_bits, "SW": sw,

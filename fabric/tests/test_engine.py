@@ -42,7 +42,14 @@ def run_engine(case: unittest.TestCase, cfg, c, spec, mm, steps: list[S.Step], i
         issue = [tuple(int(v) for v in line.split()) for line in (work / "issue.txt").read_text().splitlines()]
     case.assertEqual([row[1] for row in issue], [i % 256 for i in range(len(steps))])     # program order, tags in step order
     passed = next(line for line in out.splitlines() if line.startswith("PASS"))
-    return int(passed.split(" in ")[1].split()[0])
+    took = int(passed.split(" in ")[1].split()[0])
+    # The timing model is the engine's, command for command: every adapter's
+    # latency and every lane count in `sequencer.Timing` is the RTL's own, so
+    # the two cycle counts are equal and not merely close.  This is the
+    # assertion that keeps them from drifting -- for a long time nothing
+    # compared them and the model had settled at about half the real count.
+    case.assertEqual(took, S.schedule(steps).cycles, passed)
+    return took
 
 
 class LayoutTest(unittest.TestCase):
@@ -84,6 +91,18 @@ class PortMapTest(unittest.TestCase):
                 name, expression = assignment.split("=", 1)
                 names[name.strip()] = eval(expression.strip(), {"__builtins__": {}}, names)  # noqa: S307 - our own RTL
         return names
+
+    def test_the_lanes_are_the_ones_the_rtl_has(self) -> None:
+        # The timing model's lane counts are the RTL's own, not a second
+        # estimate of them: the programs' beat counts come from the same
+        # fields, and a model that thinks the units are wider than they are
+        # is what made it half the engine's real cycle count.
+        text = (RTL / "fabric_engine.sv").read_text()
+        localparams = re.search(r"localparam int NU = .*?;", text, re.S).group(0)
+        t = S.Timing()
+        for name, value in (("NL", t.lanes), ("CL", t.l_conv)):
+            self.assertIn(f"{name} = {value}", localparams, name)
+        self.assertEqual(E.ATT_L, t.l_attn)
 
     def test_the_port_map_is_the_one_the_rtl_wires(self) -> None:
         for chunk in (1, 2, 3):

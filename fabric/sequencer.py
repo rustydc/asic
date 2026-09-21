@@ -74,8 +74,6 @@ SHARED_PREFIX = "s_slot"     # buffers shared by every token in flight: the stat
 MEM_PREFIX = "m_"            # names of buffers in the memory image (the rest live in the vector buffer)
 
 # Operand conventions of the layer engine's adapters (rtl/fabric_engine.sv).
-NL = 8                       # lanes of the norm, swiglu and residual adapters
-CL = 4                       # channels per beat of the conv adapter
 HIST_REC = 4                 # bytes per channel of the conv history in the vector buffer (kernel - 1 used)
 SLOT_HEADER = BEAT           # the state slot: one beat of scale, exponent, peak, saturated count, then the rows
 MEM_RD, MEM_WR = 0, 1        # the memory unit's operations (arg[3:0]): memory to vector buffer, vector buffer to memory
@@ -99,32 +97,111 @@ NORM_RESIDUAL, NORM_UNIT, NORM_GATE, NORM_FFN = 0, 1, 2, 3    # the norm's const
 
 @dataclasses.dataclass(frozen=True)
 class Timing:
-    """Lanes and latencies of the units; the memory port in bytes per core cycle."""
+    """Lanes and latencies of the units, and the memory they share.
+
+    The lane counts are ``rtl/fabric_engine.sv``'s own parameters -- ``NL``
+    for the vector units, ``CL`` for the conv, ``ATT_L`` for the attention
+    cores and the record reader, ``P`` and ``COLS`` for a tile -- and not a
+    second estimate of them.  The programs' beat counts come from the same
+    fields, so a machine with wider units is one ``Timing`` and one
+    elaboration rather than two machines that disagree about which one they
+    are; that disagreement is what made this model half the engine's real
+    cycle count for as long as nothing compared them.
+
+    The latencies are each adapter's own, read off its state machine and
+    checked against the RTL command by command by ``EngineCycleTest``.  A
+    command costs its beats plus the adapter's latency, and the two are
+    separate fields so that a wider machine keeps the latency.
+    """
     core_mhz: float = 800.0
-    rows_per_cycle: int = 2
-    pass_latency: int = 16
-    l_norm: int = 16
-    norm_latency: int = 7
-    l_conv: int = 8
-    conv_latency: int = 9            # taps, two requantizes of two stages each, SiLU
-    gates_latency: int = 10          # the requantizes carry-save, resolved and saturated after
-    delta_latency: int = 6           # row out follows row in by K + 4; two passes over K rows
-    l_vec: int = 8                   # swiglu, residual, rotary, silu
-    swiglu_latency: int = 6
-    residual_latency: int = 2           # multiply, round, saturating add
-    silu_latency: int = 4
+    # Lanes, as the RTL is elaborated.
+    lanes: int = 8                   # NL: norm, SwiGLU, residual, rotary
+    l_conv: int = 4                  # CL: the causal conv
+    l_attn: int = 8                  # ATT_L: the attention cores and the record reader
+    # `P` and `COLS` are the tile's, and come from the TileSpec the pass is compiled for.
+    # Adapter latencies: what a command costs beyond its beats.
+    norm_latency: int = 33           # the front pipeline, the sum pass's tail and the inverse square root
+    tile_block_latency: int = 13     # a row block: its start cycle and the requantizer walk's tail
+    tile_done_latency: int = 2       # the write walk's last tile and the report
+    conv_latency: int = 12
+    gates_latency: int = 13
+    delta_latency: int = 29          # three passes over K rows, then the gated output
+    swiglu_latency: int = 12
+    residual_latency: int = 6
     rotary_latency: int = 3
-    rotary_table_latency: int = 4    # the turn's multiply, then the table's index, read and interpolation
-    l_attn: int = 64
-    attn_exp_stall: int = 4          # in_ready drops after a key row
-    attn_out_latency: int = 12
+    rotary_table_latency: int = 8
+    attn_row_stall: int = 5          # in_ready drops while the core exponentiates a key row
+    attn_out_latency: int = 26
+    attn_start_latency: int = 2
+    # The memory the unit talks to.  ``port_*`` is one request of the port
+    # itself; the rest is what each operation does around it.
+    port_request: int = 7            # accept, read latency and turnaround
+    port_read_beat: int = 1          # a read beat a cycle
+    port_write_beat: int = 3         # the beat mover reads the buffer, presents, acks
+    mem_read_latency: int = 8
+    mem_write_latency: int = 5
+    reader_latency: int = 8
+    scan_latency: int = 19           # the query in and its codes, before any record is read
+    scan_request: int = 5
+    append_latency: int = 58
+    append_index_latency: int = 34   # the block's index projection, its codes and its record
     port_bytes_per_cycle: float = 16e9 / 800e6   # sixteen devices at 250 MHz DDR x16 against the core clock
 
-    def norm(self, d: int) -> int:
-        return 2 * -(-d // self.l_norm) + self.norm_latency
+    def beats(self, n: int) -> int:
+        return -(-n // self.lanes)
 
-    def tile_pass(self, rows_in: int) -> int:
-        return -(-rows_in // self.rows_per_cycle) + self.pass_latency
+    def norm(self, d: int) -> int:
+        return 2 * self.beats(d) + self.norm_latency
+
+    def tile_pass(self, spec: TileSpec, row_blocks: int, tokens: int, walk: int) -> int:
+        """A pass over ``row_blocks`` row blocks for ``tokens`` tokens.
+
+        Every row block streams the tile's rows ``rows_per_cycle`` at a time
+        and then waits out the columns' requantizer walk, which is a column a
+        cycle for each token.  ``walk`` is the write phase, which visits
+        *every* tile of the array whether or not it is in this pass -- a
+        cycle for one that is not, and a beat of output per token for one
+        that is.  That walk is the array's size rather than the pass's work,
+        and it is what this model used to charge nothing for.
+        """
+        block = spec.rows // spec.rows_per_cycle + spec.cols * tokens + self.tile_block_latency
+        return row_blocks * block + walk + self.tile_done_latency
+
+    def attention(self, rows: int, group: int, head_dim: int) -> int:
+        """One core's command: the queries and the gates in, then a key row
+        and a value row each, then the group's outputs."""
+        beats = -(-head_dim // self.l_attn)
+        return (self.attn_start_latency + 4 * group * beats
+                + rows * (4 * beats + self.attn_row_stall) + group * beats + self.attn_out_latency)
+
+    def port(self, requests: int, beats: int, write: bool = False) -> int:
+        return requests * self.port_request + beats * (self.port_write_beat if write else self.port_read_beat)
+
+    def move(self, beats: int, write: bool) -> int:
+        """The beat mover: memory to the vector buffer, or back."""
+        return (self.port_write_beat * beats + self.mem_write_latency) if write else (beats + self.mem_read_latency)
+
+    def read_records(self, records: int, requests: int, record_beats: int, head_dim: int) -> int:
+        """The record reader: ``records`` key and value records in ``requests``
+        bursts.  A record's beats in and its two rows out are not overlapped,
+        so they add rather than the larger of them standing."""
+        out = 2 * -(-head_dim // self.l_attn)
+        return self.reader_latency + records * (record_beats + out) + self.port_request * requests
+
+    def scan(self, records: int, record_beats: int, selected: int) -> int:
+        """The index scan: the query's codes, then every eligible record read in
+        one burst and scored, then the chosen ids out a cycle each."""
+        if not records:
+            return self.scan_latency
+        return self.scan_latency + self.scan_request + record_beats * records + selected - 1
+
+    def write_record(self, record_beats: int) -> int:
+        return self.port_request + record_beats * self.port_write_beat
+
+    def append(self, heads: int, record_beats: int, block_end: bool) -> int:
+        """The token's window records, and at a block's end its block means and index record."""
+        one = heads * self.write_record(record_beats)
+        return self.append_latency + one + (one + self.append_index_latency if block_end else 0)
 
     def memory(self, nbytes: int, burst_bytes: int) -> int:
         """Cycles the port is busy moving nbytes in bursts of burst_bytes, at the HPI burst efficiency."""
@@ -156,6 +233,56 @@ class Step:
 
 def _plain(name: str) -> str:
     return name[1:] if name.startswith("+") else name
+
+
+def window_bursts(pos: int, window: int) -> int:
+    """Bursts the window records of one head take.  The window is a ring of
+    ``window`` slots written at ``pos % window``, so a context that has
+    wrapped past its start hands the reader two runs rather than one."""
+    first = max(0, pos - window + 1)
+    return 1 if (first % window) + (pos - first + 1) <= window else 2
+
+
+def pass_matrices(cfg, recurrent: bool) -> list[list[tuple[int, int, bool]]]:
+    """Each pass's matrices as ``(in_features, out_features, raw)``.
+
+    ``engine._passes`` compiles the same list from the weights; only the
+    shapes matter for the timing, and they follow from the config, so the
+    model can have them without a compiled layer.  ``engine._tiles`` checks
+    that the two agree."""
+    nh, nkv, hd, idim = cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim, cfg.index_dim
+    nk, nv = cfg.linear_num_key_heads, cfg.linear_num_value_heads
+    hk, hv = cfg.linear_key_head_dim, cfg.linear_value_head_dim
+    d = cfg.hidden_size
+    layer = 0 if recurrent else cfg.global_layer_offset
+    ffn = cfg.layer_intermediate_size(layer)
+    common = [[(d, ffn, False), (d, ffn, False)], [(ffn, d, False)]]     # gate and up, then down
+    if recurrent:
+        kd, vd = nk * hk, nv * hv
+        return [[(d, 2 * kd + vd, False), (d, vd, False), (d, nv, True), (d, nv, True)], [(vd, d, False)]] + common
+    return [[(d, nh * 2 * hd, False), (d, nkv * hd, False), (d, nkv * hd, False),
+             (d, idim, False), (d, idim, False)], [(nh * hd, d, False)]] + common
+
+
+def pass_walk(cfg, spec: TileSpec, recurrent: bool) -> list[int]:
+    """What the write phase of each pass costs, per token of a chunk.
+
+    The pass adapter's write phase steps over *every* tile of the array, one
+    cycle for a tile that is not in this pass and one beat of its output per
+    token for one that is, so the array's size is part of every pass's cost.
+    Returned per pass as ``fixed + per_token``, packed as a pair."""
+    passes = pass_matrices(cfg, recurrent)
+    total = sum(-(-i // spec.rows) * -(-o // spec.cols) for p in passes for i, o, _ in p)
+    out = []
+    for matrices in passes:
+        beats, hits = 0, 0
+        for i, o, raw in matrices:
+            for cb in range(-(-o // spec.cols)):
+                valid = min(spec.cols, o - cb * spec.cols)
+                beats += -(-(valid * (4 if raw else 1)) // BEAT)
+                hits += 1
+        out.append((total - hits, beats))
+    return out
 
 
 def operands(**fields) -> dict:
@@ -297,11 +424,11 @@ def recurrent_program(cfg, c: L.RecurrentConsts | None, spec: TileSpec, mm: Memo
 
     hist_bytes = _beats(conv_dim * (cfg.linear_conv_kernel - 1)) * BEAT
     hist_beats = lay["sizes"]["hist"] // BEAT
-    add("dma.hist_rd", "mem", (), ("hist",), t.memory(hist_bytes, 2048), lambda e: e.__setitem__("hist", e["hist_mem"]), nbytes=hist_bytes,
+    add("dma.hist_rd", "mem", (), ("hist",), t.move(hist_beats, write=False), lambda e: e.__setitem__("hist", e["hist_mem"]), nbytes=hist_bytes,
         ops=operands(src=("m_hist", 0), dst=("hist", 0), arg=MEM_RD, len=hist_beats))
     for i in range(T):
         add(tok("norm.h", i), "norm", ("x",), (_contrib("A", chunk),), t.norm(d), lambda e, i=i: put(e, "A", i, L._norm(get(e, "x", i), c.norm)),
-            ops=operands(src=("x", i * 2 * d), dst=("A", i * d), arg=NORM_RESIDUAL | NORM_INT16, len=d // NL))
+            ops=operands(src=("x", i * 2 * d), dst=("A", i * d), arg=NORM_RESIDUAL | NORM_INT16, len=d // t.lanes))
 
     def in_proj(e):                                     # one buffer P1 per token: qkv | z | b, a accumulators
         for i in range(T):
@@ -310,7 +437,8 @@ def recurrent_program(cfg, c: L.RecurrentConsts | None, spec: TileSpec, mm: Memo
             put(e, "z", i, fabric(c.in_proj_z)(a)[1])
             put(e, "b_acc", i, fabric(c.in_proj_b)(a)[0])
             put(e, "a_acc", i, fabric(c.in_proj_a)(a)[0])
-    add("pass.in_proj", "tiles", ("A",), ("P1",), t.tile_pass(d), in_proj,
+    walk = pass_walk(cfg, spec, recurrent=True)
+    add("pass.in_proj", "tiles", ("A",), ("P1",), t.tile_pass(spec, -(-d // spec.rows), T, walk[0][0] + T * walk[0][1]), in_proj,
         ops=operands(src=("A", 0), dst=("P1", 0), arg=[(0, 0), (8, -(-d // spec.rows)), (16, T)], a2=d, a3=p1))
 
     for i in range(T):
@@ -321,8 +449,8 @@ def recurrent_program(cfg, c: L.RecurrentConsts | None, spec: TileSpec, mm: Memo
             e[hist_name(i + 1)] = nxt
         add(tok("conv", i), "conv", ("P1", hist_name(i)), (_contrib("conv", chunk), hist_name(i + 1)),
             -(-conv_dim // t.l_conv) + t.conv_latency, conv,
-            ops=operands(src=("P1", i * p1), dst=("conv", i * conv_dim), a2=(hist_name(i), 0), a3=(hist_name(i + 1), 0), len=conv_dim // CL))
-    add("dma.hist_wr", "mem", ("hist_next",), (), t.memory(hist_bytes, 2048), lambda e: e.__setitem__("hist_mem", e["hist_next"]), nbytes=hist_bytes,
+            ops=operands(src=("P1", i * p1), dst=("conv", i * conv_dim), a2=(hist_name(i), 0), a3=(hist_name(i + 1), 0), len=conv_dim // t.l_conv))
+    add("dma.hist_wr", "mem", ("hist_next",), (), t.move(hist_beats, write=True), lambda e: e.__setitem__("hist_mem", e["hist_next"]), nbytes=hist_bytes,
         ops=operands(src=("hist_next", 0), dst=("m_hist", 0), arg=MEM_WR, len=hist_beats))
     for i in range(T):
         def gates(e, i=i):
@@ -340,7 +468,7 @@ def recurrent_program(cfg, c: L.RecurrentConsts | None, spec: TileSpec, mm: Memo
                 add(tok(f"norm.{which}[{j}]", i), "norm", ("conv",), (f"+qk_unit[{j}]",), t.norm(hk), unit_norm,
                     engine=j % UNITS["norm"][1],
                     ops=operands(src=("conv", i * conv_dim + off + j * hk), dst=(f"qk_unit[{j}]", i * 2 * hk + (hk if which == "k" else 0)),
-                                 arg=NORM_UNIT, len=hk // NL))
+                                 arg=NORM_UNIT, len=hk // t.lanes))
     # The heads over the state engines, each engine alternating two state slots; a chunk's tokens run on the slot in turn.
     slot_beats = lay["sizes"][_slot(0, 0)] // BEAT
     for h in range(nv):
@@ -348,7 +476,7 @@ def recurrent_program(cfg, c: L.RecurrentConsts | None, spec: TileSpec, mm: Memo
         slot = _slot(e_id, k)
         def s_rd(e, h=h, slot=slot):                       # the slot holds the rows and, for int8, the scale beat
             e[slot] = (e["s_mem"][h], tuple(int(x) for x in e["scale_mem"][h])) if int8_state else e["s_mem"][h]
-        add(f"dma.s_rd[{h}]", "mem", (), (slot,), t.memory(head_bytes, 2048), s_rd, nbytes=head_bytes,
+        add(f"dma.s_rd[{h}]", "mem", (), (slot,), t.move(slot_beats, write=False), s_rd, nbytes=head_bytes,
             ops=operands(src=(f"m_s[{h}]", 0), dst=(slot, 0), arg=MEM_RD, len=slot_beats))
         for i in range(T):
             def delta(e, h=h, slot=slot, i=i):
@@ -362,7 +490,7 @@ def recurrent_program(cfg, c: L.RecurrentConsts | None, spec: TileSpec, mm: Memo
                     e[slot], y = L.delta_state_int(e[slot], k_unit, v, q_unit, decay, beta)
                 put(e, f"y[{h}]", i, y)
             add(tok(f"delta[{h}]", i), "delta", (slot, f"qk_unit[{h // repeat}]", "conv", "gates"),
-                (slot, _contrib(f"y[{h}]", chunk)), 2 * hk + hk + 4 + t.delta_latency, delta, engine=e_id,
+                (slot, _contrib(f"y[{h}]", chunk)), 3 * hk + t.delta_latency, delta, engine=e_id,
                 ops=operands(src=(f"qk_unit[{h // repeat}]", i * 2 * hk), dst=(f"y[{h}]", i * 2 * hv), a2=("conv", i * conv_dim + 2 * kd + h * hv),
                              a3=(slot, 0), arg=("gates", i * lay["gates"] + 4 * h)))
 
@@ -371,28 +499,28 @@ def recurrent_program(cfg, c: L.RecurrentConsts | None, spec: TileSpec, mm: Memo
                 e["s_mem"][h], e["scale_mem"][h] = e[slot]
             else:
                 e["s_mem"][h] = e[slot]
-        add(f"dma.s_wr[{h}]", "mem", (slot,), (), t.memory(head_bytes, 2048), s_wr, nbytes=head_bytes,
+        add(f"dma.s_wr[{h}]", "mem", (slot,), (), t.move(slot_beats, write=True), s_wr, nbytes=head_bytes,
             ops=operands(src=(slot, 0), dst=(f"m_s[{h}]", 0), arg=MEM_WR, len=slot_beats))
         for i in range(T):
             def gnorm(e, h=h, i=i):
                 gate = L.silu_fixed(L.requant(get(e, "z", i)[h * hv:(h + 1) * hv], c.z_mult, c.z_shift, 16))
                 put(e, f"y_norm[{h}]", i, L._norm(get(e, f"y[{h}]", i), c.gated_norm, gain=gate))
-            add(tok(f"gnorm[{h}]", i), "norm", (f"y[{h}]", "P1"), ("+y_norm",), -(-hv // t.l_vec) + t.silu_latency + t.norm(hv), gnorm,
+            add(tok(f"gnorm[{h}]", i), "norm", (f"y[{h}]", "P1"), ("+y_norm",), t.norm(hv), gnorm,
                 engine=h % UNITS["norm"][1],
                 ops=operands(src=(f"y[{h}]", i * 2 * hv), dst=("y_norm", i * vd + h * hv), arg=NORM_GATE | NORM_INT16 | NORM_GATED,
-                             a2=("P1", i * p1 + off_z + h * hv), len=hv // NL))
+                             a2=("P1", i * p1 + off_z + h * hv), len=hv // t.lanes))
 
     def out_proj(e):
         for i in range(T):
             y_norm = np.concatenate([get(e, f"y_norm[{h}]", i) for h in range(nv)])
             put(e, "mixer", i, fabric(c.out_proj)(y_norm)[1])
-    add("pass.out_proj", "tiles", ("y_norm",), ("mixer",), t.tile_pass(vd), out_proj,
+    add("pass.out_proj", "tiles", ("y_norm",), ("mixer",), t.tile_pass(spec, -(-vd // spec.rows), T, walk[1][0] + T * walk[1][1]), out_proj,
         ops=operands(src=("y_norm", 0), dst=("mixer", 0), arg=[(0, 1), (8, -(-vd // spec.rows)), (16, T)], a2=vd, a3=d))
     for i in range(T):
-        add(tok("residual.1", i), "residual", ("x", "mixer"), (_contrib("x1", chunk),), -(-d // t.l_vec) + t.residual_latency,
+        add(tok("residual.1", i), "residual", ("x", "mixer"), (_contrib("x1", chunk),), t.beats(d) + t.residual_latency,
             lambda e, i=i: put(e, "x1", i, L.residual_int(get(e, "x", i), get(e, "mixer", i), c.res_mult, c.res_shift)),
-            ops=operands(src=("x", i * 2 * d), a2=("mixer", i * d), arg=0, dst=("x1", i * 2 * d), len=d // NL))
-    _ffn_steps(add, c.ffn if c is not None else None, spec, d, ffn, t, chunk)
+            ops=operands(src=("x", i * 2 * d), a2=("mixer", i * d), arg=0, dst=("x1", i * 2 * d), len=d // t.lanes))
+    _ffn_steps(add, c.ffn if c is not None else None, spec, d, ffn, t, walk, chunk)
     link(steps)
     return steps
 
@@ -432,7 +560,7 @@ def recurrent_layout(cfg, spec: TileSpec, mm: MemoryMap, chunk: int = 1) -> dict
     return {"sizes": sizes, "off_z": off_z, "off_b": off_b, "off_a": off_a, "p1": p1, "gates": gates}
 
 
-def _ffn_steps(add, f: L.FfnConsts | None, spec: TileSpec, d: int, ffn: int, t: Timing, chunk: int = 1) -> None:
+def _ffn_steps(add, f: L.FfnConsts | None, spec: TileSpec, d: int, ffn: int, t: Timing, walk: list, chunk: int = 1) -> None:
     get, put = _chunk_env(chunk)
     T = chunk
 
@@ -441,28 +569,28 @@ def _ffn_steps(add, f: L.FfnConsts | None, spec: TileSpec, d: int, ffn: int, t: 
 
     for i in range(T):
         add(tok("norm.h2", i), "norm", ("x1",), (_contrib("A2", chunk),), t.norm(d), lambda e, i=i: put(e, "A2", i, L._norm(get(e, "x1", i), f.norm)),
-            ops=operands(src=("x1", i * 2 * d), dst=("A2", i * d), arg=NORM_FFN | NORM_INT16, len=d // NL))
+            ops=operands(src=("x1", i * 2 * d), dst=("A2", i * d), arg=NORM_FFN | NORM_INT16, len=d // t.lanes))
 
     def gate_up(e):
         for i in range(T):
             put(e, "gate_ffn", i, L._fabric(f.gate_proj, get(e, "A2", i), spec)[1])
             put(e, "up_ffn", i, L._fabric(f.up_proj, get(e, "A2", i), spec)[1])
-    add("pass.gate_up", "tiles", ("A2",), ("GU",), t.tile_pass(d), gate_up,
+    add("pass.gate_up", "tiles", ("A2",), ("GU",), t.tile_pass(spec, -(-d // spec.rows), T, walk[2][0] + T * walk[2][1]), gate_up,
         ops=operands(src=("A2", 0), dst=("GU", 0), arg=[(0, 2), (8, -(-d // spec.rows)), (16, T)], a2=d, a3=2 * ffn))
     for i in range(T):
-        add(tok("swiglu", i), "swiglu", ("GU",), (_contrib("act", chunk),), -(-ffn // t.l_vec) + t.swiglu_latency,
+        add(tok("swiglu", i), "swiglu", ("GU",), (_contrib("act", chunk),), t.beats(ffn) + t.swiglu_latency,
             lambda e, i=i: put(e, "act", i, L.swiglu_int(get(e, "gate_ffn", i), get(e, "up_ffn", i), f.mult_g, f.sh_g, f.mult_o, f.sh_o)),
-            ops=operands(src=("GU", i * 2 * ffn), a2=("GU", i * 2 * ffn + ffn), arg=0, dst=("act", i * ffn), len=ffn // NL))
+            ops=operands(src=("GU", i * 2 * ffn), a2=("GU", i * 2 * ffn + ffn), arg=0, dst=("act", i * ffn), len=ffn // t.lanes))
 
     def down(e):
         for i in range(T):
             put(e, "ffn", i, L._fabric(f.down_proj, get(e, "act", i), spec)[1])
-    add("pass.down", "tiles", ("act",), ("ffn",), t.tile_pass(ffn), down,
+    add("pass.down", "tiles", ("act",), ("ffn",), t.tile_pass(spec, -(-ffn // spec.rows), T, walk[3][0] + T * walk[3][1]), down,
         ops=operands(src=("act", 0), dst=("ffn", 0), arg=[(0, 3), (8, -(-ffn // spec.rows)), (16, T)], a2=ffn, a3=d))
     for i in range(T):
-        add(tok("residual.2", i), "residual", ("x1", "ffn"), (_contrib("x2", chunk),), -(-d // t.l_vec) + t.residual_latency,
+        add(tok("residual.2", i), "residual", ("x1", "ffn"), (_contrib("x2", chunk),), t.beats(d) + t.residual_latency,
             lambda e, i=i: put(e, "x2", i, L.residual_int(get(e, "x1", i), get(e, "ffn", i), f.res_mult, f.res_shift)),
-            ops=operands(src=("x1", i * 2 * d), a2=("ffn", i * d), arg=1, dst=("x2", i * 2 * d), len=d // NL))
+            ops=operands(src=("x1", i * 2 * d), a2=("ffn", i * d), arg=1, dst=("x2", i * 2 * d), len=d // t.lanes))
 
 
 def global_program(cfg, c: L.GlobalConsts | None, spec: TileSpec, mm: MemoryMap, pos: int, t: Timing = Timing(),
@@ -482,6 +610,7 @@ def global_program(cfg, c: L.GlobalConsts | None, spec: TileSpec, mm: MemoryMap,
     off_k, off_v, off_iq, off_ik, p1 = lay["off_k"], lay["off_v"], lay["off_iq"], lay["off_ik"], lay["p1"]
     rows_bytes, sel_bytes = lay["rows"], lay["sel"]
     ctx = ("m_ctx", 0, MEM_PAGE_SHIFT)                     # the context's memory page, in a3
+    rec_beats = mm.kv_record_bytes // BEAT                 # a key or value record's beats
     get, put = _chunk_env(chunk)
     T = chunk
     steps: list[Step] = []
@@ -494,7 +623,7 @@ def global_program(cfg, c: L.GlobalConsts | None, spec: TileSpec, mm: MemoryMap,
 
     for i in range(T):
         add(tok("norm.h", i), "norm", ("x",), (_contrib("A", chunk),), t.norm(d), lambda e, i=i: put(e, "A", i, L._norm(get(e, "x", i), c.norm)),
-            ops=operands(src=("x", i * 2 * d), dst=("A", i * d), arg=NORM_RESIDUAL | NORM_INT16, len=d // NL))
+            ops=operands(src=("x", i * 2 * d), dst=("A", i * d), arg=NORM_RESIDUAL | NORM_INT16, len=d // t.lanes))
 
     def qkv(e):                                         # one buffer P1 per token: q, gate | k | v | index_q | index_k
         for i in range(T):
@@ -506,7 +635,8 @@ def global_program(cfg, c: L.GlobalConsts | None, spec: TileSpec, mm: MemoryMap,
             put(e, "v", i, L._fabric(c.v_proj, a, spec)[1].reshape(nkv, hd))
             put(e, "index_q", i, L._fabric(c.index_q, a, spec)[1])
             put(e, "index_k", i, L._fabric(c.index_k, a, spec)[1])
-    add("pass.qkv", "tiles", ("A",), ("P1",), t.tile_pass(d), qkv,
+    walk = pass_walk(cfg, spec, recurrent=False)
+    add("pass.qkv", "tiles", ("A",), ("P1",), t.tile_pass(spec, -(-d // spec.rows), T, walk[0][0] + T * walk[0][1]), qkv,
         ops=operands(src=("A", 0), dst=("P1", 0), arg=[(0, 0), (8, -(-d // spec.rows)), (16, T)], a2=d, a3=p1))
     for i in range(T):
         add(tok("rotary.table", i), "rotary", (), (_contrib("rot", chunk),), rd // 2 + t.rotary_table_latency,
@@ -514,34 +644,33 @@ def global_program(cfg, c: L.GlobalConsts | None, spec: TileSpec, mm: MemoryMap,
             ops=operands(dst=("rot", i * 2 * rd), arg=ROT_TABLE, a3=pos + i, len=rd // 2))
         add(tok("norm.index_q", i), "norm", ("P1",), (_contrib("iq", chunk),), t.norm(idim),
             lambda e, i=i: put(e, "index_q_unit", i, L._norm(get(e, "index_q", i), c.unit_norm)),
-            ops=operands(src=("P1", i * p1 + off_iq), dst=("iq", i * idim), arg=NORM_UNIT, len=idim // NL))
-    rot_cycles = t.norm(hd) + -(-hd // t.l_vec) + t.rotary_latency
+            ops=operands(src=("P1", i * p1 + off_iq), dst=("iq", i * idim), arg=NORM_UNIT, len=idim // t.lanes))
+    rot_cycles = t.norm(hd) + t.beats(hd) + t.rotary_latency
     for i in range(T):
         for n in range(nkv):
             def krot(e, n=n, i=i):
                 put(e, f"k[{n}]", i, L.rotary_int(L._norm(get(e, "k_raw", i)[n], c.k_norm), *get(e, "rot", i), rd, c.rot_mult_k, c.rot_sh_k))
             add(tok(f"rotary.k[{n}]", i), "rotary", ("P1", "rot"), ("+k",), rot_cycles, krot, engine=n % UNITS["rotary"][1],
                 ops=operands(src=("P1", i * p1 + off_k + n * hd), dst=("k", i * nkv * hd + n * hd), arg=ROT_HEAD | (1 << 4),
-                             a2=("rot", i * 2 * rd), len=hd // NL))
+                             a2=("rot", i * 2 * rd), len=hd // t.lanes))
         for h in range(nh):
             def qrot(e, h=h, i=i):
                 put(e, f"q[{h}]", i, L.rotary_int(L._norm(get(e, "q_raw", i)[h], c.q_norm), *get(e, "rot", i), rd, c.rot_mult_q, c.rot_sh_q))
             add(tok(f"rotary.q[{h}]", i), "rotary", ("P1", "rot"), (f"+qg[{h // group}]",), rot_cycles, qrot, engine=h % UNITS["rotary"][1],
                 ops=operands(src=("P1", i * p1 + h * 2 * hd), dst=(f"qg[{h // group}]", i * group * hd + (h % group) * hd), arg=ROT_HEAD,
-                             a2=("rot", i * 2 * rd), len=hd // NL))
+                             a2=("rot", i * 2 * rd), len=hd // t.lanes))
     # The memory side, token by token: append this token's records, scan the index, then stream rows to the cores.
-    row_cycles = 2 * -(-hd // t.l_attn) + t.attn_exp_stall
     for i in range(T):
         p = pos + i
         append_bytes = nkv * mm.kv_record_bytes + (nkv * mm.kv_record_bytes + mm.index_record_bytes) // mm.block + 2 * mm.sums_bytes
-        add(tok("mem.append", i), "mem", ("k", "P1"), (), t.memory(append_bytes, mm.kv_record_bytes), nbytes=append_bytes,
+        add(tok("mem.append", i), "mem", ("k", "P1"), (), t.append(nkv, rec_beats, (p + 1) % mm.block == 0), nbytes=append_bytes,
             ops=operands(src=("k", i * nkv * hd), dst=("P1", i * p1 + off_ik), a2=("P1", i * p1 + off_v), a3=ctx,
                          arg=[(0, MEM_APPEND), (4, p)]))
         # The scan reads the index a page of records per request; the rows are the
         # window (head-major, page bursts) and one mean record per selected block.
         eligible = eligible_blocks(p, mm.local_window, mm.block)
         scan_bytes = eligible * mm.index_record_bytes
-        add(tok("mem.scan", i), "mem", ("iq",), (_contrib("sel", chunk),), t.memory(scan_bytes, mm.index_burst_records * mm.index_record_bytes),
+        add(tok("mem.scan", i), "mem", ("iq",), (_contrib("sel", chunk),), t.scan(eligible, mm.index_record_bytes // BEAT, min(cfg.top_blocks, eligible)),
             lambda e, i=i: put(e, "selected", i, None), nbytes=scan_bytes,
             ops=operands(src=("iq", i * idim), dst=("sel", i * sel_bytes), a3=ctx, arg=[(0, MEM_SCAN), (4, p)]))
         n_window, n_blocks = min(p + 1, mm.local_window), min(cfg.top_blocks, eligible)
@@ -554,7 +683,7 @@ def global_program(cfg, c: L.GlobalConsts | None, spec: TileSpec, mm: MemoryMap,
                 k_rows, v_rows = (e["k_rows"][i], e["v_rows"][i]) if chunk > 1 else (e["k_rows"], e["v_rows"])
                 put(e, f"rows[{n}]", i, (k_rows[n], v_rows[n]))
             add(tok(f"mem.rows[{n}]", i), "mem", ("sel",), (_contrib(f"rows[{n}]", chunk),),
-                t.memory(window_bytes, mm.window_burst_records * mm.kv_record_bytes) + t.memory(block_bytes, mm.kv_record_bytes),
+                t.read_records(rows, window_bursts(p, mm.local_window) + n_blocks, rec_beats, hd),
                 mem_rows, nbytes=window_bytes + block_bytes,
                 ops=operands(src=("sel", i * sel_bytes), dst=(f"rows[{n}]", i * rows_bytes), a2=n, a3=ctx, arg=[(0, MEM_ROWS), (4, p)], len=rows))
 
@@ -564,7 +693,7 @@ def global_program(cfg, c: L.GlobalConsts | None, spec: TileSpec, mm: MemoryMap,
                 put(e, f"att[{n}]", i, L.attention_int(q, get(e, "gate", i)[heads], k_rows, v_rows, mult_s=c.mult_s, sh_s=c.sh_s,
                                                        mult_gate=c.mult_gate, sh_gate=c.sh_gate, mult_o=c.mult_o, sh_o=c.sh_o))
             add(tok(f"attn[{n}]", i), "attn", (f"qg[{n}]", "P1", f"rows[{n}]"), ("+att",),
-                rows * row_cycles + group * (hd // t.l_attn) + t.attn_out_latency, attn, engine=n % UNITS["attn"][1],
+                t.attention(rows, group, hd), attn, engine=n % UNITS["attn"][1],
                 ops=operands(src=(f"qg[{n}]", i * group * hd), dst=("att", i * nh * hd + n * group * hd),
                              a2=("P1", i * p1 + n * group * 2 * hd + hd), a3=(f"rows[{n}]", i * rows_bytes), len=rows))
 
@@ -572,13 +701,13 @@ def global_program(cfg, c: L.GlobalConsts | None, spec: TileSpec, mm: MemoryMap,
         for i in range(T):
             att = np.concatenate([get(e, f"att[{n}]", i) for n in range(nkv)]).reshape(nh * hd)
             put(e, "mixer", i, L._fabric(c.o_proj, att, spec)[1])
-    add("pass.o_proj", "tiles", ("att",), ("mixer",), t.tile_pass(nh * hd), o_proj,
+    add("pass.o_proj", "tiles", ("att",), ("mixer",), t.tile_pass(spec, -(-(nh * hd) // spec.rows), T, walk[1][0] + T * walk[1][1]), o_proj,
         ops=operands(src=("att", 0), dst=("mixer", 0), arg=[(0, 1), (8, -(-(nh * hd) // spec.rows)), (16, T)], a2=nh * hd, a3=d))
     for i in range(T):
-        add(tok("residual.1", i), "residual", ("x", "mixer"), (_contrib("x1", chunk),), -(-d // t.l_vec) + t.residual_latency,
+        add(tok("residual.1", i), "residual", ("x", "mixer"), (_contrib("x1", chunk),), t.beats(d) + t.residual_latency,
             lambda e, i=i: put(e, "x1", i, L.residual_int(get(e, "x", i), get(e, "mixer", i), c.res_mult, c.res_shift)),
-            ops=operands(src=("x", i * 2 * d), a2=("mixer", i * d), arg=0, dst=("x1", i * 2 * d), len=d // NL))
-    _ffn_steps(add, c.ffn if c is not None else None, spec, d, ffn, t, chunk)
+            ops=operands(src=("x", i * 2 * d), a2=("mixer", i * d), arg=0, dst=("x1", i * 2 * d), len=d // t.lanes))
+    _ffn_steps(add, c.ffn if c is not None else None, spec, d, ffn, t, walk, chunk)
     link(steps)
     return steps
 
@@ -721,7 +850,15 @@ class Schedule:
 
     @property
     def cycles(self) -> int:
-        return max(self.end) if self.end else 0
+        """What the engine counts: ``start`` to the cycle the controller
+        reports done, which is the cycle after the last release drained."""
+        return max(self.release) + 1 if self.release else 0
+
+    @property
+    def last_done(self) -> int:
+        """The cycle the last command's completion arrives, counted from the
+        first issue: what a testbench over stub units sees."""
+        return max(self.end) + 1 if self.end else 0
 
     def busy(self, unit: str) -> int:
         return sum(s.cycles for s in self.steps if s.unit == unit)
@@ -778,7 +915,10 @@ def schedule(steps: list[Step], releases: int = RELEASES) -> Schedule:
         if (i < n and (i == 0 or cycle > issue[i - 1])
                 and port_of[i] not in pending and port_of[i] not in running
                 and all(release[d] is not None and release[d] <= cycle for d in steps[i].deps)):
-            issue[i], end[i] = cycle, cycle + steps[i].cycles
+            # ``cycles`` is what the engine's own spans measure: the cycle the
+            # command issued to the cycle its completion arrived.  The unit
+            # therefore stops working one before that, and reports done at it.
+            issue[i], end[i] = cycle, cycle + steps[i].cycles - 1
             running[port_of[i]] = i
             i += 1
         # The next cycle anything can happen: a drain, a completion, or --
@@ -821,14 +961,19 @@ def encode(steps: list[Step], layout=None) -> list[int]:
     produced ids and their contribution bits (0xFF is no buffer).  Without
     a layout the length is the step's cycles and the operand fields are
     zero (the stub units); with one (``engine.Layout``) the fields are the
-    step's operands."""
+    step's operands.  A stub unit takes its duration from ``arg`` rather
+    than the length, because a full-size command can run longer than the
+    length field is wide -- one attention core streams tens of thousands of
+    context rows -- while a real command's length is always its beats."""
     ids = buffer_ids(steps)
     words = []
     for i, step in enumerate(steps):
-        assert step.cycles < (1 << 16) and step.engine < 16
+        assert step.cycles < (1 << 32) and step.engine < 16
         ops = step.ops if layout is not None and step.ops is not None else {}
-        length = resolve_value(ops["len"], layout) if "len" in ops else step.cycles
+        length = resolve_value(ops["len"], layout) if "len" in ops else min(step.cycles, 0xFFFF)
         fields = {k: resolve_value(ops.get(k), layout) for k in ("arg", "src", "dst", "a2", "a3")}
+        if layout is None:
+            fields["arg"] = step.cycles
         assert length < (1 << 16) and fields["arg"] < (1 << 32), step.name
         assert all(fields[k] < (1 << ADDR_BITS) for k in ("src", "dst", "a2", "a3")), step.name
         w = UNITS[step.unit][0] | (step.engine << 4) | (int(i == len(steps) - 1) << 8) | (length << 16)
@@ -854,7 +999,7 @@ def emit_program(directory: Path, steps: list[Step]) -> dict:
     write_hex(directory / "program.hex", encode(steps), 256)
     sched = schedule(steps)
     (directory / "expected_issue.txt").write_text("".join(f"{i} {a} {b}\n" for i, (a, b) in enumerate(zip(sched.issue, sched.end))))
-    params = {"N": len(steps), "EXPECTED_CYCLES": sched.cycles}
+    params = {"N": len(steps), "EXPECTED_CYCLES": sched.last_done}
     for name, (uid, engines) in UNITS.items():
         params[f"E{uid}"] = engines
     (directory / "params.json").write_text(json.dumps(params))

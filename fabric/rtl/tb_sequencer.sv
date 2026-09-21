@@ -18,12 +18,13 @@ module fabric_unit_stub #(
     input  wire          cmd_valid,
     input  wire [3:0]    cmd_engine,
     input  wire [15:0]   cmd_len,
+    input  wire [31:0]   cmd_arg,
     input  wire [7:0]    cmd_tag,
     output wire          cmd_ready,
     output reg  [NE-1:0] done_valid,
     output reg  [NE*8-1:0] done_tag
 );
-    reg [15:0] remaining [0:NE-1];
+    reg [31:0] remaining [0:NE-1];
     reg [7:0]  tag_r     [0:NE-1];
     reg [NE-1:0] busy;
     assign cmd_ready = (cmd_engine < E) && !busy[cmd_engine];
@@ -38,13 +39,19 @@ module fabric_unit_stub #(
                 if (busy[e]) begin
                     if (remaining[e] <= 1) begin
                         busy[e] <= 1'b0; done_valid[e] <= 1'b1; done_tag[e*8 +: 8] <= tag_r[e];
-                        $fdisplay(tb_sequencer.trace, "%0d %0d %0d %0d %0d", tag_r[e], UID, e, tb_sequencer.issued_at[tag_r[e]], tb_sequencer.cycle);
-                        tb_sequencer.last_done = tb_sequencer.cycle;
+                        // done_valid is assigned here and seen the cycle after, so
+                        // that is the cycle the completion arrives.
+                        $fdisplay(tb_sequencer.trace, "%0d %0d %0d %0d %0d", tag_r[e], UID, e, tb_sequencer.issued_at[tag_r[e]], tb_sequencer.cycle + 1);
+                        tb_sequencer.last_done = tb_sequencer.cycle + 1;
                     end else remaining[e] <= remaining[e] - 1'b1;
                 end
             end
             if (cmd_valid && cmd_ready) begin
-                busy[cmd_engine] <= 1'b1; remaining[cmd_engine] <= cmd_len; tag_r[cmd_engine] <= cmd_tag;
+                // arg is the command's whole span, issue to completion, as a real
+                // adapter's is; the first of those cycles is this one.  It is not
+                // the length, which is sixteen bits and holds a real command's beats.
+                busy[cmd_engine] <= 1'b1; remaining[cmd_engine] <= (cmd_arg > 1) ? cmd_arg - 1'b1 : 32'd1;
+                tag_r[cmd_engine] <= cmd_tag;
             end
         end
     end
@@ -87,7 +94,7 @@ module tb_sequencer #(
     generate
         for (u = 0; u < NU; u = u + 1) begin : g_unit
             fabric_unit_stub #(.UID(u), .E(engines(u)), .NE(NE)) stub (
-                .clk(clk), .rst_n(rst_n), .cmd_valid(cmd_valid[u]), .cmd_engine(cmd_engine), .cmd_len(cmd_len),
+                .clk(clk), .rst_n(rst_n), .cmd_valid(cmd_valid[u]), .cmd_engine(cmd_engine), .cmd_len(cmd_len), .cmd_arg(cmd_arg),
                 .cmd_tag(cmd_tag), .cmd_ready(cmd_ready[u]), .done_valid(done_valid[u*NE +: NE]), .done_tag(done_tag[u*NE*8 +: NE*8]));
         end
     endgenerate
