@@ -111,46 +111,100 @@ module fabric_vb #(
     reg [127:0]  wd [0:NB*WPOT-1];
     reg [15:0]   wm [0:NB*WPOT-1];
     reg          wv [0:NB*WPOT-1];
-    integer i, j, b, s;
+    // Every port's slot, decided in parallel rather than by a scan.  Written as
+    // a walk over the ports carrying rn[b] from one to the next, the allocator
+    // is an NR-deep chain of compare-and-update per bank, which is where this
+    // module's 7.9 ns went -- the shape the sequencer's drain had.  The same
+    // decision made all at once is: which ports name an address first in their
+    // bank, how many such ports come before each of them, and for a port that
+    // is not first, the slot of the one it matched.  All three are compares
+    // and counts over the ports, of logarithmic depth.
+    reg [NR-1:0]   r_use, r_first;
+    reg [1:0]      r_pre [0:NR-1];                       // slot if first: distinct addresses before it
+    reg [1:0]      r_ix  [0:NR-1];                       // the slot it actually takes
+    reg [NW-1:0]   w_use;
+    reg [1:0]      w_pre [0:NW-1];
+    reg [BB-1:0]   w_bank [0:NW-1];
+    integer i, j, b, s, n;
 `ifndef FABRIC_SYNTH
     integer      max_rd [0:NB-1], max_wr [0:NB-1];       // over the run, for the report
     initial for (i = 0; i < NB; i = i + 1) begin max_rd[i] = 0; max_wr[i] = 0; end
 `endif
 
     always @(*) begin
-        for (i = 0; i < NB; i = i + 1) begin rn[i] = 0; wn[i] = 0; end
-        for (i = 0; i < NB*RPOT; i = i + 1) begin ra[i] = 0; rv[i] = 1'b0; end
-        for (i = 0; i < NB*WPOT; i = i + 1) begin wa[i] = 0; wd[i] = 0; wm[i] = 0; wv[i] = 1'b0; end
+        // Reads: which ports are asking, and which of them names its address
+        // first in its bank.  A later port with the same address shares that
+        // port's slot, which is what lets two units stream one buffer.
         for (i = 0; i < NR; i = i + 1) begin
             r_bank[i] = bank_of(rd_addr[i*AW +: AW]);
-            r_slot[i] = 0;
-            r_got[i] = 1'b0;
-            if (rd_en[i] && (^rd_addr[i*AW +: AW] !== 1'bx)) begin
-                b = r_bank[i];
-                for (s = 0; s < RMAX; s = s + 1)           // a constant bound: synthesis wants one
-                    if (s < rn[b] && !r_got[i] && ra[(b << RSH) + s] == rd_addr[i*AW +: AW]) begin
-                        r_slot[i] = s[1:0]; r_got[i] = 1'b1;
+            r_use[i]  = rd_en[i] && (^rd_addr[i*AW +: AW] !== 1'bx);
+        end
+        for (i = 0; i < NR; i = i + 1) begin
+            r_first[i] = r_use[i];
+            for (j = 0; j < NR; j = j + 1)
+                if (j < i && r_use[j] && r_bank[j] == r_bank[i]
+                    && rd_addr[j*AW +: AW] == rd_addr[i*AW +: AW]) r_first[i] = 1'b0;
+        end
+        for (i = 0; i < NR; i = i + 1) begin
+            n = 0;                                        // distinct addresses of this bank before i
+            for (j = 0; j < NR; j = j + 1)
+                if (j < i && r_first[j] && r_bank[j] == r_bank[i] && n < RMAX) n = n + 1;
+            r_pre[i] = n[1:0];
+        end
+        for (i = 0; i < NR; i = i + 1) begin
+            r_ix[i] = r_pre[i];                           // and a sharer takes the slot it matched
+            if (!r_first[i])
+                for (j = 0; j < NR; j = j + 1)
+                    if (j < i && r_first[j] && r_bank[j] == r_bank[i]
+                        && rd_addr[j*AW +: AW] == rd_addr[i*AW +: AW]) r_ix[i] = r_pre[j];
+            r_slot[i] = r_ix[i];
+            r_got[i]  = r_use[i] && (r_ix[i] < RMAX);
+        end
+        for (b = 0; b < NB; b = b + 1) begin
+            rn[b] = 0;
+            for (i = 0; i < NR; i = i + 1)
+                if (r_first[i] && r_bank[i] == b) rn[b] = rn[b] + 1;
+            for (s = 0; s < RPOT; s = s + 1) begin
+                ra[(b << RSH) + s] = 0;
+                rv[(b << RSH) + s] = 1'b0;
+                for (i = 0; i < NR; i = i + 1)            // one-hot: one port owns a slot
+                    if (r_first[i] && r_bank[i] == b && r_pre[i] == s && s < RMAX) begin
+                        ra[(b << RSH) + s] = ra[(b << RSH) + s] | rd_addr[i*AW +: AW];
+                        rv[(b << RSH) + s] = 1'b1;
                     end
-                if (!r_got[i] && rn[b] < RMAX) begin
-                    ra[(b << RSH) + rn[b]] = rd_addr[i*AW +: AW];
-                    rv[(b << RSH) + rn[b]] = 1'b1;
-                    r_slot[i] = rn[b][1:0];
-                    r_got[i] = 1'b1;
-                    rn[b] = rn[b] + 1;
-                end
             end
         end
-        for (i = 0; i < NW; i = i + 1)
-            if (wr_en[i]) begin
-                b = bank_of(wr_addr[i*AW +: AW]);
-                if (wn[b] < WMAX) begin
-                    wa[(b << WSH) + wn[b]] = wr_addr[i*AW +: AW];
-                    wd[(b << WSH) + wn[b]] = wr_data[i*128 +: 128];
-                    wm[(b << WSH) + wn[b]] = wr_be[i*16 +: 16];
-                    wv[(b << WSH) + wn[b]] = 1'b1;
-                    wn[b] = wn[b] + 1;
-                end else wn[b] = wn[b] + 1;
+        // Writes: no sharing, so a port's slot is how many of its bank come
+        // before it.  A bank asked for more than it has is still counted, so
+        // the check below sees it.
+        for (i = 0; i < NW; i = i + 1) begin
+            w_bank[i] = bank_of(wr_addr[i*AW +: AW]);
+            w_use[i]  = wr_en[i];
+        end
+        for (i = 0; i < NW; i = i + 1) begin
+            n = 0;
+            for (j = 0; j < NW; j = j + 1)
+                if (j < i && w_use[j] && w_bank[j] == w_bank[i] && n < WMAX) n = n + 1;
+            w_pre[i] = n[1:0];
+        end
+        for (b = 0; b < NB; b = b + 1) begin
+            wn[b] = 0;
+            for (i = 0; i < NW; i = i + 1)
+                if (w_use[i] && w_bank[i] == b) wn[b] = wn[b] + 1;
+            for (s = 0; s < WPOT; s = s + 1) begin
+                wa[(b << WSH) + s] = 0;
+                wd[(b << WSH) + s] = 0;
+                wm[(b << WSH) + s] = 0;
+                wv[(b << WSH) + s] = 1'b0;
+                for (i = 0; i < NW; i = i + 1)
+                    if (w_use[i] && w_bank[i] == b && w_pre[i] == s && s < WMAX) begin
+                        wa[(b << WSH) + s] = wa[(b << WSH) + s] | wr_addr[i*AW +: AW];
+                        wd[(b << WSH) + s] = wd[(b << WSH) + s] | wr_data[i*128 +: 128];
+                        wm[(b << WSH) + s] = wm[(b << WSH) + s] | wr_be[i*16 +: 16];
+                        wv[(b << WSH) + s] = 1'b1;
+                    end
             end
+        end
     end
 
 `ifndef FABRIC_SYNTH
