@@ -1421,7 +1421,7 @@ against them, and the 105 tests pass.
 | head_gates | the per-head gates | 2.13 -> 1.58 | 1.45 -> 1.40 | 24,704 |
 | swiglu | SwiGLU, two lanes | 4.07 -> 1.90 | 2.50 -> 1.02 | 30,126 |
 | residual | the residual add, four lanes | 2.27 -> 2.16 -> 1.53 | 1.50 -> 1.03 -> 0.89 | 12,182 |
-| rotary | the rotation, two lanes | 5.71 -> 2.50 | 5.00 -> 1.54 | 29,217 |
+| rotary | the rotation, two lanes | 5.71 -> 2.50 -> 1.94 | 5.00 -> 1.54 | 25,338 |
 | rotary_table | the rotary table | 2.48 -> 2.13 | 1.93 -> 1.59 | 15,344 |
 | attention | the attention core, one head of 32, two lanes | 59.62 -> 11.35 -> 2.41 | 33.94 -> 29.68 -> 1.49 | 90,462 |
 | index_scan | the index scan, 32 codes | 13.94 -> 2.08 | 12.73 -> 2.44 | 13,504 |
@@ -1507,10 +1507,23 @@ their bits suggest, where an SRAM is paid for in full -- as macros they
 cost the head gates 23,190 NAND2-eq -> 153,257 and the rotary table
 15,493 -> 51,422, and both got slower by the macro's access time.
 
-What is left of that kind is the units still at 2.0 to 2.5 ns -- the
-rotation, the attention core, the rotary table, the conv, the state engine
--- where what is left is a table's decode or a barrel shifter rather than
-a multiply's carry. The 800 MHz placeholder still needs them: at 2 ns a
+The **rotation** was the last of the register vectors that wanted to be a
+memory, and the only one that took a little thought.  Its head sat in a
+vector of HD by 16 bits read three ways per lane, and the drain address on
+one flop at 593 loads was two of its two and a half nanoseconds.  Two of
+those three reads are the same element -- the one the cosine multiplies is
+the lane's own either way, `buffer[pp]` for `e < H` and `buffer[pp + H]`
+for `e >= H` both being `buffer[e]` -- so they collapse into one window for
+the whole beat, and that window is the beat the memory hands over.  What
+cannot be beat-aligned is the partner at `e` plus or minus `H`, and only
+the first R elements are ever rotated, so those stay in logic: a fraction
+of HD, and the mux that is left is that fraction of the one that was.
+2.50 -> 1.94 ns, 29,217 NAND2-eq -> 25,338, and ASAP7 unmoved at 1.54.
+
+What is left of that kind is the units still at 2.0 to 2.4 ns -- the
+attention core, the rotary table, the conv, the state engine -- where what
+is left is a table's decode or a barrel shifter rather than a multiply's
+carry. The 800 MHz placeholder still needs them: at 2 ns a
 stage the die clocks at 500 MHz, not 800.
 
 The other kind was not logic at all. The attention core and the append

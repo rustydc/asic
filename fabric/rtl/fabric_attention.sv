@@ -90,22 +90,47 @@ module fabric_rotary #(
     localparam int BEATS = HD / L;
     localparam int BW    = $clog2(BEATS) + 1;
     localparam int H     = R / 2;
-    reg [HD*16-1:0] buffer;
+    // The head is a memory of beats, not a register vector.  Read as a vector
+    // it is one mux over HD by 16 bits per lane, and the drain address on one
+    // flop at 593 loads was two of this unit's two and a half nanoseconds --
+    // the shape the record reader and the attention core's accumulators had.
+    // Only the first R elements are rotated, so only those need the partner
+    // read that is not beat-aligned, and they stay in logic: R is a fraction
+    // of HD and the mux that is left is that fraction of the one that was.
+    localparam int RA = (BEATS > 1) ? $clog2(BEATS) : 1;
+    reg [R*16-1:0]  rot_buf;                  // the rotated elements, for the partner
     reg [BW-1:0]    wr, rd, rd_addr;
+    // A copy of the drain address per lane.  The address selects three
+    // sixteen-bit windows of the buffer for every lane and an entry of each
+    // table, which came to 593 loads on one flop and two of this unit's two
+    // and a half nanoseconds.  Marked so the optimizer does not merge them
+    // back into one net; they are the same value in the same cycle, so
+    // nothing moves.
+    (* keep *) reg [BW-1:0] rd_l [0:L-1];
     reg             draining, rd_valid;
+    integer         lc;
+    // The address leads the data by a cycle, which is what `rd` already is:
+    // the drain registers it into rd_addr, so the beat the memory is asked
+    // for now is the beat rd_addr will name next cycle.
+    wire [L*16-1:0] beat_q;
+    fabric_sram #(.W(L*16), .D(BEATS), .NRD(1), .NWR(1), .MB(L*16)) u_buf (
+        .clk(clk), .rd_en(1'b1), .rd_addr(rd[RA-1:0]), .rd_data(beat_q),
+        .wr_en(in_valid), .wr_addr(wr[RA-1:0]), .wr_data(in_x), .wr_mask(1'b1));
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             wr <= 0; rd <= 0; draining <= 1'b0; rd_valid <= 1'b0;
         end else begin
             rd_valid <= 1'b0;
             if (in_valid) begin
-                buffer[wr*L*16 +: L*16] <= in_x;
+                for (lc = 0; lc < L; lc = lc + 1)
+                    if (wr * L + lc < R) rot_buf[(wr * L + lc)*16 +: 16] <= in_x[lc*16 +: 16];
                 wr <= wr + 1'b1;
                 if (wr == BEATS - 1) begin draining <= 1'b1; rd <= 0; wr <= 0; end
             end
             if (draining) begin
                 rd_valid <= 1'b1;
                 rd_addr <= rd;
+                for (lc = 0; lc < L; lc = lc + 1) rd_l[lc] <= rd;
                 rd <= rd + 1'b1;
                 if (rd == BEATS - 1) draining <= 1'b0;
             end
@@ -117,7 +142,7 @@ module fabric_rotary #(
     // same two elements and the same table entry, so the half only chooses
     // which is multiplied by the cosine and whether the terms add.
     reg            v1, v2, v3, v4;
-    reg [L*16-1:0] ca1, sa1, cs1, sn1, pt1;
+    reg [L*16-1:0] sa1, cs1, sn1, pt1;
     reg [L-1:0]    rot1, add1;
     reg [L-1:0]    rot2, add2, rot3;
     reg [L*16-1:0] pt2, pt3;
@@ -126,25 +151,42 @@ module fabric_rotary #(
     reg signed [31:0] pb2 [0:L-1];
     reg [L*16-1:0] y3;
     reg signed [31:0] pm4 [0:L-1];
-    integer l, e, pp;
+    integer l, e, pp, pa;
     reg signed [32:0] comb;
+    // The output requantizer's scale and shift are command constants on input
+    // pins, and they drive every lane's multiplier and shifter: a copy each
+    // per lane, as the norm, the state engine and the residual take.
+    wire [15:0] mult_l [0:L-1];
+    wire [5:0]  shift_l [0:L-1];
+    genvar gq;
+    generate
+        for (gq = 0; gq < L; gq = gq + 1) begin : g_q
+            fabric_const_copy #(.W(16)) u_m (.clk(clk), .d(mult),  .q(mult_l[gq]));
+            fabric_const_copy #(.W(6))  u_s (.clk(clk), .d(shift), .q(shift_l[gq]));
+        end
+    endgenerate
     always @(posedge clk) begin
         v1 <= rd_valid;
+        // The element the cosine multiplies is the lane's own element either
+        // way -- for e < H it is buffer[pp] and for e >= H buffer[pp + H],
+        // and both are buffer[e] -- so it is the beat itself, one window for
+        // every lane rather than a window each, and the same value the
+        // pass-through carries.  Only the partner is per lane.
+        pt1 <= beat_q;
         for (l = 0; l < L; l = l + 1) begin
-            e  = rd_addr * L + l;
+            e  = rd_l[l] * L + l;
             pp = (e < H) ? e : (e - H);
+            pa = (e < H) ? (e + H) : (e - H);          // the element it is paired with
             rot1[l] <= (e < R);
             add1[l] <= (e >= H);                       // the second half adds its terms
-            ca1[l*16 +: 16] <= (e < H) ? buffer[pp*16 +: 16] : buffer[(pp + H)*16 +: 16];
-            sa1[l*16 +: 16] <= (e < H) ? buffer[(pp + H)*16 +: 16] : buffer[pp*16 +: 16];
+            sa1[l*16 +: 16] <= (pa < R) ? rot_buf[pa*16 +: 16] : 16'd0;
             cs1[l*16 +: 16] <= cos_tab[pp*16 +: 16];
             sn1[l*16 +: 16] <= sin_tab[pp*16 +: 16];
-            pt1[l*16 +: 16] <= buffer[e*16 +: 16];
         end
         // P2: the two products.
         v2 <= v1; rot2 <= rot1; add2 <= add1; pt2 <= pt1;
         for (l = 0; l < L; l = l + 1) begin
-            pa2[l] <= $signed(ca1[l*16 +: 16]) * $signed(cs1[l*16 +: 16]);
+            pa2[l] <= $signed(pt1[l*16 +: 16]) * $signed(cs1[l*16 +: 16]);
             pb2[l] <= $signed(sa1[l*16 +: 16]) * $signed(sn1[l*16 +: 16]);
         end
         // P3: combine, round and saturate, or pass the element through.
@@ -157,10 +199,10 @@ module fabric_rotary #(
         // P4 and P5: the output requantizer.
         v4 <= v3;
         for (l = 0; l < L; l = l + 1)
-            pm4[l] <= $signed(y3[l*16 +: 16]) * $signed({16'b0, mult});
+            pm4[l] <= $signed(y3[l*16 +: 16]) * $signed({16'b0, mult_l[l]});
         out_valid <= v4;
         for (l = 0; l < L; l = l + 1)
-            out_y[l*8 +: 8] <= fx_sat(fx_rnd_shr(pm4[l], shift), 8);
+            out_y[l*8 +: 8] <= fx_sat(fx_rnd_shr(pm4[l], shift_l[l]), 8);
     end
 endmodule
 
