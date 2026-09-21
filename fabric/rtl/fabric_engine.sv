@@ -33,21 +33,6 @@
 `default_nettype none
 `include "fabric_fx.svh"
 
-// A register the mapper may not merge away.  Sixteen registers with the same
-// input are one register to it -- `keep` on the signal keeps the net and not
-// the flop -- and a copy per slice of a read port's answer is the only reason
-// these exist.
-(* keep_hierarchy *)
-module fabric_keep_copy #(
-    parameter int W = 1
-) (
-    input  wire         clk,
-    input  wire [W-1:0] d,
-    output reg  [W-1:0] q
-);
-    always @(posedge clk) q <= d;
-endmodule
-
 // ---------------------------------------------------------------------------
 // The vector buffer.
 // ---------------------------------------------------------------------------
@@ -376,8 +361,8 @@ module fabric_vb #(
             for (gg = 0; gg < 16; gg = gg + 1) begin : g_byte
                 wire [SB-1:0] sel_l;
                 wire          odd_l;
-                fabric_keep_copy #(.W(SB)) u_sel (.clk(clk), .d(sel_w), .q(sel_l));
-                fabric_keep_copy #(.W(1))  u_odd (.clk(clk), .d(odd_w), .q(odd_l));
+                fabric_const_copy #(.W(SB)) u_sel (.clk(clk), .d(sel_w), .q(sel_l));
+                fabric_const_copy #(.W(1))  u_odd (.clk(clk), .d(odd_w), .q(odd_l));
                 wire [NB*RPOT*8-1:0] e_b, o_b;          // this byte of every slot of every bank
                 for (gk = 0; gk < NB*RPOT; gk = gk + 1) begin : g_word
                     assign e_b[gk*8 +: 8] = even_q[gk*128 + gg*8 +: 8];
@@ -391,8 +376,8 @@ module fabric_vb #(
             for (gg = 0; gg < 16; gg = gg + 1) begin : g_out
                 wire [3:0] off_l;
                 wire       en_l;
-                fabric_keep_copy #(.W(4)) u_off (.clk(clk), .d(off_w), .q(off_l));
-                fabric_keep_copy #(.W(1)) u_en  (.clk(clk), .d(en_w),  .q(en_l));
+                fabric_const_copy #(.W(4)) u_off (.clk(clk), .d(off_w), .q(off_l));
+                fabric_const_copy #(.W(1)) u_en  (.clk(clk), .d(en_w),  .q(en_l));
                 wire [127:0] pick;                      // the sixteen bytes this one could come from
                 for (gk = 0; gk < 16; gk = gk + 1) begin : g_pick
                     assign pick[gk*8 +: 8] = win[(gg + gk)*8 +: 8];
