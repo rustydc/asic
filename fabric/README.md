@@ -1417,20 +1417,20 @@ against them, and the 105 tests pass.
 | columns | the tile's column datapath, 16 columns | 1.14 | 0.73 | 40,573 |
 | rmsnorm | the norm, two lanes, with the inverse square root | 4.41 -> 1.75 | 2.29 -> 1.24 | 69,492 |
 | delta_state8 | the int8 state engine, four lanes of a 16-row state | 22.93 -> 2.12 | 11.26 -> 1.31 | 130,970 |
-| conv_silu | the causal conv and SiLU, two lanes | 2.25 | 1.72 | 41,147 |
+| conv_silu | the causal conv and SiLU, two lanes | 2.25 -> 2.06 | 1.72 -> 1.22 | 39,510 |
 | head_gates | the per-head gates | 2.13 -> 2.10 | 1.45 -> 1.43 | 26,666 |
 | swiglu | SwiGLU, two lanes | 4.07 -> 1.90 | 2.50 -> 1.02 | 30,126 |
-| residual | the residual add, four lanes | 2.27 -> 2.16 | 1.50 -> 1.03 | 13,489 |
+| residual | the residual add, four lanes | 2.27 -> 2.16 -> 1.53 | 1.50 -> 1.03 -> 0.89 | 12,182 |
 | rotary | the rotation, two lanes | 5.71 -> 2.50 | 5.00 -> 1.54 | 29,217 |
-| rotary_table | the rotary table | 2.48 | 1.93 | 14,450 |
+| rotary_table | the rotary table | 2.48 -> 2.13 | 1.93 -> 1.59 | 15,344 |
 | attention | the attention core, one head of 32, two lanes | 59.62 -> 11.35 -> 2.38 | 33.94 -> 29.68 -> 1.59 | 90,389 |
 | index_scan | the index scan, 32 codes | 13.94 -> 2.08 | 12.73 -> 2.44 | 13,504 |
 | topk | top-K of eight | 0.71 | 0.48 | 6,840 |
-| record_reader | the record reader, two records of 32 | 2.42 | 3.10 | 11,815 |
+| record_reader | the record reader, two records of 32 | 2.42 -> 0.94 | 3.10 -> 0.49 | 2,220 |
 | kv_append | the append, one head of 32 | 52.14 -> 25.35 -> 4.36 | 15.52 -> 15.39 -> 3.41 | 75,780 |
 | mem_arbiter | the memory arbiter, four requesters | 0.73 -> 0.67 | 0.45 -> 0.49 | 1,752 |
 | vector_buffer | the buffer's crossbar, 24 reads and 19 writes over eight banks | 7.88 | 12.60 | 407,082 |
-| sequencer | the token sequencer, a 64-step program memory (as logic) and 64 buffer ids | not mapped | not mapped |  |
+| sequencer | the token sequencer, a 64-step program memory (as logic) and 64 buffer ids | not mapped -> 4.68 | not mapped -> 6.79 | 83,325 |
 
 Four shapes carried the change.
 
@@ -1465,12 +1465,23 @@ Four shapes carried the change.
   did not map at all. The ids sit per engine port now, which is known at
   issue, so a completion reads a register.
 
-What is left is of two kinds. The logic-bound units sit between one and
+What was left was of two kinds. The logic-bound units sit between one and
 three nanoseconds on both libraries, against a floor of 1.36 on NanGate
-45 and 0.73 on ASAP7 for one multiply: the residual, the conv,
-the rotary table and the record reader each still carry a round and an
-add, or a table index and a multiply, in one stage, and are one more split
-from that floor. Going below the floor is the tile's own trick, a
+45 and 0.73 on ASAP7 for one multiply, and four of them still carried two
+operations between two flops. Three wanted the same split as the rest:
+the residual had a variable shift, a 24-bit add and a saturate in one
+stage and took the shift straight off the command's input pin, so it is
+three stages now with a registered copy of the shift per lane (1.53 ns and
+0.89); the conv summed its taps through a chain of 64-bit adds for
+products that need eighteen bits and did each of its two requantizes in
+one stage (2.06 and 1.22, latency 9 where it was 7); the rotary table
+computed the turn and then indexed, read and interpolated the sine table
+in one cycle, and since only bits 31:16 of the product are wanted, the
+upper half of its multiplier is no longer built either (2.13 and 1.59).
+
+What is left of that kind is the units at 2.1 to 2.5 ns that are already
+one multiply a stage -- the norm, the state engine, the attention core,
+the gates, the rotation. Going below the floor is the tile's own trick, a
 carry-save multiply with its resolve in the next stage, and it is what
 the 800 MHz placeholder needs: at 2 ns a stage the die clocks at 500 MHz,
 not 800.
@@ -1524,21 +1535,52 @@ one looking for resource sharing before the machine runs out of memory.
 Flattening a bank's slots at a power-of-two stride makes every one of
 them a shift and a concatenation instead.
 
-The sequencer is a third kind: it still does not map, and the id table
-was only half the reason. What is left is the release itself. Up to
-`NU * NE` engines can report done in a cycle, each returning six consumed
-ids and two produced, and each of those decrements one entry of a
-counter array of `NID` buffers. Written as a loop that is a chain of 320
-read-modify-writes of the whole array, which yosys expands to 55,000
-cells and seven gigabytes before it is killed. Flattening it into a
-release count per id, subtracted once, is a decoder per slot and a
-popcount per id, which maps but grows with `NID` (256 in the engine) and
-is not obviously cheaper. The structure that is actually wanted bounds
-the releases per cycle, from a queue, and that changes when a dependent
-step may issue if several engines finish together, so the Python timing
-model has to change with the RTL. That is a design change with its own
-verification, not a rewrite of an expression, which is why it is the
-next item rather than part of this one.
+The record reader was the fourth of the units above, and belongs with the
+memories rather than with the splits. Eleven cells deep, two of its two
+and a half nanoseconds were one flop driving 519 loads: "record `rrec`,
+beat `ob`" read as registers is one mux over `MAXR * 2 * HD` bytes, whose
+first select bit sees half of it. That array is a small SRAM in silicon,
+so it is one now, its word the beat that arrives from memory and its
+address leading the data by a cycle. 0.94 ns and 0.49, at 2,220 NAND2-eq
+against 11,815 with the macro's own 651 counted in. Each half of a record
+starts at a word of its own, because `HD` need not be a whole number of
+beats and at the test geometry it is not: 24 elements of 8 bits is a beat
+and a half.
+
+The sequencer was a third kind, and the id table was only half the
+reason. The release itself was the rest. Up to `NU * NE` engines can
+report done in a cycle, each returning six consumed ids and two produced,
+and each of those decrements one entry of a counter array of `NID`
+buffers: as a loop that is a chain of 320 read-modify-writes of the whole
+array, which yosys expanded to 55,000 cells and seven gigabytes before it
+was killed. Flattening it into a release count per id, subtracted once,
+is a decoder per slot and a popcount per id, which maps but grows with
+`NID` and is not obviously cheaper.
+
+What it does instead is bound the release: `NREL` completions drain a
+cycle, lowest engine port first, and a port whose release has not drained
+is given no new command, because it still holds the buffers it must
+return. That is all the bound needs, since the ids live with the port.
+Two things then dominated what was left, and both were shapes this
+document has met before. `running` gated every counter and every live
+bit, and did not need to -- when it is low nothing issues and no unit is
+busy, so none of that state moves anyway -- which was one flop's enable
+at 835 loads and 42 of the module's 43 nanoseconds. And "the lowest port
+still to drain" was written as a scan, which is `NPORT` stages of
+"nothing found yet" each selecting that port's ids: forty gates of fanout
+sixty, 15 of the remaining 21. It is `x & -x` now and the select an or of
+masks, which is associative and comes out of synthesis as a tree.
+42.7 -> 21.5 -> 4.68 ns on NanGate and 14.1 -> 6.79 on ASAP7.
+
+Bounding the release is the one change here that the timing model had to
+follow, because it changes when a dependent step may issue if several
+engines finish together. `schedule` is a cycle-for-cycle model of the
+controller now rather than a list scheduler, stepping from event to event
+so that it still runs in milliseconds over a program of half a million
+cycles. It costs one cycle in 1,033 on the one program measured where two
+engines ever finish together, and nothing at all at the 9B geometry: over
+every program measured, at most two steps end in the same cycle and
+almost always one.
 
 ## What the vector buffer's ports are really asked for
 
@@ -1642,10 +1684,13 @@ share, measured.
    that runs both layers' programs over the real units and over the HPI
    path, above. Open behind them: the simulator's traffic terms brought
    in line with the map. The units' pipelining that their synthesis asked
-   for is done, above, and so are the memories as macros and the append's
-   lanes: what is left of it is the sequencer's release path, which needs
-   the timing model changed with it, and one more split in the residual,
-   the conv, the rotary table and the record reader. The vector buffer is
+   for is done, above, and so are the memories as macros, the append's
+   lanes, the last four units' splits and the sequencer's release path:
+   every module of the engine maps now. What is left of it is the clock
+   itself -- the units that are already one multiply a stage sit at 2.1 to
+   2.5 ns against a 1.36 ns floor, which is 450 MHz and not the 800 the
+   energy model assumes, and closing that is the tile's carry-save trick
+   applied to the norm, the state engine and the attention core. The vector buffer is
    the other module with no implementation, and it is now measured and
    banked: four to seven 1R1W banks carry every program measured, against
    24 read and 19 write ports wired, so the bank falls out of a colouring
