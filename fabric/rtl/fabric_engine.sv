@@ -33,6 +33,21 @@
 `default_nettype none
 `include "fabric_fx.svh"
 
+// A register the mapper may not merge away.  Sixteen registers with the same
+// input are one register to it -- `keep` on the signal keeps the net and not
+// the flop -- and a copy per slice of a read port's answer is the only reason
+// these exist.
+(* keep_hierarchy *)
+module fabric_keep_copy #(
+    parameter int W = 1
+) (
+    input  wire         clk,
+    input  wire [W-1:0] d,
+    output reg  [W-1:0] q
+);
+    always @(posedge clk) q <= d;
+endmodule
+
 // ---------------------------------------------------------------------------
 // The vector buffer.
 // ---------------------------------------------------------------------------
@@ -54,7 +69,6 @@ module fabric_vb #(
     // itself, which is what the checks below are written against.
     parameter int NPR   = NR,
     parameter int NPW   = NW,
-    parameter int RGRP  = 16,               // copies of a read port's select, one per slice of its answer
     parameter [63:0] RMAP0 = 64'hFEDCBA9876543210,
     parameter [63:0] RMAP1 = 64'hFEDCBA9876543210,
     parameter [63:0] WMAP0 = 64'hFEDCBA9876543210,
@@ -95,7 +109,6 @@ module fabric_vb #(
     localparam int WSH  = (WMAX > 1) ? $clog2(WMAX) : 0;
     localparam int WPOT = 1 << WSH;
     localparam int SB   = (NB*RPOT > 1) ? $clog2(NB*RPOT) : 1;
-    localparam int RGW  = 128 / RGRP;                   // bits of the answer a select copy carries
     localparam int WPB  = (1 << BSH) / 16;              // sixteen-byte words in a bank
     localparam int HALF = (WPB > 1) ? WPB / 2 : 1;      // words in each of its halves
     localparam int HW   = (HALF > 1) ? $clog2(HALF) : 1;
@@ -343,13 +356,16 @@ module fabric_vb #(
     // A port's answer is a mux over every bank's slots, then a shift down to
     // the byte it started at, and both are selected by a handful of bits
     // against the whole 256-bit window.  Held once a port, the bank bit drove
-    // 1,793 loads and seven of this module's eight nanoseconds: it is a
+    // 1,793 loads and 7.14 of this module's 7.88 nanoseconds: it is a
     // register at the edge of the combinational cone, so the mapper buffers
-    // the mux but not what drives it.  Each slice of the answer therefore
-    // keeps its own copy of the select, which is the same thing the norm, the
-    // rotary and the state engine do with their constants.
+    // the mux but not what drives it.  Each byte of the answer therefore
+    // keeps its own copy of what selects it, which is what the norm, the
+    // rotary and the state engine do with their constants.  Both muxes are
+    // written out a byte at a time rather than as a part-select of the whole
+    // bank vector: a variable part-select of all NB*RPOT words is a barrel
+    // shifter over every bank, and sixteen of those a port does not map.
     reg [NPR*128-1:0] p_data;
-    genvar gp, gg;
+    genvar gp, gg, gk;
     generate
         for (gp = 0; gp < NPR; gp = gp + 1) begin : g_read
             wire [SB-1:0] sel_w = (r_bank[gp] << RSH) + r_slot[gp];   // a concatenation: see RSH
@@ -357,23 +373,35 @@ module fabric_vb #(
             wire          odd_w = p_addr[gp*AW + 4];
             wire          en_w  = p_en[gp] && r_got[gp];
             wire [255:0]  win;                          // the two words in address order
-            for (gg = 0; gg < RGRP; gg = gg + 1) begin : g_slice
-                reg [SB-1:0] sel_l;
-                reg [3:0]    off_l;
-                reg          odd_l, en_l;
-                always @(posedge clk) begin
-                    sel_l <= sel_w; off_l <= off_w; odd_l <= odd_w; en_l <= en_w;
+            for (gg = 0; gg < 16; gg = gg + 1) begin : g_byte
+                wire [SB-1:0] sel_l;
+                wire          odd_l;
+                fabric_keep_copy #(.W(SB)) u_sel (.clk(clk), .d(sel_w), .q(sel_l));
+                fabric_keep_copy #(.W(1))  u_odd (.clk(clk), .d(odd_w), .q(odd_l));
+                wire [NB*RPOT*8-1:0] e_b, o_b;          // this byte of every slot of every bank
+                for (gk = 0; gk < NB*RPOT; gk = gk + 1) begin : g_word
+                    assign e_b[gk*8 +: 8] = even_q[gk*128 + gg*8 +: 8];
+                    assign o_b[gk*8 +: 8] = odd_q [gk*128 + gg*8 +: 8];
                 end
-                wire [RGW-1:0] e = even_q[{sel_l, 7'd0} + gg*RGW +: RGW];
-                wire [RGW-1:0] o = odd_q [{sel_l, 7'd0} + gg*RGW +: RGW];
-                assign win[gg*RGW +: RGW]       = odd_l ? o : e;
-                assign win[128 + gg*RGW +: RGW] = odd_l ? e : o;
-                always @(*)
-                    p_data[gp*128 + gg*RGW +: RGW] = en_l ? win[{1'b0, off_l, 3'd0} + gg*RGW +: RGW]
-                                                          : {RGW{1'bx}};
+                wire [7:0] e = e_b[{sel_l, 3'd0} +: 8];
+                wire [7:0] o = o_b[{sel_l, 3'd0} +: 8];
+                assign win[gg*8 +: 8]       = odd_l ? o : e;
+                assign win[128 + gg*8 +: 8] = odd_l ? e : o;
+            end
+            for (gg = 0; gg < 16; gg = gg + 1) begin : g_out
+                wire [3:0] off_l;
+                wire       en_l;
+                fabric_keep_copy #(.W(4)) u_off (.clk(clk), .d(off_w), .q(off_l));
+                fabric_keep_copy #(.W(1)) u_en  (.clk(clk), .d(en_w),  .q(en_l));
+                wire [127:0] pick;                      // the sixteen bytes this one could come from
+                for (gk = 0; gk < 16; gk = gk + 1) begin : g_pick
+                    assign pick[gk*8 +: 8] = win[(gg + gk)*8 +: 8];
+                end
+                always @(*) p_data[gp*128 + gg*8 +: 8] = en_l ? pick[{off_l, 3'd0} +: 8] : 8'bx;
             end
         end
     endgenerate
+
     // Every logical port that folded onto a crossbar port reads its answer:
     // wires, since at most one of them asked for it.
     always @(*)
