@@ -1429,7 +1429,7 @@ against them, and the 105 tests pass.
 | record_reader | the record reader, two records of 32 | 2.42 -> 0.94 | 3.10 -> 0.49 | 2,220 |
 | kv_append | the append, one head of 32 | 52.14 -> 4.36 -> 1.88 | 15.52 -> 3.41 -> 2.68 | 63,943 |
 | mem_arbiter | the memory arbiter, four requesters | 0.73 -> 0.67 | 0.45 -> 0.49 | 1,752 |
-| vector_buffer | the buffer's crossbar, 26 reads and 19 writes folded onto 11 and 8, over eight banks | 7.88 | 12.60 -> 7.81 | 407,082 -> 278,031 |
+| vector_buffer | the buffer's crossbar, 26 reads and 19 writes folded onto 11 and 8, over eight banks | 7.88 -> 1.46 | 12.60 -> 0.89 | 407,082 -> 355,461 |
 | sequencer | the token sequencer, a 64-step program memory (as logic) and 64 buffer ids | not mapped -> 2.81 | not mapped -> 2.10 | 62,925 |
 
 Four shapes carried the change.
