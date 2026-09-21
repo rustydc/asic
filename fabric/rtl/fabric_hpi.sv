@@ -463,7 +463,7 @@ module fabric_hpi_channel #(
 endmodule
 
 // ---------------------------------------------------------------------------
-// The die's memory port over NDEV devices: consecutive 2 KB stripes on
+// The die's memory port over NDEV devices: consecutive stripes on
 // consecutive devices, a burst split into stripe chunks that run on their
 // devices concurrently, read data returned in order from the channels'
 // page buffers.
@@ -499,7 +499,7 @@ module fabric_hpi_stripe #(
     input  wire [NDEV*DW-1:0] x_rdata,
     input  wire [NDEV-1:0]    x_done
 );
-    localparam int STRIPE = 2048;
+    localparam int STRIPE = 1024;                         // fabric.hpi.STRIPE_BYTES; a test checks they agree
     localparam int BPS    = STRIPE / (DW / 8);            // beats per stripe
     localparam int DEVW   = $clog2(NDEV) + 1;
     localparam int SHIFT  = $clog2(STRIPE);

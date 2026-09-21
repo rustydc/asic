@@ -35,7 +35,14 @@ import numpy as np
 from fabric.tile import write_hex
 
 BEAT_BYTES = 16
-STRIPE_BYTES = 2048             # one device page at x16: 1024 words
+# How much of a transfer goes to one device before the next.  It sets how
+# many devices a transfer of a given size spreads over, which is what decides
+# the bandwidth a transfer sees: a recurrent layer's state slot is 16 KB, so
+# at 2 KB it reached eight of the sixteen devices and at 1 KB it reaches all
+# of them.  It has to divide the device's page, because a burst never crosses
+# one; half a page is the smallest that keeps a burst's command overhead
+# under a tenth of its data at this geometry.
+STRIPE_BYTES = 1024
 
 
 @dataclass(frozen=True)

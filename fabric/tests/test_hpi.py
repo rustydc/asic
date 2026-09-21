@@ -18,7 +18,11 @@ class DeviceTest(unittest.TestCase):
         self.assertEqual(d.words * 2, d.bytes)
         self.assertEqual(1 << (d.row_bits + d.col_bits), d.words)
         self.assertEqual(d.page_words, 1 << d.col_bits)
-        self.assertEqual(H.STRIPE_BYTES, d.page_words * 2)
+        # The stripe divides the page, because a burst never crosses one, and
+        # the RTL's stripe unit has to be told the same number.
+        self.assertEqual((d.page_words * 2) % H.STRIPE_BYTES, 0)
+        rtl = (Path(__file__).parents[1] / "rtl" / "fabric_hpi.sv").read_text()
+        self.assertIn(f"localparam int STRIPE = {H.STRIPE_BYTES};", rtl)
 
     def test_latency_codes_follow_the_datasheet_tables(self) -> None:
         self.assertEqual(H.latency_codes(250), (0b110, 10, 0b011, 9))
@@ -45,17 +49,21 @@ class DeviceTest(unittest.TestCase):
         self.assertEqual(H.register_frame(H.CMD_MR_WRITE, 8), [0xC0, 0, 0, 0, 8])
 
     def test_striping_and_chunks(self) -> None:
+        # Written against STRIPE_BYTES rather than a number, because the size
+        # is a lever: it decides how many devices a transfer of a given size
+        # reaches, and a test that restates it stops the lever being pulled.
+        stripe, bps = H.STRIPE_BYTES, H.STRIPE_BYTES // H.BEAT_BYTES
         self.assertEqual(H.split_address(0, 16), (0, 0))
-        self.assertEqual(H.split_address(2048, 16), (1, 0))
-        self.assertEqual(H.split_address(16 * 2048 + 100, 16), (0, 2048 + 100))
+        self.assertEqual(H.split_address(stripe, 16), (1, 0))
+        self.assertEqual(H.split_address(16 * stripe + 100, 16), (0, stripe + 100))
         parts = H.chunks(0x7680, 269, 4)
-        self.assertEqual([n for _, _, n in parts], [24, 128, 117])
-        self.assertEqual([d for d, _, _ in parts], [2, 3, 0])
         self.assertEqual(sum(n for _, _, n in parts), 269)
-        # A head's 32 KB state runs on all sixteen devices.
-        self.assertEqual(sorted(d for d, _, _ in H.chunks(0, 2048, 16)), list(range(16)))
+        self.assertTrue(all(n <= bps for _, _, n in parts))
+        self.assertEqual([d for d, _, _ in parts][:2], [(0x7680 // stripe) % 4, (0x7680 // stripe + 1) % 4])
+        # A head's 16 KB state reaches every one of sixteen devices.
+        self.assertEqual(sorted(d for d, _, _ in H.chunks(0, 16 * 1024 // H.BEAT_BYTES, 16)), list(range(16)))
         for _, daddr, n in H.chunks(12345 * 16, 500, 16):
-            self.assertLessEqual(daddr % 2048 + n * 16, 2048)
+            self.assertLessEqual(daddr % stripe + n * H.BEAT_BYTES, stripe)
 
     def test_efficiency(self) -> None:
         self.assertGreater(H.efficiency(128), 0.95)      # a full page

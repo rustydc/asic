@@ -210,10 +210,12 @@ class Timing:
         here means anything on that path."""
         if not self.devices:
             return beats
-        chunks = max(1, -(-beats // self.stripe_beats))
-        per_device = -(-chunks // min(self.devices, chunks))
-        in_chunk = min(beats, self.stripe_beats)
-        return int(per_device * (self.burst_clocks + self.beat_clocks * in_chunk) * self.ctrl_ratio)
+        stripe = self.stripe_beats
+        sizes = [min(stripe, beats - i * stripe) for i in range(max(1, -(-beats // stripe)))]
+        load = [0] * min(self.devices, len(sizes))
+        for i, size in enumerate(sizes):                 # the map hands the chunks round in turn
+            load[i % len(load)] += self.burst_clocks + self.beat_clocks * size
+        return int(max(load) * self.ctrl_ratio)
 
     def move(self, beats: int, write: bool) -> int:
         """The beat mover: memory to the vector buffer, or back."""
