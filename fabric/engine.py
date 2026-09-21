@@ -32,7 +32,9 @@ from fabric.memory import BEAT, MemoryMap
 from fabric.tile import TileSpec, compile_matrix, write_hex
 
 NPASS = 4                    # the recurrent layer's passes: in_proj, out_proj, gate_up, down
-ATT_L = 8                    # rtl/fabric_engine.sv's ATT_L: the attention cores' and record reader's lanes
+# rtl/fabric_engine.sv's ATT_L: the attention cores' and the record reader's
+# lanes, which must divide the head because they stream HD / L beats with no
+# ragged last one.  `sequencer.Timing.attn_lanes` is the same rule.
 TAB_BITS = 56                # a pass-table entry
 
 
@@ -617,7 +619,7 @@ class EngineRun:
                        "RD": cfg.rotary_dim, "IDIM": cfg.index_dim, "W": mm.local_window, "BS": mm.block, "TOP": cfg.top_blocks,
                        "KV_BITS": mm.kv_bits, "REC_BYTES": mm.kv_record_bytes, "RPB": mm.index_burst_records, "MAXR": mm.window_burst_records,
                        "WINDOW_OFF": regions["window0"][0], "BLOCK_OFF": regions["blocks0"][0], "INDEX_OFF": regions["index0"][0],
-                       "SUMS_OFF": regions["sums0"][0], "ATT_L": ATT_L,
+                       "SUMS_OFF": regions["sums0"][0], "ATT_L": S.Timing().head_lanes(cfg.head_dim), "SW_L": S.Timing().l_vec,
                        "ROWS": spec.rows, "COLS": spec.cols, "P": spec.rows_per_cycle, "NT": nt, "TMAX": self.chunk,
                        "MODEL_TILES": int(model_tiles), "AW": max(16, (max(self.layout.vb_bytes, 1) - 1).bit_length() + 1),
                        "WB": spec.weight_bits, "ACC": spec.acc_bits, "SB": spec.scale_bits, "SHB": spec.shift_bits, "SW": sw,

@@ -1451,17 +1451,33 @@ module fabric_mem_unit #(
 
     // Requester 0, the mover: a burst between memory and the buffer or the sums register.
     localparam [1:0] MV_RD_VB = 0, MV_WR_VB = 1, MV_RD_REG = 2, MV_WR_REG = 3;
-    reg          mv_go, mv_busy, mv_req, mv_done, mv_present, mv_vbv;
+    reg          mv_go, mv_busy, mv_req, mv_done, mv_present;
     reg [1:0]    mv_mode;
     reg [31:0]   mv_maddr;
     reg [AW-1:0] mv_vaddr;
     reg [11:0]   mv_n, mv_i;
+    // Writing the buffer out, the read addresses run a beat ahead of the data:
+    // `mv_a` is the beat whose address has gone to the buffer, `mv_i` the beat
+    // the port has taken, `mv_q` says the buffer is answering this cycle and
+    // `mv_hold` catches that answer when the port is not ready.  Written as
+    // address, then data, then present -- one beat at a time through all three
+    // -- this was three cycles a beat, and the state DMA is most of a recurrent
+    // token.
+    reg          mv_q, mv_hv;
+    reg [11:0]   mv_a;
+    reg [DW-1:0] mv_hold;
+    wire         mv_have   = mv_hv || mv_q;                 // a beat is ready to present
+    wire         mv_take   = mv_have && r_wdata_ready[0];
+    wire         mv_keep   = mv_q && !mv_take;              // it has to wait: hold it
+    wire         mv_hv_nxt = mv_keep || (mv_hv && !mv_take);
+    wire         mv_issue  = mv_busy && (mv_mode == MV_WR_VB) && !mv_req && (mv_a < mv_n) && !mv_hv_nxt;
     assign r_req_valid[0]   = mv_req;
     assign r_req_write[0]   = (mv_mode == MV_WR_VB) || (mv_mode == MV_WR_REG);
     assign r_req_addr[0*32 +: 32]  = mv_maddr;
     assign r_req_beats[0*12 +: 12] = mv_n;
-    assign r_wdata_valid[0] = mv_present;
-    assign r_wdata[0*DW +: DW] = (mv_mode == MV_WR_REG) ? ap_s_out_data : rd_data;
+    assign r_wdata_valid[0] = (mv_mode == MV_WR_VB) ? mv_have : mv_present;
+    assign r_wdata[0*DW +: DW] = (mv_mode == MV_WR_REG) ? ap_s_out_data
+                               : ((mv_mode == MV_WR_VB) && mv_hv) ? mv_hold : rd_data;
 
     // Requester 1, the append.
     reg [NKV*HD*8-1:0] k_r, v_r;
@@ -1542,9 +1558,9 @@ module fabric_mem_unit #(
     reg [7:0]    ld_i, ld_i_d, ld_n;
     always @* begin
         rd_addr = ld_base + ld_i * 16;
-        if (mv_busy && mv_mode == MV_WR_VB) rd_addr = mv_vaddr + mv_i * 16;
+        if (mv_busy && mv_mode == MV_WR_VB) rd_addr = mv_vaddr + mv_a * 16;
     end
-    assign rd_en = ld_on || (mv_busy && mv_mode == MV_WR_VB);
+    assign rd_en = ld_on || mv_issue;
 
     // The query's largest magnitude, as a balanced tree rather than a chain of
     // compare-selects as long as the vector.
@@ -1574,7 +1590,8 @@ module fabric_mem_unit #(
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             state <= S_IDLE; done_valid <= 1'b0; wr_en <= 1'b0; ld_on <= 1'b0; ldv <= 1'b0; ld_i <= 0; ld_n <= 0;
-            mv_go <= 1'b0; mv_busy <= 1'b0; mv_req <= 1'b0; mv_done <= 1'b0; mv_present <= 1'b0; mv_vbv <= 1'b0; mv_i <= 0;
+            mv_go <= 1'b0; mv_busy <= 1'b0; mv_req <= 1'b0; mv_done <= 1'b0; mv_present <= 1'b0; mv_i <= 0;
+            mv_a <= 0; mv_q <= 1'b0; mv_hv <= 1'b0;
             ap_start <= 1'b0; sc_start <= 1'b0; tk_clear <= 1'b0; tk_finish <= 1'b0; sc_done_d <= 1'b0; rc_start <= 1'b0;
             rr_addr_valid <= 1'b0; rw_p <= 0; rw_j <= 0; rw_rec <= 0; rw_ob <= 0; rw_blocks <= 1'b0; rw_reqs_done <= 1'b0; sel_count <= 0;
         end else begin
@@ -1594,7 +1611,10 @@ module fabric_mem_unit #(
                 default: sel_r[ld_i_d*128 +: 128] <= rd_data;
             endcase
             // The mover.
-            if (mv_go) begin mv_busy <= 1'b1; mv_req <= 1'b1; mv_i <= 0; mv_present <= 1'b0; mv_vbv <= 1'b0; end
+            if (mv_go) begin
+                mv_busy <= 1'b1; mv_req <= 1'b1; mv_i <= 0; mv_present <= 1'b0;
+                mv_a <= 0; mv_q <= 1'b0; mv_hv <= 1'b0;
+            end
             else if (mv_busy) begin
                 if (mv_req && r_req_ready[0]) mv_req <= 1'b0;
                 case (mv_mode)
@@ -1608,11 +1628,15 @@ module fabric_mem_unit #(
                         if (mv_i == mv_n - 1) begin mv_busy <= 1'b0; mv_done <= 1'b1; end
                     end
                     MV_WR_VB: begin
-                        // A beat is read from the buffer, then presented until taken.
-                        if (!mv_req && !mv_present && !mv_vbv) mv_vbv <= 1'b1;
-                        else if (mv_vbv) begin mv_vbv <= 1'b0; mv_present <= 1'b1; end
-                        else if (mv_present && r_wdata_ready[0]) begin
-                            mv_present <= 1'b0; mv_i <= mv_i + 1'b1;
+                        // One beat a cycle: the address of the next goes out while
+                        // this one is on the port, and a beat the port did not take
+                        // waits in `mv_hold` rather than being read again.
+                        mv_q <= mv_issue;
+                        mv_hv <= mv_hv_nxt;
+                        if (mv_keep) mv_hold <= rd_data;
+                        if (mv_issue) mv_a <= mv_a + 1'b1;
+                        if (mv_take) begin
+                            mv_i <= mv_i + 1'b1;
                             if (mv_i == mv_n - 1) begin mv_busy <= 1'b0; mv_done <= 1'b1; end
                         end
                     end
@@ -1739,7 +1763,8 @@ module fabric_layer_engine #(
     parameter int BLOCK_OFF  = 2048,
     parameter int INDEX_OFF  = 6144,
     parameter int SUMS_OFF   = 8192,
-    parameter int ATT_L = 8,
+    parameter int ATT_L = 8,                    // the attention cores, the record reader and the rotary
+    parameter int SW_L  = 16,                   // SwiGLU, whose operands are int8
     parameter int ROWS = 96,                    // the tiles
     parameter int COLS = 16,
     parameter int P    = 2,
@@ -1787,6 +1812,11 @@ module fabric_layer_engine #(
     input  wire         m_rdata_valid,
     input  wire [127:0] m_rdata
 );
+    // A buffer beat is sixteen bytes: a unit whose operands are int16 takes
+    // eight of them a beat, one whose operands are int8 takes sixteen.  NL is
+    // the norm's and the residual's, whose vectors are int16; CL is the conv's,
+    // whose history is four bytes a channel.  The int8 units -- SwiGLU, the
+    // rotary, the attention cores and the record reader -- take SW_L and ATT_L.
     localparam int NU = 10, NE = 4, NL = 8, CL = 4, GROUP = NH / NKV;
     localparam int U_TILES = 0, U_NORM = 1, U_CONV = 2, U_GATES = 3, U_DELTA = 4, U_SWIGLU = 5, U_RESIDUAL = 6, U_ROTARY = 7, U_ATTN = 8, U_MEM = 9;
     // Vector-buffer ports.
@@ -1892,7 +1922,7 @@ module fabric_layer_engine #(
                 .wr_be(wr_be[(W_DELTA + e)*16 +: 16]));
         end
         for (e = 0; e < 2; e = e + 1) begin : g_rotary
-            fabric_rotary_adapter #(.HD(HD), .R(RD), .NL(NL), .SW(SW), .AW(AW), .LUT_DIR(LUT_DIR)) u (
+            fabric_rotary_adapter #(.HD(HD), .R(RD), .NL(ATT_L), .SW(SW), .AW(AW), .LUT_DIR(LUT_DIR)) u (
                 .clk(clk), .rst_n(rst_n), .cmd_valid(cmd_valid[U_ROTARY] && cmd_engine == e), .cmd_src(cmd_src), .cmd_dst(cmd_dst),
                 .cmd_a2(cmd_a2), .cmd_a3(cmd_a3), .cmd_arg(cmd_arg), .cmd_tag(cmd_tag), .cmd_ready(ready_rotary[e]),
                 .done_valid(done_valid[U_ROTARY*NE + e]), .done_tag(done_tag[(U_ROTARY*NE + e)*8 +: 8]),
@@ -1934,7 +1964,7 @@ module fabric_layer_engine #(
         .rd_data_b(rd_data[R_GATES*128 +: 128]), .rd_data_a(rd_data[(R_GATES+1)*128 +: 128]),
         .wr_en(wr_en[W_GATES]), .wr_addr(wr_addr[W_GATES*AW +: AW]), .wr_data(wr_data[W_GATES*128 +: 128]), .wr_be(wr_be[W_GATES*16 +: 16]));
 
-    fabric_swiglu_adapter #(.NL(NL), .AW(AW), .LUT_DIR(LUT_DIR)) u_swiglu (
+    fabric_swiglu_adapter #(.NL(SW_L), .AW(AW), .LUT_DIR(LUT_DIR)) u_swiglu (
         .clk(clk), .rst_n(rst_n), .cmd_valid(cmd_valid[U_SWIGLU] && cmd_engine == 0), .cmd_len(cmd_len), .cmd_src(cmd_src), .cmd_dst(cmd_dst),
         .cmd_a2(cmd_a2), .cmd_a3(cmd_a3), .cmd_arg(cmd_arg), .cmd_tag(cmd_tag), .cmd_ready(ready_swiglu), .done_valid(done_valid[U_SWIGLU*NE]), .done_tag(done_tag[U_SWIGLU*NE*8 +: 8]),
         .rd_addr_g(rd_addr[R_SWIGLU*AW +: AW]), .rd_addr_u(rd_addr[(R_SWIGLU+1)*AW +: AW]),

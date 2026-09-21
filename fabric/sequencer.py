@@ -115,9 +115,13 @@ class Timing:
     """
     core_mhz: float = 800.0
     # Lanes, as the RTL is elaborated.
-    lanes: int = 8                   # NL: norm, SwiGLU, residual, rotary
+    # A buffer beat is sixteen bytes, so a unit's lanes are capped by what its
+    # operands weigh: eight for the norm and the residual, whose vectors are
+    # int16, sixteen for the units whose operands are int8.
+    lanes: int = 8                   # NL: the norm and the residual
+    l_vec: int = 16                  # SW_L: SwiGLU
     l_conv: int = 4                  # CL: the causal conv
-    l_attn: int = 8                  # ATT_L: the attention cores and the record reader
+    l_attn: int = 16                 # ATT_L at most: a beat of the buffer, as int8
     # `P` and `COLS` are the tile's, and come from the TileSpec the pass is compiled for.
     # Adapter latencies: what a command costs beyond its beats.
     norm_latency: int = 33           # the front pipeline, the sum pass's tail and the inverse square root
@@ -137,18 +141,26 @@ class Timing:
     # itself; the rest is what each operation does around it.
     port_request: int = 7            # accept, read latency and turnaround
     port_read_beat: int = 1          # a read beat a cycle
-    port_write_beat: int = 3         # the beat mover reads the buffer, presents, acks
+    port_write_beat: int = 1         # the mover's addresses run a beat ahead of its data
     mem_read_latency: int = 8
-    mem_write_latency: int = 5
+    mem_write_latency: int = 6
     reader_latency: int = 8
     scan_latency: int = 19           # the query in and its codes, before any record is read
     scan_request: int = 5
+    append_beat: int = 3             # the append's own write path, a beat at a time
     append_latency: int = 58
     append_index_latency: int = 34   # the block's index projection, its codes and its record
     port_bytes_per_cycle: float = 16e9 / 800e6   # sixteen devices at 250 MHz DDR x16 against the core clock
 
     def beats(self, n: int) -> int:
         return -(-n // self.lanes)
+
+    def head_lanes(self, head_dim: int) -> int:
+        """The lanes of the units that stream a head: the attention cores, the
+        record reader and the rotary.  They take ``HD / L`` beats with no
+        ragged last one, so the lane count has to divide the head, and their
+        operands are int8, so a buffer beat holds sixteen of them."""
+        return max(l for l in (1, 2, 4, 8, 16) if l <= self.l_attn and head_dim % l == 0)
 
     def norm(self, d: int) -> int:
         return 2 * self.beats(d) + self.norm_latency
@@ -170,7 +182,7 @@ class Timing:
     def attention(self, rows: int, group: int, head_dim: int) -> int:
         """One core's command: the queries and the gates in, then a key row
         and a value row each, then the group's outputs."""
-        beats = -(-head_dim // self.l_attn)
+        beats = head_dim // self.head_lanes(head_dim)
         return (self.attn_start_latency + 4 * group * beats
                 + rows * (4 * beats + self.attn_row_stall) + group * beats + self.attn_out_latency)
 
@@ -185,7 +197,7 @@ class Timing:
         """The record reader: ``records`` key and value records in ``requests``
         bursts.  A record's beats in and its two rows out are not overlapped,
         so they add rather than the larger of them standing."""
-        out = 2 * -(-head_dim // self.l_attn)
+        out = 2 * (head_dim // self.head_lanes(head_dim))
         return self.reader_latency + records * (record_beats + out) + self.port_request * requests
 
     def scan(self, records: int, record_beats: int, selected: int) -> int:
@@ -196,7 +208,10 @@ class Timing:
         return self.scan_latency + self.scan_request + record_beats * records + selected - 1
 
     def write_record(self, record_beats: int) -> int:
-        return self.port_request + record_beats * self.port_write_beat
+        """A record the append writes.  It has its own path to the port, not
+        the mover's, and still takes three cycles a beat: the same address,
+        data, present that the mover used to."""
+        return self.port_request + record_beats * self.append_beat
 
     def append(self, heads: int, record_beats: int, block_end: bool) -> int:
         """The token's window records, and at a block's end its block means and index record."""
@@ -578,9 +593,9 @@ def _ffn_steps(add, f: L.FfnConsts | None, spec: TileSpec, d: int, ffn: int, t: 
     add("pass.gate_up", "tiles", ("A2",), ("GU",), t.tile_pass(spec, -(-d // spec.rows), T, walk[2][0] + T * walk[2][1]), gate_up,
         ops=operands(src=("A2", 0), dst=("GU", 0), arg=[(0, 2), (8, -(-d // spec.rows)), (16, T)], a2=d, a3=2 * ffn))
     for i in range(T):
-        add(tok("swiglu", i), "swiglu", ("GU",), (_contrib("act", chunk),), t.beats(ffn) + t.swiglu_latency,
+        add(tok("swiglu", i), "swiglu", ("GU",), (_contrib("act", chunk),), -(-ffn // t.l_vec) + t.swiglu_latency,
             lambda e, i=i: put(e, "act", i, L.swiglu_int(get(e, "gate_ffn", i), get(e, "up_ffn", i), f.mult_g, f.sh_g, f.mult_o, f.sh_o)),
-            ops=operands(src=("GU", i * 2 * ffn), a2=("GU", i * 2 * ffn + ffn), arg=0, dst=("act", i * ffn), len=ffn // t.lanes))
+            ops=operands(src=("GU", i * 2 * ffn), a2=("GU", i * 2 * ffn + ffn), arg=0, dst=("act", i * ffn), len=ffn // t.l_vec))
 
     def down(e):
         for i in range(T):
@@ -645,20 +660,21 @@ def global_program(cfg, c: L.GlobalConsts | None, spec: TileSpec, mm: MemoryMap,
         add(tok("norm.index_q", i), "norm", ("P1",), (_contrib("iq", chunk),), t.norm(idim),
             lambda e, i=i: put(e, "index_q_unit", i, L._norm(get(e, "index_q", i), c.unit_norm)),
             ops=operands(src=("P1", i * p1 + off_iq), dst=("iq", i * idim), arg=NORM_UNIT, len=idim // t.lanes))
-    rot_cycles = t.norm(hd) + t.beats(hd) + t.rotary_latency
+    rot_l = t.head_lanes(hd)                               # the rotary streams a head, like the cores
+    rot_cycles = 2 * (hd // rot_l) + t.norm_latency + hd // rot_l + t.rotary_latency
     for i in range(T):
         for n in range(nkv):
             def krot(e, n=n, i=i):
                 put(e, f"k[{n}]", i, L.rotary_int(L._norm(get(e, "k_raw", i)[n], c.k_norm), *get(e, "rot", i), rd, c.rot_mult_k, c.rot_sh_k))
             add(tok(f"rotary.k[{n}]", i), "rotary", ("P1", "rot"), ("+k",), rot_cycles, krot, engine=n % UNITS["rotary"][1],
                 ops=operands(src=("P1", i * p1 + off_k + n * hd), dst=("k", i * nkv * hd + n * hd), arg=ROT_HEAD | (1 << 4),
-                             a2=("rot", i * 2 * rd), len=hd // t.lanes))
+                             a2=("rot", i * 2 * rd), len=hd // rot_l))
         for h in range(nh):
             def qrot(e, h=h, i=i):
                 put(e, f"q[{h}]", i, L.rotary_int(L._norm(get(e, "q_raw", i)[h], c.q_norm), *get(e, "rot", i), rd, c.rot_mult_q, c.rot_sh_q))
             add(tok(f"rotary.q[{h}]", i), "rotary", ("P1", "rot"), (f"+qg[{h // group}]",), rot_cycles, qrot, engine=h % UNITS["rotary"][1],
                 ops=operands(src=("P1", i * p1 + h * 2 * hd), dst=(f"qg[{h // group}]", i * group * hd + (h % group) * hd), arg=ROT_HEAD,
-                             a2=("rot", i * 2 * rd), len=hd // t.lanes))
+                             a2=("rot", i * 2 * rd), len=hd // rot_l))
     # The memory side, token by token: append this token's records, scan the index, then stream rows to the cores.
     for i in range(T):
         p = pos + i
