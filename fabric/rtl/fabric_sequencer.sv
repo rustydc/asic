@@ -158,6 +158,7 @@ module fabric_sequencer #(
     reg [CW-1:0] wr_cnt [0:NID-1];
     reg [CW-1:0] rd_cnt [0:NID-1];
     integer p, k, m, id, x;
+    reg signed [CW:0] dr, dw;                            // a counter's move this cycle
 
     // The drained ids travel as arguments, not as a reference to rel_c and
     // rel_p: what a function reads is not in an always @* block's sensitivity,
@@ -211,21 +212,36 @@ module fabric_sequencer #(
                 // The drains: NREL completions return their buffers; the rest wait.
                 pend <= held;
                 for (x = 0; x < NREL; x = x + 1)
-                    if (rel_en[x]) begin
+                    if (rel_en[x]) tab_live[rel_tag[x*8 +: 8]] <= 1'b0;
+                // Every counter moves by what this cycle did to it, once.
+                // Written as the drain's decrements and then the issue's
+                // increments, each a read-modify-write of a 256-entry array at
+                // a computed index, it was sixteen of those chained: 118 gates
+                // from a done port to a counter, and the whole of this
+                // module's path.  The ids in play are at most NREL*(NC+NP)
+                // returning and NC+NP taken, so a counter's delta is a couple
+                // of dozen compares against them, and all of them in parallel.
+                for (id = 0; id < NID; id = id + 1) begin
+                    dr = 0;
+                    dw = 0;
+                    for (x = 0; x < NREL; x = x + 1)
+                        if (rel_en[x]) begin
+                            for (k = 0; k < NC; k = k + 1)
+                                if (rel_c[x*NC*8 + k*8 +: 8] == id[7:0]) dr = dr - 1;
+                            for (k = 0; k < NP; k = k + 1)
+                                if (rel_p[x*NC*8 + k*8 +: 8] == id[7:0]) dw = dw - 1;
+                        end
+                    if (issue) begin
                         for (k = 0; k < NC; k = k + 1)
-                            if (rel_c[x*NC*8 + k*8 +: 8] != 8'hFF)
-                                rd_cnt[rel_c[x*NC*8 + k*8 +: 8]] = rd_cnt[rel_c[x*NC*8 + k*8 +: 8]] - 1'b1;
+                            if (cur_c[k] == id[7:0]) dr = dr + 1;
                         for (k = 0; k < NP; k = k + 1)
-                            if (rel_p[x*NC*8 + k*8 +: 8] != 8'hFF)
-                                wr_cnt[rel_p[x*NC*8 + k*8 +: 8]] = wr_cnt[rel_p[x*NC*8 + k*8 +: 8]] - 1'b1;
-                        tab_live[rel_tag[x*8 +: 8]] <= 1'b0;
+                            if (cur_p[k] == id[7:0]) dw = dw + 1;
                     end
+                    if (dr != 0) rd_cnt[id] = rd_cnt[id] + dr[CW-1:0];
+                    if (dw != 0) wr_cnt[id] = wr_cnt[id] + dw[CW-1:0];
+                end
                 outstanding <= outstanding + {9'd0, issue} - {2'd0, n_done_now};
                 if (issue) begin
-                    for (k = 0; k < NC; k = k + 1)
-                        if (cur_c[k] != 8'hFF) rd_cnt[cur_c[k]] = rd_cnt[cur_c[k]] + 1'b1;
-                    for (k = 0; k < NP; k = k + 1)
-                        if (cur_p[k] != 8'hFF) wr_cnt[cur_p[k]] = wr_cnt[cur_p[k]] + 1'b1;
                     slot_c[cur_port] <= cur[IDB +: NC*8];
                     slot_p[cur_port] <= cur[IDB + 8*NC +: NP*8];
                     slot_tag[cur_port] <= pc[7:0];

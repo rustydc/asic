@@ -1427,10 +1427,10 @@ against them, and the 105 tests pass.
 | index_scan | the index scan, 32 codes | 13.94 -> 2.08 | 12.73 -> 2.44 | 13,504 |
 | topk | top-K of eight | 0.71 | 0.48 | 6,840 |
 | record_reader | the record reader, two records of 32 | 2.42 -> 0.94 | 3.10 -> 0.49 | 2,220 |
-| kv_append | the append, one head of 32 | 52.14 -> 25.35 -> 4.36 | 15.52 -> 15.39 -> 3.41 | 75,780 |
+| kv_append | the append, one head of 32 | 52.14 -> 4.36 -> 1.88 | 15.52 -> 3.41 -> 2.68 | 63,943 |
 | mem_arbiter | the memory arbiter, four requesters | 0.73 -> 0.67 | 0.45 -> 0.49 | 1,752 |
 | vector_buffer | the buffer's crossbar, 24 reads and 19 writes over eight banks | 7.88 | 12.60 | 407,082 |
-| sequencer | the token sequencer, a 64-step program memory (as logic) and 64 buffer ids | not mapped -> 4.68 | not mapped -> 6.79 | 83,325 |
+| sequencer | the token sequencer, a 64-step program memory (as logic) and 64 buffer ids | not mapped -> 2.79 | not mapped -> 2.24 | 62,241 |
 
 Four shapes carried the change.
 
@@ -1519,6 +1519,20 @@ cannot be beat-aligned is the partner at `e` plus or minus `H`, and only
 the first R elements are ever rotated, so those stay in logic: a fraction
 of HD, and the mux that is left is that fraction of the one that was.
 2.50 -> 1.94 ns, 29,217 NAND2-eq -> 25,338, and ASAP7 unmoved at 1.54.
+
+The append and the sequencer, the two units that were still at four and a
+half nanoseconds when everything else was at two, came down the same way.
+The append's code packer ran from the pack lane counter through the mux
+that picks the element, the scale's add, the fifteen, the reciprocal's
+multiply, a variable shift and the clip in one stage -- sixty-three gates;
+the product and its shift are two stages now, 4.36 -> 1.88 ns and 3.41 ->
+2.68.  The sequencer moved every counter by the drain's decrements and
+then the issue's increments, sixteen read-modify-writes of a 256-entry
+array at a computed index, chained: 118 gates from a done port to a
+counter.  The ids in play are at most NREL*(NC+NP) returning and NC+NP
+taken, so a counter's delta is a couple of dozen compares against them and
+all of them in parallel: 4.68 -> 2.79 ns, 6.79 -> 2.24, and 62,241
+NAND2-eq against 83,325.
 
 What is left of that kind is the units still at 2.0 to 2.4 ns -- the
 attention core, the rotary table, the conv, the state engine -- where what

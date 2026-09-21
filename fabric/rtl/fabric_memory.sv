@@ -819,6 +819,9 @@ module fabric_kv_append #(
     localparam int LSTEPS = (CPB + LI - 1) / LI;          // cycles a beat
     reg        ipack;                                     // a beat is being packed
     reg [7:0]  lane;
+    reg        ip_v;                                      // the packer's second stage
+    reg [7:0]  ip_l;
+    reg [LI*32-1:0] ip_q;
 
     localparam [3:0] S_IDLE = 0, S_WIN = 1, S_WIN_DATA = 2, S_BLK = 3, S_BLK_DATA = 4, S_NORM_IN = 5, S_NORM_OUT = 6,
                      S_SCALE = 7, S_CODES = 8, S_IREC = 9, S_IREC_DATA = 10, S_DONE = 11;
@@ -839,13 +842,18 @@ module fabric_kv_append #(
     // reciprocal is thirty.  Written through the 64-bit helpers it was CPB
     // lanes of a 64 by 64 multiply, twice over, in one cycle -- the same
     // mistake the index scan's chain of 64-bit adds was.
-    function automatic [LI*4-1:0] idx_lanes(input integer bt, input integer ln);
+    // The lane's product, and then its shift and clip: one operation a stage.
+    // In one, the path ran from the pack lane counter through the mux that
+    // picks the element, the scale's add, the fifteen, the reciprocal's
+    // multiply, a variable shift and the clip -- sixty-three gates, the whole
+    // of this unit's 4.36 ns.
+    function automatic [LI*32-1:0] idx_mul(input integer bt, input integer ln);
         integer e, idx, sh;
         reg signed [9:0]  a;
         reg signed [13:0] b;
         reg signed [31:0] q;
         begin
-            idx_lanes = 0;
+            idx_mul = 0;
             sh = 24 - rc_lz;                      // the round is written out: synthesis will not take
             for (e = 0; e < LI; e = e + 1) begin  // fx_rnd_shr's variable shift through a nested call
                 idx = bt * CPB + ln * LI + e;
@@ -853,11 +861,24 @@ module fabric_kv_append #(
                     a = $signed(unit[idx*8 +: 8]) + $signed({2'b0, scale});
                     b = 14'sd15 * a;
                     q = $signed(b) * $signed({1'b0, rc_r});
-                    if (sh > 0) q = (q + (32'sd1 <<< (sh - 1))) >>> sh;
-                    if (q < 0) q = 0;
-                    if (q > 15) q = 15;
-                    idx_lanes[e*4 +: 4] = q[3:0];
+                    if (sh > 0) q = q + (32'sd1 <<< (sh - 1));
+                    idx_mul[e*32 +: 32] = q;
                 end
+            end
+        end
+    endfunction
+    function automatic [LI*4-1:0] idx_clip(input [LI*32-1:0] prod);
+        integer e, sh;
+        reg signed [31:0] q;
+        begin
+            idx_clip = 0;
+            sh = 24 - rc_lz;
+            for (e = 0; e < LI; e = e + 1) begin
+                q = $signed(prod[e*32 +: 32]);
+                if (sh > 0) q = q >>> sh;
+                if (q < 0) q = 0;
+                if (q > 15) q = 15;
+                idx_clip[e*4 +: 4] = q[3:0];
             end
         end
     endfunction
@@ -880,19 +901,20 @@ module fabric_kv_append #(
     always @(posedge clk) begin
         if (state == S_WIN || (state == S_WIN_DATA && !req_valid && wdata_ready))
             wb_q <= rec_beat(k_r, v_r, head, wb_beat);
-        if (ipack) begin
-            // The last beat of an index record is the scale, and is one lane's
-            // work; the rest are LI codes at a time into the beat being held.
-            if (beat == CB) wb_q <= {{(DW-8){1'b0}}, scale};
-            else wb_q[lane*LI*4 +: LI*4] <= idx_lanes(beat, lane);
-        end
+        // Stage one of the packer: the lane's products, held.  Stage two, a
+        // cycle behind it, shifts and clips them into the beat.
+        ip_v <= ipack && (beat != CB) && (lane < LSTEPS);
+        ip_l <= lane;
+        if (ipack && beat != CB) ip_q <= idx_mul(beat, lane);
+        if (ipack && beat == CB) wb_q <= {{(DW-8){1'b0}}, scale};
+        if (ip_v) wb_q[ip_l*LI*4 +: LI*4] <= idx_clip(ip_q);
     end
 
     integer b, e;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             state <= S_IDLE; head <= 0; beat <= 0; nbeat <= 0; req_valid <= 1'b0; done <= 1'b0;
-            nv_in <= 1'b0; rc_start <= 1'b0; ipack <= 1'b0; lane <= 0;
+            nv_in <= 1'b0; rc_start <= 1'b0; ipack <= 1'b0; lane <= 0; ip_v <= 1'b0;
         end else begin
             done <= 1'b0;
             nv_in <= 1'b0;
@@ -978,8 +1000,8 @@ module fabric_kv_append #(
                 S_IREC_DATA: begin
                     if (req_valid && req_ready) req_valid <= 1'b0;
                     if (ipack) begin
-                        lane <= lane + 1'b1;
-                        if (lane == LSTEPS - 1 || beat == CB) begin ipack <= 1'b0; lane <= 0; end
+                        lane <= lane + 1'b1;               // one past LSTEPS: the second stage's own cycle
+                        if (lane == LSTEPS || beat == CB) begin ipack <= 1'b0; lane <= 0; end
                     end else if (!req_valid && wdata_ready) begin
                         beat <= beat + 1'b1;
                         if (beat == IREC_BEATS - 1) state <= S_DONE;
