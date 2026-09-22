@@ -28,11 +28,31 @@ module fabric_rotary_table #(
     localparam int JW = $clog2(H) + 1;
     reg          busy;
     reg [JW-1:0] j;
+    // The frequency this cycle, as a one-hot select rather than
+    // `inv_freq[j*32 +: 32]`.  A variable part-select of the whole vector is
+    // a barrel shifter over all H*32 bits, and `j` addresses twice as many
+    // positions as there are frequencies, so one bit of `j` reached 132
+    // loads: 651 ps of clock-to-output, 31 percent of this unit's path.  An
+    // or of masks is the structure the index actually has, and it costs `j`
+    // H comparators.
+    wire [H-1:0] jsel;
+    genvar gjs;
+    generate
+        for (gjs = 0; gjs < H; gjs = gjs + 1) begin : g_jsel
+            assign jsel[gjs] = (j == gjs[JW-1:0]);
+        end
+    endgenerate
+    reg [31:0] inv_sel;
+    integer qj;
+    always @* begin
+        inv_sel = 0;
+        for (qj = 0; qj < H; qj = qj + 1) inv_sel = inv_sel | (inv_freq[qj*32 +: 32] & {32{jsel[qj]}});
+    end
     // The turn is the fraction of a revolution, so only bits 31:16 of the
     // product are wanted and the upper half of the multiplier is not built.
     // It is a stage of its own: the multiply and then the table's own index,
     // read and interpolation in one cycle were two multiplies and a table.
-    wire [31:0]  prod = pos * inv_freq[j*32 +: 32];
+    wire [31:0]  prod = pos * inv_sel;
     reg  [15:0]  turn;
     reg          v0, v1, v2;
     reg [JW-1:0] j0, j1, j2;
@@ -340,6 +360,19 @@ module fabric_attention #(
     fabric_recip #(.LW(LW), .LUT_DIR(LUT_DIR)) u_rc (.clk(clk), .start(rc_start), .l(rc_l), .done(rc_done), .r(rc_r), .lz_out(rc_lz));
     reg [16:0] r_hold;
     reg [5:0]  lz_hold;
+    // The output round's shift amount reaches every lane's barrel shifter, so
+    // one flop held 122 loads and 207 fF: 575 ps of clock-to-output, a
+    // quarter of this core's path.  A copy per lane, which is what
+    // fabric_const_copy is for.  Each takes the same next value as `lz_hold`,
+    // so they are that register, not a cycle behind it.
+    wire [5:0] lz_next = (state == S_RECIP && rc_done) ? rc_lz : lz_hold;
+    wire [5:0] lz_c [0:L-1];
+    genvar glz;
+    generate
+        for (glz = 0; glz < L; glz = glz + 1) begin : g_lz
+            fabric_const_copy #(.W(6)) u_lz (.clk(clk), .d(lz_next), .q(lz_c[glz]));
+        end
+    endgenerate
 
     // Output pipeline: O1 the two products, O2 their round and saturate,
     // O3..O5 the sigmoid, then the gate's product, the scale's and the
@@ -559,7 +592,7 @@ module fabric_attention #(
     always @(posedge clk) begin
         ov2 <= ov1;
         for (ol = 0; ol < L; ol = ol + 1) begin
-            w2[ol*16 +: 16]  <= fx_sat(fx_rnd_shr(wm1[ol], 7 + LW - lz_hold), 16);
+            w2[ol*16 +: 16]  <= fx_sat(fx_rnd_shr(wm1[ol], 7 + LW - lz_c[ol]), 16);
             tg2[ol*16 +: 16] <= fx_sat(fx_rnd_shr(gm1[ol], sh_gate), 16);
         end
         o6v <= sgv[0];
