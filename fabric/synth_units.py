@@ -81,8 +81,13 @@ UNITS = [
           "RMAP0": 5305655462704809316, "RMAP1": 2259224409,
           "WMAP0": 5143726797662605616, "WMAP1": 5},
          "the vector buffer's crossbar, 26 reads and 19 writes folded onto 11 and 8 over eight banks (the banks are macros)", noshare=True),
-    Unit("sequencer", "fabric_sequencer", ("fabric_sequencer.sv",), {"NU": 10, "NE": 4, "DEPTH": 64, "NID": 64},
-         "the token sequencer, a 64-step program memory (as logic) and 64 buffer ids", files=(("program.hex", _program_image()),)),
+    # Sized for the programs that exist: a 9B stream of two contexts is 346
+    # steps and 134 buffer ids, so a 64-step, 64-id sequencer measures a
+    # quarter of both of the arrays on its critical path.
+    Unit("sequencer", "fabric_sequencer", ("fabric_sram.sv", "fabric_sequencer.sv"),
+         {"NU": 10, "NE": 4, "DEPTH": 512, "NID": 256},
+         "the token sequencer, a 512-step program memory and 256 buffer ids",
+         files=(("program.hex", _program_image(512)),)),
 ]
 
 

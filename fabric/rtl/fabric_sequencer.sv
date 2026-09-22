@@ -69,11 +69,35 @@ module fabric_sequencer #(
     input  wire [NU*NE*8-1:0]   done_tag
 );
     localparam int NC = 6, NP = 2, IDB = 64 + 4 * 30;   // the ids follow the four address operands
-    reg [255:0] prog [0:DEPTH-1];
-    initial if (PROG_FILE != "") $readmemh(PROG_FILE, prog);
+    localparam int PAW = (DEPTH > 1) ? $clog2(DEPTH) : 1;
 
-    reg  [15:0]  pc;
-    wire [255:0] cur      = prog[pc];
+    // The program is fetched ahead of the step being checked.  Read where it
+    // is used, it is a DEPTH-entry mux of 256-bit words in the same cycle as
+    // the issue check -- which indexes a counter per buffer id the step names
+    // -- and the two together were 37 levels of logic and the whole of this
+    // module's path.  They are a memory now, which wants its address a cycle
+    // early anyway, so `fpc` runs ahead on its own and the head step and the
+    // one after it wait in `q0` and `q1`.  Two deep because a step may issue
+    // every cycle and a one-deep queue would give up every other one.
+    reg  [15:0]  pc;                                    // the step being checked
+    reg  [PAW-1:0] fpc;                                 // the step being fetched
+    reg  [255:0] q0, q1;
+    reg  [1:0]   qn;                                    // steps in hand
+    reg          fetched_v;                             // the memory answers this cycle
+    wire [255:0] fetched;
+    wire         issue;
+    // Room for what a fetch started now would bring: the memory answers the
+    // cycle after its address, so one step may already be on its way.
+    wire [2:0]   after = {1'b0, qn} + {2'b0, fetched_v} - {2'b0, issue};
+    wire         fetch = running && (after < 3'd2) && ({16'd0, fpc} != n_steps);
+    fabric_sram #(.W(256), .D(DEPTH), .NRD(1), .NWR(1), .MB(256)) u_prog (
+        .clk(clk), .rd_en(fetch), .rd_addr(fpc), .rd_data(fetched),
+        .wr_en(1'b0), .wr_addr({PAW{1'b0}}), .wr_data(256'd0), .wr_mask(1'b0));
+`ifndef FABRIC_SYNTH
+    initial if (PROG_FILE != "") $readmemh(PROG_FILE, u_prog.mem);
+`endif
+
+    wire [255:0] cur      = q0;
     wire [3:0]   cur_unit = cur[3:0];
     wire         cur_last = cur[8];
     assign cmd_engine = cur[7:4];
@@ -202,18 +226,21 @@ module fabric_sequencer #(
 
     reg  [9:0]  outstanding;
     reg         finishing;
-    wire        want  = running && !finishing && deps_ok && !tab_live[pc[7:0]] && !blocked[cur_port];
+    wire        want  = running && !finishing && qn != 2'd0 && deps_ok && !tab_live[pc[7:0]]
+                        && !blocked[cur_port];
     assign cmd_valid = want ? (1 << cur_unit) : 0;
-    wire        issue = want && cmd_ready[cur_unit];
+    assign      issue = want && cmd_ready[cur_unit];
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             pc <= 0; running <= 1'b0; done <= 1'b0; outstanding <= 0; finishing <= 1'b0; tab_live <= 0; pend <= 0; busy <= 0;
+            fpc <= 0; qn <= 0; fetched_v <= 1'b0;
             for (id = 0; id < NID; id = id + 1) begin wr_cnt[id] = 0; rd_cnt[id] = 0; end
         end else begin
             done <= 1'b0;
             if (start && !running) begin
                 pc <= 0; running <= 1'b1; outstanding <= 0; finishing <= 1'b0; tab_live <= 0; pend <= 0; busy <= 0;
+                fpc <= 0; qn <= 0; fetched_v <= 1'b0;
                 for (id = 0; id < NID; id = id + 1) begin wr_cnt[id] = 0; rd_cnt[id] = 0; end
             end else begin
                 // Not gated on `running`: when it is low nothing issues and no
@@ -221,6 +248,17 @@ module fabric_sequencer #(
                 // more than everything else here -- one flop's enable reaching
                 // every counter and every live bit was 835 loads, and the three
                 // gates behind it were 42 of the module's 43 nanoseconds.
+                // The fetch runs ahead of the check: the memory answers the cycle
+                // after its address, so `fetched_v` says a step arrives now and
+                // the queue takes it while the head one issues.
+                fetched_v <= fetch;
+                if (fetch) fpc <= fpc + 1'b1;
+                if (fetched_v && issue)      q0 <= (qn == 2'd1) ? fetched : q1;
+                else if (fetched_v)          begin if (qn == 2'd0) q0 <= fetched; else q1 <= fetched; end
+                else if (issue)              q0 <= q1;
+                if (fetched_v && issue && qn == 2'd2) q1 <= fetched;
+                qn <= qn + {1'b0, fetched_v} - {1'b0, issue};
+                if (issue) pc <= pc + 1'b1;
                 // The drains: NREL completions return their buffers; the rest wait.
                 pend <= held;
                 for (p = 0; p < NPORT; p = p + 1)
@@ -261,7 +299,6 @@ module fabric_sequencer #(
                     slot_p[cur_port] <= cur[IDB + 8*NC +: NP*8];
                     slot_tag[cur_port] <= pc[7:0];
                     tab_live[pc[7:0]] <= 1'b1;
-                    pc <= pc + 1'b1;
                     if (cur_last || pc + 1 == n_steps) finishing <= 1'b1;
                 end
                 if (running && finishing && outstanding == n_done_now && held == 0) begin
@@ -272,6 +309,7 @@ module fabric_sequencer #(
     end
 
 `ifndef FABRIC_SYNTH
+    always @(posedge clk) if (rst_n && qn > 2'd2) $display("FAIL: the fetch queue overran");
     // The port's own record of the command and the tag the unit returns are
     // the same command: the release reads the register, not the reply.  This
     // is what `busy` is for, and it was firing before there was one.
