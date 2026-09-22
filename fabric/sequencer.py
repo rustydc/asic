@@ -113,7 +113,15 @@ class Timing:
     command costs its beats plus the adapter's latency, and the two are
     separate fields so that a wider machine keeps the latency.
     """
-    core_mhz: float = 800.0
+    # The core clock, from the measured units rather than a round number.
+    # The slowest of them (``fabric/results/synth_units.json``) is the
+    # attention core at 2,127 ps on NanGate 45, and that library's FO4 is
+    # 20.54 ps on a twenty-stage fanout-of-four inverter chain, so the stage
+    # is 103.5 FO4 deep.  A 28 nm FO4 of 15 to 18 ps puts it at 1.55 to 1.86
+    # ns, 537 to 644 MHz; this is the middle of that.  Pre-layout, one
+    # corner, and the 28 nm FO4 is an assumption -- no 28 nm library here
+    # measures it.  See the clock section of the README.
+    core_mhz: float = 585.0
     # Lanes, as the RTL is elaborated.
     # A buffer beat is sixteen bytes, so a unit's lanes are capped by what its
     # operands weigh: eight for the norm and the residual, whose vectors are
@@ -150,7 +158,6 @@ class Timing:
     append_beat: int = 3             # the append's own write path, a beat at a time
     append_latency: int = 58
     append_index_latency: int = 34   # the block's index projection, its codes and its record
-    port_bytes_per_cycle: float = 16e9 / 800e6   # sixteen devices at 250 MHz DDR x16 against the core clock
     # The memory behind the port.  ``devices`` of 0 is the testbench's own
     # model, a beat a cycle after a short latency, which is what the engine
     # tests run against and what the constants above are measured on.  With
@@ -162,7 +169,19 @@ class Timing:
     stripe_beats: int = hpi.STRIPE_BYTES // BEAT
     burst_clocks: int = 20           # a burst's command, latency and tCPH, at 250 MHz
     beat_clocks: int = 4             # x16 DDR: four clocks to a sixteen-byte beat
-    ctrl_ratio: float = 800.0 / 250.0
+    controller_mhz: float = 250.0    # the HPI controller's own clock
+
+    # Both of these are the memory measured against the core clock, so they
+    # follow it rather than repeating a number it might no longer have.
+    @property
+    def port_bytes_per_cycle(self) -> float:
+        """Sixteen devices at 250 MHz DDR x16, per core cycle."""
+        return 16e9 / (self.core_mhz * 1e6)
+
+    @property
+    def ctrl_ratio(self) -> float:
+        """Core cycles to a controller clock."""
+        return self.core_mhz / self.controller_mhz
 
     def beats(self, n: int) -> int:
         return -(-n // self.lanes)

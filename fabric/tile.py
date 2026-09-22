@@ -353,8 +353,11 @@ class DensityModel:
     64-column tile on sky130 costs 1663, 2050 and 2808 NAND2 equivalents per
     column at 1, 2 and 4 rows per cycle: about 1280 per column plus 380 per
     bank.  At a 28 nm NAND2 of about 0.30 um2 that is 385 + 115 per bank.
-    The ROM cell, clock, and energy numbers remain placeholders for the MPW
-    tile.
+    The clock is no longer a placeholder: it is the slowest unit's stage
+    depth in FO4 on NanGate 45 scaled by a 28 nm FO4, which
+    ``fabric.sequencer.Timing.core_mhz`` derives and the README's clock
+    section works through.  The ROM cell and energy numbers still are, and
+    wait on the MPW tile.
     """
 
     node: str = "28nm-class estimate"
@@ -363,7 +366,7 @@ class DensityModel:
     mac_um2_per_column_per_bank: float = 115.0   # 380 NAND2-eq: tap select, one's complement, CSA per bank
     acc_um2_per_column: float = 385.0       # 1280 NAND2-eq: carry-save accumulator, requantizer share, registers
     tile_overhead_um2: float = 2500.0       # multiples generator, ROM periphery, control per tile (placeholder)
-    clock_mhz: float = 800.0
+    clock_mhz: float = 585.0                # the engine's slowest stage scaled by FO4; see fabric.sequencer.Timing
     rom_fj_per_bit: float = 3.0
     mac_fj_per_coefficient: float = 60.0
 
@@ -476,7 +479,7 @@ def main() -> None:
     parser.add_argument("--rows", type=int, default=None, help="tile depth; defaults to the hidden width")
     parser.add_argument("--cols", type=int, default=64)
     parser.add_argument("--rows-per-cycle", type=int, default=2)
-    parser.add_argument("--clock-mhz", type=float, default=800.0)
+    parser.add_argument("--clock-mhz", type=float, default=DensityModel.clock_mhz)
     args = parser.parse_args()
     from fixed_llm_poc import ASICLMConfig  # local import: torch is optional for the tile model
 

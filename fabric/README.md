@@ -106,17 +106,18 @@ the column datapath do not depend on which vias are present.
 ## Mapping the models
 
 The mapping counts tiles per matrix for one `R,R,R,G` shard and for a head
-die holding half the vocabulary. All numbers use the placeholder density model
-below.
+die holding half the vocabulary. All numbers use the density model below,
+whose areas and clock are derived from synthesis and whose ROM cell and
+energy figures are still placeholders.
 
 | | 9B layer die | 9B head die | 4B layer die | 4B head die |
 | --- | ---: | ---: | ---: | ---: |
 | Tiles | 3306 | 1940 | 2858 | 1940 |
 | Coefficients | 866M | 509M | 447M | 318M |
-| Utilization | 99.9% | 100% | 97.7% | 100% |
+| Utilization | 99.9% | 100% | 95.4% | 100% |
 | Area at 2 rows/cycle | 242 mm² | 142 mm² | 176 mm² | 119 mm² |
-| Latency per layer, 800 MHz | 10.2 µs | 2.6 µs (die) | 6.4 µs | 1.6 µs (die) |
-| Fabric energy per token | 62 µJ | 37 µJ | 32 µJ | 19 µJ |
+| Latency per layer, 585 MHz | 14.0 µs | 3.5 µs (die) | 8.8 µs | 2.2 µs (die) |
+| Fabric energy per token | 62 µJ | 37 µJ | 32 µJ | 23 µJ |
 
 The head slice fits inside a layer die's tile count in both geometries, which
 is what makes the head-mode personalization possible. At 50K tokens/s the
@@ -127,10 +128,11 @@ the coefficient count; the MAC columns scale with rows per cycle.
 
 | Rows/cycle | Clock | 9B layer die area | ROM / MAC | Latency per layer | Pass |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 800 MHz | 218 mm² | 104 / 106 mm² | 20.5 µs | 5.1 µs |
-| 2 | 800 MHz | 242 mm² | 104 / 130 mm² | 10.2 µs | 2.6 µs |
-| 4 | 800 MHz | 291 mm² | 104 / 179 mm² | 5.1 µs | 1.3 µs |
-| 2 | 500 MHz | 242 mm² | 104 / 130 mm² | 16.4 µs | 4.1 µs |
+| 1 | 585 MHz | 218 mm² | 104 / 106 mm² | 28.0 µs | 7.0 µs |
+| 2 | 585 MHz | 242 mm² | 104 / 130 mm² | 14.0 µs | 3.5 µs |
+| 4 | 585 MHz | 291 mm² | 104 / 179 mm² | 7.0 µs | 1.8 µs |
+| 2 | 537 MHz | 242 mm² | 104 / 130 mm² | 15.3 µs | 3.8 µs |
+| 2 | 644 MHz | 242 mm² | 104 / 130 mm² | 12.7 µs | 3.2 µs |
 
 Two rows per cycle is the baseline. The simulator's stage times are derived
 from it: 102 ticks (10.2 µs) per 9B layer, 26 ticks per head die.
@@ -145,8 +147,9 @@ about 66 µs.
 ## Density model
 
 `DensityModel` holds the numbers behind the tables. The MAC-column entries
-are calibrated from open-tooling synthesis (next section); the rest are
-placeholders the MPW tile is meant to replace.
+are calibrated from open-tooling synthesis (next section) and the clock is
+derived from it; the rest are placeholders the MPW tile is meant to
+replace.
 
 | Entry | Value | Source |
 | --- | ---: | --- |
@@ -154,7 +157,7 @@ placeholders the MPW tile is meant to replace.
 | MAC column | 115 µm² per bank | 380 NAND2 equivalents from 64-column sky130 synthesis, at a 0.30 µm² 28 nm NAND2 |
 | Accumulator, requantizer share, registers | 385 µm² per column | 1280 NAND2 equivalents, same source |
 | Tile overhead | 2500 µm² | placeholder: multiples generator, ROM periphery, control |
-| Clock | 800 MHz | placeholder: ROM read plus column add in one cycle |
+| Clock | 585 MHz | the engine's slowest stage, 103.5 FO4 on NanGate 45, at a 15 to 18 ps 28 nm FO4 (clock section below) |
 | ROM read | 3 fJ per bit | placeholder |
 | MAC | 60 fJ per coefficient | placeholder |
 
@@ -212,13 +215,17 @@ On the predictive kits: FreePDK15 (NC State, 15 nm FinFET) is the same kind
 of thing as ASAP7 and NanGate 45, an academic model of a node with no fab
 behind it. Its standard cells are the NanGate 15 nm library distributed by
 Silvaco behind a registration, so it is not fetchable in a script the way the
-OpenROAD platforms are, and ASAP7 already gives the below-28 nm bracket. Any
-of them is fine for relative area, useless for a tapeout.
+OpenROAD platforms are. It would be worth having: ASAP7 does not in fact give
+a below-28 nm bracket, because its FO4 measures 18.5 ps against NanGate 45's
+20.5 (clock section below), so it times like a 45 nm library whatever its
+name says. Any of them is fine for relative area, useless for a tapeout.
 
 What open PDKs can and cannot do for this project:
 
 * **Relative column cost: yes, done above.** Predictive kits (NanGate 45,
-  ASAP7, FreePDK15) bracket the target node from both sides.
+  ASAP7, FreePDK15) give relative cost. They do not bracket the target node
+  from both sides: measured on an inverter chain, the ASAP7 build here is no
+  faster than NanGate 45.
 * **The MPW tile: yes.** A 1024 × 64 test tile on sky130 or IHP SG13G2 is
   about a square millimetre of columns plus a hand-drawn via-ROM array, and
   both processes run open shuttles. That measures the column datapath, the
@@ -271,10 +278,23 @@ place-and-route would fix; the "buffered" column subtracts it and charges a
 buffer tree instead. ASAP7 maps to its smallest cells throughout, so it is
 pessimistic in the other direction. Budget 20 to 40 percent on top for wires.
 
-Read across the nodes: 130 nm at roughly 300 MHz and predictive 7 nm at
-roughly 1.7 GHz bracket a 28 nm-class part somewhere around 0.6 to 1.2 GHz
-for this logic depth. The 800 MHz placeholder is inside that range, not
-proven by it. The MPW tile and a foundry library settle it.
+Read across the nodes by FO4, which is what makes paths on different
+libraries comparable. Twenty inverters each loaded by three more measure
+77.6 ps on sky130, 65.6 on IHP SG13G2, 20.5 on NanGate 45 and 18.5 on
+ASAP7. The first three scale the way the nodes do; the fourth does not,
+so the ASAP7 build here is a 45 nm-speed library with a 7 nm name and
+cannot be the fast side of any bracket. What it can do is check the
+normalization, and it holds: the column datapath is 54.8 FO4 on sky130
+and 54.7 on NanGate 45, two libraries 3.8x apart agreeing to a tenth of a
+percent on the same logic.
+
+So the clock rests on one library and one assumption. The engine's
+slowest stage is the attention core at 2,127 ps on NanGate 45, which is
+103.5 FO4; at a 28 nm FO4 of 15 to 18 ps that is 1.55 to 1.86 ns, or 537
+to 644 MHz. `Timing.core_mhz` and `DensityModel.clock_mhz` are 585 MHz,
+the middle of it. Nothing here measures a 28 nm library -- that FO4
+range is taken from the literature, and the MPW tile and a foundry
+library settle it.
 
 Getting here changed the design, and every change was driven by a reported
 critical path:
@@ -351,8 +371,9 @@ that fix gains. On sky130 the routed flop-to-flop path is 4.2 ns, the same
 as the unbuffered pre-layout path, so none of the expected buffering gain
 arrived (see below); the 2345-sink clock tree built from `clkbuf_4` alone
 is eight levels and 1.9 ns deep, but its 470 ps of skew happens to favour
-the worst path. The 28 nm-class bracket stays where the previous section
-put it, roughly 0.6 to 1.2 GHz, with the 800 MHz placeholder inside it.
+the worst path. This is the evidence that the pre-layout unit numbers are
+worth scaling at all; the 537 to 644 MHz the previous section derives for
+28 nm stands on it.
 
 What limits each node now:
 
@@ -444,7 +465,7 @@ supply point on every top-layer node (this build turns `-dx 20 -dy 20`
 into 4.2 million sources), so it is the distribution loss alone; a real
 bump grid adds to it. For the tile this says two things: stripe pitch and
 rail width are first-order design parameters at this power density, and
-the density model's 800 MHz at 28 nm will need a grid sized from the
+the density model's 585 MHz at 28 nm will need a grid sized from the
 measured current, not the platform default. It does not change the area
 model.
 
@@ -884,7 +905,7 @@ which is why the scan now reads a page of records per request (the
 memory-side section above).
 
 The controller runs on the device clock and the arbiter and the units on
-the core's, 800 MHz against 250, so the memory port crosses a clock
+the core's, 585 MHz against 250, so the memory port crosses a clock
 boundary in `rtl/fabric_cdc.sv`: `fabric_async_fifo` is a dual-clock FIFO
 with gray-coded pointers and two-flop synchronisers, full decided on the
 write clock from the synchronised read pointer and empty on the read
@@ -1385,17 +1406,28 @@ every module in it at its default parameters before the top is chosen,
 and the attention core at 256 wide or the state engine at 128 x 128 is
 gigabytes of yosys; `read_verilog -defer` elaborates only the top's tree
 at its parameters, and the rotary table that was killed at 5 GB maps in
-19 s. ABC's buffer-and-stime script aborts on this ASAP7 liberty, so the
-ASAP7 columns are the plain `abc -D` fallback and their areas are not
-comparable with NanGate's (up to a factor of two either way for the
-same logic). And the ASAP7 paths are 1.1 to 2x shorter than NanGate's
-where the path is logic, more than the two libraries' FO4 ratio (20.5 ps
-against 18.5 ps for this liberty on an inverter chain): the mapping
-differs, not the transistors. A 28 nm FO4 is 15 to 18 ps, so a unit's 28 nm path is
-roughly its ASAP7 number and its NanGate number times 0.8; the columns
-at 1.14 / 0.73 ns land at 0.6 to 0.9 ns, the 800 MHz clock, as the
-earlier bracket said. The sequencer is the one unit with no number at
-all: it runs out of memory in yosys, for a reason given at the end.
+19 s. ABC's buffer-and-stime script used to abort here and the run fell
+back to an unbuffered mapping without saying so, which timed a flop with
+a thousand loads at tens of nanoseconds and called it a measurement;
+`topo` now runs before the buffering as well as after, and a result that
+did fall back says so. And the ASAP7 paths are 1.1 to 2x shorter than
+NanGate's where the path is logic, more than the two libraries' FO4
+ratio (20.5 ps against 18.5 ps on an inverter chain): the mapping
+differs, not the transistors. A 28 nm FO4 is 15 to 18 ps, so a unit's
+28 nm path is its NanGate number times 0.73 to 0.88; the columns at
+1.12 ns land at 0.82 to 0.99 ns.
+
+ASAP7 is the weaker of the two here, in a way worth knowing before
+reading its column. On `index_scan` the same RTL maps to the same 111
+flops on both libraries, and the worst register carries 16 loads on
+NanGate and 302 on ASAP7 -- 239.5 fF against that flop's own 46.08 fF
+limit, a nanosecond of clock-to-output, and 1,073 transition violations
+downstream of it, against none of either on NanGate. Where ABC leaves a
+net like that, its own estimate comes in up to twice under OpenSTA's;
+where it does not, the two agree to 7 percent. So a unit whose worst
+register has a large fanout is penalised on ASAP7 by the mapping rather
+than by the node, which is most of why the two libraries rank the units
+differently.
 
 What a stage may hold is a handful of measured costs. On NanGate 45,
 post-synthesis and without wires, one 16-bit multiply is 1.36 ns, a
@@ -1418,19 +1450,19 @@ against them, and the 105 tests pass.
 | rmsnorm | the norm, two lanes, with the inverse square root | 4.41 -> 1.72 | 2.29 -> 1.21 | 69,454 |
 | delta_state8 | the int8 state engine, four lanes of a 16-row state | 22.93 -> 2.03 | 11.26 -> 1.27 | 133,994 |
 | conv_silu | the causal conv and SiLU, two lanes | 2.25 -> 2.07 | 1.72 -> 1.22 | 39,513 |
-| head_gates | the per-head gates | 2.13 -> 1.58 | 1.45 -> 1.40 | 24,704 |
-| swiglu | SwiGLU, two lanes | 4.07 -> 1.90 | 2.50 -> 1.02 | 30,126 |
-| residual | the residual add, four lanes | 2.27 -> 2.16 -> 1.53 | 1.50 -> 1.03 -> 0.89 | 12,182 |
-| rotary | the rotation, two lanes | 5.71 -> 2.50 -> 1.94 | 5.00 -> 1.54 | 25,338 |
-| rotary_table | the rotary table | 2.48 -> 2.13 | 1.93 -> 1.59 | 15,344 |
-| attention | the attention core, one head of 32, two lanes | 59.62 -> 11.35 -> 2.41 | 33.94 -> 29.68 -> 1.49 | 90,462 |
-| index_scan | the index scan, 32 codes | 13.94 -> 2.08 | 12.73 -> 2.44 | 13,504 |
+| head_gates | the per-head gates | 2.13 -> 1.58 | 1.45 -> 0.99 | 24,704 |
+| swiglu | SwiGLU, two lanes | 4.07 -> 1.90 | 2.50 -> 1.02 | 30,139 |
+| residual | the residual add, four lanes | 2.27 -> 2.16 -> 1.53 | 1.50 -> 1.03 -> 0.89 | 12,194 |
+| rotary | the rotation, two lanes | 5.71 -> 2.50 -> 1.93 | 5.00 -> 1.54 | 25,338 |
+| rotary_table | the rotary table | 2.48 -> 1.67 | 1.93 -> 1.12 | 15,144 |
+| attention | the attention core, one head of 32, two lanes | 59.62 -> 11.35 -> 2.13 | 33.94 -> 29.68 -> 1.51 | 90,514 |
+| index_scan | the index scan, 32 codes | 13.94 -> 2.07 | 12.73 -> 2.60 | 13,404 |
 | topk | top-K of eight | 0.71 | 0.48 | 6,840 |
 | record_reader | the record reader, two records of 32 | 2.42 -> 0.94 | 3.10 -> 0.49 | 2,220 |
-| kv_append | the append, one head of 32 | 52.14 -> 4.36 -> 1.88 | 15.52 -> 3.41 -> 2.68 | 63,943 |
-| mem_arbiter | the memory arbiter, four requesters | 0.73 -> 0.67 | 0.45 -> 0.49 | 1,752 |
-| vector_buffer | the buffer's crossbar, 26 reads and 19 writes folded onto 11 and 8, over eight banks | 7.88 -> 1.46 | 12.60 -> 0.89 | 407,082 -> 355,461 |
-| sequencer | the token sequencer, a 512-step program memory (a macro) and 256 buffer ids | not mapped -> 9.15 -> 2.44 | not mapped -> 2.10 | 234,216 |
+| kv_append | the append, one head of 32 | 52.14 -> 4.36 -> 1.88 | 15.52 -> 3.41 -> 1.17 | 63,943 |
+| mem_arbiter | the memory arbiter, four requesters | 0.73 | 0.45 | 1,660 |
+| vector_buffer | the buffer's crossbar, 26 reads and 19 writes folded onto 11 and 8, over eight banks | 7.88 -> 1.46 | 12.60 -> 0.88 | 407,082 -> 355,461 |
+| sequencer | the token sequencer, a 512-step program memory (a macro) and 256 buffer ids | not mapped -> 9.15 -> 2.04 | not mapped -> 1.23 | 240,621 |
 
 Four shapes carried the change.
 
@@ -1534,11 +1566,11 @@ taken, so a counter's delta is a couple of dozen compares against them and
 all of them in parallel: 4.68 -> 2.79 ns, 6.79 -> 2.24, and 62,241
 NAND2-eq against 83,325.
 
-What is left of that kind is the units still at 2.0 to 2.4 ns -- the
-attention core, the rotary table, the conv, the state engine -- where what
-is left is a table's decode or a barrel shifter rather than a multiply's
-carry. The 800 MHz placeholder still needs them: at 2 ns a
-stage the die clocks at 500 MHz, not 800.
+What is left of that kind is the units still around 2.0 to 2.1 ns -- the
+attention core, the conv, the index scan, the sequencer, the state engine
+-- where what is left is a ripple carry rather than a multiply's. They are
+what sets the clock: at 2.1 ns a stage on NanGate 45 the die clocks at
+585 MHz, not 800.
 
 The other kind was not logic at all. The attention core and the append
 reported 11 and 52 ns on NanGate, and almost all of it was one flop
