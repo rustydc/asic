@@ -120,15 +120,25 @@ module fabric_rotary #(
     localparam int RA = (BEATS > 1) ? $clog2(BEATS) : 1;
     reg [R*16-1:0]  rot_buf;                  // the rotated elements, for the partner
     reg [BW-1:0]    wr, rd, rd_addr;
-    // A copy of the drain address per lane.  The address selects three
-    // sixteen-bit windows of the buffer for every lane and an entry of each
-    // table, which came to 593 loads on one flop and two of this unit's two
-    // and a half nanoseconds.  Marked so the optimizer does not merge them
-    // back into one net; they are the same value in the same cycle, so
-    // nothing moves.
-    (* keep *) reg [BW-1:0] rd_l [0:L-1];
     reg             draining, rd_valid;
     integer         lc;
+    // A copy of the drain address per lane.  The address selects three
+    // sixteen-bit windows of the buffer for every lane and an entry of each
+    // table: 593 loads on one flop at two lanes, and 1,001 at the sixteen
+    // the 9B head actually has, where it was 4.07 of this unit's 4.60 ns.
+    // These were `(* keep *)` on a register array, which keeps the net and
+    // lets the mapper merge the flops back into one -- so the copies were
+    // never there.  fabric_const_copy keeps them, because each is its own
+    // module.  Every copy takes the address's next value, so all of them
+    // and `rd_addr` are the same register.
+    wire [BW-1:0] rd_l [0:L-1];
+    wire [BW-1:0] rd_l_next = draining ? rd : rd_addr;
+    genvar grl;
+    generate
+        for (grl = 0; grl < L; grl = grl + 1) begin : g_rdl
+            fabric_const_copy #(.W(BW)) u_rd (.clk(clk), .d(rd_l_next), .q(rd_l[grl]));
+        end
+    endgenerate
     // The address leads the data by a cycle, which is what `rd` already is:
     // the drain registers it into rd_addr, so the beat the memory is asked
     // for now is the beat rd_addr will name next cycle.
@@ -150,7 +160,6 @@ module fabric_rotary #(
             if (draining) begin
                 rd_valid <= 1'b1;
                 rd_addr <= rd;
-                for (lc = 0; lc < L; lc = lc + 1) rd_l[lc] <= rd;
                 rd <= rd + 1'b1;
                 if (rd == BEATS - 1) draining <= 1'b0;
             end
@@ -351,6 +360,27 @@ module fabric_attention #(
         end
     endgenerate
 
+    // The softmax rescale factors, one per head, each multiplying every one
+    // of that head's L lanes.  Shared, `f_r[0]` alone carried 842 loads and
+    // 1.38 pF at the 9B geometry -- 3.39 of the core's 5.24 ns -- because a
+    // sixteen-bit operand into L multipliers is L times sixteen fanouts.  A
+    // copy per head and lane, taking the same next value as the register, so
+    // the copy is that register.
+    wire fp_take = (state == S_APPLY) && exp_v[0];
+    wire [15:0] f_r_c [0:G*L-1];
+    wire [15:0] p_r_c [0:G*L-1];
+    genvar gfp, lfp;
+    generate
+        for (gfp = 0; gfp < G; gfp = gfp + 1) begin : g_fp
+            wire [15:0] f_nx = fp_take ? (newmax[gfp] ? (m_valid[gfp] ? exp_y[gfp] : 16'hFFFF) : 16'hFFFF) : f_r[gfp];
+            wire [15:0] p_nx = fp_take ? (newmax[gfp] ? 16'hFFFF : exp_y[gfp]) : p_r[gfp];
+            for (lfp = 0; lfp < L; lfp = lfp + 1) begin : g_fpl
+                fabric_const_copy #(.W(16)) u_f (.clk(clk), .d(f_nx), .q(f_r_c[gfp*L + lfp]));
+                fabric_const_copy #(.W(16)) u_p (.clk(clk), .d(p_nx), .q(p_r_c[gfp*L + lfp]));
+            end
+        end
+    endgenerate
+
     // Reciprocal for the output.
     reg          rc_start;
     wire         rc_done;
@@ -366,6 +396,16 @@ module fabric_attention #(
     // fabric_const_copy is for.  Each takes the same next value as `lz_hold`,
     // so they are that register, not a cycle behind it.
     wire [5:0] lz_next = (state == S_RECIP && rc_done) ? rc_lz : lz_hold;
+    // `r_hold` is the same story on the output product: one seventeen-bit
+    // operand into every lane's multiplier.
+    wire [16:0] r_next = (state == S_RECIP && rc_done) ? rc_r : r_hold;
+    wire [16:0] r_c [0:L-1];
+    genvar grc;
+    generate
+        for (grc = 0; grc < L; grc = grc + 1) begin : g_rc
+            fabric_const_copy #(.W(17)) u_r (.clk(clk), .d(r_next), .q(r_c[grc]));
+        end
+    endgenerate
     wire [5:0] lz_c [0:L-1];
     genvar glz;
     generate
@@ -404,6 +444,27 @@ module fabric_attention #(
     reg [BW-1:0] o_waddr;
     reg [3:0]    drain;
     reg          out_go;
+    // `o_seen` chooses, for every lane of every head, whether the value
+    // memory is read or zero, so one flop held G*L multiplexers: 780 loads
+    // and 1.46 pF at the 9B geometry, 3.57 of this core's 5.84 ns.  A copy
+    // per lane of each head for the value update and per lane for the output
+    // product.  `start` clears the copies through their own next value, so
+    // they match the register that has the reset.
+    wire o_seen_next = (!rst_n || start) ? 1'b0
+                     : ((vv && vbeat == BEATS - 1) ? 1'b1 : o_seen);
+    wire o_seen_v [0:G*L-1];                 // the value update, per head and lane
+    wire o_seen_o [0:L-1];                   // the output product, per lane
+    genvar gos, los;
+    generate
+        for (gos = 0; gos < G; gos = gos + 1) begin : g_osv
+            for (los = 0; los < L; los = los + 1) begin : g_osl
+                fabric_const_copy #(.W(1)) u_os (.clk(clk), .d(o_seen_next), .q(o_seen_v[gos*L + los]));
+            end
+        end
+        for (los = 0; los < L; los = los + 1) begin : g_oso
+            fabric_const_copy #(.W(1)) u_os (.clk(clk), .d(o_seen_next), .q(o_seen_o[los]));
+        end
+    endgenerate
 
     // The beat each memory is asked for: the one that will arrive, not the one
     // that has.  A memory answers a cycle later, so an address that tracked
@@ -534,8 +595,8 @@ module fabric_attention #(
                         // so the read and the write never meet.
                         for (g = 0; g < G; g = g + 1)
                             for (l = 0; l < L; l = l + 1) begin
-                                va[g][l] <= $signed(o_seen ? o_rd[g][l*OW +: OW] : {OW{1'b0}}) * $signed({{(OW+1){1'b0}}, f_r[g]});
-                                vb[g][l] <= $signed({9'b0, p_r[g]}) * $signed(in_data[l*8 +: 8]);
+                                va[g][l] <= $signed(o_seen_v[g*L + l] ? o_rd[g][l*OW +: OW] : {OW{1'b0}}) * $signed({{(OW+1){1'b0}}, f_r_c[g*L + l]});
+                                vb[g][l] <= $signed({9'b0, p_r_c[g*L + l]}) * $signed(in_data[l*8 +: 8]);
                             end
                         vv    <= 1'b1;
                         vbeat <= beat;
@@ -557,7 +618,7 @@ module fabric_attention #(
                     // One beat per cycle into the output pipeline.
                     ov1 <= 1'b1;
                     for (l = 0; l < L; l = l + 1) begin
-                        wm1[l] <= $signed(o_seen ? o_rd[ohead][l*OW +: OW] : {OW{1'b0}}) * $signed({{(OW+1){1'b0}}, r_hold});
+                        wm1[l] <= $signed(o_seen_o[l] ? o_rd[ohead][l*OW +: OW] : {OW{1'b0}}) * $signed({{(OW+1){1'b0}}, r_c[l]});
                         gm1[l] <= $signed(gate_rd[ohead][l*8 +: 8]) * $signed({8'b0, mult_gate});
                     end
                     if (obeat == BEATS - 1) begin

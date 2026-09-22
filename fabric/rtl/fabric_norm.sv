@@ -46,8 +46,12 @@ module fabric_rmsnorm #(
     localparam int BEATS = D / L;
     localparam int BW    = $clog2(BEATS) + 1;
 
-    reg [L*XW-1:0] xmem [0:BEATS-1];
-    reg [L*GW-1:0] gmem [0:BEATS-1];
+    // The vector waits here between the sum pass and the drain.  Macros, not
+    // register arrays: at the 9B width these are 512 beats of 128 bits each,
+    // which as registers is 131,072 flops -- 1.55M NAND2 equivalents, more
+    // than any other unit in the engine -- and the read is a 512-to-1 mux
+    // whose address carried 203 loads and 1.72 of this unit's 2.31 ns.  The
+    // rotation and the attention core already hold their beats this way.
     reg [BW-1:0]   wr;
     reg [SW-1:0]   ss;
 
@@ -120,8 +124,6 @@ module fabric_rmsnorm #(
                     ssk[i] <= ssk[i] + {{(SW-PW){1'b0}}, sq1[i*PW +: PW]};
             case (phase)
                 2'd0: if (in_valid) begin
-                    xmem[wr] <= in_x;
-                    gmem[wr] <= in_gain;
                     wr <= wr + 1'b1;
                     if (wr == n_beats - 1) begin
                         phase <= 2'd1;
@@ -175,8 +177,19 @@ module fabric_rmsnorm #(
     localparam int MW = XW + 18;                 // x * r
     localparam int NG = 16 + GW;                 // n * gain
     localparam int QW = NG + 16;                 // that * mult
-    reg [L*XW-1:0] x0;
-    reg [L*GW-1:0] g0, g1, g2;
+    // The macros answer the cycle after their address, which is the cycle
+    // `x0 <= xmem[rd_addr]` used to land in, so `rd_addr` is the address to
+    // present and the beat arrives where the drain pipeline expects it.
+    localparam int RA = (BEATS > 1) ? $clog2(BEATS) : 1;
+    wire [L*XW-1:0] x0;
+    wire [L*GW-1:0] g0;
+    fabric_sram #(.W(L*XW), .D(BEATS), .NRD(1), .NWR(1), .MB(L*XW)) u_x (
+        .clk(clk), .rd_en(1'b1), .rd_addr(rd_addr[RA-1:0]), .rd_data(x0),
+        .wr_en(in_valid && phase == 2'd0), .wr_addr(wr[RA-1:0]), .wr_data(in_x), .wr_mask(1'b1));
+    fabric_sram #(.W(L*GW), .D(BEATS), .NRD(1), .NWR(1), .MB(L*GW)) u_g (
+        .clk(clk), .rd_en(1'b1), .rd_addr(rd_addr[RA-1:0]), .rd_data(g0),
+        .wr_en(in_valid && phase == 2'd0), .wr_addr(wr[RA-1:0]), .wr_data(in_gain), .wr_mask(1'b1));
+    reg [L*GW-1:0] g1, g2;
     reg            v0, v1, v2, v3, v4, v5;
     reg signed [MW-1:0] m1 [0:L-1];
     reg [L*16-1:0] n2;
@@ -186,8 +199,6 @@ module fabric_rmsnorm #(
     integer k;
     always @(posedge clk) begin
         v0 <= rd_valid;
-        x0 <= xmem[rd_addr];
-        g0 <= gmem[rd_addr];
         v1 <= v0;
         g1 <= g0;
         for (k = 0; k < L; k = k + 1)
