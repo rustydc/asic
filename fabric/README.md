@@ -1394,12 +1394,23 @@ python -m fabric.synth_units --lib nangate45=nangate45_typ.lib:1600 --lib asap7=
 
 `fabric/results/synth_units.json` holds the result per unit and library:
 cells, flops, area, the critical path with its start and end registers
-and the cell types along it. The lane count is the geometry that sets
-area (the norm at two lanes, the state engine at four lanes of a 16-row
-state, the attention core at two lanes of a 32-wide head), so the NAND2
-equivalents are per lane or per row, not the die's; the critical path is
-the number that matters, since a unit's worst stage is the same at any
-lane count.
+and the cell types along it. Most units are listed at a small geometry
+and again at the 9B elaboration (`*_real`), because the small one turned
+out not to be representative of the path -- an assumption this section
+used to state and which is false.
+
+Area scales with the lanes as expected, but so does the fanout of every
+register a lane count multiplies, and the mapper cannot buffer a
+register's own output. At 9B the rotation spends 4.07 of its 4.60 ns on
+one flop with 1,001 loads and 1.67 pF, the attention core 3.57 of 5.84 ns
+on a one-bit flag with 780, and the norm 1.72 of 2.31 ns on a read
+address with 203. It is not lane count in itself: SwiGLU goes from two
+lanes to sixteen and moves 1.90 to 1.99 ns. It is a shared control
+register that every lane reads, the same fault `fetched_v` and `lz_hold`
+had, and the same fix works. Until that fix is made, the 585 MHz above is
+what this design can reach and not what it currently measures: at the 9B
+geometry the slowest unit is the attention core at 5.84 ns, which is
+284 FO4 and about 215 MHz at 28 nm.
 
 Three things about the flow first. Reading a source file elaborates
 every module in it at its default parameters before the top is chosen,

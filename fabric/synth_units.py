@@ -2,11 +2,20 @@
 
 The column datapath has its own flow (``fabric.synth``, ``fabric.sta``);
 this runs the same flow over the vector units, the state engine, the
-attention core, the memory units and the sequencer, each at a small but
-representative geometry (the lane count sets area, not depth), and writes
-the critical path and area of each per library.  The result is a bracket
-on the clock, not a clock: post-synthesis, no wires, one corner, on open
-libraries at 7 nm (predictive) and 45 nm.
+attention core, the memory units and the sequencer, and writes the critical
+path and area of each per library.  The result is a bracket on the clock,
+not a clock: post-synthesis, no wires, one corner, on open libraries at
+7 nm (predictive) and 45 nm.
+
+Most units are listed at a small geometry and again (``*_real``) at the 9B
+elaboration, because the small one is not representative of the path the
+way it was assumed to be.  Area scales with the lanes, as expected, but so
+does the fanout of any register a lane count multiplies, and the mapper
+cannot buffer a register's own output: at 9B the rotation spends 4.07 of
+its 4.60 ns on one flop with 1,001 loads, the attention core 3.57 of 5.84
+on a one-bit flag with 780, and the norm 1.72 of 2.31 on a read address
+with 203.  A unit measured narrow can hide most of its real path, so the
+clock has to come from the ``*_real`` rows.
 
     python -m fabric.synth_units --lib asap7=asap7.lib:800 --lib nangate45=ng45.lib:1600 \\
         --sta /path/to/sta --out fabric/results/synth_units.json
@@ -65,6 +74,25 @@ UNITS = [
     Unit("rotary_table", "fabric_rotary_table", VEC + ("fabric_attention.sv",), {"R": 16}, "the rotary table", luts=True),
     Unit("attention", "fabric_attention", VEC + ("fabric_attention.sv",), {"HD": 32, "G": 1, "L": 2, "LW": 28},
          "the attention core, one head of 32, two lanes", luts=True),
+    # The real elaboration, to test whether a unit's worst stage is the same at
+    # any lane count: the 9B attention core is one group of four heads of 256,
+    # sixteen lanes, against the representative geometry's one head of 32 and
+    # two lanes.
+    Unit("attention_real", "fabric_attention", VEC + ("fabric_attention.sv",), {"HD": 256, "G": 4, "L": 16, "LW": 28},
+         "the attention core at the 9B geometry: four heads of 256, sixteen lanes", luts=True),
+    # The same units at the 9B elaboration, to see how much of each unit's
+    # path the representative geometry hides.  Lanes are NL=8, CL=4,
+    # ATT_L=SW_L=16; the head is 256 wide and the hidden width 4096.
+    Unit("rmsnorm_real", "fabric_rmsnorm", VEC + ("fabric_norm.sv",), {"D": 4096, "XW": 16, "OW": 8, "L": 8, "SW": 44},
+         "the norm at 9B: eight lanes over 4096", luts=True),
+    Unit("swiglu_real", "fabric_swiglu", VEC + ("fabric_ffn.sv",), {"L": 16}, "SwiGLU at 9B: sixteen lanes", luts=True),
+    Unit("residual_real", "fabric_residual", VEC + ("fabric_ffn.sv",), {"L": 8}, "the residual add at 9B: eight lanes"),
+    Unit("conv_silu_real", "fabric_conv_silu", VEC + ("fabric_recurrent.sv",), {"K": 4, "L": 4},
+         "the conv and SiLU at 9B: four lanes", luts=True),
+    Unit("rotary_real", "fabric_rotary", VEC + ("fabric_attention.sv",), {"HD": 256, "R": 64, "L": 16},
+         "the rotation at 9B: sixteen lanes of a 256-wide head"),
+    Unit("columns_real", "fabric_columns", VEC + ("fabric_tile.sv",), {"ROWS": 4096, "COLS": 64, "WB": 4, "AB": 8, "P": 2, "ACC": 24},
+         "the tile's column datapath at 64 columns"),
     Unit("index_scan", "fabric_index_scan", ("fabric_memory.sv", "fabric_norm.sv") + VEC, {"IDIM": 32, "RPB": 8},
          "the index scan, 32 codes", luts=True),
     Unit("topk", "fabric_topk", ("fabric_memory.sv", "fabric_norm.sv") + VEC, {"K": 8}, "top-K of eight", luts=True),
