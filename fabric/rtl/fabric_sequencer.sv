@@ -90,6 +90,23 @@ module fabric_sequencer #(
     // cycle after its address, so one step may already be on its way.
     wire [2:0]   after = {1'b0, qn} + {2'b0, fetched_v} - {2'b0, issue};
     wire         fetch = running && (after < 3'd2) && ({16'd0, fpc} != n_steps);
+    // `fetched_v` selects what each of the queue's 512 bits takes, so one flop
+    // held 490 loads and 798 fF: two nanoseconds of clock-to-output, and the
+    // whole of this module's path once the counting above came off it.  The
+    // mapper buffers what it drives and cannot help the flop itself, so the
+    // flop is replicated, a copy per slice of the queue -- the same trick as
+    // fabric_const_copy for a lane's shift amount and fabric_strobe_copy for
+    // the tile's strobe.  Every copy takes `fetch`, so all of them and
+    // `fetched_v` (which keeps the few loads that are left) always agree.
+    localparam int NQC = 16;                            // copies, one per queue slice
+    localparam int QSL = 256 / NQC;
+    wire [NQC-1:0] fetched_vc;
+    genvar gq;
+    generate
+        for (gq = 0; gq < NQC; gq = gq + 1) begin : g_fv
+            fabric_seq_copy u_fv (.clk(clk), .rst_n(rst_n), .d(fetch), .q(fetched_vc[gq]));
+        end
+    endgenerate
     fabric_sram #(.W(256), .D(DEPTH), .NRD(1), .NWR(1), .MB(256)) u_prog (
         .clk(clk), .rd_en(fetch), .rd_addr(fpc), .rd_data(fetched),
         .wr_en(1'b0), .wr_addr({PAW{1'b0}}), .wr_data(256'd0), .wr_mask(1'b0));
@@ -143,12 +160,17 @@ module fabric_sequencer #(
     reg  [NREL*NC*8-1:0] rel_c;                   // consumed and produced ids at the
     reg  [NREL*NC*8-1:0] rel_p;                   // same stride, so one scan serves both
     reg  [NREL*8-1:0]    rel_tag;
-    // "The lowest port still to drain" is x & -x, not a scan.  Written as a
+    // "The lowest port still to drain" is one-hot, not a scan.  Written as a
     // scan it is NPORT stages of "nothing found yet", each selecting that
     // port's ids, which is a chain of forty gates of fanout sixty -- 15 of the
     // module's 21 nanoseconds.  One-hot, the select is an or of masks, which
     // is associative and comes out of synthesis as a tree.
-    reg [NPORT-1:0] remaining, one;
+    // The one-hot is a prefix or, not ``x & -x``: the incrementer's carry is
+    // a ripple forty bits long and synthesis leaves it one, which measured
+    // twenty gates and 915 ps of the release's path.  Doubling the span each
+    // pass answers "is any lower port set" in ceil(log2 NPORT) levels.
+    reg [NPORT-1:0] remaining, one, lower;
+    integer sh;
     reg [NC*8-1:0]  sel_c;
     reg [NP*8-1:0]  sel_p;
     reg [7:0]       sel_tag;
@@ -161,7 +183,9 @@ module fabric_sequencer #(
         rel_tag = 0;
         remaining = want_rel;
         for (r = 0; r < NREL; r = r + 1) begin
-            one = remaining & (~remaining + {{(NPORT-1){1'b0}}, 1'b1});
+            lower = {remaining[NPORT-2:0], 1'b0};              // lower[i] = remaining[i-1]
+            for (sh = 1; sh < NPORT; sh = sh * 2) lower = lower | (lower << sh);
+            one = remaining & ~lower;
             sel_c = 0; sel_p = 0; sel_tag = 0;
             for (q = 0; q < NPORT; q = q + 1) begin
                 sel_c   = sel_c   | (slot_c[q]   & {(NC*8){one[q]}});
@@ -193,7 +217,7 @@ module fabric_sequencer #(
     // themselves are updated by the drains and then the issue.
     reg [CW-1:0] wr_cnt [0:NID-1];
     reg [CW-1:0] rd_cnt [0:NID-1];
-    integer p, k, m, id, x;
+    integer p, k, m, id, x, w;
     reg signed [CW:0] dr, dw;                            // a counter's move this cycle
 
     // The drained ids travel as arguments, not as a reference to rel_c and
@@ -212,7 +236,6 @@ module fabric_sequencer #(
     endfunction
 
     reg deps_ok;
-    reg [7:0] n_done_now;
     always @* begin
         deps_ok = 1'b1;
         for (k = 0; k < NC; k = k + 1)
@@ -220,11 +243,25 @@ module fabric_sequencer #(
         for (k = 0; k < NP; k = k + 1)
             if (cur_p[k] != 8'hFF && (rd_cnt[cur_p[k]] != released(cur_p[k], NC, rel_en, rel_c)
                                       || (!cur_contrib[k] && wr_cnt[cur_p[k]] != released(cur_p[k], NP, rel_en, rel_p)))) deps_ok = 1'b0;
-        n_done_now = 0;
-        for (p = 0; p < NPORT; p = p + 1) if (done_valid[p]) n_done_now = n_done_now + 1'b1;
     end
 
+    // Commands issued and not yet returned.  Counted against the drains,
+    // which are at most NREL a cycle, and not against the completions, which
+    // are up to NPORT: a population count of the forty done ports is forty
+    // chained increments, and synthesis leaves it a chain -- 38 levels and
+    // 1.75 of this module's 2.44 nanoseconds, for a number read nowhere but
+    // the test below.  A command that has completed and not drained is still
+    // outstanding, so reaching zero is what it always was: every step issued
+    // has returned its buffers, which is also what `held == 0` said.
+    localparam int RW = (NREL > 1) ? $clog2(NREL + 1) : 1;
+    reg  [RW-1:0] n_rel;
+    integer z;
+    always @* begin
+        n_rel = 0;
+        for (z = 0; z < NREL; z = z + 1) if (rel_en[z]) n_rel = n_rel + 1'b1;
+    end
     reg  [9:0]  outstanding;
+    wire [9:0]  out_next = outstanding + {9'd0, issue} - {{(10-RW){1'b0}}, n_rel};
     reg         finishing;
     wire        want  = running && !finishing && qn != 2'd0 && deps_ok && !tab_live[pc[7:0]]
                         && !blocked[cur_port];
@@ -253,10 +290,17 @@ module fabric_sequencer #(
                 // the queue takes it while the head one issues.
                 fetched_v <= fetch;
                 if (fetch) fpc <= fpc + 1'b1;
-                if (fetched_v && issue)      q0 <= (qn == 2'd1) ? fetched : q1;
-                else if (fetched_v)          begin if (qn == 2'd0) q0 <= fetched; else q1 <= fetched; end
-                else if (issue)              q0 <= q1;
-                if (fetched_v && issue && qn == 2'd2) q1 <= fetched;
+                // Each slice of the queue reads its own copy of `fetched_v`.
+                for (w = 0; w < NQC; w = w + 1) begin
+                    if (fetched_vc[w] && issue)
+                        q0[w*QSL +: QSL] <= (qn == 2'd1) ? fetched[w*QSL +: QSL] : q1[w*QSL +: QSL];
+                    else if (fetched_vc[w])
+                        begin if (qn == 2'd0) q0[w*QSL +: QSL] <= fetched[w*QSL +: QSL];
+                              else            q1[w*QSL +: QSL] <= fetched[w*QSL +: QSL]; end
+                    else if (issue)
+                        q0[w*QSL +: QSL] <= q1[w*QSL +: QSL];
+                    if (fetched_vc[w] && issue && qn == 2'd2) q1[w*QSL +: QSL] <= fetched[w*QSL +: QSL];
+                end
                 qn <= qn + {1'b0, fetched_v} - {1'b0, issue};
                 if (issue) pc <= pc + 1'b1;
                 // The drains: NREL completions return their buffers; the rest wait.
@@ -292,7 +336,7 @@ module fabric_sequencer #(
                     if (dr != 0) rd_cnt[id] = rd_cnt[id] + dr[CW-1:0];
                     if (dw != 0) wr_cnt[id] = wr_cnt[id] + dw[CW-1:0];
                 end
-                outstanding <= outstanding + {9'd0, issue} - {2'd0, n_done_now};
+                outstanding <= out_next;
                 if (issue) begin
                     busy[cur_port] <= 1'b1;                  // after the drains: a port reissued in its drain cycle stays busy
                     slot_c[cur_port] <= cur[IDB +: NC*8];
@@ -301,7 +345,7 @@ module fabric_sequencer #(
                     tab_live[pc[7:0]] <= 1'b1;
                     if (cur_last || pc + 1 == n_steps) finishing <= 1'b1;
                 end
-                if (running && finishing && outstanding == n_done_now && held == 0) begin
+                if (running && finishing && out_next == 10'd0) begin
                     running <= 1'b0; done <= 1'b1;
                 end
             end
@@ -320,6 +364,22 @@ module fabric_sequencer #(
                     $display("FAIL: port %0d returned tag %0d, it was given %0d%s", m, done_tag[m*8 +: 8], slot_tag[m],
                              busy[m] ? "" : " and had no command outstanding");
 `endif
+endmodule
+
+// One registered copy of a strobe the sequencer spreads over a wide register.
+// Its own hierarchy, so synthesis cannot merge the copies back into one flop:
+// `keep` on the register would hold the net and merge the flop anyway.  The
+// vector units and the tile have the same thing for the same reason
+// (fabric_const_copy, fabric_strobe_copy); this one carries a reset, because
+// what it drives must be known from the first cycle.
+(* keep_hierarchy *)
+module fabric_seq_copy (
+    input  wire clk,
+    input  wire rst_n,
+    input  wire d,
+    output reg  q
+);
+    always @(posedge clk or negedge rst_n) if (!rst_n) q <= 1'b0; else q <= d;
 endmodule
 
 `default_nettype wire
