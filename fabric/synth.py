@@ -43,6 +43,7 @@ class SynthResult:
     abc_delay_ps: float | None      # ABC stime critical path after buffering, no wire load (timing mode only)
     critical_path: str | None       # ABC's reported start-point -> end-point
     log_excerpt: str
+    buffered: bool = True           # false when ABC's timing script aborted and the fallback mapped unbuffered
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -248,8 +249,13 @@ def synthesize(liberty: Path | Sequence[Path], *, rows: int = 256, cols: int = 8
             # Timing-driven mapping plus ABC's own static timing (buffered, no wire load).
             # No upsize/dnsize: ABC aborts when the target is unreachable, and sizing is a
             # place-and-route job anyway.
+            # `topo` before the buffering, not only after: ABC's buffer pass
+            # walks the mapped network in order and aborts ("node N has no
+            # fanout") on one that `map` left out of order.  Without it the
+            # run fails and the fallback below maps unbuffered, which times a
+            # register with a thousand loads at tens of nanoseconds.
             (work / "abc.script").write_text("\n".join([
-                "strash", "dch -f", f"map -D {target_ps}", "buffer -p",
+                "strash", "dch -f", f"map -D {target_ps}", "topo", "buffer -p",
                 "topo", "stime -p", "print_stats -m"]) + "\n", encoding="utf-8")
             abc_cmd = f"abc {lib_args} {dont_use} -script abc.script"
         else:
@@ -272,9 +278,14 @@ def synthesize(liberty: Path | Sequence[Path], *, rows: int = 256, cols: int = 8
         result = subprocess.run([*command, "-q", "-l", "synth.log", "synth.ys"], cwd=work,
                                 capture_output=True, text=True)
         log = (work / "synth.log").read_text(encoding="utf-8") if (work / "synth.log").exists() else result.stdout
+        buffered = True
         if result.returncode != 0 and target_ps and "abc.script" in script:
             # ABC's buffer/stime script aborts on some libraries (ASAP7 in our runs);
             # fall back to plain timing-driven mapping so OpenSTA can still time it.
+            # The result is unbuffered, so a net with a large fanout is timed with
+            # no buffer tree at all -- that is a bound, not a path, and the caller
+            # is told which it got.
+            buffered = False
             script = script.replace(abc_cmd, f"abc {lib_args} -D {target_ps}")
             (work / "synth.ys").write_text(script, encoding="utf-8")
             result = subprocess.run([*command, "-q", "-l", "synth.log", "synth.ys"], cwd=work,
@@ -295,7 +306,7 @@ def synthesize(liberty: Path | Sequence[Path], *, rows: int = 256, cols: int = 8
     label = "+".join(p.name for p in liberties)
     per = area / cols if params is None or "COLS" in params else area
     return SynthResult(label, rows, cols, rows_per_cycle, cells, area, per, flops, delay, critical,
-                       tail[-3000:])
+                       tail[-3000:], buffered)
 
 
 def parse_stat(log: str) -> tuple[int, float, int]:

@@ -119,7 +119,7 @@ def run_unit(unit: Unit, lib_name: str, liberty: Path, target_ps: int, sta: Path
             return {"unit": unit.name, "library": lib_name, "error": str(error)[-1500:], "seconds": time.time() - t0}
         out = {"unit": unit.name, "library": lib_name, "top": unit.top, "params": unit.params, "note": unit.note,
                "cells": synth.cells, "flops": synth.flops, "area_um2": synth.area_um2, "abc_delay_ps": synth.abc_delay_ps,
-               "target_ps": target_ps, "seconds": time.time() - t0}
+               "buffered": synth.buffered, "target_ps": target_ps, "seconds": time.time() - t0}
         nand2 = nand2_area(liberty)
         if nand2:
             out["nand2_equiv"] = synth.area_um2 / nand2
@@ -164,7 +164,8 @@ def report_markdown(results: list[dict]) -> str:
                 row += ["failed", ""]
             else:
                 path = r.get("critical_path_ps", r.get("abc_delay_ps"))
-                row += [f"{path:.0f}" if path else "?", f"{r.get('nand2_equiv', 0):,.0f}"]
+                mark = "" if r.get("buffered", True) else " (unbuffered)"
+                row += [(f"{path:.0f}" if path else "?") + mark, f"{r.get('nand2_equiv', 0):,.0f}"]
         lines.append("| " + " | ".join(row) + " |")
     return "\n".join(lines)
 
@@ -193,7 +194,10 @@ def main() -> None:
     with ProcessPoolExecutor(max_workers=args.jobs) as pool:
         for result in pool.map(_job, jobs):
             results.append(result)
-            status = result.get("error", "")[:80] or f"{result.get('critical_path_ps', result.get('abc_delay_ps', 0)) or 0:.0f} ps, {result.get('nand2_equiv', 0):,.0f} NAND2-eq"
+            status = result.get("error", "")[:80] or (
+                f"{result.get('critical_path_ps', result.get('abc_delay_ps', 0)) or 0:.0f} ps, "
+                f"{result.get('nand2_equiv', 0):,.0f} NAND2-eq"
+                + ("" if result.get("buffered", True) else "  (UNBUFFERED: ABC's timing script aborted)"))
             print(f"{result['unit']:14s} {result['library']:10s} {result['seconds']:6.0f} s  {status}", flush=True)
             args.out.parent.mkdir(parents=True, exist_ok=True)
             args.out.write_text(json.dumps(results, indent=2))
