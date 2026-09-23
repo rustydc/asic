@@ -326,7 +326,7 @@ module fabric_attention #(
     // State.
     localparam [3:0] S_ACCEPT = 4'd0, S_EXP = 4'd1, S_APPLY = 4'd2, S_VALUE = 4'd3,
                      S_RECIP = 4'd4, S_OUT = 4'd5, S_DONE = 4'd6, S_EXP2 = 4'd7,
-                     S_EXP1B = 4'd8;
+                     S_EXP1B = 4'd8, S_ACCW = 4'd9;
     reg [3:0] state;
     reg signed [47:0] sm [0:G-1];
     assign in_ready = (state == S_ACCEPT) || (state == S_VALUE);
@@ -354,17 +354,37 @@ module fabric_attention #(
     reg  [SCW-1:0] score_s [0:G-1], score_c [0:G-1];
     wire [SCW-1:0] score_sn [0:G-1], score_cn [0:G-1];
     wire signed [SCW-1:0] score [0:G-1];
-    genvar gc, gl;
+    // The query beat and the key beat are registered off the memory, so the
+    // macro read has a cycle of its own: it is 512 ps of one, and everything
+    // below used to share it.
+    reg [QW-1:0] q_rdq [0:G-1];
+    reg [L*8-1:0] in_dataq;
+    reg           accv;                    // a key beat landed last cycle
+    // Every partial product of every lane goes into one tree, rather than
+    // sixteen multiplies each resolving its own.  `a * b` on two int8s is a
+    // handful of partial products and then a carry-propagate add, and
+    // sixteen of those adds ran before the tree could start.  Written out,
+    //     q * d = sum(i < 7) d[i] * (q << i)  -  d[7] * (q << 7)
+    // and the subtracted term is its complement with a one, which is one more
+    // operand rather than a negate.  Nothing between the memory and the
+    // accumulator propagates a carry at all.
+    localparam int PPL = 9;                 // per lane: seven, the complement, its one
+    genvar gc, gl, gp;
     generate
         for (gc = 0; gc < G; gc = gc + 1) begin : g_contrib
-            wire [(L+2)*SCW-1:0] cops;
+            wire [(L*PPL+2)*SCW-1:0] cops;
             for (gl = 0; gl < L; gl = gl + 1) begin : g_cp
-                wire signed [15:0] pr = $signed(q_rd[gc][gl*8 +: 8]) * $signed(in_data[gl*8 +: 8]);
-                assign cops[gl*SCW +: SCW] = {{(SCW-16){pr[15]}}, pr};
+                wire signed [SCW-1:0] qx = $signed(q_rdq[gc][gl*8 +: 8]);
+                wire [7:0]            d  = in_dataq[gl*8 +: 8];
+                for (gp = 0; gp < 7; gp = gp + 1) begin : g_pp
+                    assign cops[(gl*PPL + gp)*SCW +: SCW] = d[gp] ? (qx <<< gp) : {SCW{1'b0}};
+                end
+                assign cops[(gl*PPL + 7)*SCW +: SCW] = d[7] ? ~(qx <<< 7) : {SCW{1'b0}};
+                assign cops[(gl*PPL + 8)*SCW +: SCW] = {{(SCW-1){1'b0}}, d[7]};
             end
-            assign cops[L*SCW +: SCW]     = score_s[gc];
-            assign cops[(L+1)*SCW +: SCW] = {score_c[gc][SCW-2:0], 1'b0};
-            fabric_csa_tree #(.N(L+2), .W(SCW)) u_ct (.ops(cops), .s(score_sn[gc]), .c(score_cn[gc]));
+            assign cops[(L*PPL)*SCW +: SCW]     = score_s[gc];
+            assign cops[(L*PPL+1)*SCW +: SCW]   = {score_c[gc][SCW-2:0], 1'b0};
+            fabric_csa_tree #(.N(L*PPL+2), .W(SCW)) u_ct (.ops(cops), .s(score_sn[gc]), .c(score_cn[gc]));
             // A carry-save pair is only a number modulo its width: the
             // integer s + 2c may exceed it by a multiple of 2^SCW that no
             // amount of arithmetic here can see.  Added into another tree
@@ -688,6 +708,7 @@ module fabric_attention #(
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             state <= S_ACCEPT; beat <= 0; head <= 0; exp_go <= 1'b0; rc_start <= 1'b0; done <= 1'b0;
+            accv <= 1'b0;
             ov1 <= 1'b0; out_go <= 1'b0; ohead <= 0; obeat <= 0; drain <= 0; vv <= 1'b0; o_we <= 1'b0; o_seen <= 1'b0;
             for (g = 0; g < G; g = g + 1) begin m_valid[g] <= 1'b0; l_r[g] <= 0; score_s[g] <= 0; score_c[g] <= 0; end
         end else begin
@@ -708,8 +729,18 @@ module fabric_attention #(
                 if (vbeat == BEATS - 1) o_seen <= 1'b1;   // every beat written: the memory may be read
             end
             vv <= 1'b0;
+            // The memory's output and the beat it pairs with, registered; the
+            // accumulate reads them the cycle after, and its own valid says
+            // a key beat landed.
+            for (g = 0; g < G; g = g + 1) q_rdq[g] <= q_rd[g];
+            in_dataq <= in_data;
+            accv <= (state == S_ACCEPT) && !finish && in_valid && (in_kind == 2'd2);
+            if (accv)
+                for (g = 0; g < G; g = g + 1) begin
+                    score_s[g] <= score_sn[g]; score_c[g] <= score_cn[g];
+                end
             if (start) begin
-                state <= S_ACCEPT; beat <= 0; head <= 0; o_seen <= 1'b0;
+                state <= S_ACCEPT; beat <= 0; head <= 0; o_seen <= 1'b0; accv <= 1'b0;
                 for (g = 0; g < G; g = g + 1) begin
                     m_valid[g] <= 1'b0; l_r[g] <= 0; score_s[g] <= 0; score_c[g] <= 0;
                 end
@@ -719,19 +750,19 @@ module fabric_attention #(
                     if (finish) begin
                         state <= S_RECIP; ohead <= 0; rc_l <= l_r[0]; rc_start <= 1'b1;
                     end else if (in_valid) begin
-                        case (in_kind)
-                            2'd0, 2'd1: ;                     // the memories take them; see q_we and gate_we
-                            2'd2: for (g = 0; g < G; g = g + 1) begin score_s[g] <= score_sn[g]; score_c[g] <= score_cn[g]; end
-                            default: ;
-                        endcase
+                        // The accumulate is off the registered beat above.
                         if (beat == BEATS - 1) begin
                             beat <= 0;
                             if (in_kind == 2'd0 || in_kind == 2'd1) head <= (head == G - 1) ? 0 : head + 1'b1;
-                            if (in_kind == 2'd2) state <= S_EXP;
+                            if (in_kind == 2'd2) state <= S_ACCW;
                         end else begin
                             beat <= beat + 1'b1;
                         end
                     end
+                end
+                S_ACCW: begin
+                    // The last key beat's products land this cycle.
+                    state <= S_EXP;
                 end
                 S_EXP: begin
                     // The score is complete: its scale's partial products.
