@@ -216,6 +216,24 @@ module fabric_sequencer #(
     reg [NREL*NC*8-1:0] d_c, d_p;
     reg [NREL*8-1:0]    d_tag;
     reg [NPORT-1:0]     d_now;
+    // `d_en` gates every one of the 512 counter updates, and registering it
+    // is exactly what the mapper cannot buffer: one flop at 495 loads and 739
+    // fF, 1,857 of this module's 2,833 ps spent before any logic runs.  It is
+    // the shape `fetched_v` had and the fix is the same -- a copy per slice
+    // of the counters, each taking the same combinational pick, so every copy
+    // and `d_en` are one register.
+    localparam int NDC = 16;                       // copies, one per slice of the counters
+    localparam int IPC = NID / NDC;                // ids to a slice
+    wire [NDC*NREL-1:0] d_en_c;
+    genvar gdc, gdx;
+    generate
+        for (gdc = 0; gdc < NDC; gdc = gdc + 1) begin : g_dec
+            for (gdx = 0; gdx < NREL; gdx = gdx + 1) begin : g_dex
+                fabric_seq_copy u_d (.clk(clk), .rst_n(rst_n), .d(rel_en[gdx]),
+                                     .q(d_en_c[gdc*NREL + gdx]));
+            end
+        end
+    endgenerate
     // A port's record is one command, so it can be given no second one while
     // the first is outstanding: a unit reports done a cycle after it drops
     // its ready, and without this the completion returned the newer
@@ -337,7 +355,7 @@ module fabric_sequencer #(
                     dr = 0;
                     dw = 0;
                     for (x = 0; x < NREL; x = x + 1)
-                        if (d_en[x]) begin
+                        if (d_en_c[(id / IPC) * NREL + x]) begin
                             for (k = 0; k < NC; k = k + 1)
                                 if (d_c[x*NC*8 + k*8 +: 8] == id[7:0]) dr = dr - 1;
                             for (k = 0; k < NP; k = k + 1)
