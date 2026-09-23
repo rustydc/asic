@@ -197,12 +197,23 @@ module fabric_rmsnorm #(
     reg signed [QW-1:0] q4 [0:L-1];
     reg signed [QW-1:0] s5 [0:L-1];
     integer k;
+    // The macro's read is a stage of its own.  Feeding its output straight
+    // into the multiply put the access time and a sixteen-bit multiply in
+    // one cycle -- at the 9B width, 1.16 of the unit's 2.66 ns was the macro
+    // getting its data out -- so the stage is now the longer of the two
+    // rather than their sum, for one cycle of latency.
+    reg [L*XW-1:0] x0q;
+    reg [L*GW-1:0] g0q;
+    reg            v0q;
     always @(posedge clk) begin
         v0 <= rd_valid;
-        v1 <= v0;
-        g1 <= g0;
+        v0q <= v0;
+        x0q <= x0;
+        g0q <= g0;
+        v1 <= v0q;
+        g1 <= g0q;
         for (k = 0; k < L; k = k + 1)
-            m1[k] <= $signed({{(MW-XW){x0[k*XW+XW-1]}}, x0[k*XW +: XW]}) * $signed({{(MW-17){1'b0}}, r_l[k]});
+            m1[k] <= $signed({{(MW-XW){x0q[k*XW+XW-1]}}, x0q[k*XW +: XW]}) * $signed({{(MW-17){1'b0}}, r_l[k]});
         v2 <= v1;
         g2 <= g1;
         for (k = 0; k < L; k = k + 1)

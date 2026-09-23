@@ -393,24 +393,47 @@ module fabric_index_scan #(
     // 64; the sum is a balanced tree, since a chain of CPB adds is CPB carry
     // chains deep and ABC cannot restructure them.
     localparam int PWID = 16;
-    localparam int LV   = $clog2(CPB);
-    localparam int CPP  = 1 << LV;                         // the tree's width, CPB padded
-    integer c, lv;
-    reg signed [PWID-1:0] tree [0:LV][0:CPP-1];
-    always @* begin
-        // An assignment, not a conditional expression: an unsigned zero in the
-        // other arm would make the whole expression unsigned.
-        for (c = 0; c < CPP; c = c + 1) begin
-            tree[0][c] = 0;
-            if (c < CPB && beat * CPB + c < IDIM)
-                tree[0][c] = (2 * $signed({1'b0, q_codes[(beat*CPB + c)*4 +: 4]}) - 16'sd15)
-                             * (2 * $signed({1'b0, rdata[c*4 +: 4]}) - 16'sd15);
+    // The beat's slice of the query codes, as a one-hot select.  Indexing
+    // q_codes with `beat` is a barrel shifter over all IDIM*4 bits, once per
+    // code of the beat, which put 263 loads on one bit of `beat` and a third
+    // of this unit's path on that flop's clock-to-output.  An or of masks is
+    // the structure the index has, and costs `beat` CB comparators.
+    wire [CB-1:0] bsel;
+    genvar gb;
+    generate
+        for (gb = 0; gb < CB; gb = gb + 1) begin : g_bsel
+            assign bsel[gb] = (beat == gb[BW-1:0]);
         end
-        for (lv = 1; lv <= LV; lv = lv + 1)
-            for (c = 0; c < (CPP >> lv); c = c + 1)
-                tree[lv][c] = tree[lv-1][2*c] + tree[lv-1][2*c+1];
+    endgenerate
+    reg [CPB*4-1:0] q_beat;
+    reg [CPB-1:0]   q_live;                                // codes of this beat inside IDIM
+    integer c, b;
+    always @* begin
+        q_beat = 0;
+        q_live = 0;
+        for (b = 0; b < CB; b = b + 1)
+            for (c = 0; c < CPB; c = c + 1)
+                if (b * CPB + c < IDIM) begin
+                    q_beat[c*4 +: 4] = q_beat[c*4 +: 4] | (q_codes[(b*CPB + c)*4 +: 4] & {4{bsel[b]}});
+                    q_live[c] = q_live[c] | bsel[b];
+                end
     end
-    wire signed [PWID-1:0] part = tree[LV][0];
+    // The products, reduced carry-save rather than by an adder tree.  Five
+    // levels of sixteen-bit adds is five ripple carries in series -- sixty
+    // gates of this unit's path -- where a carry-save layer is one.  One
+    // real add resolves the pair at the end.
+    wire [CPB*PWID-1:0] prod;
+    genvar gp;
+    generate
+        for (gp = 0; gp < CPB; gp = gp + 1) begin : g_prod
+            wire signed [PWID-1:0] pr = (2 * $signed({1'b0, q_beat[gp*4 +: 4]}) - 16'sd15)
+                                      * (2 * $signed({1'b0, rdata[gp*4 +: 4]}) - 16'sd15);
+            assign prod[gp*PWID +: PWID] = q_live[gp] ? pr : {PWID{1'b0}};
+        end
+    endgenerate
+    wire [PWID-1:0] psum, pcar;
+    fabric_csa_tree #(.N(CPB), .W(PWID)) u_part (.ops(prod), .s(psum), .c(pcar));
+    wire signed [PWID-1:0] part = $signed(psum) + $signed({pcar[PWID-2:0], 1'b0});
     wire signed [63:0] final_score = acc * $signed({56'b0, rdata[7:0]});
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin

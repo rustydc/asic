@@ -132,7 +132,7 @@ class Timing:
     l_attn: int = 16                 # ATT_L at most: a beat of the buffer, as int8
     # `P` and `COLS` are the tile's, and come from the TileSpec the pass is compiled for.
     # Adapter latencies: what a command costs beyond its beats.
-    norm_latency: int = 33           # the front pipeline, the sum pass's tail and the inverse square root
+    norm_latency: int = 34           # the front pipeline, the sum pass's tail and the inverse square root
     tile_block_latency: int = 13     # a row block: its start cycle and the requantizer walk's tail
     tile_done_latency: int = 2       # the write walk's last tile and the report
     conv_latency: int = 12
@@ -156,7 +156,7 @@ class Timing:
     scan_latency: int = 19           # the query in and its codes, before any record is read
     scan_request: int = 5
     append_beat: int = 3             # the append's own write path, a beat at a time
-    append_latency: int = 58
+    append_latency: int = 59
     append_index_latency: int = 34   # the block's index projection, its codes and its record
     # The memory behind the port.  ``devices`` of 0 is the testbench's own
     # model, a beat a cycle after a short latency, which is what the engine
