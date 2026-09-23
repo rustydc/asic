@@ -253,8 +253,7 @@ class SequencerRtlTest(unittest.TestCase):
             params = S.emit_program(work, steps)
             args = [f"-Ptb_sequencer.{name}={value}" for name, value in params.items()]
             subprocess.run(["iverilog", "-g2012", "-I", str(RTL), "-s", "tb_sequencer", "-o", "sim.vvp", *args,
-                            str(RTL / "fabric_sram.sv"), str(RTL / "fabric_vector.sv"),
-                            str(RTL / "fabric_sequencer.sv"), str(RTL / "tb_sequencer.sv")],
+                            str(RTL / "fabric_sram.sv"), str(RTL / "fabric_sequencer.sv"), str(RTL / "tb_sequencer.sv")],
                            cwd=work, check=True, capture_output=True, text=True)
             out = subprocess.run(["vvp", "sim.vvp"], cwd=work, check=True, capture_output=True, text=True).stdout
             trace = (work / "trace.txt").read_text()
