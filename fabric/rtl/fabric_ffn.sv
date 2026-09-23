@@ -35,9 +35,25 @@ module fabric_swiglu #(
         for (c = 0; c < L; c = c + 1)
             tm1[c*24 +: 24] <= $signed(in_g[c*8 +: 8]) * $signed({8'b0, mult_g});
         v2 <= v1;
-        for (c = 0; c < L; c = c + 1)
-            tg2[c*16 +: 16] <= fx_sat(fx_rnd_shr($signed(tm1[c*24 +: 24]), sh_g), 16);
+        tg2 <= tg2_n;
     end
+    // Both requantizes at the width their value has -- 24 bits for the gate
+    // and 40 for the output -- rather than the 64 the helpers in
+    // fabric_fx.svh evaluate at.  At 64 the barrel shifter, the rounding
+    // incrementer and the saturating compare are each more than twice as
+    // wide as the number going through them, and the output's was this
+    // unit's path at 2,104 ps with the gate's behind it at 1,736.
+    wire [L*16-1:0] tg2_n;
+    wire [L*8-1:0]  outy_n;
+    genvar gq;
+    generate
+        for (gq = 0; gq < L; gq = gq + 1) begin : g_rq
+            fabric_rnd_sat #(.W(24), .SW(6), .N(16)) u_tg (
+                .v(tm1[gq*24 +: 24]), .sh(sh_g), .y(tg2_n[gq*16 +: 16]));
+            fabric_rnd_sat #(.W(40), .SW(6), .N(8)) u_oy (
+                .v(p2[gq*40 +: 40]), .sh(sh_o), .y(outy_n[gq*8 +: 8]));
+        end
+    endgenerate
     wire [L-1:0]    sv;
     wire [L*16-1:0] s6;
     genvar g;
@@ -64,8 +80,7 @@ module fabric_swiglu #(
         for (c = 0; c < L; c = c + 1)
             p2[c*40 +: 40] <= $signed(p1[c*24 +: 24]) * $signed({8'b0, mult_o});
         out_valid <= q2v;
-        for (c = 0; c < L; c = c + 1)
-            out_y[c*8 +: 8] <= fx_sat(fx_rnd_shr($signed(p2[c*40 +: 40]), sh_o), 8);
+        out_y     <= outy_n;
     end
 endmodule
 
