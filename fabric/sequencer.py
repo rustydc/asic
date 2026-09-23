@@ -994,7 +994,14 @@ def schedule(steps: list[Step], releases: int = RELEASES) -> Schedule:
             ahead.append(min(end[s] for s in running.values()) + 1)
         if (i < n and port_of[i] not in pending and port_of[i] not in running
                 and all(release[d] is not None for d in steps[i].deps)):
-            ahead.append(cycle + 1 if i == 0 else issue[i - 1] + 1)
+            # Every candidate here must be past `cycle`, or the loop below
+            # stops advancing.  A dependency that released *at* this cycle is
+            # not yet visible -- the drain is registered -- so the earliest
+            # the head can go is the cycle after the last of them.
+            earliest = cycle + 1 if i == 0 else issue[i - 1] + 1
+            for d in steps[i].deps:
+                earliest = max(earliest, release[d] + 1)
+            ahead.append(earliest)
         cycle = min(ahead) if ahead else cycle + 1
     return Schedule(issue, end, steps, [r if r is not None else 0 for r in release])
 
