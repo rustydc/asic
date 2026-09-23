@@ -222,12 +222,13 @@ module fabric_sequencer #(
     // command's ids for the older one -- buffers the newer command was still
     // reading.  A port whose completion drains this cycle is free, because
     // the drain reads the register and the issue writes it.
-    // A port holds its buffers until the drain has actually moved the
-    // counters, which is now the cycle after the pick, so `busy` is what it
-    // says and nothing is forgiven early: freeing the port in the pick cycle
-    // would let an issue overwrite the slot the drain has yet to apply.
+    // A port is free in the cycle its drain applies, not the cycle it is
+    // picked: the drain reads `d_c` and `d_p`, which were registered from the
+    // slot a cycle earlier, so an issue may overwrite the slot underneath it.
+    // Forgiving it a cycle earlier than that -- when the pick happens -- would
+    // hand the port a command before its ids had been taken.
     reg  [NPORT-1:0] busy;
-    wire [NPORT-1:0] blocked = busy;
+    wire [NPORT-1:0] blocked = busy & ~d_now;
 
     // Outstanding writers and readers per buffer.  The issue check sees the
     // head step's ids with this cycle's drains forwarded; the counters

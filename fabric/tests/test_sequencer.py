@@ -59,13 +59,17 @@ class ScheduleTest(unittest.TestCase):
         S.link(steps)
         sched = S.schedule(steps)
         # A step's cycles are its whole span, issue to completion, as the
-        # engine's own spans measure it: a issues at 0 and completes at 10, so
-        # c has engine 0 from 10, and d issues in program order after c.
-        self.assertEqual(sched.issue, [0, 1, 10, 11])
-        self.assertEqual(sched.end, [9, 5, 12, 14])          # the last cycle each was working
-        self.assertEqual(sched.release, [10, 6, 13, 15])     # and the cycle its buffers came back
-        self.assertEqual(sched.last_done, 15)
-        self.assertEqual(sched.cycles, 16)                   # the controller reports done the cycle after
+        # engine's own spans measure it: a issues at 0, completes at 10, and
+        # its drain is picked there.  The drain is registered and the counters
+        # are registers, so it applies at 11 and is readable at 12 -- c takes
+        # engine 0 at 11, when the port is free because a's ids were
+        # registered out of its slot at the pick, and d waits for x to be
+        # readable at 12.
+        self.assertEqual(sched.issue, [0, 1, 11, 12])
+        self.assertEqual(sched.end, [9, 5, 13, 15])          # the last cycle each was working
+        self.assertEqual(sched.release, [10, 6, 14, 16])     # and the cycle its buffers came back
+        self.assertEqual(sched.last_done, 16)
+        self.assertEqual(sched.cycles, 18)                   # done is two after the last drain
 
     def test_full_size_layers_are_memory_bound(self) -> None:
         from fixed_llm_poc import ASICLMConfig

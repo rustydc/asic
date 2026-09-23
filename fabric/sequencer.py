@@ -948,9 +948,13 @@ def schedule(steps: list[Step], releases: int = RELEASES) -> Schedule:
     and the addressed engine is free.  A unit that stops working at cycle
     ``e`` reports done at ``e + 1``, and the controller *drains* at most
     ``releases`` completions a cycle, lowest engine port first.  The drain is
-    registered, so a dependant issues at ``release + 1`` and not in the drain
-    cycle itself: picking the port, reading its ids and moving the counters by
-    them did not fit in one cycle (rtl/fabric_sequencer.sv).  With nothing
+    registered and the counters are registers, so a release picked at ``c`` is
+    applied at ``c + 1``, readable at ``c + 2``, and a dependant issues there
+    rather than in the drain cycle: picking the port, reading its ids and
+    moving the counters by them did not fit in one cycle
+    (rtl/fabric_sequencer.sv).  The port itself is free at ``c + 1``, because
+    the ids were registered out of its slot when the drain was picked.  With
+    nothing
     else waiting a step issues one cycle after its last dependency ended,
     which is what an unbounded release gave.  A port whose release has not
     drained holds the buffers it must return and can be given no new
@@ -963,6 +967,7 @@ def schedule(steps: list[Step], releases: int = RELEASES) -> Schedule:
     n = len(steps)
     issue, end = [0] * n, [0] * n
     release: list[int | None] = [None] * n                   # the cycle each step's buffers came back
+    port_free: dict[int, int] = {}                           # engine port -> the cycle it may be given a command again
     port_of = [UNITS[s.unit][0] * NE + s.engine for s in steps]
     running: dict[int, int] = {}                             # engine port -> the step on it
     pending: dict[int, int] = {}                             # engine port -> a step whose release is held
@@ -977,10 +982,15 @@ def schedule(steps: list[Step], releases: int = RELEASES) -> Schedule:
                 del running[port]
         for port in sorted(want)[:releases]:
             release[want.pop(port)] = cycle
+            # The drain applies the cycle after it is picked, and the port is
+            # free in that cycle -- the ids it returns were registered out of
+            # the slot when it was picked, so the slot may be written then.
+            port_free[port] = cycle + 1
         pending = want
         if (i < n and (i == 0 or cycle > issue[i - 1])
                 and port_of[i] not in pending and port_of[i] not in running
-                and all(release[d] is not None and release[d] < cycle for d in steps[i].deps)):
+                and cycle >= port_free.get(port_of[i], 0)
+                and all(release[d] is not None and release[d] + 2 <= cycle for d in steps[i].deps)):
             # ``cycles`` is what the engine's own spans measure: the cycle the
             # command issued to the cycle its completion arrived.  The unit
             # therefore stops working one before that, and reports done at it.
@@ -999,8 +1009,9 @@ def schedule(steps: list[Step], releases: int = RELEASES) -> Schedule:
             # not yet visible -- the drain is registered -- so the earliest
             # the head can go is the cycle after the last of them.
             earliest = cycle + 1 if i == 0 else issue[i - 1] + 1
+            earliest = max(earliest, port_free.get(port_of[i], 0))
             for d in steps[i].deps:
-                earliest = max(earliest, release[d] + 1)
+                earliest = max(earliest, release[d] + 2)
             ahead.append(earliest)
         cycle = min(ahead) if ahead else cycle + 1
     return Schedule(issue, end, steps, [r if r is not None else 0 for r in release])
