@@ -404,7 +404,13 @@ module fabric_delta_state8 #(
     reg signed [7:0] e1;
     reg            rescale;
     reg signed [3:0] de;
-    reg [V*8-1:0]  t_mem [0:K-1];
+    // The rows pass 1 keeps, for pass 2 to walk.  A macro, not a register
+    // array: at the 9B head this is 128 rows of 128 bytes, 131,072 flops,
+    // and the elaboration did not map at all -- yosys ran 85 minutes and
+    // died in simplemap.  The two passes are disjoint in time, so one read
+    // port and one write port are enough, and the read already lands a
+    // cycle after its address.
+    localparam int TA = (K > 1) ? $clog2(K) : 1;
     reg [KW-1:0]   wr, rd;
     reg [3:0]      phase;            // 0 pass 1, 1 pred, 2 diff, 3 beta*diff, 4 c*r, 5 c, 6 pass 2, 7 y, 8 reduce
     reg signed [31:0] pred_acc [0:V-1];
@@ -529,7 +535,11 @@ module fabric_delta_state8 #(
     reg [V*8-1:0]  tr3;
     reg signed [15:0] kp4 [0:V-1];
     reg            vd1, vd2, vd3, vd4;
-    reg [V*8-1:0]  rowd1, rowd2;
+    reg [V*8-1:0]  rowd2;
+    wire [V*8-1:0] rowd1;               // the macro's output, valid with vd1
+    fabric_sram #(.W(V*8), .D(K), .NRD(1), .NWR(1), .MB(V*8)) u_t (
+        .clk(clk), .rd_en(1'b1), .rd_addr(rd[TA-1:0]), .rd_data(rowd1),
+        .wr_en(va3), .wr_addr(ia3[TA-1:0]), .wr_data(tr3), .wr_mask(1'b1));
     reg [KW-1:0]   id1, id2, id3, id4;
     reg signed [32:0] dm2 [0:V-1];
     reg [V*8-1:0]  tn3;
@@ -626,7 +636,7 @@ module fabric_delta_state8 #(
             if (vd1)
                 for (j = 0; j < V; j = j + 1) dm2[j] = $signed(k_r[id1*8 +: 8]) * c[j];
             if (phase == 4'd6) begin
-                vd1 <= 1'b1; rowd1 <= t_mem[rd]; id1 <= rd; rd <= rd + 1'b1;
+                vd1 <= 1'b1; id1 <= rd; rd <= rd + 1'b1;
                 if (rd == K - 1) phase <= 4'd0;          // the pipeline carries the rest
             end
 
@@ -665,16 +675,14 @@ module fabric_delta_state8 #(
                 if (ia4 == K - 1) phase <= 4'd1;
             end
             va4 <= va3; ia4 <= ia3;
-            if (va3) begin
-                t_mem[ia3] <= tr3;
+            if (va3)
                 for (j = 0; j < V; j = j + 1) kp4[j] = $signed(k_r[ia3*8 +: 8]) * $signed(tr3[j*8 +: 8]);
-            end
             va3 <= va2; ia3 <= ia2;
             if (va2)
                 for (j = 0; j < V; j = j + 1) begin
                     tr = rescale ? fx_sat((rs2[j] + rndr) >>> shr_, 8)
                                  : $signed({{56{rowa2[j*8+7]}}, rowa2[j*8 +: 8]});
-                    tr3[j*8 +: 8] = tr[7:0];
+                    tr3[j*8 +: 8] <= tr[7:0];   // a register, not a blocking temp: the macro samples it
                 end
             va2 <= va1; ia2 <= ia1; rowa2 <= rowa1;
             if (va1)
