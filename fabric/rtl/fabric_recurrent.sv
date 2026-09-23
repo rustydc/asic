@@ -43,15 +43,31 @@ module fabric_conv_silu #(
     reg [L*16-1:0]      mi1, mo1;
     reg [L*6-1:0]       si1, so1;
     integer c, j;
-    reg signed [AW_-1:0] acc;
+    // The taps are summed carry-save.  Written as `acc = acc + tap` over the
+    // window it is one carry-propagate add per tap in series -- the shape the
+    // attention core's contribution had and the sequencer's counters -- and
+    // it measured 1,569 ps of this unit's 1,877.  A layer is one gate and the
+    // pair resolves once at the end.
+    wire signed [AW_-1:0] acc_n [0:L-1];
+    genvar gt, gj;
+    generate
+        for (gt = 0; gt < L; gt = gt + 1) begin : g_tap
+            wire [K*AW_-1:0] taps;
+            for (gj = 0; gj < K - 1; gj = gj + 1) begin : g_h
+                assign taps[gj*AW_ +: AW_] =
+                    $signed(in_hist[gt*HW + gj*8 +: 8]) * $signed(in_w[gt*K*8 + gj*8 +: 8]);
+            end
+            assign taps[(K-1)*AW_ +: AW_] =
+                $signed(in_x[gt*8 +: 8]) * $signed(in_w[gt*K*8 + (K-1)*8 +: 8]);
+            wire [AW_-1:0] ts, tc;
+            fabric_csa_tree #(.N(K), .W(AW_)) u_tt (.ops(taps), .s(ts), .c(tc));
+            assign acc_n[gt] = $signed(ts) + $signed({tc[AW_-2:0], 1'b0});
+        end
+    endgenerate
     always @(posedge clk) begin
         v1 <= in_valid;
         for (c = 0; c < L; c = c + 1) begin
-            acc = 0;
-            for (j = 0; j < K - 1; j = j + 1)
-                acc = acc + $signed(in_hist[c*HW + j*8 +: 8]) * $signed(in_w[c*K*8 + j*8 +: 8]);
-            acc = acc + $signed(in_x[c*8 +: 8]) * $signed(in_w[c*K*8 + (K-1)*8 +: 8]);
-            acc1[c] <= acc;
+            acc1[c] <= acc_n[c];
             if (K > 2) hist1[c*HW +: HW] <= {in_x[c*8 +: 8], in_hist[c*HW + 8 +: HW-8]};
             else       hist1[c*HW +: HW] <= in_x[c*8 +: 8];
         end

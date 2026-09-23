@@ -171,27 +171,10 @@ module fabric_sequencer #(
     // pass answers "is any lower port set" in ceil(log2 NPORT) levels.
     reg [NPORT-1:0] remaining, one, lower;
     integer sh;
+    reg [NC*8-1:0]  sel_c;
+    reg [NP*8-1:0]  sel_p;
+    reg [7:0]       sel_tag;
     integer q, r;
-    // Every port's record, packed once: consumed ids, produced ids, tag.
-    localparam int RECW = NC*8 + NP*8 + 8;
-    wire [NPORT*RECW-1:0] recs;
-    // What each pass of the scan above hands to fabric_seq_lowest, and what
-    // comes back.  With NREL of one there is a single pass and `remaining` is
-    // `want_rel`, so nothing of the prefix or is in front of it.
-    wire [NREL-1:0]      low_any;
-    wire [NREL*RECW-1:0] low_q;
-    reg  [NREL*NPORT-1:0] scan_in;
-    genvar gs, gp;
-    generate
-        for (gp = 0; gp < NPORT; gp = gp + 1) begin : g_rec
-            assign recs[gp*RECW +: RECW] = {slot_tag[gp], slot_p[gp], slot_c[gp]};
-        end
-        for (gs = 0; gs < NREL; gs = gs + 1) begin : g_low
-            fabric_seq_lowest #(.N(NPORT), .W(RECW)) u_low (
-                .set(scan_in[gs*NPORT +: NPORT]), .rec(recs),
-                .any(low_any[gs]), .q(low_q[gs*RECW +: RECW]));
-        end
-    endgenerate
     always @* begin
         rel_now = 0;
         rel_en  = 0;
@@ -200,15 +183,20 @@ module fabric_sequencer #(
         rel_tag = 0;
         remaining = want_rel;
         for (r = 0; r < NREL; r = r + 1) begin
-            scan_in[r*NPORT +: NPORT] = remaining;
             lower = {remaining[NPORT-2:0], 1'b0};              // lower[i] = remaining[i-1]
             for (sh = 1; sh < NPORT; sh = sh * 2) lower = lower | (lower << sh);
             one = remaining & ~lower;
-            if (low_any[r]) begin
+            sel_c = 0; sel_p = 0; sel_tag = 0;
+            for (q = 0; q < NPORT; q = q + 1) begin
+                sel_c   = sel_c   | (slot_c[q]   & {(NC*8){one[q]}});
+                sel_p   = sel_p   | (slot_p[q]   & {(NP*8){one[q]}});
+                sel_tag = sel_tag | (slot_tag[q] & {8{one[q]}});
+            end
+            if (|one) begin
                 rel_en[r] = 1'b1;
-                rel_c[r*NC*8 +: NC*8] = low_q[r*RECW +: NC*8];
-                rel_p[r*NC*8 +: NP*8] = low_q[r*RECW + NC*8 +: NP*8];
-                rel_tag[r*8 +: 8]     = low_q[r*RECW + NC*8 + NP*8 +: 8];
+                rel_c[r*NC*8 +: NC*8] = sel_c;
+                rel_p[r*NC*8 +: NP*8] = sel_p;
+                rel_tag[r*8 +: 8]     = sel_tag;
             end
             rel_now   = rel_now | one;
             remaining = remaining & ~one;
@@ -230,6 +218,7 @@ module fabric_sequencer #(
     reg [CW-1:0] wr_cnt [0:NID-1];
     reg [CW-1:0] rd_cnt [0:NID-1];
     integer p, k, m, id, x, w;
+    reg signed [CW:0] dr, dw;                            // a counter's move this cycle
 
     // The drained ids travel as arguments, not as a reference to rel_c and
     // rel_p: what a function reads is not in an always @* block's sensitivity,
@@ -245,73 +234,6 @@ module fabric_sequencer #(
                         if (j < n && ids[(y*NC + j)*8 +: 8] == buf_id) released = released + 1'b1;
         end
     endfunction
-
-    // A counter's move this cycle is a count of the ids in play that name it,
-    // and a count written as chained read-modify-writes -- which is what the
-    // loop in the always block below was -- is one carry-propagate add per id
-    // in series.  Six of them for the readers, and that chain was 38 of the
-    // 54 logic stages from a done port to a counter, the whole of this
-    // module's path.  Reduced carry-save the matches cost a gate a layer and
-    // the update is one add at the end.  A drain's -1 goes in as CW ones,
-    // which is -1 in two's complement and needs no subtract; a count never
-    // leaves its range, so the wrap that would expose the difference is not
-    // reachable.
-    localparam int NRC = NREL * NC;
-    localparam int NRP = NREL * NP;
-    // Each id in play is decoded once into a bit per buffer, not compared
-    // against all NID of them.  Compared, the same eight bits drive 256
-    // comparators apiece and the mapper answers with a buffer tree -- three
-    // stages of BUF_X8 and BUF_X4 at forty, 34 and sixteen femtofarads, 160
-    // ps of the path before a counter's own logic starts.  Split in halves an
-    // id's eight bits reach 32 four-bit comparators, and a buffer's own bit
-    // is one AND of two of them, which is the same depth for a thirtieth of
-    // the load.
-    wire [CW-1:0]  rd_next [0:NID-1];
-    wire [CW-1:0]  wr_next [0:NID-1];
-    wire [NID-1:0] up_c [0:NC-1];
-    wire [NID-1:0] up_p [0:NP-1];
-    wire [NID-1:0] dn_c [0:NRC-1];
-    wire [NID-1:0] dn_p [0:NRP-1];
-    genvar gn, gu, gd, gh;
-    generate
-        for (gu = 0; gu < NC; gu = gu + 1) begin : g_dc
-            fabric_seq_dec #(.NID(NID)) u_d (.id(cur_c[gu]), .en(issue), .oh(up_c[gu]));
-        end
-        for (gu = 0; gu < NP; gu = gu + 1) begin : g_dp
-            fabric_seq_dec #(.NID(NID)) u_d (.id(cur_p[gu]), .en(issue), .oh(up_p[gu]));
-        end
-        for (gd = 0; gd < NRC; gd = gd + 1) begin : g_drc
-            fabric_seq_dec #(.NID(NID)) u_d (
-                .id(rel_c[(gd/NC)*NC*8 + (gd%NC)*8 +: 8]), .en(rel_en[gd/NC]), .oh(dn_c[gd]));
-        end
-        for (gd = 0; gd < NRP; gd = gd + 1) begin : g_drp
-            fabric_seq_dec #(.NID(NID)) u_d (
-                .id(rel_p[(gd/NP)*NC*8 + (gd%NP)*8 +: 8]), .en(rel_en[gd/NP]), .oh(dn_p[gd]));
-        end
-        for (gn = 0; gn < NID; gn = gn + 1) begin : g_cnt
-            wire [(1 + NC + NRC)*CW-1:0] rops;
-            wire [(1 + NP + NRP)*CW-1:0] wops;
-            assign rops[0 +: CW] = rd_cnt[gn];
-            assign wops[0 +: CW] = wr_cnt[gn];
-            for (gu = 0; gu < NC; gu = gu + 1) begin : g_ru
-                assign rops[(1 + gu)*CW +: CW] = {{(CW-1){1'b0}}, up_c[gu][gn]};
-            end
-            for (gu = 0; gu < NP; gu = gu + 1) begin : g_wu
-                assign wops[(1 + gu)*CW +: CW] = {{(CW-1){1'b0}}, up_p[gu][gn]};
-            end
-            for (gd = 0; gd < NRC; gd = gd + 1) begin : g_rd
-                assign rops[(1 + NC + gd)*CW +: CW] = {CW{dn_c[gd][gn]}};
-            end
-            for (gd = 0; gd < NRP; gd = gd + 1) begin : g_wd
-                assign wops[(1 + NP + gd)*CW +: CW] = {CW{dn_p[gd][gn]}};
-            end
-            wire [CW-1:0] rs, rc, ws, wc;
-            fabric_csa_tree #(.N(1 + NC + NRC), .W(CW)) u_r (.ops(rops), .s(rs), .c(rc));
-            fabric_csa_tree #(.N(1 + NP + NRP), .W(CW)) u_w (.ops(wops), .s(ws), .c(wc));
-            assign rd_next[gn] = rs + {rc[CW-2:0], 1'b0};
-            assign wr_next[gn] = ws + {wc[CW-2:0], 1'b0};
-        end
-    endgenerate
 
     reg deps_ok;
     always @* begin
@@ -350,13 +272,13 @@ module fabric_sequencer #(
         if (!rst_n) begin
             pc <= 0; running <= 1'b0; done <= 1'b0; outstanding <= 0; finishing <= 1'b0; tab_live <= 0; pend <= 0; busy <= 0;
             fpc <= 0; qn <= 0; fetched_v <= 1'b0;
-            for (id = 0; id < NID; id = id + 1) begin wr_cnt[id] <= 0; rd_cnt[id] <= 0; end
+            for (id = 0; id < NID; id = id + 1) begin wr_cnt[id] = 0; rd_cnt[id] = 0; end
         end else begin
             done <= 1'b0;
             if (start && !running) begin
                 pc <= 0; running <= 1'b1; outstanding <= 0; finishing <= 1'b0; tab_live <= 0; pend <= 0; busy <= 0;
                 fpc <= 0; qn <= 0; fetched_v <= 1'b0;
-                for (id = 0; id < NID; id = id + 1) begin wr_cnt[id] <= 0; rd_cnt[id] <= 0; end
+                for (id = 0; id < NID; id = id + 1) begin wr_cnt[id] = 0; rd_cnt[id] = 0; end
             end else begin
                 // Not gated on `running`: when it is low nothing issues and no
                 // unit is busy, so none of this moves anyway, and the gate cost
@@ -394,11 +316,25 @@ module fabric_sequencer #(
                 // from a done port to a counter, and the whole of this
                 // module's path.  The ids in play are at most NREL*(NC+NP)
                 // returning and NC+NP taken, so a counter's delta is a couple
-                // of dozen compares against them, all of them in parallel, and
-                // the sum of the matches is carry-save (see rd_next above).
+                // of dozen compares against them, and all of them in parallel.
                 for (id = 0; id < NID; id = id + 1) begin
-                    rd_cnt[id] <= rd_next[id];
-                    wr_cnt[id] <= wr_next[id];
+                    dr = 0;
+                    dw = 0;
+                    for (x = 0; x < NREL; x = x + 1)
+                        if (rel_en[x]) begin
+                            for (k = 0; k < NC; k = k + 1)
+                                if (rel_c[x*NC*8 + k*8 +: 8] == id[7:0]) dr = dr - 1;
+                            for (k = 0; k < NP; k = k + 1)
+                                if (rel_p[x*NC*8 + k*8 +: 8] == id[7:0]) dw = dw - 1;
+                        end
+                    if (issue) begin
+                        for (k = 0; k < NC; k = k + 1)
+                            if (cur_c[k] == id[7:0]) dr = dr + 1;
+                        for (k = 0; k < NP; k = k + 1)
+                            if (cur_p[k] == id[7:0]) dw = dw + 1;
+                    end
+                    if (dr != 0) rd_cnt[id] = rd_cnt[id] + dr[CW-1:0];
+                    if (dw != 0) wr_cnt[id] = wr_cnt[id] + dw[CW-1:0];
                 end
                 outstanding <= out_next;
                 if (issue) begin
@@ -428,81 +364,6 @@ module fabric_sequencer #(
                     $display("FAIL: port %0d returned tag %0d, it was given %0d%s", m, done_tag[m*8 +: 8], slot_tag[m],
                              busy[m] ? "" : " and had no command outstanding");
 `endif
-endmodule
-
-// The lowest set port's record, in one pass down a tree.  A prefix or over
-// the ports and then a select by the one-hot it produces is two trees in
-// series, and the one-hot between them has to reach every bit of every
-// port's record before the select can start: 1,155 ps from a completion to
-// the ids it returns, which was half this module's path and the half the
-// carry-save counters did not touch.  Folded together, each node carries the
-// pair (is anything set under me, the record of the lowest one that is) and
-// reduces bottom-up -- at every node the left child's record when anything
-// under it is set, the right child's otherwise.  The same depth as either
-// tree alone, and nothing fans out in between.
-//
-// The one-hot is still wanted, for `rel_now` and what it clears; it is a
-// register's input rather than a counter's, so it keeps the prefix or and
-// runs alongside this.
-module fabric_seq_lowest #(
-    parameter int N = 40,
-    parameter int W = 64
-) (
-    input  wire [N-1:0]   set,
-    input  wire [N*W-1:0] rec,
-    output wire           any,
-    output wire [W-1:0]   q
-);
-    localparam int LV = $clog2(N);
-    localparam int PP = 1 << LV;
-    wire [PP-1:0]   a_l [0:LV];
-    wire [PP*W-1:0] r_l [0:LV];
-    genvar i, v;
-    generate
-        for (i = 0; i < PP; i = i + 1) begin : g_leaf
-            assign a_l[0][i] = (i < N) ? set[i] : 1'b0;
-            assign r_l[0][i*W +: W] = (i < N) ? rec[i*W +: W] : {W{1'b0}};
-        end
-        for (v = 0; v < LV; v = v + 1) begin : g_lvl
-            for (i = 0; i < (PP >> (v + 1)); i = i + 1) begin : g_nd
-                assign a_l[v+1][i] = a_l[v][2*i] | a_l[v][2*i+1];
-                assign r_l[v+1][i*W +: W] = a_l[v][2*i] ? r_l[v][(2*i)*W +: W]
-                                                        : r_l[v][(2*i+1)*W +: W];
-            end
-        end
-    endgenerate
-    assign any = a_l[LV][0];
-    assign q   = r_l[LV][0 +: W];
-endmodule
-
-// One id in play, decoded to a bit per buffer.  The eight bits split into two
-// halves of four, each a sixteen-way one-hot, and a buffer's bit is the AND of
-// its two -- 32 comparators feeding NID two-input gates, in place of NID
-// eight-bit comparators all hanging off the same eight nets.
-module fabric_seq_dec #(
-    parameter int NID = 256
-) (
-    input  wire [7:0]      id,
-    input  wire            en,
-    output wire [NID-1:0]  oh
-);
-    localparam int LOW = (NID > 16) ? 4 : $clog2(NID > 1 ? NID : 2);
-    localparam int NL  = 1 << LOW;
-    localparam int NH  = (NID + NL - 1) / NL;
-    wire [NL-1:0] lo;
-    wire [NH-1:0] hi;
-    genvar i;
-    generate
-        for (i = 0; i < NL; i = i + 1) begin : g_lo
-            assign lo[i] = (id[LOW-1:0] == i[LOW-1:0]);
-        end
-        for (i = 0; i < NH; i = i + 1) begin : g_hi
-            assign hi[i] = en && (id[7:LOW] == i[7-LOW:0]);
-        end
-        for (i = 0; i < NID; i = i + 1) begin : g_oh
-            assign oh[i] = hi[i / NL] && lo[i % NL];
-        end
-    endgenerate
 endmodule
 
 // One registered copy of a strobe the sequencer spreads over a wide register.
