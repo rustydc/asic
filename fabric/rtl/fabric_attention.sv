@@ -467,13 +467,22 @@ module fabric_attention #(
         end
     endgenerate
     reg signed [23:0]  gm1 [0:L-1];
+    // The output weight's requantize is two stages.  In one it was the
+    // product's 54-bit resolve, a barrel shifter, a round and a saturate --
+    // 2,275 ps and the core's worst path once the scale and round were split.
+    // The gate takes a matching stage so the two still meet at `og6`, and the
+    // sigmoid's valid travels with it.
+    reg signed [VPW:0] wsv [0:L-1];
+    reg [L-1:0]        wrb;
+    reg [L*16-1:0]     tg2a;
+    reg                ov2b;
     reg [L*16-1:0]     w2;
     reg [L*16-1:0]     tg2;
     wire [L-1:0]       sgv;
     wire [L*16-1:0]    sg5;
     generate
         for (gg = 0; gg < L; gg = gg + 1) begin : g_sig
-            fabric_sigmoid #(.LUT_DIR(LUT_DIR)) u_sg (.clk(clk), .valid_in(ov2), .t(tg2[gg*16 +: 16]), .valid_out(sgv[gg]), .y(sg5[gg*16 +: 16]));
+            fabric_sigmoid #(.LUT_DIR(LUT_DIR)) u_sg (.clk(clk), .valid_in(ov2b), .t(tg2[gg*16 +: 16]), .valid_out(sgv[gg]), .y(sg5[gg*16 +: 16]));
         end
     endgenerate
     reg [L*16-1:0] w3, w4, w5;
@@ -812,7 +821,7 @@ module fabric_attention #(
                     // sigmoid's three and the three after it.  Its own
                     // counter, since obeat only spans a head's beats.
                     drain <= drain + 1'b1;
-                    if (drain == 4'd11) begin done <= 1'b1; state <= S_ACCEPT; obeat <= 0; drain <= 0; end
+                    if (drain == 4'd12) begin done <= 1'b1; state <= S_ACCEPT; obeat <= 0; drain <= 0; end
                 end
                 default: state <= S_ACCEPT;
             endcase
@@ -826,8 +835,11 @@ module fabric_attention #(
     integer ol;
     always @(posedge clk) begin
         ov2 <= ov1;
-        w2  <= w2_n;
-        tg2 <= tg2_n;
+        for (ol = 0; ol < L; ol = ol + 1) begin wsv[ol] <= wsv_n[ol]; wrb[ol] <= wrb_n[ol]; end
+        tg2a <= tg2_n;
+        ov2b <= ov2;
+        w2   <= w2_n;
+        tg2  <= tg2a;
         o6v <= sgv[0];
         for (ol = 0; ol < L; ol = ol + 1)
             og6[ol] <= $signed({{18{w5[ol*16+15]}}, w5[ol*16 +: 16]}) * $signed({18'b0, sg5[ol*16 +: 16]});
@@ -843,14 +855,18 @@ module fabric_attention #(
     // weight's shift amount -- which the leading-zero count sets, so it is a
     // register -- fans out to every mux of its level.
     wire [5:0]      sh_w [0:L-1];
+    wire signed [VPW:0] wsv_n [0:L-1];
+    wire [L-1:0]        wrb_n;
     wire [L*16-1:0] w2_n, tg2_n;
     wire [L*8-1:0]  od_n;
     genvar go;
     generate
         for (go = 0; go < L; go = go + 1) begin : g_oq
             assign sh_w[go] = (7 + LW) - lz_c[go];      // in [7, 7+LW]: lz_c counts at most LW
-            fabric_rnd_sat #(.W(VPW), .SW(6), .N(16)) u_w2 (
-                .v(wm1q[go]), .sh(sh_w[go]), .y(w2_n[go*16 +: 16]));
+            fabric_rnd_sat_shift #(.W(VPW), .SW(6)) u_ws (
+                .v(wm1q[go]), .sh(sh_w[go]), .sv(wsv_n[go]), .rb(wrb_n[go]));
+            fabric_rnd_sat_round #(.W(VPW), .N(16)) u_w2 (
+                .sv(wsv[go]), .rb(wrb[go]), .y(w2_n[go*16 +: 16]));
             fabric_rnd_sat #(.W(24), .SW(6), .N(16)) u_tg (
                 .v(gm1[go]), .sh(sh_gate), .y(tg2_n[go*16 +: 16]));
             fabric_rnd_sat #(.W(56), .SW(6), .N(8)) u_od (
