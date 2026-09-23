@@ -368,6 +368,13 @@ endmodule
 module fabric_delta_state8 #(
     parameter int K     = 128,
     parameter int V     = 128,
+    // Value lanes of arithmetic.  The state rows reach this unit over the
+    // buffer's 128-bit port, so a row of V bytes takes V/16 cycles to
+    // arrive and a V-wide datapath idles for all but one of them.  VL lanes
+    // and V/VL slices do the same work at the same rate for a fraction of
+    // the multipliers.  VL = V is the unsliced unit, cycle for cycle what it
+    // always was.
+    parameter int VL    = V,
     parameter int YSH   = 11,
     parameter int E_MIN = -4,
     parameter int E_MAX = 6,
@@ -398,6 +405,8 @@ module fabric_delta_state8 #(
     output reg  [V*16-1:0] y
 );
     localparam int KW = $clog2(K) + 1;
+    localparam int SL = V / VL;                  // slices of the value dimension
+    localparam int SW = (SL > 1) ? $clog2(SL) : 1;
     reg [K*8-1:0]  q_r, k_r;
     reg [V*8-1:0]  v_r;
     reg [15:0]     b_r, g1;
@@ -436,17 +445,17 @@ module fabric_delta_state8 #(
     reg signed [49:0] rndc;
     reg signed [47:0] rndy;
     reg signed [23:0] rndr;
-    wire [5:0] shp_l [0:V-1];
-    wire [5:0] shc_l [0:V-1];
-    wire [5:0] shy_l [0:V-1];
-    wire [5:0] shr_l [0:V-1];
+    wire [5:0] shp_l [0:VL-1];
+    wire [5:0] shc_l [0:VL-1];
+    wire [5:0] shy_l [0:VL-1];
+    wire [5:0] shr_l [0:VL-1];
     // The scale multiplies every lane's accumulator, twice over; a copy per
     // lane keeps that off one flop's fanout, as for the shift amounts.
-    wire [15:0] g1_l [0:V-1];
-    wire [V*50-1:0] cms_w, cmc_w;
+    wire [15:0] g1_l [0:VL-1];
+    wire [VL*50-1:0] cms_w, cmc_w;
     genvar gv;
     generate
-        for (gv = 0; gv < V; gv = gv + 1) begin : g_sh
+        for (gv = 0; gv < VL; gv = gv + 1) begin : g_sh
             fabric_const_copy #(.W(6))  u_p (.clk(clk), .d(shp),  .q(shp_l[gv]));
             fabric_const_copy #(.W(6))  u_c (.clk(clk), .d(shc),  .q(shc_l[gv]));
             fabric_const_copy #(.W(6))  u_y (.clk(clk), .d(shy),  .q(shy_l[gv]));
@@ -465,7 +474,10 @@ module fabric_delta_state8 #(
     reg [32:0] rem, rem_next;
     reg [16:0] quo;
     reg [5:0]  dstep;
-    integer j;
+    integer j, u;
+    // One slice per cycle through each stage.  `ps` walks the phases between
+    // the passes; the passes carry a slice with each pipeline stage.
+    reg [SW-1:0] ps, sa1, sa2, sa3, sa4, sd1, sd2, sd3, sd4;
     reg signed [7:0] e1f;
     reg signed [3:0] de_w;
     always @(posedge clk or negedge rst_n) begin
@@ -519,13 +531,14 @@ module fabric_delta_state8 #(
     // copy per lane.  The copy is a cycle behind the quotient, which costs
     // nothing: the diff phase waits on `r_ready` and two more phases run
     // before anything multiplies by it.
-    wire [16:0] r_l [0:V-1];
+    wire [16:0] r_l [0:VL-1];
     genvar gr;
     generate
-        for (gr = 0; gr < V; gr = gr + 1) begin : g_rl
+        for (gr = 0; gr < VL; gr = gr + 1) begin : g_rl
             fabric_const_copy #(.W(17)) u_r (.clk(clk), .d(r), .q(r_l[gr]));
             fabric_mul_cs #(.AW(32), .BW(17), .PW(50)) u_c (
-                .a(bd[gr]), .b(r_l[gr]), .addend(rndc), .s(cms_w[gr*50 +: 50]), .c(cmc_w[gr*50 +: 50]));
+                .a(bd[ps * VL + gr]), .b(r_l[gr]), .addend(rndc),
+                .s(cms_w[gr*50 +: 50]), .c(cmc_w[gr*50 +: 50]));
         end
     endgenerate
 
@@ -550,7 +563,7 @@ module fabric_delta_state8 #(
     wire [V*8-1:0] rowd1;               // the macro's output, valid with vd1
     fabric_sram #(.W(V*8), .D(K), .NRD(1), .NWR(1), .MB(V*8)) u_t (
         .clk(clk), .rd_en(1'b1), .rd_addr(rd[TA-1:0]), .rd_data(rowd1),
-        .wr_en(va3), .wr_addr(ia3[TA-1:0]), .wr_data(tr3), .wr_mask(1'b1));
+        .wr_en(va3 && sa3 == SL - 1), .wr_addr(ia3[TA-1:0]), .wr_data(tr3), .wr_mask(1'b1));
     reg [KW-1:0]   id1, id2, id3, id4;
     // `k_r` and `q_r` are K bytes, and indexing them with a row counter is a
     // barrel shifter over all K*8 bits.  At the real 128 rows `ia3` alone
@@ -594,7 +607,8 @@ module fabric_delta_state8 #(
             // ---- the tail: y and the reduction of the per-lane peak and
             // saturated counts, newest stage first.
             if (phase == 4'd7) begin
-                tail <= tail + 1'b1;
+                if (tail > 3'd1 || ps == SL - 1) begin tail <= tail + 1'b1; ps <= 0; end
+                else ps <= ps + 1'b1;
                 if (tail == 3'd4) begin
                     y_valid <= 1'b1;
                     phase <= 4'd0;
@@ -610,8 +624,10 @@ module fabric_delta_state8 #(
                     nsat_acc <= nsat[15:0]; nsat_out <= nsat[15:0];
                 end
                 if (tail == 3'd1)
-                    for (j = 0; j < V; j = j + 1)
-                        y[j*16 +: 16] <= fx_sat((ym[j] + rndy) >>> shy_l[j], 16);
+                    for (u = 0; u < VL; u = u + 1) begin
+                        j = ps * VL + u;
+                        y[j*16 +: 16] <= fx_sat((ym[j] + rndy) >>> shy_l[u], 16);
+                    end
                 if (tail == 3'd2)
                     for (gg = 0; gg < G2N; gg = gg + 1) begin
                         pk_b[gg] = 0; ns_b[gg] = 0;
@@ -631,17 +647,24 @@ module fabric_delta_state8 #(
                             end
                     end
                 if (tail == 3'd0)
-                    for (j = 0; j < V; j = j + 1) ym[j] = y_acc[j] * $signed({16'b0, g1_l[j]});
+                    for (u = 0; u < VL; u = u + 1) begin
+                        j = ps * VL + u;
+                        ym[j] = y_acc[j] * $signed({16'b0, g1_l[u]});
+                    end
             end
 
             // ---- pass 2, newest stage first.
             if (vd4) begin
-                for (j = 0; j < V; j = j + 1) y_acc[j] = y_acc[j] + ym4[j];
-                if (id4 == K - 1) begin phase <= 4'd7; tail <= 0; end
+                for (u = 0; u < VL; u = u + 1) begin
+                    j = sd4 * VL + u;
+                    y_acc[j] = y_acc[j] + ym4[j];
+                end
+                if (id4 == K - 1 && sd4 == SL - 1) begin phase <= 4'd7; tail <= 0; ps <= 0; end
             end
-            vd4 <= vd3; id4 <= id3;
+            vd4 <= vd3; id4 <= id3; sd4 <= sd3;
             if (vd3) begin
-                for (j = 0; j < V; j = j + 1) begin
+                for (u = 0; u < VL; u = u + 1) begin
+                    j = sd3 * VL + u;
                     ym4[j] = $signed(q_d3) * $signed(tn3[j*8 +: 8]);
                     tn = $signed({{56{tn3[j*8+7]}}, tn3[j*8 +: 8]});
                     mag = (tn < 0) ? -tn : tn;
@@ -649,72 +672,112 @@ module fabric_delta_state8 #(
                     if (mag >= 127) ns[j] = ns[j] + 1'b1;
                 end
             end
-            vd3 <= vd2; id3 <= id2;
+            vd3 <= vd2; id3 <= id2; sd3 <= sd2;
             if (vd2) begin
-                for (j = 0; j < V; j = j + 1) begin
+                for (u = 0; u < VL; u = u + 1) begin
+                    j = sd2 * VL + u;
                     dl = fx_rnd_shr(dm2[j], 14);
                     tn = fx_sat($signed({{56{rowd2[j*8+7]}}, rowd2[j*8 +: 8]}) + dl, 8);
                     tn3[j*8 +: 8] = tn[7:0];
                     row_out[j*8 +: 8] <= tn[7:0];
                 end
-                row_out_valid <= 1'b1;
+                if (sd2 == SL - 1) row_out_valid <= 1'b1;   // the row is whole on the last slice
             end
-            vd2 <= vd1; id2 <= id1; rowd2 <= rowd1;
+            vd2 <= vd1; id2 <= id1; sd2 <= sd1;
+            // `rd` advances at the issue, so the macro has moved on to the
+            // next row by the second slice: take the row once, at the first.
+            if (vd1 && sd1 == 0) rowd2 <= rowd1;
             if (vd1)
-                for (j = 0; j < V; j = j + 1) dm2[j] = $signed(k_d1) * c[j];
-            if (phase == 4'd6) begin
-                vd1 <= 1'b1; id1 <= rd; rd <= rd + 1'b1;
+                for (u = 0; u < VL; u = u + 1) begin
+                    j = sd1 * VL + u;
+                    dm2[j] = $signed(k_d1) * c[j];
+                end
+            // As in pass 1: a row is SL cycles of VL lanes, so the read
+            // address advances once a row and the slice walks between.
+            if (vd1 && sd1 != SL - 1) begin vd1 <= 1'b1; sd1 <= sd1 + 1'b1; end
+            else if (phase == 4'd6) begin
+                vd1 <= 1'b1; sd1 <= 0; id1 <= rd; rd <= rd + 1'b1;
                 if (rd == K - 1) phase <= 4'd0;          // the pipeline carries the rest
             end
 
             // ---- the phases between the passes, newest first.
             if (phase == 4'd5) begin
-                for (j = 0; j < V; j = j + 1)
-                    c[j] = ($signed(cms[j]) + $signed({cmc[j][48:0], 1'b0})) >>> shc_l[j];
-                phase <= 4'd6; rd <= 0;
+                for (u = 0; u < VL; u = u + 1) begin
+                    j = ps * VL + u;
+                    c[j] = ($signed(cms[j]) + $signed({cmc[j][48:0], 1'b0})) >>> shc_l[u];
+                end
+                if (ps == SL - 1) begin ps <= 0; phase <= 4'd6; rd <= 0; end
+                else ps <= ps + 1'b1;
             end
             if (phase == 4'd4) begin
-                for (j = 0; j < V; j = j + 1) begin
-                    cms[j] = cms_w[j*50 +: 50];
-                    cmc[j] = cmc_w[j*50 +: 50];
+                for (u = 0; u < VL; u = u + 1) begin
+                    j = ps * VL + u;
+                    cms[j] = cms_w[u*50 +: 50];
+                    cmc[j] = cmc_w[u*50 +: 50];
                 end
-                phase <= 4'd5;
+                if (ps == SL - 1) begin ps <= 0; phase <= 4'd5; end
+                else ps <= ps + 1'b1;
             end
             if (phase == 4'd3) begin
-                for (j = 0; j < V; j = j + 1) bd[j] = $signed({16'b0, b_r}) * diff[j];
-                phase <= 4'd4;
+                for (u = 0; u < VL; u = u + 1) begin
+                    j = ps * VL + u;
+                    bd[j] = $signed({16'b0, b_r}) * diff[j];
+                end
+                if (ps == SL - 1) begin ps <= 0; phase <= 4'd4; end
+                else ps <= ps + 1'b1;
             end
             if (phase == 4'd2) begin
-                for (j = 0; j < V; j = j + 1) begin
-                    pr = (pm[j] + rndp) >>> shp_l[j];
+                for (u = 0; u < VL; u = u + 1) begin
+                    j = ps * VL + u;
+                    pr = (pm[j] + rndp) >>> shp_l[u];
                     diff[j] = fx_sat($signed({{56{v_r[j*8+7]}}, v_r[j*8 +: 8]}) - pr, 16);
                 end
-                phase <= 4'd3;
+                if (ps == SL - 1) begin ps <= 0; phase <= 4'd3; end
+                else ps <= ps + 1'b1;
             end
             if (phase == 4'd1 && r_ready) begin
-                for (j = 0; j < V; j = j + 1) pm[j] = pred_acc[j] * $signed({16'b0, g1_l[j]});
-                phase <= 4'd2;
+                for (u = 0; u < VL; u = u + 1) begin
+                    j = ps * VL + u;
+                    pm[j] = pred_acc[j] * $signed({16'b0, g1_l[u]});
+                end
+                if (ps == SL - 1) begin ps <= 0; phase <= 4'd2; end
+                else ps <= ps + 1'b1;
             end
 
             // ---- pass 1, newest stage first.
             if (va4) begin
-                for (j = 0; j < V; j = j + 1) pred_acc[j] = pred_acc[j] + {{16{kp4[j][15]}}, kp4[j]};
-                if (ia4 == K - 1) phase <= 4'd1;
+                for (u = 0; u < VL; u = u + 1) begin
+                    j = sa4 * VL + u;
+                    pred_acc[j] = pred_acc[j] + {{16{kp4[j][15]}}, kp4[j]};
+                end
+                if (ia4 == K - 1 && sa4 == SL - 1) begin phase <= 4'd1; ps <= 0; end
             end
-            va4 <= va3; ia4 <= ia3;
+            va4 <= va3; ia4 <= ia3; sa4 <= sa3;
             if (va3)
-                for (j = 0; j < V; j = j + 1) kp4[j] = $signed(k_a3) * $signed(tr3[j*8 +: 8]);
-            va3 <= va2; ia3 <= ia2;
+                for (u = 0; u < VL; u = u + 1) begin
+                    j = sa3 * VL + u;
+                    kp4[j] = $signed(k_a3) * $signed(tr3[j*8 +: 8]);
+                end
+            va3 <= va2; ia3 <= ia2; sa3 <= sa2;
             if (va2)
-                for (j = 0; j < V; j = j + 1) begin
-                    tr = rescale ? fx_sat((rs2[j] + rndr) >>> shr_, 8)
+                for (u = 0; u < VL; u = u + 1) begin
+                    j = sa2 * VL + u;
+                    tr = rescale ? fx_sat((rs2[j] + rndr) >>> shr_l[u], 8)
                                  : $signed({{56{rowa2[j*8+7]}}, rowa2[j*8 +: 8]});
                     tr3[j*8 +: 8] <= tr[7:0];   // a register, not a blocking temp: the macro samples it
                 end
-            va2 <= va1; ia2 <= ia1; rowa2 <= rowa1;
+            va2 <= va1; ia2 <= ia1; sa2 <= sa1; rowa2 <= rowa1;
             if (va1)
-                for (j = 0; j < V; j = j + 1) rs2[j] = $signed(rowa1[j*8 +: 8]) * $signed({8'b0, gren});
-            if (phase == 4'd0 && row_in_valid) begin va1 <= 1'b1; rowa1 <= row_in; ia1 <= wr; wr <= wr + 1'b1; end
+                for (u = 0; u < VL; u = u + 1) begin
+                    j = sa1 * VL + u;
+                    rs2[j] = $signed(rowa1[j*8 +: 8]) * $signed({8'b0, gren});
+                end
+            // A row is VL lanes at a time: the issue holds `va1` for SL cycles
+            // and walks the slice, which is the rate the row arrived at.
+            if (va1 && sa1 != SL - 1) begin va1 <= 1'b1; sa1 <= sa1 + 1'b1; end
+            else if (phase == 4'd0 && row_in_valid) begin
+                va1 <= 1'b1; sa1 <= 0; rowa1 <= row_in; ia1 <= wr; wr <= wr + 1'b1;
+            end
 
             if (start) begin
                 q_r <= q; k_r <= k; v_r <= v; b_r <= beta;
@@ -728,6 +791,16 @@ module fabric_delta_state8 #(
             end
         end
     end
+`ifndef FABRIC_SYNTH
+    // The rows arrive a beat at a time, so a row takes V/16 cycles to reach
+    // this unit and the slices take SL.  VL is chosen so those are equal; if
+    // a row ever arrives while the last one still has slices to run it is
+    // dropped, and silently, so say so.
+    always @(posedge clk)
+        if (rst_n && row_in_valid && va1 && sa1 != SL - 1)
+            $display("FAIL: a state row arrived while the one before it still had slices to run");
+`endif
+
 endmodule
 
 `default_nettype wire

@@ -344,6 +344,11 @@ class VectorRtlTest(unittest.TestCase):
         for k, v, case in ((16, 16, "plain"), (16, 16, "renorm"), (16, 16, "grow"), (16, 16, "shrink"),
                            (128, 128, "renorm"), (128, 128, "grow")):
             self.check("tb_delta_state8", lambda d: L.emit_delta8_vectors(d, rng, k, v, case))
+        # The same head sliced: sixteen lanes of arithmetic over eight slices,
+        # which is the rate the rows arrive at over the buffer's port.
+        for k, v, vl, case in ((128, 128, 16, "renorm"), (128, 128, 16, "grow"),
+                               (128, 128, 32, "shrink"), (16, 16, 4, "plain")):
+            self.check("tb_delta_state8", lambda d: L.emit_delta8_vectors(d, rng, k, v, case, vl))
 
     def test_swiglu_and_residual(self) -> None:
         rng = np.random.default_rng(15)

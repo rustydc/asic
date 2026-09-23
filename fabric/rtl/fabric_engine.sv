@@ -872,6 +872,9 @@ endmodule
 module fabric_delta_adapter #(
     parameter int K   = 16,
     parameter int V   = 16,
+    // The state rows arrive a beat at a time, so the engine below needs no
+    // more arithmetic lanes than a beat carries.
+    parameter int VL  = (V < 16) ? V : 16,
     parameter int YSH = 9,
     parameter int AW  = 16,
     parameter int E_MIN = -4,
@@ -922,7 +925,7 @@ module fabric_delta_adapter #(
     wire [V*16-1:0] y;
     wire [15:0]     g_out, nsat_out;
     wire [7:0]      e_out, peak_out;
-    fabric_delta_state8 #(.K(K), .V(V), .YSH(YSH), .E_MIN(E_MIN), .E_MAX(E_MAX), .PEAK_GROW(PEAK_GROW), .SAT_SHIFT(SAT_SHIFT)) u_delta (
+    fabric_delta_state8 #(.K(K), .V(V), .VL(VL), .YSH(YSH), .E_MIN(E_MIN), .E_MAX(E_MAX), .PEAK_GROW(PEAK_GROW), .SAT_SHIFT(SAT_SHIFT)) u_delta (
         .clk(clk), .rst_n(rst_n), .start(start), .q(q_r), .k(k_r), .v(v_r), .decay(decay), .beta(beta), .g_in(g_in), .e_in(e_in),
         .peak_in(peak_in), .nsat_in(nsat_in), .g_out(g_out), .e_out(e_out), .peak_out(peak_out), .nsat_out(nsat_out),
         .row_in_valid(row_in_valid), .row_in(row_in), .row_out_valid(row_out_valid), .row_out(row_out), .y_valid(y_valid), .y(y));

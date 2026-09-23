@@ -1055,7 +1055,8 @@ def emit_delta_vectors(directory: Path, rng: np.random.Generator, k: int, v: int
     return _params(directory, K=k, V=v, DECAY=decay, BETA=beta, YSH=ysh_for(k))
 
 
-def emit_delta8_vectors(directory: Path, rng: np.random.Generator, k: int, v: int, case: str) -> dict:
+def emit_delta8_vectors(directory: Path, rng: np.random.Generator, k: int, v: int, case: str,
+                        vl: int | None = None) -> dict:
     """Vectors for the int8 state engine.  ``case``: ``plain`` (no rescale this
     token), ``renorm`` (the scale crosses one half, exponent kept), ``grow``
     (rescale with room to double the resolution), ``shrink`` (the state
@@ -1086,7 +1087,7 @@ def emit_delta8_vectors(directory: Path, rng: np.random.Generator, k: int, v: in
     write_hex(directory / "v.hex", vv, 8)
     write_hex(directory / "expected_s.hex", [pack(row) for row in t_new], 8 * v)
     write_hex(directory / "expected_y.hex", y, 16)
-    return _params(directory, K=k, V=v, DECAY=decay, BETA=beta, G=g, E=e & 0xFF, PEAK=peak, NSAT=nsat, EXPECTED_G=g_new,
+    return _params(directory, K=k, V=v, VL=vl or v, DECAY=decay, BETA=beta, G=g, E=e & 0xFF, PEAK=peak, NSAT=nsat, EXPECTED_G=g_new,
                    EXPECTED_E=e_new & 0xFF, EXPECTED_PEAK=peak_new, EXPECTED_NSAT=nsat_new, YSH=ysh_for(k),
                    PEAK_GROW=PEAK_GROW, SAT_SHIFT=SAT_SHIFT)
 

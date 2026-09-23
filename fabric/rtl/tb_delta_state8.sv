@@ -6,6 +6,7 @@
 module tb_delta_state8 #(
     parameter int K     = 16,
     parameter int V     = 16,
+    parameter int VL    = V,
     parameter int DECAY = 60000,
     parameter int BETA  = 30000,
     parameter int G     = 40000,
@@ -30,6 +31,7 @@ module tb_delta_state8 #(
     reg            start = 0;
     reg [K*8-1:0]  q = 0, k = 0;
     reg [V*8-1:0]  v = 0;
+    localparam int SL = V / VL;
     reg            row_in_valid = 0;
     reg [V*8-1:0]  row_in = 0;
     wire           row_out_valid, y_valid;
@@ -38,7 +40,7 @@ module tb_delta_state8 #(
     wire [15:0]    g_out;
     wire [7:0]     e_out, peak_out;
     wire [15:0]    nsat_out;
-    fabric_delta_state8 #(.K(K), .V(V), .YSH(YSH), .PEAK_GROW(PEAK_GROW), .SAT_SHIFT(SAT_SHIFT)) dut (
+    fabric_delta_state8 #(.K(K), .V(V), .VL(VL), .YSH(YSH), .PEAK_GROW(PEAK_GROW), .SAT_SHIFT(SAT_SHIFT)) dut (
         .clk(clk), .rst_n(rst_n), .start(start), .q(q), .k(k), .v(v), .decay(DECAY[15:0]), .beta(BETA[15:0]),
         .g_in(G[15:0]), .e_in(E[7:0]), .peak_in(PEAK[7:0]), .nsat_in(NSAT[15:0]), .g_out(g_out), .e_out(e_out), .peak_out(peak_out), .nsat_out(nsat_out),
         .row_in_valid(row_in_valid), .row_in(row_in), .row_out_valid(row_out_valid),
@@ -82,10 +84,15 @@ module tb_delta_state8 #(
         for (i = 0; i < K; i = i + 1) begin
             row_in_valid = 1; row_in = smem[i];
             @(negedge clk);
-            if (i % 4 == 1) begin row_in_valid = 0; @(negedge clk); end
+            // A row of V bytes reaches the engine over V/16 beats, which is
+            // the rate its V/VL slices consume one at; idle between rows the
+            // way the adapter does, plus the odd extra gap.
+            row_in_valid = 0;
+            if (SL > 1) repeat (SL - 1) @(negedge clk);
+            else if (i % 4 == 1) @(negedge clk);
         end
         row_in_valid = 0;
-        repeat (K + 48) @(posedge clk);
+        repeat ((K + 80) * SL) @(posedge clk);
         if (g_out !== EXPECTED_G[15:0]) begin errors = errors + 1; $display("scale: got %0d expected %0d", g_out, EXPECTED_G); end
         if (e_out !== EXPECTED_E[7:0]) begin errors = errors + 1; $display("exponent: got %0d expected %0d", $signed(e_out), $signed(EXPECTED_E[7:0])); end
         if (peak_out !== EXPECTED_PEAK[7:0]) begin errors = errors + 1; $display("peak: got %0d expected %0d", peak_out, EXPECTED_PEAK); end
