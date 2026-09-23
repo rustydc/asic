@@ -465,7 +465,13 @@ module fabric_rsqrt #(
     reg  [16:0]   r0_2, r0_3, r0_4, r0_5;
     reg  [33:0]   sq3;
     reg  [49:0]   p4;
-    reg  signed [63:0] u5;
+    // 3 - M r0^2 spans [3*2^30 - 2^34, 3*2^30], which is 35 bits.  At 64 the
+    // Newton step below is a 17 by 64 multiply for a 17-bit result.
+    reg  signed [34:0] u5;
+    // The product needs its own name: assigned straight into `r` the context
+    // is seventeen bits and the multiply is evaluated there, which is the
+    // same width-inference trap the 64-bit extensions were hiding.
+    wire signed [52:0] rp5;
     always @(posedge clk) begin
         v1 <= start;
         m1 <= sh[SW-1:SW-16];
@@ -481,12 +487,13 @@ module fabric_rsqrt #(
         p4 <= m3 * sq3;
         // S5: u = 3 - M r0^2 in Q2.30.
         v5 <= v4; a5 <= a4; r0_5 <= r0_4;
-        u5 <= (64'sd3 <<< 30) - ($signed({14'b0, p4}) >>> 16);
+        u5 <= $signed(35'sd3 <<< 30) - $signed({1'b0, p4[49:16]});
         // S6: r1 = r0 (3 - M r0^2) / 2.
         done <= v5;
-        r    <= ($signed({47'b0, r0_5}) * u5) >>> 31;
+        r    <= rp5 >>> 31;
         a    <= a5;
     end
+    assign rp5 = $signed({1'b0, r0_5}) * u5;
 endmodule
 
 // ---------------------------------------------------------------------------
@@ -529,17 +536,22 @@ module fabric_recip #(
     reg  [5:0]    z1, z2, z3;
     reg           v1, v2, v3;
     reg  [16:0]   r0_2, r0_3;
-    reg  signed [63:0] u3;
+    // 2 - m r0 spans [-2^16, 2^16], which is 18 bits, and the same 17 by 64
+    // multiply followed it.
+    reg  signed [17:0] u3;
+    wire [32:0]   mr = m2 * r0_2;
+    wire signed [35:0] rp3;
     always @(posedge clk) begin
         v1 <= start; m1 <= m_w; z1 <= lz;
         v2 <= v1; m2 <= m1; z2 <= z1;
         r0_2 <= seed[(m1 >> 6) - 512];
         v3 <= v2; z3 <= z2; r0_3 <= r0_2;
-        u3 <= (64'sd2 <<< 15) - (($signed({48'b0, m2}) * $signed({47'b0, r0_2})) >>> 16);
+        u3 <= $signed(18'sd2 <<< 15) - $signed({1'b0, mr[32:16]});
         done   <= v3;
-        r      <= ($signed({47'b0, r0_3}) * u3) >>> 15;
+        r      <= rp3 >>> 15;
         lz_out <= z3;
     end
+    assign rp3 = $signed({1'b0, r0_3}) * u3;
 endmodule
 
 `default_nettype wire
