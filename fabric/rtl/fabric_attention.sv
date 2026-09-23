@@ -360,31 +360,24 @@ module fabric_attention #(
     reg [QW-1:0] q_rdq [0:G-1];
     reg [L*8-1:0] in_dataq;
     reg           accv;                    // a key beat landed last cycle
-    // Every partial product of every lane goes into one tree, rather than
-    // sixteen multiplies each resolving its own.  `a * b` on two int8s is a
-    // handful of partial products and then a carry-propagate add, and
-    // sixteen of those adds ran before the tree could start.  Written out,
-    //     q * d = sum(i < 7) d[i] * (q << i)  -  d[7] * (q << 7)
-    // and the subtracted term is its complement with a one, which is one more
-    // operand rather than a negate.  Nothing between the memory and the
-    // accumulator propagates a carry at all.
-    localparam int PPL = 9;                 // per lane: seven, the complement, its one
-    genvar gc, gl, gp;
+    // The sixteen products stay products.  Expanding them into partial
+    // products and reducing all of them in one tree does take the multiplies'
+    // carry-propagate adds off the path -- but those sixteen adds are in
+    // parallel, so between them they are one add of depth, and the flat tree
+    // is twelve layers where a multiply and a tree over sixteen operands are
+    // one add and seven.  A hundred picoseconds at most, bought with two and
+    // a half times the logic in this block and five times the simulation.
+    genvar gc, gl;
     generate
         for (gc = 0; gc < G; gc = gc + 1) begin : g_contrib
-            wire [(L*PPL+2)*SCW-1:0] cops;
+            wire [(L+2)*SCW-1:0] cops;
             for (gl = 0; gl < L; gl = gl + 1) begin : g_cp
-                wire signed [SCW-1:0] qx = $signed(q_rdq[gc][gl*8 +: 8]);
-                wire [7:0]            d  = in_dataq[gl*8 +: 8];
-                for (gp = 0; gp < 7; gp = gp + 1) begin : g_pp
-                    assign cops[(gl*PPL + gp)*SCW +: SCW] = d[gp] ? (qx <<< gp) : {SCW{1'b0}};
-                end
-                assign cops[(gl*PPL + 7)*SCW +: SCW] = d[7] ? ~(qx <<< 7) : {SCW{1'b0}};
-                assign cops[(gl*PPL + 8)*SCW +: SCW] = {{(SCW-1){1'b0}}, d[7]};
+                wire signed [15:0] pr = $signed(q_rdq[gc][gl*8 +: 8]) * $signed(in_dataq[gl*8 +: 8]);
+                assign cops[gl*SCW +: SCW] = {{(SCW-16){pr[15]}}, pr};
             end
-            assign cops[(L*PPL)*SCW +: SCW]     = score_s[gc];
-            assign cops[(L*PPL+1)*SCW +: SCW]   = {score_c[gc][SCW-2:0], 1'b0};
-            fabric_csa_tree #(.N(L*PPL+2), .W(SCW)) u_ct (.ops(cops), .s(score_sn[gc]), .c(score_cn[gc]));
+            assign cops[L*SCW +: SCW]     = score_s[gc];
+            assign cops[(L+1)*SCW +: SCW] = {score_c[gc][SCW-2:0], 1'b0};
+            fabric_csa_tree #(.N(L+2), .W(SCW)) u_ct (.ops(cops), .s(score_sn[gc]), .c(score_cn[gc]));
             // A carry-save pair is only a number modulo its width: the
             // integer s + 2c may exceed it by a multiple of 2^SCW that no
             // amount of arithmetic here can see.  Added into another tree
