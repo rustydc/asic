@@ -314,7 +314,6 @@ module fabric_attention #(
     wire [G-1:0]   q_we, gate_we;
     reg            o_we;
     reg            o_seen;                // the first record has written every beat
-    reg signed [31:0] score [0:G-1];
     reg signed [31:0] m_r [0:G-1];
     reg               m_valid [0:G-1];
     reg [LW-1:0]      l_r [0:G-1];
@@ -335,24 +334,37 @@ module fabric_attention #(
     // int8s need 16 bits and their sum over the beat needs 16 + log2(L), so
     // the tree is narrow, and balanced: a chain of L adds is L carry chains
     // deep and ABC cannot restructure them.
-    localparam int CW2 = 16 + $clog2(L) + 1;
     integer g, l;
-    wire signed [CW2-1:0] contrib [0:G-1];
     // The products are reduced carry-save, not by a tree of adds.  Balanced,
     // the tree is log2(L) adds deep, but each of those is a carry chain that
     // ABC cannot restructure: at sixteen lanes it was four ripples in series
-    // and most of this core's path.  A carry-save layer is one gate deep, and
-    // one real add resolves the pair at the end.
+    // and most of this core's path.  A carry-save layer is one gate deep.
+    //
+    // The accumulator is carry-save as well -- value = s + 2c -- and joins
+    // the beat's products as two more operands of the same tree.  Resolved
+    // every beat instead, the accumulate is the tree's own resolve and then a
+    // 32-bit add, two carry propagations in series behind a macro read that
+    // already costs 512 ps of the cycle.  Kept redundant, the accumulate is a
+    // layer, and the one real add belongs to S_EXP, whose only other work is
+    // the score's multiply.  The tree runs at the accumulator's width because
+    // a carry-save pair cannot be sign-extended a word at a time: the sign is
+    // a property of the value, and the value is not resolved.
+    localparam int SCW = 32;
+    reg  [SCW-1:0] score_s [0:G-1], score_c [0:G-1];
+    wire [SCW-1:0] score_sn [0:G-1], score_cn [0:G-1];
+    wire signed [SCW-1:0] score [0:G-1];
     genvar gc, gl;
     generate
         for (gc = 0; gc < G; gc = gc + 1) begin : g_contrib
-            wire [L*CW2-1:0] cprod;
+            wire [(L+2)*SCW-1:0] cops;
             for (gl = 0; gl < L; gl = gl + 1) begin : g_cp
-                assign cprod[gl*CW2 +: CW2] = $signed(q_rd[gc][gl*8 +: 8]) * $signed(in_data[gl*8 +: 8]);
+                wire signed [15:0] pr = $signed(q_rd[gc][gl*8 +: 8]) * $signed(in_data[gl*8 +: 8]);
+                assign cops[gl*SCW +: SCW] = {{(SCW-16){pr[15]}}, pr};
             end
-            wire [CW2-1:0] cs, cc;
-            fabric_csa_tree #(.N(L), .W(CW2)) u_ct (.ops(cprod), .s(cs), .c(cc));
-            assign contrib[gc] = $signed(cs) + $signed({cc[CW2-2:0], 1'b0});
+            assign cops[L*SCW +: SCW]     = score_s[gc];
+            assign cops[(L+1)*SCW +: SCW] = {score_c[gc][SCW-2:0], 1'b0};
+            fabric_csa_tree #(.N(L+2), .W(SCW)) u_ct (.ops(cops), .s(score_sn[gc]), .c(score_cn[gc]));
+            assign score[gc] = $signed(score_s[gc]) + $signed({score_c[gc][SCW-2:0], 1'b0});
         end
     endgenerate
 
@@ -442,7 +454,18 @@ module fabric_attention #(
     reg [L*16-1:0] w3, w4, w5;
     always @(posedge clk) begin w3 <= w2; w4 <= w3; w5 <= w4; end
 
-    reg signed [63:0] sc, dd, ow, tmp;
+    reg signed [47:0] sc;
+    reg signed [49:0] dd;
+    reg signed [63:0] ow, tmp;
+    // The score's round, out of the always block so it is one module
+    // at the value's width rather than the helpers' 64.
+    wire signed [47:0] sc_w [0:G-1];
+    genvar gsc;
+    generate
+        for (gsc = 0; gsc < G; gsc = gsc + 1) begin : g_sc
+            fabric_rnd #(.W(48), .SW(6)) u_sc (.v(sm[gsc]), .sh(sh_s), .y(sc_w[gsc]));
+        end
+    endgenerate
     // The value update's two products, applied the cycle after they are formed.
     reg signed [OW+17:0] va [0:G-1][0:L-1];
     reg signed [24:0]    vb [0:G-1][0:L-1];
@@ -508,7 +531,7 @@ module fabric_attention #(
         if (!rst_n) begin
             state <= S_ACCEPT; beat <= 0; head <= 0; exp_go <= 1'b0; rc_start <= 1'b0; done <= 1'b0;
             ov1 <= 1'b0; out_go <= 1'b0; ohead <= 0; obeat <= 0; drain <= 0; vv <= 1'b0; o_we <= 1'b0; o_seen <= 1'b0;
-            for (g = 0; g < G; g = g + 1) begin m_valid[g] <= 1'b0; l_r[g] <= 0; score[g] <= 0; end
+            for (g = 0; g < G; g = g + 1) begin m_valid[g] <= 1'b0; l_r[g] <= 0; score_s[g] <= 0; score_c[g] <= 0; end
         end else begin
             exp_go <= 1'b0;
             rc_start <= 1'b0;
@@ -531,7 +554,7 @@ module fabric_attention #(
             if (start) begin
                 state <= S_ACCEPT; beat <= 0; head <= 0; o_seen <= 1'b0;
                 for (g = 0; g < G; g = g + 1) begin
-                    m_valid[g] <= 1'b0; l_r[g] <= 0; score[g] <= 0;
+                    m_valid[g] <= 1'b0; l_r[g] <= 0; score_s[g] <= 0; score_c[g] <= 0;
                 end
             end
             case (state)
@@ -541,7 +564,7 @@ module fabric_attention #(
                     end else if (in_valid) begin
                         case (in_kind)
                             2'd0, 2'd1: ;                     // the memories take them; see q_we and gate_we
-                            2'd2: for (g = 0; g < G; g = g + 1) score[g] <= score[g] + {{(32-CW2){contrib[g][CW2-1]}}, contrib[g]};
+                            2'd2: for (g = 0; g < G; g = g + 1) begin score_s[g] <= score_sn[g]; score_c[g] <= score_cn[g]; end
                             default: ;
                         endcase
                         if (beat == BEATS - 1) begin
@@ -562,17 +585,22 @@ module fabric_attention #(
                 S_EXP2: begin
                     // Round it, compare with the maximum, launch the exponentials.
                     for (g = 0; g < G; g = g + 1) begin
-                        sc = fx_rnd_shr(sm[g], sh_s);
-                        if (!m_valid[g] || sc > $signed({{32{m_r[g][31]}}, m_r[g]})) begin
+                        // `sc` comes off fabric_rnd at the 48 bits `sm` has,
+                        // so the shift, the compare and the difference are 48
+                        // and 50 wide rather than 64: this was the core's
+                        // second path, and every one of those is a carry
+                        // chain the width of the value.
+                        sc = sc_w[g];
+                        if (!m_valid[g] || sc > $signed({{18{m_r[g][31]}}, m_r[g]})) begin
                             newmax[g] <= 1'b1;
-                            dd = m_valid[g] ? (sc - $signed({{32{m_r[g][31]}}, m_r[g]})) : 64'sd0;
+                            dd = m_valid[g] ? ($signed({{2{sc[47]}}, sc}) - $signed({{20{m_r[g][31]}}, m_r[g]})) : 50'sd0;
                             m_r[g] <= sc[31:0];
                         end else begin
                             newmax[g] <= 1'b0;
-                            dd = $signed({{32{m_r[g][31]}}, m_r[g]}) - sc;
+                            dd = $signed({{20{m_r[g][31]}}, m_r[g]}) - $signed({{2{sc[47]}}, sc});
                         end
-                        d_in[g] <= (dd > 64'sd4194303) ? 22'd4194303 : dd[21:0];
-                        score[g] <= 0;
+                        d_in[g] <= (dd > 50'sd4194303) ? 22'd4194303 : dd[21:0];
+                        score_s[g] <= 0; score_c[g] <= 0;
                     end
                     exp_go <= 1'b1;
                     state <= S_APPLY;

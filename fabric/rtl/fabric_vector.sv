@@ -111,11 +111,54 @@ module fabric_rnd_sat #(
         for (i = 1; i < SMAX; i = i + 1)
             if (sh == i[SW-1:0]) rb = vx[i-1];
     end
-    wire signed [W:0] sv = $signed({v[W-1], v}) >>> sh;
-    wire signed [W:0] r  = sv + $signed({{W{1'b0}}, rb});
-    wire [W-N+1:0] top = r[W:N-1];
-    wire fits = (&top) | (~|top);
-    assign y = fits ? r[N-1:0] : (r[W] ? {1'b1, {(N-1){1'b0}}} : {1'b0, {(N-1){1'b1}}});
+    // The shift keeps one bit above the sign, so the top two bits of `sv`
+    // always agree; that is what lets the carry out of the low half be
+    // resolved below without a second add.
+    wire signed [W:0] sv  = $signed({v[W-1], v}) >>> sh;
+    wire [N-1:0]      svl = sv[N-1:0];
+    wire [W-N:0]      hi  = sv[W:N];
+    // Only the low N bits of the rounded value survive the saturate, so only
+    // they are added.  Rounding the whole width is a carry chain as long as
+    // the value: 34 gates of it, and the convolution's path once the shifter
+    // came off it.  The carry out of the low bits is the round bit and those
+    // bits all ones, and the high part's only job is to say whether the
+    // result still fits -- which is two reductions, not a compare.
+    wire [N-1:0]   lo  = svl + {{(N-1){1'b0}}, rb};
+    wire           cy  = rb & (&svl);
+    wire [W-N+1:0] top = {hi, lo[N-1]};
+    // With a carry the low bits are zero, so the result fits exactly when the
+    // high part was all ones and the carry cleared it.
+    wire fits = cy ? (&hi) : ((&top) | (~|top));
+    assign y = fits ? lo : (sv[W] ? {1'b1, {(N-1){1'b0}}} : {1'b0, {(N-1){1'b1}}});
+endmodule
+
+// ---------------------------------------------------------------------------
+// The round-shift on its own, at the value's own width, for the places that
+// use the result whole rather than saturated.  The same number as fx_rnd_shr
+// and here for the same reason: the helpers evaluate at 64 bits, so a 48-bit
+// value buys a shifter, a round mux and an incrementer of 64, and whatever
+// compares or subtracts the result afterwards is 64 wide too.
+// ---------------------------------------------------------------------------
+module fabric_rnd #(
+    parameter int W  = 48,
+    parameter int SW = 6
+) (
+    input  wire signed [W-1:0] v,
+    input  wire [SW-1:0]       sh,
+    output wire signed [W-1:0] y
+);
+    localparam int SMAX = 1 << SW;
+    localparam int VW = (W > SMAX) ? W : SMAX;
+    wire signed [VW-1:0] vx = $signed(v);
+    reg rb;
+    integer i;
+    always @* begin
+        rb = 1'b0;
+        for (i = 1; i < SMAX; i = i + 1)
+            if (sh == i[SW-1:0]) rb = vx[i-1];
+    end
+    wire signed [W-1:0] sv = v >>> sh;
+    assign y = sv + {{(W-1){1'b0}}, rb};
 endmodule
 
 // ---------------------------------------------------------------------------
