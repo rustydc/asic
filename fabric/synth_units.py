@@ -137,7 +137,7 @@ UNITS = [
     # Sized for the programs that exist: a 9B stream of two contexts is 346
     # steps and 134 buffer ids, so a 64-step, 64-id sequencer measures a
     # quarter of both of the arrays on its critical path.
-    Unit("sequencer", "fabric_sequencer", ("fabric_sram.sv", "fabric_sequencer.sv"),
+    Unit("sequencer", "fabric_sequencer", VEC + ("fabric_sequencer.sv",),
          {"NU": 10, "NE": 4, "DEPTH": 512, "NID": 256},
          "the token sequencer, a 512-step program memory and 256 buffer ids",
          files=(("program.hex", _program_image(512)),)),

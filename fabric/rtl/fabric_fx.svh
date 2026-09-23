@@ -7,9 +7,27 @@
 `define FABRIC_FX_SVH
 
 // Arithmetic right shift with round-half-up; a shift of zero is the identity.
+//
+// Written as shift-then-round rather than round-then-shift.  Writing v as
+// q*2^sh + r with 0 <= r < 2^sh, floor((v + 2^(sh-1)) / 2^sh) is q + 1 exactly
+// when r >= 2^(sh-1), which is bit sh-1 of v, so the two forms are the same
+// number.  In hardware they are not the same cost: the first spends a 64-bit
+// carry-propagate add *ahead* of the barrel shifter, the second replaces it
+// with a 64:1 mux that runs alongside the shift and a carry chain that is only
+// an incrementer.  Every requantize in the design sits on that path.
+// The shift is taken on its own line: folded into the add, the unsigned round
+// bit would make the whole expression unsigned and `>>>` a logical shift.
 function automatic signed [63:0] fx_rnd_shr(input signed [63:0] v, input integer sh);
-    if (sh <= 0) fx_rnd_shr = v;
-    else         fx_rnd_shr = (v + (64'sd1 <<< (sh - 1))) >>> sh;
+    reg signed [63:0] sv;
+    reg               rb;
+    begin
+        if (sh <= 0) fx_rnd_shr = v;
+        else begin
+            sv = v >>> sh;
+            rb = v[sh - 1];
+            fx_rnd_shr = sv + $signed({63'b0, rb});
+        end
+    end
 endfunction
 
 // Saturate to a signed width.

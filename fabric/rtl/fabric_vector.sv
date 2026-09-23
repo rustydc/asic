@@ -74,6 +74,51 @@ module fabric_csa_tree #(
 endmodule
 
 // ---------------------------------------------------------------------------
+// One requantize: round-shift a W-bit signed value right by sh, then saturate
+// to N bits.  The same number as fx_sat(fx_rnd_shr(v, sh), N), at the width
+// the value actually has.
+//
+// The helpers in fabric_fx.svh evaluate at 64 bits so that a chain of two or
+// three multiplies never truncates.  That is right for the arithmetic and
+// expensive here: a 33-bit product sign-extended to 64 buys a barrel shifter
+// of twice the width, and each bit of the shift amount selects every mux in
+// its own level, so it doubles that register's fanout too -- and a register's
+// own output is the one net the mapper cannot buffer.  The convolution spent
+// 421 of its 2,071 ps on the clk-to-Q of one shift-amount bit driving 87
+// loads.  Saturating with a compare costs a second carry chain the width of
+// the shifter; a value fits in N bits exactly when its bits above N-1 are all
+// copies of bit N-1, which is a pair of reduction trees instead.
+// ---------------------------------------------------------------------------
+module fabric_rnd_sat #(
+    parameter int W  = 32,                 // width of the value
+    parameter int SW = 6,                  // width of the shift amount
+    parameter int N  = 8                   // width of the result
+) (
+    input  wire signed [W-1:0] v,
+    input  wire [SW-1:0]       sh,
+    output wire signed [N-1:0] y
+);
+    localparam int SMAX = 1 << SW;
+    // The round bit is bit sh-1 of v; a shift of zero rounds nothing.  Above
+    // W-1 every bit of v is the sign bit, so those arms of the mux are the
+    // same net and fold away.
+    localparam int VW = (W > SMAX) ? W : SMAX;
+    wire signed [VW-1:0] vx = $signed(v);
+    reg rb;
+    integer i;
+    always @* begin
+        rb = 1'b0;
+        for (i = 1; i < SMAX; i = i + 1)
+            if (sh == i[SW-1:0]) rb = vx[i-1];
+    end
+    wire signed [W:0] sv = $signed({v[W-1], v}) >>> sh;
+    wire signed [W:0] r  = sv + $signed({{W{1'b0}}, rb});
+    wire [W-N+1:0] top = r[W:N-1];
+    wire fits = (&top) | (~|top);
+    assign y = fits ? r[N-1:0] : (r[W] ? {1'b1, {(N-1){1'b0}}} : {1'b0, {(N-1){1'b1}}});
+endmodule
+
+// ---------------------------------------------------------------------------
 // A signed multiplicand by an unsigned multiplier, left in carry-save form:
 // value = s + 2c, and nothing along the way propagates a carry.  Whatever the
 // stage was going to add to the product -- a rounding constant, a bias --

@@ -72,10 +72,24 @@ module fabric_conv_silu #(
         si2 <= si1;
         hist2 <= hist1; mo2b <= mo1; so2b <= so1;
         v3 <= v2;
-        for (c = 0; c < L; c = c + 1)
-            t3[c*16 +: 16] <= fx_sat(fx_rnd_shr($signed({{(64-PW1_){q2[c][PW1_-1]}}, q2[c]}), si2[c*6 +: 6]), 16);
+        t3 <= t3_n;
         hist3 <= hist2; mo3b <= mo2b; so3b <= so2b;
     end
+    // Both requantizes go through fabric_rnd_sat rather than the 64-bit
+    // helpers: the products are PW1_ and PW2_ wide, and a shifter built at 64
+    // costs twice the delay and twice the fanout on the shift amount, which is
+    // where this unit's critical path was (see fabric_vector.sv).
+    wire [L*16-1:0] t3_n;
+    wire [L*8-1:0]  y9_n;
+    genvar gr;
+    generate
+        for (gr = 0; gr < L; gr = gr + 1) begin : g_rq
+            fabric_rnd_sat #(.W(PW1_), .SW(6), .N(16)) u_t3 (
+                .v(q2[gr]), .sh(si2[gr*6 +: 6]), .y(t3_n[gr*16 +: 16]));
+            fabric_rnd_sat #(.W(PW2_), .SW(6), .N(8)) u_y9 (
+                .v(q8[gr]), .sh(so8[gr*6 +: 6]), .y(y9_n[gr*8 +: 8]));
+        end
+    endgenerate
     // S4..S7: SiLU per lane; the history and constants wait four cycles.
     wire [L-1:0]    sv;
     wire [L*16-1:0] s6;
@@ -105,8 +119,7 @@ module fabric_conv_silu #(
         hist8 <= hist7; so8 <= so7;
         out_valid <= v8;
         out_hist  <= hist8;
-        for (c = 0; c < L; c = c + 1)
-            out_y[c*8 +: 8] <= fx_sat(fx_rnd_shr($signed({{(64-PW2_){q8[c][PW2_-1]}}, q8[c]}), so8[c*6 +: 6]), 8);
+        out_y     <= y9_n;
     end
 endmodule
 
@@ -555,9 +568,12 @@ module fabric_delta_state8 #(
     reg            va1, va2, va3, va4;
     reg [V*8-1:0]  rowa1, rowa2;
     reg [KW-1:0]   ia1, ia2, ia3, ia4;
-    reg signed [23:0] rs2 [0:V-1];
+    // Pipeline-local: written by one stage and read by the next at the same
+    // slice, so they hold a slice's lanes rather than the whole value
+    // dimension.  V-wide they would be a mux and a decoder per access.
+    reg signed [23:0] rs2 [0:VL-1];
     reg [V*8-1:0]  tr3;
-    reg signed [15:0] kp4 [0:V-1];
+    reg signed [15:0] kp4 [0:VL-1];
     reg            vd1, vd2, vd3, vd4;
     reg [V*8-1:0]  rowd2;
     wire [V*8-1:0] rowd1;               // the macro's output, valid with vd1
@@ -581,9 +597,9 @@ module fabric_delta_state8 #(
             q_d3 = q_d3 | (q_r[kk*8 +: 8] & {8{id3 == kk[KW-1:0]}});
         end
     end
-    reg signed [32:0] dm2 [0:V-1];
-    reg [V*8-1:0]  tn3;
-    reg signed [15:0] ym4 [0:V-1];
+    reg signed [32:0] dm2 [0:VL-1];
+    reg [VL*8-1:0] tn3;
+    reg signed [15:0] ym4 [0:VL-1];
     reg [7:0]      pk [0:V-1];
     reg [15:0]     ns [0:V-1];
     reg [7:0]      pk_a [0:G1N-1];
@@ -657,7 +673,7 @@ module fabric_delta_state8 #(
             if (vd4) begin
                 for (u = 0; u < VL; u = u + 1) begin
                     j = sd4 * VL + u;
-                    y_acc[j] = y_acc[j] + ym4[j];
+                    y_acc[j] = y_acc[j] + ym4[u];
                 end
                 if (id4 == K - 1 && sd4 == SL - 1) begin phase <= 4'd7; tail <= 0; ps <= 0; end
             end
@@ -665,8 +681,8 @@ module fabric_delta_state8 #(
             if (vd3) begin
                 for (u = 0; u < VL; u = u + 1) begin
                     j = sd3 * VL + u;
-                    ym4[j] = $signed(q_d3) * $signed(tn3[j*8 +: 8]);
-                    tn = $signed({{56{tn3[j*8+7]}}, tn3[j*8 +: 8]});
+                    ym4[u] = $signed(q_d3) * $signed(tn3[u*8 +: 8]);
+                    tn = $signed({{56{tn3[u*8+7]}}, tn3[u*8 +: 8]});
                     mag = (tn < 0) ? -tn : tn;
                     if (mag[7:0] > pk[j]) pk[j] = mag[7:0];
                     if (mag >= 127) ns[j] = ns[j] + 1'b1;
@@ -676,9 +692,9 @@ module fabric_delta_state8 #(
             if (vd2) begin
                 for (u = 0; u < VL; u = u + 1) begin
                     j = sd2 * VL + u;
-                    dl = fx_rnd_shr(dm2[j], 14);
+                    dl = fx_rnd_shr(dm2[u], 14);
                     tn = fx_sat($signed({{56{rowd2[j*8+7]}}, rowd2[j*8 +: 8]}) + dl, 8);
-                    tn3[j*8 +: 8] = tn[7:0];
+                    tn3[u*8 +: 8] = tn[7:0];
                     row_out[j*8 +: 8] <= tn[7:0];
                 end
                 if (sd2 == SL - 1) row_out_valid <= 1'b1;   // the row is whole on the last slice
@@ -690,7 +706,7 @@ module fabric_delta_state8 #(
             if (vd1)
                 for (u = 0; u < VL; u = u + 1) begin
                     j = sd1 * VL + u;
-                    dm2[j] = $signed(k_d1) * c[j];
+                    dm2[u] = $signed(k_d1) * c[j];
                 end
             // As in pass 1: a row is SL cycles of VL lanes, so the read
             // address advances once a row and the slice walks between.
@@ -748,7 +764,7 @@ module fabric_delta_state8 #(
             if (va4) begin
                 for (u = 0; u < VL; u = u + 1) begin
                     j = sa4 * VL + u;
-                    pred_acc[j] = pred_acc[j] + {{16{kp4[j][15]}}, kp4[j]};
+                    pred_acc[j] = pred_acc[j] + {{16{kp4[u][15]}}, kp4[u]};
                 end
                 if (ia4 == K - 1 && sa4 == SL - 1) begin phase <= 4'd1; ps <= 0; end
             end
@@ -756,13 +772,13 @@ module fabric_delta_state8 #(
             if (va3)
                 for (u = 0; u < VL; u = u + 1) begin
                     j = sa3 * VL + u;
-                    kp4[j] = $signed(k_a3) * $signed(tr3[j*8 +: 8]);
+                    kp4[u] = $signed(k_a3) * $signed(tr3[j*8 +: 8]);
                 end
             va3 <= va2; ia3 <= ia2; sa3 <= sa2;
             if (va2)
                 for (u = 0; u < VL; u = u + 1) begin
                     j = sa2 * VL + u;
-                    tr = rescale ? fx_sat((rs2[j] + rndr) >>> shr_l[u], 8)
+                    tr = rescale ? fx_sat((rs2[u] + rndr) >>> shr_l[u], 8)
                                  : $signed({{56{rowa2[j*8+7]}}, rowa2[j*8 +: 8]});
                     tr3[j*8 +: 8] <= tr[7:0];   // a register, not a blocking temp: the macro samples it
                 end
@@ -770,7 +786,7 @@ module fabric_delta_state8 #(
             if (va1)
                 for (u = 0; u < VL; u = u + 1) begin
                     j = sa1 * VL + u;
-                    rs2[j] = $signed(rowa1[j*8 +: 8]) * $signed({8'b0, gren});
+                    rs2[u] = $signed(rowa1[j*8 +: 8]) * $signed({8'b0, gren});
                 end
             // A row is VL lanes at a time: the issue holds `va1` for SL cycles
             // and walks the slice, which is the rate the row arrived at.

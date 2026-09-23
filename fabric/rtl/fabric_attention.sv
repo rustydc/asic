@@ -181,7 +181,6 @@ module fabric_rotary #(
     reg [L*16-1:0] y3;
     reg signed [31:0] pm4 [0:L-1];
     integer l, e, pp, pa;
-    reg signed [32:0] comb;
     // The output requantizer's scale and shift are command constants on input
     // pins, and they drive every lane's multiplier and shifter: a copy each
     // per lane, as the norm, the state engine and the residual take.
@@ -220,19 +219,36 @@ module fabric_rotary #(
         end
         // P3: combine, round and saturate, or pass the element through.
         v3 <= v2; rot3 <= rot2; pt3 <= pt2;
-        for (l = 0; l < L; l = l + 1) begin
-            comb = add2[l] ? ($signed({pa2[l][31], pa2[l]}) + $signed({pb2[l][31], pb2[l]}))
-                           : ($signed({pa2[l][31], pa2[l]}) - $signed({pb2[l][31], pb2[l]}));
-            y3[l*16 +: 16] <= rot2[l] ? fx_sat(fx_rnd_shr(comb, 15), 16) : pt2[l*16 +: 16];
-        end
+        for (l = 0; l < L; l = l + 1)
+            y3[l*16 +: 16] <= rot2[l] ? y3_n[l*16 +: 16] : pt2[l*16 +: 16];
         // P4 and P5: the output requantizer.
         v4 <= v3;
         for (l = 0; l < L; l = l + 1)
             pm4[l] <= $signed(y3[l*16 +: 16]) * $signed({16'b0, mult_l[l]});
         out_valid <= v4;
-        for (l = 0; l < L; l = l + 1)
-            out_y[l*8 +: 8] <= fx_sat(fx_rnd_shr(pm4[l], shift_l[l]), 8);
+        out_y <= outy_n;
     end
+    // Both rounds go through fabric_rnd_sat at the width the value has.  The
+    // combination is 33 bits and the requantized product 32; taken through the
+    // 64-bit helpers each one is a shifter, a carry-propagate add and a
+    // compare of twice that width, and the output shift amount -- a register,
+    // so the mapper cannot buffer it -- fans out to every mux of its level.
+    // That was 327 of this unit's 2,017 ps before the arithmetic even started.
+    wire signed [32:0] comb_n [0:L-1];
+    wire [L*16-1:0]    y3_n;
+    wire [L*8-1:0]     outy_n;
+    genvar gr;
+    generate
+        for (gr = 0; gr < L; gr = gr + 1) begin : g_rs
+            assign comb_n[gr] = add2[gr]
+                ? ($signed({pa2[gr][31], pa2[gr]}) + $signed({pb2[gr][31], pb2[gr]}))
+                : ($signed({pa2[gr][31], pa2[gr]}) - $signed({pb2[gr][31], pb2[gr]}));
+            fabric_rnd_sat #(.W(33), .SW(6), .N(16)) u_y3 (
+                .v(comb_n[gr]), .sh(6'd15), .y(y3_n[gr*16 +: 16]));
+            fabric_rnd_sat #(.W(32), .SW(6), .N(8)) u_oy (
+                .v(pm4[gr]), .sh(shift_l[gr]), .y(outy_n[gr*8 +: 8]));
+        end
+    endgenerate
 endmodule
 
 // ---------------------------------------------------------------------------
@@ -320,30 +336,23 @@ module fabric_attention #(
     // the tree is narrow, and balanced: a chain of L adds is L carry chains
     // deep and ABC cannot restructure them.
     localparam int CW2 = 16 + $clog2(L) + 1;
-    localparam int LLV = $clog2(L);
-    localparam int LPP = 1 << LLV;
-    integer g, l, clv;
-    reg signed [CW2-1:0] ctree [0:G-1][0:LLV][0:LPP-1];
+    integer g, l;
     wire signed [CW2-1:0] contrib [0:G-1];
-    always @* begin
-        for (g = 0; g < G; g = g + 1) begin
-            // An assignment, not a conditional expression: an unsigned zero in
-            // the other arm would make the whole expression unsigned and the
-            // negative products would extend with zeros.
-            for (l = 0; l < LPP; l = l + 1) begin
-                ctree[g][0][l] = 0;
-                if (l < L)
-                    ctree[g][0][l] = $signed(q_rd[g][l*8 +: 8]) * $signed(in_data[l*8 +: 8]);
-            end
-            for (clv = 1; clv <= LLV; clv = clv + 1)
-                for (l = 0; l < (LPP >> clv); l = l + 1)
-                    ctree[g][clv][l] = ctree[g][clv-1][2*l] + ctree[g][clv-1][2*l+1];
-        end
-    end
-    genvar gc;
+    // The products are reduced carry-save, not by a tree of adds.  Balanced,
+    // the tree is log2(L) adds deep, but each of those is a carry chain that
+    // ABC cannot restructure: at sixteen lanes it was four ripples in series
+    // and most of this core's path.  A carry-save layer is one gate deep, and
+    // one real add resolves the pair at the end.
+    genvar gc, gl;
     generate
         for (gc = 0; gc < G; gc = gc + 1) begin : g_contrib
-            assign contrib[gc] = ctree[gc][LLV][0];
+            wire [L*CW2-1:0] cprod;
+            for (gl = 0; gl < L; gl = gl + 1) begin : g_cp
+                assign cprod[gl*CW2 +: CW2] = $signed(q_rd[gc][gl*8 +: 8]) * $signed(in_data[gl*8 +: 8]);
+            end
+            wire [CW2-1:0] cs, cc;
+            fabric_csa_tree #(.N(L), .W(CW2)) u_ct (.ops(cprod), .s(cs), .c(cc));
+            assign contrib[gc] = $signed(cs) + $signed({cc[CW2-2:0], 1'b0});
         end
     endgenerate
 
@@ -652,10 +661,8 @@ module fabric_attention #(
     integer ol;
     always @(posedge clk) begin
         ov2 <= ov1;
-        for (ol = 0; ol < L; ol = ol + 1) begin
-            w2[ol*16 +: 16]  <= fx_sat(fx_rnd_shr(wm1[ol], 7 + LW - lz_c[ol]), 16);
-            tg2[ol*16 +: 16] <= fx_sat(fx_rnd_shr(gm1[ol], sh_gate), 16);
-        end
+        w2  <= w2_n;
+        tg2 <= tg2_n;
         o6v <= sgv[0];
         for (ol = 0; ol < L; ol = ol + 1)
             og6[ol] <= $signed({{18{w5[ol*16+15]}}, w5[ol*16 +: 16]}) * $signed({18'b0, sg5[ol*16 +: 16]});
@@ -663,9 +670,28 @@ module fabric_attention #(
         for (ol = 0; ol < L; ol = ol + 1)
             oq7[ol] <= $signed({{22{og6[ol][33]}}, og6[ol]}) * $signed({40'b0, mult_o});
         out_valid <= o7v;
-        for (ol = 0; ol < L; ol = ol + 1)
-            out_data[ol*8 +: 8] <= fx_sat(fx_rnd_shr(oq7[ol], sh_o), 8);
+        out_data  <= od_n;
     end
+    // The three rounds at the width their value has: 54, 24 and 56 bits, not
+    // the 64 the helpers in fabric_fx.svh evaluate at.  Each one saved is a
+    // shifter, a carry-propagate add and a compare of the difference, and the
+    // weight's shift amount -- which the leading-zero count sets, so it is a
+    // register -- fans out to every mux of its level.
+    wire [5:0]      sh_w [0:L-1];
+    wire [L*16-1:0] w2_n, tg2_n;
+    wire [L*8-1:0]  od_n;
+    genvar go;
+    generate
+        for (go = 0; go < L; go = go + 1) begin : g_oq
+            assign sh_w[go] = (7 + LW) - lz_c[go];      // in [7, 7+LW]: lz_c counts at most LW
+            fabric_rnd_sat #(.W(OW+18), .SW(6), .N(16)) u_w2 (
+                .v(wm1[go]), .sh(sh_w[go]), .y(w2_n[go*16 +: 16]));
+            fabric_rnd_sat #(.W(24), .SW(6), .N(16)) u_tg (
+                .v(gm1[go]), .sh(sh_gate), .y(tg2_n[go*16 +: 16]));
+            fabric_rnd_sat #(.W(56), .SW(6), .N(8)) u_od (
+                .v(oq7[go]), .sh(sh_o), .y(od_n[go*8 +: 8]));
+        end
+    endgenerate
 endmodule
 
 `default_nettype wire

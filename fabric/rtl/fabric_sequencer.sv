@@ -218,7 +218,6 @@ module fabric_sequencer #(
     reg [CW-1:0] wr_cnt [0:NID-1];
     reg [CW-1:0] rd_cnt [0:NID-1];
     integer p, k, m, id, x, w;
-    reg signed [CW:0] dr, dw;                            // a counter's move this cycle
 
     // The drained ids travel as arguments, not as a reference to rel_c and
     // rel_p: what a function reads is not in an always @* block's sensitivity,
@@ -234,6 +233,50 @@ module fabric_sequencer #(
                         if (j < n && ids[(y*NC + j)*8 +: 8] == buf_id) released = released + 1'b1;
         end
     endfunction
+
+    // A counter's move this cycle is a count of the ids in play that name it,
+    // and a count written as chained read-modify-writes -- which is what the
+    // loop in the always block below was -- is one carry-propagate add per id
+    // in series.  Six of them for the readers, and that chain was 38 of the
+    // 54 logic stages from a done port to a counter, the whole of this
+    // module's path.  Reduced carry-save the matches cost a gate a layer and
+    // the update is one add at the end.  A drain's -1 goes in as CW ones,
+    // which is -1 in two's complement and needs no subtract; a count never
+    // leaves its range, so the wrap that would expose the difference is not
+    // reachable.
+    localparam int NRC = NREL * NC;
+    localparam int NRP = NREL * NP;
+    wire [CW-1:0] rd_next [0:NID-1];
+    wire [CW-1:0] wr_next [0:NID-1];
+    genvar gn, gu, gd;
+    generate
+        for (gn = 0; gn < NID; gn = gn + 1) begin : g_cnt
+            localparam [7:0] MYID = gn;
+            wire [(1 + NC + NRC)*CW-1:0] rops;
+            wire [(1 + NP + NRP)*CW-1:0] wops;
+            assign rops[0 +: CW] = rd_cnt[gn];
+            assign wops[0 +: CW] = wr_cnt[gn];
+            for (gu = 0; gu < NC; gu = gu + 1) begin : g_ru
+                assign rops[(1 + gu)*CW +: CW] = {{(CW-1){1'b0}}, issue && (cur_c[gu] == MYID)};
+            end
+            for (gu = 0; gu < NP; gu = gu + 1) begin : g_wu
+                assign wops[(1 + gu)*CW +: CW] = {{(CW-1){1'b0}}, issue && (cur_p[gu] == MYID)};
+            end
+            for (gd = 0; gd < NRC; gd = gd + 1) begin : g_rd
+                assign rops[(1 + NC + gd)*CW +: CW] =
+                    {CW{rel_en[gd/NC] && (rel_c[(gd/NC)*NC*8 + (gd%NC)*8 +: 8] == MYID)}};
+            end
+            for (gd = 0; gd < NRP; gd = gd + 1) begin : g_wd
+                assign wops[(1 + NP + gd)*CW +: CW] =
+                    {CW{rel_en[gd/NP] && (rel_p[(gd/NP)*NC*8 + (gd%NP)*8 +: 8] == MYID)}};
+            end
+            wire [CW-1:0] rs, rc, ws, wc;
+            fabric_csa_tree #(.N(1 + NC + NRC), .W(CW)) u_r (.ops(rops), .s(rs), .c(rc));
+            fabric_csa_tree #(.N(1 + NP + NRP), .W(CW)) u_w (.ops(wops), .s(ws), .c(wc));
+            assign rd_next[gn] = rs + {rc[CW-2:0], 1'b0};
+            assign wr_next[gn] = ws + {wc[CW-2:0], 1'b0};
+        end
+    endgenerate
 
     reg deps_ok;
     always @* begin
@@ -272,13 +315,13 @@ module fabric_sequencer #(
         if (!rst_n) begin
             pc <= 0; running <= 1'b0; done <= 1'b0; outstanding <= 0; finishing <= 1'b0; tab_live <= 0; pend <= 0; busy <= 0;
             fpc <= 0; qn <= 0; fetched_v <= 1'b0;
-            for (id = 0; id < NID; id = id + 1) begin wr_cnt[id] = 0; rd_cnt[id] = 0; end
+            for (id = 0; id < NID; id = id + 1) begin wr_cnt[id] <= 0; rd_cnt[id] <= 0; end
         end else begin
             done <= 1'b0;
             if (start && !running) begin
                 pc <= 0; running <= 1'b1; outstanding <= 0; finishing <= 1'b0; tab_live <= 0; pend <= 0; busy <= 0;
                 fpc <= 0; qn <= 0; fetched_v <= 1'b0;
-                for (id = 0; id < NID; id = id + 1) begin wr_cnt[id] = 0; rd_cnt[id] = 0; end
+                for (id = 0; id < NID; id = id + 1) begin wr_cnt[id] <= 0; rd_cnt[id] <= 0; end
             end else begin
                 // Not gated on `running`: when it is low nothing issues and no
                 // unit is busy, so none of this moves anyway, and the gate cost
@@ -316,25 +359,11 @@ module fabric_sequencer #(
                 // from a done port to a counter, and the whole of this
                 // module's path.  The ids in play are at most NREL*(NC+NP)
                 // returning and NC+NP taken, so a counter's delta is a couple
-                // of dozen compares against them, and all of them in parallel.
+                // of dozen compares against them, all of them in parallel, and
+                // the sum of the matches is carry-save (see rd_next above).
                 for (id = 0; id < NID; id = id + 1) begin
-                    dr = 0;
-                    dw = 0;
-                    for (x = 0; x < NREL; x = x + 1)
-                        if (rel_en[x]) begin
-                            for (k = 0; k < NC; k = k + 1)
-                                if (rel_c[x*NC*8 + k*8 +: 8] == id[7:0]) dr = dr - 1;
-                            for (k = 0; k < NP; k = k + 1)
-                                if (rel_p[x*NC*8 + k*8 +: 8] == id[7:0]) dw = dw - 1;
-                        end
-                    if (issue) begin
-                        for (k = 0; k < NC; k = k + 1)
-                            if (cur_c[k] == id[7:0]) dr = dr + 1;
-                        for (k = 0; k < NP; k = k + 1)
-                            if (cur_p[k] == id[7:0]) dw = dw + 1;
-                    end
-                    if (dr != 0) rd_cnt[id] = rd_cnt[id] + dr[CW-1:0];
-                    if (dw != 0) wr_cnt[id] = wr_cnt[id] + dw[CW-1:0];
+                    rd_cnt[id] <= rd_next[id];
+                    wr_cnt[id] <= wr_next[id];
                 end
                 outstanding <= out_next;
                 if (issue) begin
