@@ -431,9 +431,25 @@ module fabric_index_scan #(
             assign prod[gp*PWID +: PWID] = q_live[gp] ? pr : {PWID{1'b0}};
         end
     endgenerate
-    wire [PWID-1:0] psum, pcar;
-    fabric_csa_tree #(.N(CPB), .W(PWID)) u_part (.ops(prod), .s(psum), .c(pcar));
-    wire signed [PWID-1:0] part = $signed(psum) + $signed({pcar[PWID-2:0], 1'b0});
+    // The accumulator is one more operand of the same tree.  Reduced to a
+    // pair and then resolved and added into `acc`, the beat spends two carry
+    // propagations -- the tree's own and a 32-bit add -- and that was 2,248
+    // ps of a unit whose next path is 1,664.  One tree, one resolve.  It runs
+    // at the accumulator's width: a product is a value and may be
+    // sign-extended into it, where a carry-save pair may not.
+    localparam int ACCW = 32;
+    wire [(CPB+1)*ACCW-1:0] aops;
+    genvar ga;
+    generate
+        for (ga = 0; ga < CPB; ga = ga + 1) begin : g_aop
+            assign aops[ga*ACCW +: ACCW] =
+                {{(ACCW-PWID){prod[ga*PWID + PWID-1]}}, prod[ga*PWID +: PWID]};
+        end
+    endgenerate
+    assign aops[CPB*ACCW +: ACCW] = acc;
+    wire [ACCW-1:0] asum, acar;
+    fabric_csa_tree #(.N(CPB+1), .W(ACCW)) u_acc (.ops(aops), .s(asum), .c(acar));
+    wire signed [ACCW-1:0] acc_next = $signed(asum) + $signed({acar[ACCW-2:0], 1'b0});
     wire signed [63:0] final_score = acc * $signed({56'b0, rdata[7:0]});
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -452,7 +468,7 @@ module fabric_index_scan #(
                 end
                 if (inflight && rdata_valid) begin
                     if (beat < CB) begin
-                        acc <= acc + {{(32-PWID){part[PWID-1]}}, part};
+                        acc <= acc_next;
                         beat <= beat + 1'b1;
                     end else begin
                         cand_valid <= 1'b1; cand_id <= blk; cand_score <= final_score[31:0];
