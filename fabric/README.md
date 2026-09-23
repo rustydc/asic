@@ -1407,10 +1407,21 @@ on a one-bit flag with 780, and the norm 1.72 of 2.31 ns on a read
 address with 203. It is not lane count in itself: SwiGLU goes from two
 lanes to sixteen and moves 1.90 to 1.99 ns. It is a shared control
 register that every lane reads, the same fault `fetched_v` and `lz_hold`
-had, and the same fix works. Until that fix is made, the 585 MHz above is
-what this design can reach and not what it currently measures: at the 9B
-geometry the slowest unit is the attention core at 5.84 ns, which is
-284 FO4 and about 215 MHz at 28 nm.
+had, and the same fix works: replicated, the rotation is 4.60 -> 2.02 ns
+and the attention core 5.84 -> 2.44. The norm's was a symptom of its
+beat buffers being register arrays rather than macros, which at the 9B
+width is 131,072 flops; as macros it is 1.55M -> 182k NAND2 equivalents
+and 2.31 -> 2.66 ns, the slower half of that trade being the modelled
+macro access time now on its path.
+
+What those rows say about the clock: the slowest unit that maps at 9B is
+the index scan at 3.12 ns, 152 FO4, about 400 MHz at 28 nm -- and that
+is still typical-corner and pre-layout. Two rows are missing rather than
+slow. The state engine at its real 128 x 128 does not map at all (yosys
+runs 85 minutes and dies in `simplemap`), and its 2.03 ns row is a 16 x 4
+toy; the append at 9B had not finished when this was written. The 585 MHz
+above is the number the small geometries gave, not a measurement of this
+machine.
 
 Three things about the flow first. Reading a source file elaborates
 every module in it at its default parameters before the top is chosen,
