@@ -293,9 +293,20 @@ module fabric_lut #(
         t1   <= t[u[IB+FB-1:FB] + 1];
         frac <= u[FB-1:0];
     end
-    wire signed [63:0] d    = $signed({{(64-W){1'b0}}, t1}) - $signed({{(64-W){1'b0}}, t0});
-    wire signed [63:0] step = fx_rnd_shr(d * $signed({{(64-FB){1'b0}}, frac}), FB);
-    wire signed [63:0] sum  = $signed({{(64-W){1'b0}}, t0}) + step;
+    // The interpolation at the width it has.  Two W-bit entries differ by
+    // W + 1 bits, the fraction is FB, and W bits of the sum are kept -- but
+    // through the helpers in fabric_fx.svh it was a 64-bit subtract, a 64-bit
+    // multiply, a 64-bit round and a 64-bit add for sixteen bits of answer.
+    // This table is under every scalar unit in the design: the sigmoid, the
+    // SiLU, exp, softplus, the inverse square root, the reciprocal and the
+    // rotary table.
+    localparam int PW = W + 1 + FB;
+    wire signed [W:0]    d    = $signed({1'b0, t1}) - $signed({1'b0, t0});
+    wire signed [PW-1:0] prod = d * $signed({1'b0, frac});
+    // The shift is by a constant, so the round is an increment on the bits
+    // that are kept: bit FB-1 of the product is the round bit.
+    wire signed [W:0]    step = $signed(prod[PW-1:FB]) + {{W{1'b0}}, prod[FB-1]};
+    wire signed [W+1:0]  sum  = $signed({2'b0, t0}) + $signed({step[W], step});
     always @(posedge clk) y <= sum[W-1:0];
 endmodule
 
@@ -341,9 +352,12 @@ module fabric_silu #(parameter LUT_DIR = "./") (
         t2 <= t1;
         t3 <= t2;
     end
-    wire signed [63:0] p = fx_rnd_shr($signed({{48{t3[15]}}, t3}) * $signed({48'b0, sig}), 16);
+    // Sixteen by sixteen is 32 bits, and sixteen of them are kept: the round
+    // by a constant sixteen is an increment on the top half, not a 64-bit
+    // shift of a 64-bit product.
+    wire signed [32:0] pr = $signed(t3) * $signed({1'b0, sig});
     always @(posedge clk) begin
-        y         <= p[15:0];
+        y         <= pr[31:16] + {15'b0, pr[15]};
         valid_out <= sv;
     end
 endmodule
