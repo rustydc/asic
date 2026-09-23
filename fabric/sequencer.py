@@ -135,7 +135,7 @@ class Timing:
     norm_latency: int = 34           # the front pipeline, the sum pass's tail and the inverse square root
     tile_block_latency: int = 13     # a row block: its start cycle and the requantizer walk's tail
     tile_done_latency: int = 2       # the write walk's last tile and the report
-    conv_latency: int = 12
+    conv_latency: int = 14
     gates_latency: int = 13
     delta_latency: int = 29          # three passes over K rows, then the gated output
     swiglu_latency: int = 12
@@ -914,8 +914,9 @@ class Schedule:
     @property
     def cycles(self) -> int:
         """What the engine counts: ``start`` to the cycle the controller
-        reports done, which is the cycle after the last release drained."""
-        return max(self.release) + 1 if self.release else 0
+        reports done, which is the cycle after the last release drained --
+        and the drain is registered, so one more after that."""
+        return max(self.release) + 2 if self.release else 0
 
     @property
     def last_done(self) -> int:
@@ -946,8 +947,10 @@ def schedule(steps: list[Step], releases: int = RELEASES) -> Schedule:
     previous issue at which every dependency's buffers have been released
     and the addressed engine is free.  A unit that stops working at cycle
     ``e`` reports done at ``e + 1``, and the controller *drains* at most
-    ``releases`` completions a cycle, lowest engine port first, forwarding
-    the cycle's drains into the same cycle's issue check -- so with nothing
+    ``releases`` completions a cycle, lowest engine port first.  The drain is
+    registered, so a dependant issues at ``release + 1`` and not in the drain
+    cycle itself: picking the port, reading its ids and moving the counters by
+    them did not fit in one cycle (rtl/fabric_sequencer.sv).  With nothing
     else waiting a step issues one cycle after its last dependency ended,
     which is what an unbounded release gave.  A port whose release has not
     drained holds the buffers it must return and can be given no new
@@ -977,7 +980,7 @@ def schedule(steps: list[Step], releases: int = RELEASES) -> Schedule:
         pending = want
         if (i < n and (i == 0 or cycle > issue[i - 1])
                 and port_of[i] not in pending and port_of[i] not in running
-                and all(release[d] is not None and release[d] <= cycle for d in steps[i].deps)):
+                and all(release[d] is not None and release[d] < cycle for d in steps[i].deps)):
             # ``cycles`` is what the engine's own spans measure: the cycle the
             # command issued to the cycle its completion arrived.  The unit
             # therefore stops working one before that, and reports done at it.

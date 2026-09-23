@@ -89,14 +89,18 @@ endmodule
 // the shifter; a value fits in N bits exactly when its bits above N-1 are all
 // copies of bit N-1, which is a pair of reduction trees instead.
 // ---------------------------------------------------------------------------
-module fabric_rnd_sat #(
+// The shift half: the value shifted, and the round bit beside it.  Kept
+// separate so a pipeline can put a register here -- the shift and the
+// saturate are each about half of the requantize, and in one stage they were
+// the convolution's two worst paths.
+module fabric_rnd_sat_shift #(
     parameter int W  = 32,                 // width of the value
-    parameter int SW = 6,                  // width of the shift amount
-    parameter int N  = 8                   // width of the result
+    parameter int SW = 6                   // width of the shift amount
 ) (
     input  wire signed [W-1:0] v,
     input  wire [SW-1:0]       sh,
-    output wire signed [N-1:0] y
+    output wire signed [W:0]   sv,
+    output wire                rb
 );
     localparam int SMAX = 1 << SW;
     // The round bit is bit sh-1 of v; a shift of zero rounds nothing.  Above
@@ -104,17 +108,29 @@ module fabric_rnd_sat #(
     // same net and fold away.
     localparam int VW = (W > SMAX) ? W : SMAX;
     wire signed [VW-1:0] vx = $signed(v);
-    reg rb;
+    reg r;
     integer i;
     always @* begin
-        rb = 1'b0;
+        r = 1'b0;
         for (i = 1; i < SMAX; i = i + 1)
-            if (sh == i[SW-1:0]) rb = vx[i-1];
+            if (sh == i[SW-1:0]) r = vx[i-1];
     end
-    // The shift keeps one bit above the sign, so the top two bits of `sv`
-    // always agree; that is what lets the carry out of the low half be
-    // resolved below without a second add.
-    wire signed [W:0] sv  = $signed({v[W-1], v}) >>> sh;
+    assign rb = r;
+    // One bit above the sign, so the top two bits of `sv` always agree; that
+    // is what lets the carry out of the low half be resolved in the round
+    // half without a second add.
+    assign sv = $signed({v[W-1], v}) >>> sh;
+endmodule
+
+// The round and saturate half.
+module fabric_rnd_sat_round #(
+    parameter int W = 32,
+    parameter int N = 8                    // width of the result
+) (
+    input  wire signed [W:0]   sv,
+    input  wire                rb,
+    output wire signed [N-1:0] y
+);
     wire [N-1:0]      svl = sv[N-1:0];
     wire [W-N:0]      hi  = sv[W:N];
     // Only the low N bits of the rounded value survive the saturate, so only
@@ -130,6 +146,22 @@ module fabric_rnd_sat #(
     // high part was all ones and the carry cleared it.
     wire fits = cy ? (&hi) : ((&top) | (~|top));
     assign y = fits ? lo : (sv[W] ? {1'b1, {(N-1){1'b0}}} : {1'b0, {(N-1){1'b1}}});
+endmodule
+
+// Both halves with nothing between them, for the stages that can afford it.
+module fabric_rnd_sat #(
+    parameter int W  = 32,
+    parameter int SW = 6,
+    parameter int N  = 8
+) (
+    input  wire signed [W-1:0] v,
+    input  wire [SW-1:0]       sh,
+    output wire signed [N-1:0] y
+);
+    wire signed [W:0] sv;
+    wire              rb;
+    fabric_rnd_sat_shift #(.W(W), .SW(SW)) u_s (.v(v), .sh(sh), .sv(sv), .rb(rb));
+    fabric_rnd_sat_round #(.W(W), .N(N))   u_r (.sv(sv), .rb(rb), .y(y));
 endmodule
 
 // ---------------------------------------------------------------------------

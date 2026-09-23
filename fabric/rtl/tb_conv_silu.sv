@@ -74,7 +74,7 @@ module tb_conv_silu #(
         end
         @(negedge clk);
         in_valid = 0;
-        repeat (12) @(posedge clk);
+        repeat (14) @(posedge clk);          // latency 11 and a margin
         if (got != BEATS) $display("FAIL: %0d output beats, expected %0d", got, BEATS);
         else if (errors == 0) $display("PASS: %0d channels", C);
         else $display("FAIL: %0d mismatches", errors);

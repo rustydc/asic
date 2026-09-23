@@ -203,14 +203,31 @@ module fabric_sequencer #(
         end
     end
     wire [NPORT-1:0] held = want_rel & ~rel_now;
+    // The drain, registered.  Picking the port, reading its ids and then
+    // moving 256 counters by them was one cycle, and it is the only structure
+    // in this module anywhere near the clock: its two endpoints, rd_cnt and
+    // wr_cnt, were 2,317 and 2,245 ps with nothing else close.  The pick and
+    // the read are one cycle now and the counters the next, so a release
+    // lands the cycle after the completion rather than in it -- which is what
+    // `release[d] < cycle` says in fabric/sequencer.py, and what lets the
+    // issue check read the counters plainly instead of forwarding this
+    // cycle's drains into them.
+    reg [NREL-1:0]      d_en;
+    reg [NREL*NC*8-1:0] d_c, d_p;
+    reg [NREL*8-1:0]    d_tag;
+    reg [NPORT-1:0]     d_now;
     // A port's record is one command, so it can be given no second one while
     // the first is outstanding: a unit reports done a cycle after it drops
     // its ready, and without this the completion returned the newer
     // command's ids for the older one -- buffers the newer command was still
     // reading.  A port whose completion drains this cycle is free, because
     // the drain reads the register and the issue writes it.
+    // A port holds its buffers until the drain has actually moved the
+    // counters, which is now the cycle after the pick, so `busy` is what it
+    // says and nothing is forgiven early: freeing the port in the pick cycle
+    // would let an issue overwrite the slot the drain has yet to apply.
     reg  [NPORT-1:0] busy;
-    wire [NPORT-1:0] blocked = busy & ~rel_now;
+    wire [NPORT-1:0] blocked = busy;
 
     // Outstanding writers and readers per buffer.  The issue check sees the
     // head step's ids with this cycle's drains forwarded; the counters
@@ -223,26 +240,20 @@ module fabric_sequencer #(
     // The drained ids travel as arguments, not as a reference to rel_c and
     // rel_p: what a function reads is not in an always @* block's sensitivity,
     // only what it is passed, and a stale deps_ok deadlocks.
-    function automatic [CW-1:0] released(input [7:0] buf_id, input integer n,
-                                         input [NREL-1:0] en, input [NREL*NC*8-1:0] ids);
-        integer y, j;
-        begin
-            released = 0;
-            for (y = 0; y < NREL; y = y + 1)
-                if (en[y])
-                    for (j = 0; j < NC; j = j + 1)
-                        if (j < n && ids[(y*NC + j)*8 +: 8] == buf_id) released = released + 1'b1;
-        end
-    endfunction
-
+    // With the drain registered the counters already hold every release that
+    // has landed, so the check is a read.  It used to forward this cycle's
+    // drains into itself through `released`, which counted matches as one
+    // `+ 1` per id in play -- six of them, and yosys leaves that a chain of
+    // six carry-propagate adds -- at eight call sites, all of them behind a
+    // 256-to-1 mux of the counter array.
     reg deps_ok;
     always @* begin
         deps_ok = 1'b1;
         for (k = 0; k < NC; k = k + 1)
-            if (cur_c[k] != 8'hFF && wr_cnt[cur_c[k]] != released(cur_c[k], NP, rel_en, rel_p)) deps_ok = 1'b0;
+            if (cur_c[k] != 8'hFF && wr_cnt[cur_c[k]] != 0) deps_ok = 1'b0;
         for (k = 0; k < NP; k = k + 1)
-            if (cur_p[k] != 8'hFF && (rd_cnt[cur_p[k]] != released(cur_p[k], NC, rel_en, rel_c)
-                                      || (!cur_contrib[k] && wr_cnt[cur_p[k]] != released(cur_p[k], NP, rel_en, rel_p)))) deps_ok = 1'b0;
+            if (cur_p[k] != 8'hFF && (rd_cnt[cur_p[k]] != 0
+                                      || (!cur_contrib[k] && wr_cnt[cur_p[k]] != 0))) deps_ok = 1'b0;
     end
 
     // Commands issued and not yet returned.  Counted against the drains,
@@ -258,7 +269,7 @@ module fabric_sequencer #(
     integer z;
     always @* begin
         n_rel = 0;
-        for (z = 0; z < NREL; z = z + 1) if (rel_en[z]) n_rel = n_rel + 1'b1;
+        for (z = 0; z < NREL; z = z + 1) if (d_en[z]) n_rel = n_rel + 1'b1;
     end
     reg  [9:0]  outstanding;
     wire [9:0]  out_next = outstanding + {9'd0, issue} - {{(10-RW){1'b0}}, n_rel};
@@ -271,12 +282,14 @@ module fabric_sequencer #(
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             pc <= 0; running <= 1'b0; done <= 1'b0; outstanding <= 0; finishing <= 1'b0; tab_live <= 0; pend <= 0; busy <= 0;
+                d_en <= 0; d_now <= 0;
             fpc <= 0; qn <= 0; fetched_v <= 1'b0;
             for (id = 0; id < NID; id = id + 1) begin wr_cnt[id] = 0; rd_cnt[id] = 0; end
         end else begin
             done <= 1'b0;
             if (start && !running) begin
                 pc <= 0; running <= 1'b1; outstanding <= 0; finishing <= 1'b0; tab_live <= 0; pend <= 0; busy <= 0;
+                d_en <= 0; d_now <= 0;
                 fpc <= 0; qn <= 0; fetched_v <= 1'b0;
                 for (id = 0; id < NID; id = id + 1) begin wr_cnt[id] = 0; rd_cnt[id] = 0; end
             end else begin
@@ -305,10 +318,12 @@ module fabric_sequencer #(
                 if (issue) pc <= pc + 1'b1;
                 // The drains: NREL completions return their buffers; the rest wait.
                 pend <= held;
+                // This cycle's pick, for the next one to apply.
+                d_en <= rel_en; d_c <= rel_c; d_p <= rel_p; d_tag <= rel_tag; d_now <= rel_now;
                 for (p = 0; p < NPORT; p = p + 1)
-                    if (rel_now[p]) busy[p] <= 1'b0;
+                    if (d_now[p]) busy[p] <= 1'b0;
                 for (x = 0; x < NREL; x = x + 1)
-                    if (rel_en[x]) tab_live[rel_tag[x*8 +: 8]] <= 1'b0;
+                    if (d_en[x]) tab_live[d_tag[x*8 +: 8]] <= 1'b0;
                 // Every counter moves by what this cycle did to it, once.
                 // Written as the drain's decrements and then the issue's
                 // increments, each a read-modify-write of a 256-entry array at
@@ -321,11 +336,11 @@ module fabric_sequencer #(
                     dr = 0;
                     dw = 0;
                     for (x = 0; x < NREL; x = x + 1)
-                        if (rel_en[x]) begin
+                        if (d_en[x]) begin
                             for (k = 0; k < NC; k = k + 1)
-                                if (rel_c[x*NC*8 + k*8 +: 8] == id[7:0]) dr = dr - 1;
+                                if (d_c[x*NC*8 + k*8 +: 8] == id[7:0]) dr = dr - 1;
                             for (k = 0; k < NP; k = k + 1)
-                                if (rel_p[x*NC*8 + k*8 +: 8] == id[7:0]) dw = dw - 1;
+                                if (d_p[x*NC*8 + k*8 +: 8] == id[7:0]) dw = dw - 1;
                         end
                     if (issue) begin
                         for (k = 0; k < NC; k = k + 1)

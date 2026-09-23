@@ -73,37 +73,72 @@ module fabric_conv_silu #(
         end
         mi1 <= mult_in; si1 <= sh_in; mo1 <= mult_out; so1 <= sh_out;
     end
-    // S2: the F16 requantize's multiply.  S3: its round and saturate.  One
-    // multiply, or one round with its shift and its saturate, to a stage.
-    reg                  v2, v3;
-    reg signed [PW1_-1:0] q2 [0:L-1];
+    // S2: the F16 requantize's multiply, carry-save.  S2B: its resolve and
+    // the shift.  S3: the round and saturate.
+    //
+    // Three stages where there were two.  A multiply written `a * b` is a
+    // partial-product tree and a final add the width of the product, and a
+    // requantize is a barrel shifter, a round and a saturate; one of each to
+    // a stage put a carry propagation either side of the shifter and left
+    // this unit's two worst paths at 1,877 and 1,856 ps.  Split, the multiply
+    // is a tree, the resolve shares a stage with the shifter it feeds, and
+    // the round is what it always was.  The convolution is a feed-forward
+    // pipeline, so the two stages are latency and not throughput --
+    // `conv_latency` in fabric/sequencer.py, over a command of a thousand
+    // beats at 9B.
+    reg                  v2, v2b, v3;
+    reg [PW1_-1:0]       q2s [0:L-1], q2c [0:L-1];
+    reg signed [PW1_:0]  sv2 [0:L-1];
+    reg [L-1:0]          rb2;
     reg [L*16-1:0]       t3;
-    reg [L*HW-1:0]       hist2, hist3;
-    reg [L*16-1:0]       mo2b, mo3b;
-    reg [L*6-1:0]        so2b, so3b, si2;
+    reg [L*HW-1:0]       hist2, hist2b, hist3;
+    reg [L*16-1:0]       mo2b, mo2c, mo3b;
+    reg [L*6-1:0]        so2b, so2c, so3b, si2;
     always @(posedge clk) begin
         v2 <= v1;
-        for (c = 0; c < L; c = c + 1)
-            q2[c] <= $signed(acc1[c]) * $signed({1'b0, mi1[c*16 +: 16]});
+        for (c = 0; c < L; c = c + 1) begin q2s[c] <= q2s_n[c]; q2c[c] <= q2c_n[c]; end
         si2 <= si1;
         hist2 <= hist1; mo2b <= mo1; so2b <= so1;
-        v3 <= v2;
+        v2b <= v2;
+        for (c = 0; c < L; c = c + 1) begin sv2[c] <= sv2_n[c]; rb2[c] <= rb2_n[c]; end
+        hist2b <= hist2; mo2c <= mo2b; so2c <= so2b;
+        v3 <= v2b;
         t3 <= t3_n;
-        hist3 <= hist2; mo3b <= mo2b; so3b <= so2b;
+        hist3 <= hist2b; mo3b <= mo2c; so3b <= so2c;
     end
-    // Both requantizes go through fabric_rnd_sat rather than the 64-bit
-    // helpers: the products are PW1_ and PW2_ wide, and a shifter built at 64
-    // costs twice the delay and twice the fanout on the shift amount, which is
-    // where this unit's critical path was (see fabric_vector.sv).
-    wire [L*16-1:0] t3_n;
-    wire [L*8-1:0]  y9_n;
+    // The products are PW1_ and PW2_ wide, not the 64 the helpers in
+    // fabric_fx.svh evaluate at: a shifter built at 64 costs twice the delay
+    // and twice the fanout on the shift amount, which is a register and so
+    // the one net the mapper cannot buffer (see fabric_vector.sv).
+    wire [PW1_-1:0]      q2s_n [0:L-1], q2c_n [0:L-1];
+    wire signed [PW1_:0] sv2_n [0:L-1];
+    wire [L-1:0]         rb2_n;
+    wire [PW2_-1:0]      q8s_n [0:L-1], q8c_n [0:L-1];
+    wire signed [PW2_:0] sv8_n [0:L-1];
+    wire [L-1:0]         rb8_n;
+    wire [L*16-1:0]      t3_n;
+    wire [L*8-1:0]       y9_n;
     genvar gr;
     generate
         for (gr = 0; gr < L; gr = gr + 1) begin : g_rq
-            fabric_rnd_sat #(.W(PW1_), .SW(6), .N(16)) u_t3 (
-                .v(q2[gr]), .sh(si2[gr*6 +: 6]), .y(t3_n[gr*16 +: 16]));
-            fabric_rnd_sat #(.W(PW2_), .SW(6), .N(8)) u_y9 (
-                .v(q8[gr]), .sh(so8[gr*6 +: 6]), .y(y9_n[gr*8 +: 8]));
+            fabric_mul_cs #(.AW(AW_), .BW(16), .PW(PW1_), .ADD(1)) u_m2 (
+                .a(acc1[gr]), .b(mi1[gr*16 +: 16]), .addend({PW1_{1'b0}}),
+                .s(q2s_n[gr]), .c(q2c_n[gr]));
+            wire signed [PW1_-1:0] q2q =
+                $signed(q2s[gr]) + $signed({q2c[gr][PW1_-2:0], 1'b0});
+            fabric_rnd_sat_shift #(.W(PW1_), .SW(6)) u_s2 (
+                .v(q2q), .sh(si2[gr*6 +: 6]), .sv(sv2_n[gr]), .rb(rb2_n[gr]));
+            fabric_rnd_sat_round #(.W(PW1_), .N(16)) u_t3 (
+                .sv(sv2[gr]), .rb(rb2[gr]), .y(t3_n[gr*16 +: 16]));
+            fabric_mul_cs #(.AW(16), .BW(16), .PW(PW2_), .ADD(1)) u_m8 (
+                .a(s6[gr*16 +: 16]), .b(mo7[gr*16 +: 16]), .addend({PW2_{1'b0}}),
+                .s(q8s_n[gr]), .c(q8c_n[gr]));
+            wire signed [PW2_-1:0] q8q =
+                $signed(q8s[gr]) + $signed({q8c[gr][PW2_-2:0], 1'b0});
+            fabric_rnd_sat_shift #(.W(PW2_), .SW(6)) u_s8 (
+                .v(q8q), .sh(so8[gr*6 +: 6]), .sv(sv8_n[gr]), .rb(rb8_n[gr]));
+            fabric_rnd_sat_round #(.W(PW2_), .N(8)) u_y9 (
+                .sv(sv8[gr]), .rb(rb8[gr]), .y(y9_n[gr*8 +: 8]));
         end
     endgenerate
     // S4..S7: SiLU per lane; the history and constants wait four cycles.
@@ -123,18 +158,23 @@ module fabric_conv_silu #(
         mo4 <= mo3b; mo5 <= mo4; mo6 <= mo5; mo7 <= mo6;
         so4 <= so3b; so5 <= so4; so6 <= so5; so7 <= so6;
     end
-    // S8: the int8 requantize's multiply.  S9: its round and saturate.
-    reg                  v8;
-    reg signed [PW2_-1:0] q8 [0:L-1];
-    reg [L*HW-1:0]       hist8;
+    // S8: the int8 requantize's multiply, carry-save.  S8B: its resolve and
+    // the shift.  S9: the round and saturate.  The same three as above.
+    reg                  v8, v8b;
+    reg [PW2_-1:0]       q8s [0:L-1], q8c [0:L-1];
+    reg signed [PW2_:0]  sv8 [0:L-1];
+    reg [L-1:0]          rb8;
+    reg [L*HW-1:0]       hist8, hist8b;
     reg [L*6-1:0]        so8;
     always @(posedge clk) begin
         v8 <= sv[0];
-        for (c = 0; c < L; c = c + 1)
-            q8[c] <= $signed(s6[c*16 +: 16]) * $signed({1'b0, mo7[c*16 +: 16]});
+        for (c = 0; c < L; c = c + 1) begin q8s[c] <= q8s_n[c]; q8c[c] <= q8c_n[c]; end
         hist8 <= hist7; so8 <= so7;
-        out_valid <= v8;
-        out_hist  <= hist8;
+        v8b <= v8;
+        for (c = 0; c < L; c = c + 1) begin sv8[c] <= sv8_n[c]; rb8[c] <= rb8_n[c]; end
+        hist8b <= hist8;
+        out_valid <= v8b;
+        out_hist  <= hist8b;
         out_y     <= y9_n;
     end
 endmodule
