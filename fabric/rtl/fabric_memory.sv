@@ -426,9 +426,16 @@ module fabric_index_scan #(
     genvar gp;
     generate
         for (gp = 0; gp < CPB; gp = gp + 1) begin : g_prod
-            wire signed [PWID-1:0] pr = (2 * $signed({1'b0, q_beat[gp*4 +: 4]}) - 16'sd15)
-                                      * (2 * $signed({1'b0, rdata[gp*4 +: 4]}) - 16'sd15);
-            assign prod[gp*PWID +: PWID] = q_live[gp] ? pr : {PWID{1'b0}};
+            // A code is four bits, so its level 2c - 15 is six and the
+            // product of two of them is twelve.  Written against 16-bit
+            // literals the levels were 16 bits and every code bought a 16 by
+            // 16 multiply, CPB of them to a beat, for a number that never
+            // leaves [-225, 225].
+            wire signed [5:0]  ql = {1'b0, q_beat[gp*4 +: 4], 1'b0} - 6'sd15;
+            wire signed [5:0]  rl = {1'b0, rdata[gp*4 +: 4], 1'b0} - 6'sd15;
+            wire signed [11:0] pr = ql * rl;
+            assign prod[gp*PWID +: PWID] =
+                q_live[gp] ? {{(PWID-12){pr[11]}}, pr} : {PWID{1'b0}};
         end
     endgenerate
     // The accumulator is one more operand of the same tree.  Reduced to a
