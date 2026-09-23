@@ -265,10 +265,13 @@ module fabric_head_gates #(
     // S6: t = A * softplus in F16 (22 bits).
     reg        v6;
     reg [21:0] t6;
-    wire signed [63:0] prod = fx_rnd_shr($signed({48'b0, ac5}) * $signed({48'b0, sp5}), 10);
+    // Sixteen by sixteen is 32 bits and 22 are kept; the shift is by a
+    // constant, so the round is an increment on the bits that survive it.
+    wire [31:0] acsp = ac5 * sp5;
+    wire [21:0] t6_n = acsp[31:10] + {21'b0, acsp[9]};
     always @(posedge clk) begin
         v6 <= spv;
-        t6 <= prod[21:0];
+        t6 <= t6_n;
     end
     // S7..S9: exp; beta waits four cycles.
     fabric_exp_neg #(.LUT_DIR(LUT_DIR)) u_exp (.clk(clk), .valid_in(v6), .t(t6), .valid_out(out_valid), .y(decay));

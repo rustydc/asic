@@ -457,7 +457,8 @@ module fabric_index_scan #(
     wire [ACCW-1:0] asum, acar;
     fabric_csa_tree #(.N(CPB+1), .W(ACCW)) u_acc (.ops(aops), .s(asum), .c(acar));
     wire signed [ACCW-1:0] acc_next = $signed(asum) + $signed({acar[ACCW-2:0], 1'b0});
-    wire signed [63:0] final_score = acc * $signed({56'b0, rdata[7:0]});
+    // A 32-bit accumulator by an 8-bit scale is 40 bits, and 32 are kept.
+    wire signed [39:0] final_score = acc * $signed({1'b0, rdata[7:0]});
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             busy <= 1'b0; inflight <= 1'b0; blk <= 0; first <= 0; count <= 0; got <= 0; beat <= 0; acc <= 0;
