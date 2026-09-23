@@ -246,29 +246,52 @@ module fabric_sequencer #(
     // reachable.
     localparam int NRC = NREL * NC;
     localparam int NRP = NREL * NP;
-    wire [CW-1:0] rd_next [0:NID-1];
-    wire [CW-1:0] wr_next [0:NID-1];
-    genvar gn, gu, gd;
+    // Each id in play is decoded once into a bit per buffer, not compared
+    // against all NID of them.  Compared, the same eight bits drive 256
+    // comparators apiece and the mapper answers with a buffer tree -- three
+    // stages of BUF_X8 and BUF_X4 at forty, 34 and sixteen femtofarads, 160
+    // ps of the path before a counter's own logic starts.  Split in halves an
+    // id's eight bits reach 32 four-bit comparators, and a buffer's own bit
+    // is one AND of two of them, which is the same depth for a thirtieth of
+    // the load.
+    wire [CW-1:0]  rd_next [0:NID-1];
+    wire [CW-1:0]  wr_next [0:NID-1];
+    wire [NID-1:0] up_c [0:NC-1];
+    wire [NID-1:0] up_p [0:NP-1];
+    wire [NID-1:0] dn_c [0:NRC-1];
+    wire [NID-1:0] dn_p [0:NRP-1];
+    genvar gn, gu, gd, gh;
     generate
+        for (gu = 0; gu < NC; gu = gu + 1) begin : g_dc
+            fabric_seq_dec #(.NID(NID)) u_d (.id(cur_c[gu]), .en(issue), .oh(up_c[gu]));
+        end
+        for (gu = 0; gu < NP; gu = gu + 1) begin : g_dp
+            fabric_seq_dec #(.NID(NID)) u_d (.id(cur_p[gu]), .en(issue), .oh(up_p[gu]));
+        end
+        for (gd = 0; gd < NRC; gd = gd + 1) begin : g_drc
+            fabric_seq_dec #(.NID(NID)) u_d (
+                .id(rel_c[(gd/NC)*NC*8 + (gd%NC)*8 +: 8]), .en(rel_en[gd/NC]), .oh(dn_c[gd]));
+        end
+        for (gd = 0; gd < NRP; gd = gd + 1) begin : g_drp
+            fabric_seq_dec #(.NID(NID)) u_d (
+                .id(rel_p[(gd/NP)*NC*8 + (gd%NP)*8 +: 8]), .en(rel_en[gd/NP]), .oh(dn_p[gd]));
+        end
         for (gn = 0; gn < NID; gn = gn + 1) begin : g_cnt
-            localparam [7:0] MYID = gn;
             wire [(1 + NC + NRC)*CW-1:0] rops;
             wire [(1 + NP + NRP)*CW-1:0] wops;
             assign rops[0 +: CW] = rd_cnt[gn];
             assign wops[0 +: CW] = wr_cnt[gn];
             for (gu = 0; gu < NC; gu = gu + 1) begin : g_ru
-                assign rops[(1 + gu)*CW +: CW] = {{(CW-1){1'b0}}, issue && (cur_c[gu] == MYID)};
+                assign rops[(1 + gu)*CW +: CW] = {{(CW-1){1'b0}}, up_c[gu][gn]};
             end
             for (gu = 0; gu < NP; gu = gu + 1) begin : g_wu
-                assign wops[(1 + gu)*CW +: CW] = {{(CW-1){1'b0}}, issue && (cur_p[gu] == MYID)};
+                assign wops[(1 + gu)*CW +: CW] = {{(CW-1){1'b0}}, up_p[gu][gn]};
             end
             for (gd = 0; gd < NRC; gd = gd + 1) begin : g_rd
-                assign rops[(1 + NC + gd)*CW +: CW] =
-                    {CW{rel_en[gd/NC] && (rel_c[(gd/NC)*NC*8 + (gd%NC)*8 +: 8] == MYID)}};
+                assign rops[(1 + NC + gd)*CW +: CW] = {CW{dn_c[gd][gn]}};
             end
             for (gd = 0; gd < NRP; gd = gd + 1) begin : g_wd
-                assign wops[(1 + NP + gd)*CW +: CW] =
-                    {CW{rel_en[gd/NP] && (rel_p[(gd/NP)*NC*8 + (gd%NP)*8 +: 8] == MYID)}};
+                assign wops[(1 + NP + gd)*CW +: CW] = {CW{dn_p[gd][gn]}};
             end
             wire [CW-1:0] rs, rc, ws, wc;
             fabric_csa_tree #(.N(1 + NC + NRC), .W(CW)) u_r (.ops(rops), .s(rs), .c(rc));
@@ -393,6 +416,36 @@ module fabric_sequencer #(
                     $display("FAIL: port %0d returned tag %0d, it was given %0d%s", m, done_tag[m*8 +: 8], slot_tag[m],
                              busy[m] ? "" : " and had no command outstanding");
 `endif
+endmodule
+
+// One id in play, decoded to a bit per buffer.  The eight bits split into two
+// halves of four, each a sixteen-way one-hot, and a buffer's bit is the AND of
+// its two -- 32 comparators feeding NID two-input gates, in place of NID
+// eight-bit comparators all hanging off the same eight nets.
+module fabric_seq_dec #(
+    parameter int NID = 256
+) (
+    input  wire [7:0]      id,
+    input  wire            en,
+    output wire [NID-1:0]  oh
+);
+    localparam int LOW = (NID > 16) ? 4 : $clog2(NID > 1 ? NID : 2);
+    localparam int NL  = 1 << LOW;
+    localparam int NH  = (NID + NL - 1) / NL;
+    wire [NL-1:0] lo;
+    wire [NH-1:0] hi;
+    genvar i;
+    generate
+        for (i = 0; i < NL; i = i + 1) begin : g_lo
+            assign lo[i] = (id[LOW-1:0] == i[LOW-1:0]);
+        end
+        for (i = 0; i < NH; i = i + 1) begin : g_hi
+            assign hi[i] = en && (id[7:LOW] == i[7-LOW:0]);
+        end
+        for (i = 0; i < NID; i = i + 1) begin : g_oh
+            assign oh[i] = hi[i / NL] && lo[i % NL];
+        end
+    endgenerate
 endmodule
 
 // One registered copy of a strobe the sequencer spreads over a wide register.

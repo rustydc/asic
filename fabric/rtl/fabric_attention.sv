@@ -440,7 +440,24 @@ module fabric_attention #(
     // output's round.  One multiply, or one round with its saturate, to a
     // stage.
     reg                ov1, ov2;
-    reg signed [OW+17:0] wm1 [0:L-1];
+    // The output weight's product is carry-save for the same reason as the
+    // value update's: it is the same 54-bit add behind the same macro read,
+    // and this was the core's worst path.  The resolve belongs to O2, where
+    // the round and the saturate already are.
+    reg  [VPW-1:0] wm1_s [0:L-1], wm1_c [0:L-1];
+    wire [VPW-1:0] wm1_sn [0:L-1], wm1_cn [0:L-1];
+    wire signed [VPW-1:0] wm1q [0:L-1];
+    genvar gwm;
+    generate
+        for (gwm = 0; gwm < L; gwm = gwm + 1) begin : g_wm
+            wire signed [OW-1:0] wsel =
+                o_seen_o[gwm] ? $signed(o_rd[ohead][gwm*OW +: OW]) : {OW{1'b0}};
+            fabric_mul_cs #(.AW(OW), .BW(17), .PW(VPW), .ADD(1)) u_wm (
+                .a(wsel), .b(r_c[gwm]), .addend({VPW{1'b0}}),
+                .s(wm1_sn[gwm]), .c(wm1_cn[gwm]));
+            assign wm1q[gwm] = $signed(wm1_s[gwm]) + $signed({wm1_c[gwm][VPW-2:0], 1'b0});
+        end
+    endgenerate
     reg signed [23:0]  gm1 [0:L-1];
     reg [L*16-1:0]     w2;
     reg [L*16-1:0]     tg2;
@@ -456,7 +473,7 @@ module fabric_attention #(
 
     reg signed [47:0] sc;
     reg signed [49:0] dd;
-    reg signed [63:0] ow, tmp;
+    reg signed [63:0] tmp;
     // The score's round, out of the always block so it is one module
     // at the value's width rather than the helpers' 64.
     wire signed [47:0] sc_w [0:G-1];
@@ -467,8 +484,49 @@ module fabric_attention #(
         end
     endgenerate
     // The value update's two products, applied the cycle after they are formed.
-    reg signed [OW+17:0] va [0:G-1][0:L-1];
-    reg signed [24:0]    vb [0:G-1][0:L-1];
+    //
+    // Both are left in carry-save: value = s + 2c, and nothing along the way
+    // propagates a carry.  Written `a * b` each one is a partial-product tree
+    // *and* a final add the width of the product, and at 54 bits that add was
+    // 2,001 of this core's 2,646 ps -- in the same cycle as a 645 ps read of
+    // the output accumulator's macro, which leaves it nothing.  The round's
+    // own constant goes in as one more operand of the tree, because
+    //     round(va, 16) + vb == round(va + 2^15 + vb*2^16, 16)
+    // and the shift is by a constant, so the cycle below resolves the pair
+    // and takes bits 51:16 -- one add for what was three.
+    localparam int VPW = OW + 18;              // 36 x 16 and the rounding constant
+    localparam int BPW = VPW - 16;             // vb's own, before its shift into place
+    reg  [VPW-1:0] va_s [0:G-1][0:L-1], va_c [0:G-1][0:L-1];
+    reg  [BPW-1:0] vb_s [0:G-1][0:L-1], vb_c [0:G-1][0:L-1];
+    wire [VPW-1:0] va_sn [0:G-1][0:L-1], va_cn [0:G-1][0:L-1];
+    wire [BPW-1:0] vb_sn [0:G-1][0:L-1], vb_cn [0:G-1][0:L-1];
+    wire [OW-1:0]  ow_n [0:G-1][0:L-1];
+    genvar gv, lv;
+    generate
+        for (gv = 0; gv < G; gv = gv + 1) begin : g_vm
+            for (lv = 0; lv < L; lv = lv + 1) begin : g_vl
+                wire signed [OW-1:0] osel =
+                    o_seen_v[gv*L + lv] ? $signed(o_rd[gv][lv*OW +: OW]) : {OW{1'b0}};
+                fabric_mul_cs #(.AW(OW), .BW(16), .PW(VPW), .ADD(1)) u_va (
+                    .a(osel), .b(f_r_c[gv*L + lv]), .addend({{(VPW-16){1'b0}}, 1'b1, 15'b0}),
+                    .s(va_sn[gv][lv]), .c(va_cn[gv][lv]));
+                fabric_mul_cs #(.AW(8), .BW(16), .PW(BPW), .ADD(1)) u_vb (
+                    .a(in_data[lv*8 +: 8]), .b(p_r_c[gv*L + lv]), .addend({BPW{1'b0}}),
+                    .s(vb_sn[gv][lv]), .c(vb_cn[gv][lv]));
+                // The two pairs reduce to one and that one add is the whole
+                // of the next cycle's arithmetic.
+                wire [4*VPW-1:0] wops;
+                assign wops[0*VPW +: VPW] = va_s[gv][lv];
+                assign wops[1*VPW +: VPW] = {va_c[gv][lv][VPW-2:0], 1'b0};
+                assign wops[2*VPW +: VPW] = {vb_s[gv][lv], 16'b0};
+                assign wops[3*VPW +: VPW] = {vb_c[gv][lv][BPW-2:0], 1'b0, 16'b0};
+                wire [VPW-1:0] ws, wc;
+                fabric_csa_tree #(.N(4), .W(VPW)) u_wt (.ops(wops), .s(ws), .c(wc));
+                wire signed [VPW-1:0] wq = $signed(ws) + $signed({wc[VPW-2:0], 1'b0});
+                assign ow_n[gv][lv] = wq[OW+15:16];
+            end
+        end
+    endgenerate
     reg                  vv;
     reg [BW-1:0]         vbeat;
     reg [GW-1:0] ohead;
@@ -543,8 +601,7 @@ module fabric_attention #(
             if (vv) begin
                 for (g = 0; g < G; g = g + 1)
                     for (l = 0; l < L; l = l + 1) begin
-                        ow = fx_rnd_shr(va[g][l], 16) + $signed({{39{vb[g][l][24]}}, vb[g][l]});
-                        o_wd[(g*L + l)*OW +: OW] <= ow[OW-1:0];
+                        o_wd[(g*L + l)*OW +: OW] <= ow_n[g][l];
                     end
                 o_we <= 1'b1;
                 o_waddr <= vbeat;
@@ -632,8 +689,8 @@ module fabric_attention #(
                         // so the read and the write never meet.
                         for (g = 0; g < G; g = g + 1)
                             for (l = 0; l < L; l = l + 1) begin
-                                va[g][l] <= $signed(o_seen_v[g*L + l] ? o_rd[g][l*OW +: OW] : {OW{1'b0}}) * $signed({{(OW+1){1'b0}}, f_r_c[g*L + l]});
-                                vb[g][l] <= $signed({9'b0, p_r_c[g*L + l]}) * $signed(in_data[l*8 +: 8]);
+                                va_s[g][l] <= va_sn[g][l]; va_c[g][l] <= va_cn[g][l];
+                                vb_s[g][l] <= vb_sn[g][l]; vb_c[g][l] <= vb_cn[g][l];
                             end
                         vv    <= 1'b1;
                         vbeat <= beat;
@@ -655,7 +712,7 @@ module fabric_attention #(
                     // One beat per cycle into the output pipeline.
                     ov1 <= 1'b1;
                     for (l = 0; l < L; l = l + 1) begin
-                        wm1[l] <= $signed(o_seen_o[l] ? o_rd[ohead][l*OW +: OW] : {OW{1'b0}}) * $signed({{(OW+1){1'b0}}, r_c[l]});
+                        wm1_s[l] <= wm1_sn[l]; wm1_c[l] <= wm1_cn[l];
                         gm1[l] <= $signed(gate_rd[ohead][l*8 +: 8]) * $signed({8'b0, mult_gate});
                     end
                     if (obeat == BEATS - 1) begin
@@ -712,8 +769,8 @@ module fabric_attention #(
     generate
         for (go = 0; go < L; go = go + 1) begin : g_oq
             assign sh_w[go] = (7 + LW) - lz_c[go];      // in [7, 7+LW]: lz_c counts at most LW
-            fabric_rnd_sat #(.W(OW+18), .SW(6), .N(16)) u_w2 (
-                .v(wm1[go]), .sh(sh_w[go]), .y(w2_n[go*16 +: 16]));
+            fabric_rnd_sat #(.W(VPW), .SW(6), .N(16)) u_w2 (
+                .v(wm1q[go]), .sh(sh_w[go]), .y(w2_n[go*16 +: 16]));
             fabric_rnd_sat #(.W(24), .SW(6), .N(16)) u_tg (
                 .v(gm1[go]), .sh(sh_gate), .y(tg2_n[go*16 +: 16]));
             fabric_rnd_sat #(.W(56), .SW(6), .N(8)) u_od (
