@@ -547,6 +547,8 @@ module fabric_attention #(
     wire [SMW-1:0] sm_sn [0:G-1], sm_cn [0:G-1];
     reg  signed [SMW-1:0] sv_r [0:G-1];
     reg  [G-1:0]          rb_r;
+    reg  [DW-1:0]  ps_r [0:G-1], pc_r [0:G-1], ns_r [0:G-1], nc_r [0:G-1];
+    wire [DW-1:0]  ps_n [0:G-1], pc_n [0:G-1], ns_n [0:G-1], nc_n [0:G-1];
     wire signed [SMW-1:0] sv_n [0:G-1];
     wire [G-1:0]          rb_n;
     wire signed [SMW-1:0] scq [0:G-1];         // the rounded score, whole
@@ -567,26 +569,32 @@ module fabric_attention #(
                 $signed(sm_s[gsc]) + $signed({sm_c[gsc][SMW-2:0], 1'b0});
             fabric_rnd_cs #(.W(SMW), .SW(6)) u_sv (
                 .v(smq), .sh(sh_s), .sv(sv_n[gsc]), .rb(rb_n[gsc]));
-            // S_EXP2: sc is sv + rb, and both differences take rb as an
-            // operand rather than waiting for it to be added in.  A negative
-            // m_r - sc is exactly `sc > m_r`, so the compare is that sign bit
-            // and not a second carry chain.
-            wire signed [DW-1:0] svx = {{(DW-SMW){sv_r[gsc][SMW-1]}}, sv_r[gsc]};
+            // Both differences against the running maximum, reduced in
+            // S_EXP1B and resolved in S_EXP2.  They take the round bit as an
+            // operand rather than waiting for it to be added in, and a
+            // negative m_r - sc is exactly `sc > m_r`, so the compare is that
+            // sign bit and not a second carry chain.
+            //
+            // The reduction sits in the earlier stage because it can: `m_r`
+            // is written at the end of S_EXP2, so the value the trees read is
+            // the same either side of the boundary.  That leaves S_EXP2 one
+            // resolve, a sign and a clamp, and costs no cycle -- S_EXP1B was
+            // the shorter of the two.
+            wire signed [DW-1:0] svx = {{(DW-SMW){sv_n[gsc][SMW-1]}}, sv_n[gsc]};
             wire signed [DW-1:0] mrx = {{(DW-32){m_r[gsc][31]}}, m_r[gsc]};
             wire [4*DW-1:0] pops, nops;
             assign pops[0*DW +: DW] = svx;
             assign pops[1*DW +: DW] = ~mrx;
             assign pops[2*DW +: DW] = {{(DW-1){1'b0}}, 1'b1};
-            assign pops[3*DW +: DW] = {{(DW-1){1'b0}}, rb_r[gsc]};
+            assign pops[3*DW +: DW] = {{(DW-1){1'b0}}, rb_n[gsc]};
             assign nops[0*DW +: DW] = mrx;
             assign nops[1*DW +: DW] = ~svx;
             assign nops[2*DW +: DW] = {{(DW-1){1'b0}}, 1'b1};
-            assign nops[3*DW +: DW] = {DW{rb_r[gsc]}};          // -rb
-            wire [DW-1:0] ps, pc, ns, nc;
-            fabric_csa_tree #(.N(4), .W(DW)) u_pt (.ops(pops), .s(ps), .c(pc));
-            fabric_csa_tree #(.N(4), .W(DW)) u_nt (.ops(nops), .s(ns), .c(nc));
-            wire signed [DW-1:0] dpos = $signed(ps) + $signed({pc[DW-2:0], 1'b0});
-            wire signed [DW-1:0] dneg = $signed(ns) + $signed({nc[DW-2:0], 1'b0});
+            assign nops[3*DW +: DW] = {DW{rb_n[gsc]}};          // -rb
+            fabric_csa_tree #(.N(4), .W(DW)) u_pt (.ops(pops), .s(ps_n[gsc]), .c(pc_n[gsc]));
+            fabric_csa_tree #(.N(4), .W(DW)) u_nt (.ops(nops), .s(ns_n[gsc]), .c(nc_n[gsc]));
+            wire signed [DW-1:0] dpos = $signed(ps_r[gsc]) + $signed({pc_r[gsc][DW-2:0], 1'b0});
+            wire signed [DW-1:0] dneg = $signed(ns_r[gsc]) + $signed({nc_r[gsc][DW-2:0], 1'b0});
             assign scq[gsc] = sv_r[gsc] + {{(SMW-1){1'b0}}, rb_r[gsc]};
             assign nmx[gsc] = !m_valid[gsc] || dneg[DW-1];
             wire signed [DW-1:0] dd_w =
@@ -765,9 +773,12 @@ module fabric_attention #(
                     state <= S_EXP1B;
                 end
                 S_EXP1B: begin
-                    // The product resolved and shifted; the round bit waits.
+                    // The product resolved and shifted, the round bit beside
+                    // it, and both differences reduced ready to resolve.
                     for (g = 0; g < G; g = g + 1) begin
                         sv_r[g] <= sv_n[g]; rb_r[g] <= rb_n[g];
+                        ps_r[g] <= ps_n[g]; pc_r[g] <= pc_n[g];
+                        ns_r[g] <= ns_n[g]; nc_r[g] <= nc_n[g];
                     end
                     state <= S_EXP2;
                 end
