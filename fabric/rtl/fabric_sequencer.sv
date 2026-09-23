@@ -171,10 +171,27 @@ module fabric_sequencer #(
     // pass answers "is any lower port set" in ceil(log2 NPORT) levels.
     reg [NPORT-1:0] remaining, one, lower;
     integer sh;
-    reg [NC*8-1:0]  sel_c;
-    reg [NP*8-1:0]  sel_p;
-    reg [7:0]       sel_tag;
     integer q, r;
+    // Every port's record, packed once: consumed ids, produced ids, tag.
+    localparam int RECW = NC*8 + NP*8 + 8;
+    wire [NPORT*RECW-1:0] recs;
+    // What each pass of the scan above hands to fabric_seq_lowest, and what
+    // comes back.  With NREL of one there is a single pass and `remaining` is
+    // `want_rel`, so nothing of the prefix or is in front of it.
+    wire [NREL-1:0]      low_any;
+    wire [NREL*RECW-1:0] low_q;
+    reg  [NREL*NPORT-1:0] scan_in;
+    genvar gs, gp;
+    generate
+        for (gp = 0; gp < NPORT; gp = gp + 1) begin : g_rec
+            assign recs[gp*RECW +: RECW] = {slot_tag[gp], slot_p[gp], slot_c[gp]};
+        end
+        for (gs = 0; gs < NREL; gs = gs + 1) begin : g_low
+            fabric_seq_lowest #(.N(NPORT), .W(RECW)) u_low (
+                .set(scan_in[gs*NPORT +: NPORT]), .rec(recs),
+                .any(low_any[gs]), .q(low_q[gs*RECW +: RECW]));
+        end
+    endgenerate
     always @* begin
         rel_now = 0;
         rel_en  = 0;
@@ -183,20 +200,15 @@ module fabric_sequencer #(
         rel_tag = 0;
         remaining = want_rel;
         for (r = 0; r < NREL; r = r + 1) begin
+            scan_in[r*NPORT +: NPORT] = remaining;
             lower = {remaining[NPORT-2:0], 1'b0};              // lower[i] = remaining[i-1]
             for (sh = 1; sh < NPORT; sh = sh * 2) lower = lower | (lower << sh);
             one = remaining & ~lower;
-            sel_c = 0; sel_p = 0; sel_tag = 0;
-            for (q = 0; q < NPORT; q = q + 1) begin
-                sel_c   = sel_c   | (slot_c[q]   & {(NC*8){one[q]}});
-                sel_p   = sel_p   | (slot_p[q]   & {(NP*8){one[q]}});
-                sel_tag = sel_tag | (slot_tag[q] & {8{one[q]}});
-            end
-            if (|one) begin
+            if (low_any[r]) begin
                 rel_en[r] = 1'b1;
-                rel_c[r*NC*8 +: NC*8] = sel_c;
-                rel_p[r*NC*8 +: NP*8] = sel_p;
-                rel_tag[r*8 +: 8]     = sel_tag;
+                rel_c[r*NC*8 +: NC*8] = low_q[r*RECW +: NC*8];
+                rel_p[r*NC*8 +: NP*8] = low_q[r*RECW + NC*8 +: NP*8];
+                rel_tag[r*8 +: 8]     = low_q[r*RECW + NC*8 + NP*8 +: 8];
             end
             rel_now   = rel_now | one;
             remaining = remaining & ~one;
@@ -416,6 +428,51 @@ module fabric_sequencer #(
                     $display("FAIL: port %0d returned tag %0d, it was given %0d%s", m, done_tag[m*8 +: 8], slot_tag[m],
                              busy[m] ? "" : " and had no command outstanding");
 `endif
+endmodule
+
+// The lowest set port's record, in one pass down a tree.  A prefix or over
+// the ports and then a select by the one-hot it produces is two trees in
+// series, and the one-hot between them has to reach every bit of every
+// port's record before the select can start: 1,155 ps from a completion to
+// the ids it returns, which was half this module's path and the half the
+// carry-save counters did not touch.  Folded together, each node carries the
+// pair (is anything set under me, the record of the lowest one that is) and
+// reduces bottom-up -- at every node the left child's record when anything
+// under it is set, the right child's otherwise.  The same depth as either
+// tree alone, and nothing fans out in between.
+//
+// The one-hot is still wanted, for `rel_now` and what it clears; it is a
+// register's input rather than a counter's, so it keeps the prefix or and
+// runs alongside this.
+module fabric_seq_lowest #(
+    parameter int N = 40,
+    parameter int W = 64
+) (
+    input  wire [N-1:0]   set,
+    input  wire [N*W-1:0] rec,
+    output wire           any,
+    output wire [W-1:0]   q
+);
+    localparam int LV = $clog2(N);
+    localparam int PP = 1 << LV;
+    wire [PP-1:0]   a_l [0:LV];
+    wire [PP*W-1:0] r_l [0:LV];
+    genvar i, v;
+    generate
+        for (i = 0; i < PP; i = i + 1) begin : g_leaf
+            assign a_l[0][i] = (i < N) ? set[i] : 1'b0;
+            assign r_l[0][i*W +: W] = (i < N) ? rec[i*W +: W] : {W{1'b0}};
+        end
+        for (v = 0; v < LV; v = v + 1) begin : g_lvl
+            for (i = 0; i < (PP >> (v + 1)); i = i + 1) begin : g_nd
+                assign a_l[v+1][i] = a_l[v][2*i] | a_l[v][2*i+1];
+                assign r_l[v+1][i*W +: W] = a_l[v][2*i] ? r_l[v][(2*i)*W +: W]
+                                                        : r_l[v][(2*i+1)*W +: W];
+            end
+        end
+    endgenerate
+    assign any = a_l[LV][0];
+    assign q   = r_l[LV][0 +: W];
 endmodule
 
 // One id in play, decoded to a bit per buffer.  The eight bits split into two

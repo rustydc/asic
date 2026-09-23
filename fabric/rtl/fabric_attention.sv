@@ -364,6 +364,13 @@ module fabric_attention #(
             assign cops[L*SCW +: SCW]     = score_s[gc];
             assign cops[(L+1)*SCW +: SCW] = {score_c[gc][SCW-2:0], 1'b0};
             fabric_csa_tree #(.N(L+2), .W(SCW)) u_ct (.ops(cops), .s(score_sn[gc]), .c(score_cn[gc]));
+            // A carry-save pair is only a number modulo its width: the
+            // integer s + 2c may exceed it by a multiple of 2^SCW that no
+            // amount of arithmetic here can see.  Added into another tree
+            // that excess is discarded again by the same wrap, which is why
+            // the accumulate above and the value update may take the pair.
+            // Multiplied it is scaled by mult_s and does not vanish, so the
+            // scale's multiply has to have the number: the resolve is here.
             assign score[gc] = $signed(score_s[gc]) + $signed({score_c[gc][SCW-2:0], 1'b0});
         end
     endgenerate
@@ -473,7 +480,32 @@ module fabric_attention #(
 
     reg signed [47:0] sc;
     reg signed [49:0] dd;
-    reg signed [63:0] tmp;
+    // The running normalizer's update, in one carry chain instead of three.
+    // Both branches are round(l * B, 16) + A, which is a multiply's own final
+    // add, the round's incrementer and then A's add, all at 64 bits because
+    // that is where the helpers evaluate.  round(x, 16) + A is
+    // round(x + 2^15 + A*2^16, 16) and the shift is by a constant, so the
+    // multiply's partial products, the rounding constant and A in its place
+    // are operands of one carry-save tree and the stage resolves it once.
+    localparam int LPW = LW + 18;
+    wire [15:0]   l_mul [0:G-1];
+    wire [15:0]   l_add [0:G-1];
+    wire [LW-1:0] l_next [0:G-1];
+    genvar glr;
+    generate
+        for (glr = 0; glr < G; glr = glr + 1) begin : g_lr
+            assign l_mul[glr] = newmax[glr] ? (m_valid[glr] ? exp_y[glr] : 16'hFFFF) : 16'hFFFF;
+            assign l_add[glr] = newmax[glr] ? 16'hFFFF : exp_y[glr];
+            wire [2*LPW-1:0] lad;
+            assign lad[0 +: LPW]   = {{(LPW-16){1'b0}}, 1'b1, 15'b0};            // the round's 2^15
+            assign lad[LPW +: LPW] = {{(LPW-32){1'b0}}, l_add[glr], 16'b0};      // A, above the shift
+            wire [LPW-1:0] ls, lc;
+            fabric_mul_cs #(.AW(LW+1), .BW(16), .PW(LPW), .ADD(2)) u_l (
+                .a({1'b0, l_r[glr]}), .b(l_mul[glr]), .addend(lad), .s(ls), .c(lc));
+            wire [LPW-1:0] lq = ls + {lc[LPW-2:0], 1'b0};
+            assign l_next[glr] = lq[LW+15:16];
+        end
+    endgenerate
     // The score's round, out of the always block so it is one module
     // at the value's width rather than the helpers' 64.
     wire signed [47:0] sc_w [0:G-1];
@@ -666,16 +698,9 @@ module fabric_attention #(
                     // Wait for the exponentials, then set f and p and update l.
                     if (exp_v[0]) begin
                         for (g = 0; g < G; g = g + 1) begin
-                            if (newmax[g]) begin
-                                f_r[g] <= m_valid[g] ? exp_y[g] : 16'hFFFF;
-                                p_r[g] <= 16'hFFFF;
-                                tmp = fx_rnd_shr($signed({{(64-LW){1'b0}}, l_r[g]}) * $signed({48'b0, (m_valid[g] ? exp_y[g] : 16'hFFFF)}), 16) + 64'sd65535;
-                            end else begin
-                                f_r[g] <= 16'hFFFF;
-                                p_r[g] <= exp_y[g];
-                                tmp = fx_rnd_shr($signed({{(64-LW){1'b0}}, l_r[g]}) * 64'sd65535, 16) + $signed({48'b0, exp_y[g]});
-                            end
-                            l_r[g] <= tmp[LW-1:0];
+                            f_r[g] <= newmax[g] ? (m_valid[g] ? exp_y[g] : 16'hFFFF) : 16'hFFFF;
+                            p_r[g] <= newmax[g] ? 16'hFFFF : exp_y[g];
+                            l_r[g] <= l_next[g];
                             m_valid[g] <= 1'b1;
                         end
                         state <= S_VALUE;
