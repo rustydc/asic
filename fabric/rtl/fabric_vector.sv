@@ -133,32 +133,32 @@ module fabric_rnd_sat #(
 endmodule
 
 // ---------------------------------------------------------------------------
-// The round-shift on its own, at the value's own width, for the places that
-// use the result whole rather than saturated.  The same number as fx_rnd_shr
-// and here for the same reason: the helpers evaluate at 64 bits, so a 48-bit
-// value buys a shifter, a round mux and an incrementer of 64, and whatever
-// compares or subtracts the result afterwards is 64 wide too.
-// ---------------------------------------------------------------------------
-module fabric_rnd #(
+// The round-shift left in two pieces: the value is sv + rb, and nothing here
+// propagates a carry.  A stage that consumes it usually has an add of its own
+// -- a difference against the running maximum, an accumulate -- and the round
+// bit rides into that tree for one more operand, where resolving it here
+// costs an incrementer as wide as the value.
+module fabric_rnd_cs #(
     parameter int W  = 48,
     parameter int SW = 6
 ) (
     input  wire signed [W-1:0] v,
     input  wire [SW-1:0]       sh,
-    output wire signed [W-1:0] y
+    output wire signed [W-1:0] sv,
+    output wire                rb
 );
     localparam int SMAX = 1 << SW;
     localparam int VW = (W > SMAX) ? W : SMAX;
     wire signed [VW-1:0] vx = $signed(v);
-    reg rb;
+    reg r;
     integer i;
     always @* begin
-        rb = 1'b0;
+        r = 1'b0;
         for (i = 1; i < SMAX; i = i + 1)
-            if (sh == i[SW-1:0]) rb = vx[i-1];
+            if (sh == i[SW-1:0]) r = vx[i-1];
     end
-    wire signed [W-1:0] sv = v >>> sh;
-    assign y = sv + {{(W-1){1'b0}}, rb};
+    assign rb = r;
+    assign sv = v >>> sh;
 endmodule
 
 // ---------------------------------------------------------------------------

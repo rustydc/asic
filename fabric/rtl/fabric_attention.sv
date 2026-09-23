@@ -325,7 +325,8 @@ module fabric_attention #(
     reg [GW-1:0] head;
     // State.
     localparam [3:0] S_ACCEPT = 4'd0, S_EXP = 4'd1, S_APPLY = 4'd2, S_VALUE = 4'd3,
-                     S_RECIP = 4'd4, S_OUT = 4'd5, S_DONE = 4'd6, S_EXP2 = 4'd7;
+                     S_RECIP = 4'd4, S_OUT = 4'd5, S_DONE = 4'd6, S_EXP2 = 4'd7,
+                     S_EXP1B = 4'd8;
     reg [3:0] state;
     reg signed [47:0] sm [0:G-1];
     assign in_ready = (state == S_ACCEPT) || (state == S_VALUE);
@@ -478,8 +479,6 @@ module fabric_attention #(
     reg [L*16-1:0] w3, w4, w5;
     always @(posedge clk) begin w3 <= w2; w4 <= w3; w5 <= w4; end
 
-    reg signed [47:0] sc;
-    reg signed [49:0] dd;
     // The running normalizer's update, in one carry chain instead of three.
     // Both branches are round(l * B, 16) + A, which is a multiply's own final
     // add, the round's incrementer and then A's add, all at 64 bits because
@@ -506,13 +505,73 @@ module fabric_attention #(
             assign l_next[glr] = lq[LW+15:16];
         end
     endgenerate
-    // The score's round, out of the always block so it is one module
-    // at the value's width rather than the helpers' 64.
-    wire signed [47:0] sc_w [0:G-1];
+    // The score's scale and round, over three stages instead of two.  In two
+    // they were five paths of a six-path unit: a 32-bit resolve and a 48-bit
+    // multiply in one cycle (2,325 ps), then a 48-bit shift, an incrementer,
+    // a compare and a difference in the next (2,271).  Split, each cycle
+    // carries one carry propagation:
+    //
+    //   S_EXP     the score's resolve and the scale's partial products
+    //   S_EXP1B   the product's resolve, and the shift -- the round bit is
+    //             carried alongside, not added
+    //   S_EXP2    the two differences against the running maximum, each with
+    //             the round bit as one more operand of its own tree
+    //
+    // It costs a cycle a key row, which is `attn_row_stall` in
+    // fabric/sequencer.py.
+    localparam int SMW = 48;                   // what `sm` has always been
+    localparam int DW  = 50;                   // a difference of a 48 and a 32
+    reg  [SMW-1:0] sm_s [0:G-1], sm_c [0:G-1];
+    wire [SMW-1:0] sm_sn [0:G-1], sm_cn [0:G-1];
+    reg  signed [SMW-1:0] sv_r [0:G-1];
+    reg  [G-1:0]          rb_r;
+    wire signed [SMW-1:0] sv_n [0:G-1];
+    wire [G-1:0]          rb_n;
+    wire signed [SMW-1:0] scq [0:G-1];         // the rounded score, whole
+    wire [G-1:0]          nmx;
+    wire [21:0]           dcl [0:G-1];
     genvar gsc;
     generate
         for (gsc = 0; gsc < G; gsc = gsc + 1) begin : g_sc
-            fabric_rnd #(.W(48), .SW(6)) u_sc (.v(sm[gsc]), .sh(sh_s), .y(sc_w[gsc]));
+            // S_EXP: the multiply, left in carry-save.  Its final add is as
+            // long as the score's resolve, and the two together were the
+            // stage's whole cost.
+            fabric_mul_cs #(.AW(SCW+1), .BW(16), .PW(SMW), .ADD(1)) u_sm (
+                .a({score[gsc][SCW-1], score[gsc]}), .b(mult_s), .addend({SMW{1'b0}}),
+                .s(sm_sn[gsc]), .c(sm_cn[gsc]));
+            // S_EXP1B: resolve it -- a carry-save pair cannot be shifted by a
+            // variable amount, the carry crosses the boundary -- then shift.
+            wire signed [SMW-1:0] smq =
+                $signed(sm_s[gsc]) + $signed({sm_c[gsc][SMW-2:0], 1'b0});
+            fabric_rnd_cs #(.W(SMW), .SW(6)) u_sv (
+                .v(smq), .sh(sh_s), .sv(sv_n[gsc]), .rb(rb_n[gsc]));
+            // S_EXP2: sc is sv + rb, and both differences take rb as an
+            // operand rather than waiting for it to be added in.  A negative
+            // m_r - sc is exactly `sc > m_r`, so the compare is that sign bit
+            // and not a second carry chain.
+            wire signed [DW-1:0] svx = {{(DW-SMW){sv_r[gsc][SMW-1]}}, sv_r[gsc]};
+            wire signed [DW-1:0] mrx = {{(DW-32){m_r[gsc][31]}}, m_r[gsc]};
+            wire [4*DW-1:0] pops, nops;
+            assign pops[0*DW +: DW] = svx;
+            assign pops[1*DW +: DW] = ~mrx;
+            assign pops[2*DW +: DW] = {{(DW-1){1'b0}}, 1'b1};
+            assign pops[3*DW +: DW] = {{(DW-1){1'b0}}, rb_r[gsc]};
+            assign nops[0*DW +: DW] = mrx;
+            assign nops[1*DW +: DW] = ~svx;
+            assign nops[2*DW +: DW] = {{(DW-1){1'b0}}, 1'b1};
+            assign nops[3*DW +: DW] = {DW{rb_r[gsc]}};          // -rb
+            wire [DW-1:0] ps, pc, ns, nc;
+            fabric_csa_tree #(.N(4), .W(DW)) u_pt (.ops(pops), .s(ps), .c(pc));
+            fabric_csa_tree #(.N(4), .W(DW)) u_nt (.ops(nops), .s(ns), .c(nc));
+            wire signed [DW-1:0] dpos = $signed(ps) + $signed({pc[DW-2:0], 1'b0});
+            wire signed [DW-1:0] dneg = $signed(ns) + $signed({nc[DW-2:0], 1'b0});
+            assign scq[gsc] = sv_r[gsc] + {{(SMW-1){1'b0}}, rb_r[gsc]};
+            assign nmx[gsc] = !m_valid[gsc] || dneg[DW-1];
+            wire signed [DW-1:0] dd_w =
+                nmx[gsc] ? (m_valid[gsc] ? dpos : {DW{1'b0}}) : dneg;
+            // The difference is never negative, so the clamp is an or of the
+            // bits above the field rather than a compare against its limit.
+            assign dcl[gsc] = (|dd_w[DW-1:22]) ? 22'd4194303 : dd_w[21:0];
         end
     endgenerate
     // The value update's two products, applied the cycle after they are formed.
@@ -666,29 +725,25 @@ module fabric_attention #(
                     end
                 end
                 S_EXP: begin
-                    // The score is complete: its scale is a stage of its own.
-                    for (g = 0; g < G; g = g + 1)
-                        sm[g] <= $signed({{16{score[g][31]}}, score[g]}) * $signed({32'b0, mult_s});
+                    // The score is complete: its scale's partial products.
+                    for (g = 0; g < G; g = g + 1) begin
+                        sm_s[g] <= sm_sn[g]; sm_c[g] <= sm_cn[g];
+                    end
+                    state <= S_EXP1B;
+                end
+                S_EXP1B: begin
+                    // The product resolved and shifted; the round bit waits.
+                    for (g = 0; g < G; g = g + 1) begin
+                        sv_r[g] <= sv_n[g]; rb_r[g] <= rb_n[g];
+                    end
                     state <= S_EXP2;
                 end
                 S_EXP2: begin
-                    // Round it, compare with the maximum, launch the exponentials.
+                    // Compare with the maximum, launch the exponentials.
                     for (g = 0; g < G; g = g + 1) begin
-                        // `sc` comes off fabric_rnd at the 48 bits `sm` has,
-                        // so the shift, the compare and the difference are 48
-                        // and 50 wide rather than 64: this was the core's
-                        // second path, and every one of those is a carry
-                        // chain the width of the value.
-                        sc = sc_w[g];
-                        if (!m_valid[g] || sc > $signed({{18{m_r[g][31]}}, m_r[g]})) begin
-                            newmax[g] <= 1'b1;
-                            dd = m_valid[g] ? ($signed({{2{sc[47]}}, sc}) - $signed({{20{m_r[g][31]}}, m_r[g]})) : 50'sd0;
-                            m_r[g] <= sc[31:0];
-                        end else begin
-                            newmax[g] <= 1'b0;
-                            dd = $signed({{20{m_r[g][31]}}, m_r[g]}) - $signed({{2{sc[47]}}, sc});
-                        end
-                        d_in[g] <= (dd > 50'sd4194303) ? 22'd4194303 : dd[21:0];
+                        newmax[g] <= nmx[g];
+                        if (nmx[g]) m_r[g] <= scq[g][31:0];
+                        d_in[g] <= dcl[g];
                         score_s[g] <= 0; score_c[g] <= 0;
                     end
                     exp_go <= 1'b1;
