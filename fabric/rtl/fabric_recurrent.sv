@@ -446,10 +446,6 @@ module fabric_delta_state8 #(
     wire [V*50-1:0] cms_w, cmc_w;
     genvar gv;
     generate
-        for (gv = 0; gv < V; gv = gv + 1) begin : g_cmul
-            fabric_mul_cs #(.AW(32), .BW(17), .PW(50)) u_c (
-                .a(bd[gv]), .b(r), .addend(rndc), .s(cms_w[gv*50 +: 50]), .c(cmc_w[gv*50 +: 50]));
-        end
         for (gv = 0; gv < V; gv = gv + 1) begin : g_sh
             fabric_const_copy #(.W(6))  u_p (.clk(clk), .d(shp),  .q(shp_l[gv]));
             fabric_const_copy #(.W(6))  u_c (.clk(clk), .d(shc),  .q(shc_l[gv]));
@@ -517,6 +513,21 @@ module fabric_delta_state8 #(
         end
     end
     wire [16:0] r = quo;
+    // The reciprocal is the second operand of every lane's carry-save
+    // multiply, so the quotient register carried 2,091 loads and 3.37 pF at
+    // 32 lanes -- 8.13 of that geometry's 9.68 ns, and it grows with V.  A
+    // copy per lane.  The copy is a cycle behind the quotient, which costs
+    // nothing: the diff phase waits on `r_ready` and two more phases run
+    // before anything multiplies by it.
+    wire [16:0] r_l [0:V-1];
+    genvar gr;
+    generate
+        for (gr = 0; gr < V; gr = gr + 1) begin : g_rl
+            fabric_const_copy #(.W(17)) u_r (.clk(clk), .d(r), .q(r_l[gr]));
+            fabric_mul_cs #(.AW(32), .BW(17), .PW(50)) u_c (
+                .a(bd[gr]), .b(r_l[gr]), .addend(rndc), .s(cms_w[gr*50 +: 50]), .c(cmc_w[gr*50 +: 50]));
+        end
+    endgenerate
 
     // Pass 1 is A1 latch, A2 rescale product, A3 rescale and keep, A4 the
     // key's product, then the accumulate; pass 2 is B1 read, B2 the update's
@@ -541,6 +552,22 @@ module fabric_delta_state8 #(
         .clk(clk), .rd_en(1'b1), .rd_addr(rd[TA-1:0]), .rd_data(rowd1),
         .wr_en(va3), .wr_addr(ia3[TA-1:0]), .wr_data(tr3), .wr_mask(1'b1));
     reg [KW-1:0]   id1, id2, id3, id4;
+    // `k_r` and `q_r` are K bytes, and indexing them with a row counter is a
+    // barrel shifter over all K*8 bits.  At the real 128 rows `ia3` alone
+    // carried 1,026 loads and 1.63 pF -- 3.98 of that geometry's 5.26 ns --
+    // because the shifter is the whole vector however few bytes come out.
+    // An or of masks is the structure the index actually has, and it costs
+    // the counter K comparators.
+    reg [7:0] k_a3, k_d1, q_d3;
+    integer kk;
+    always @* begin
+        k_a3 = 0; k_d1 = 0; q_d3 = 0;
+        for (kk = 0; kk < K; kk = kk + 1) begin
+            k_a3 = k_a3 | (k_r[kk*8 +: 8] & {8{ia3 == kk[KW-1:0]}});
+            k_d1 = k_d1 | (k_r[kk*8 +: 8] & {8{id1 == kk[KW-1:0]}});
+            q_d3 = q_d3 | (q_r[kk*8 +: 8] & {8{id3 == kk[KW-1:0]}});
+        end
+    end
     reg signed [32:0] dm2 [0:V-1];
     reg [V*8-1:0]  tn3;
     reg signed [15:0] ym4 [0:V-1];
@@ -615,7 +642,7 @@ module fabric_delta_state8 #(
             vd4 <= vd3; id4 <= id3;
             if (vd3) begin
                 for (j = 0; j < V; j = j + 1) begin
-                    ym4[j] = $signed(q_r[id3*8 +: 8]) * $signed(tn3[j*8 +: 8]);
+                    ym4[j] = $signed(q_d3) * $signed(tn3[j*8 +: 8]);
                     tn = $signed({{56{tn3[j*8+7]}}, tn3[j*8 +: 8]});
                     mag = (tn < 0) ? -tn : tn;
                     if (mag[7:0] > pk[j]) pk[j] = mag[7:0];
@@ -634,7 +661,7 @@ module fabric_delta_state8 #(
             end
             vd2 <= vd1; id2 <= id1; rowd2 <= rowd1;
             if (vd1)
-                for (j = 0; j < V; j = j + 1) dm2[j] = $signed(k_r[id1*8 +: 8]) * c[j];
+                for (j = 0; j < V; j = j + 1) dm2[j] = $signed(k_d1) * c[j];
             if (phase == 4'd6) begin
                 vd1 <= 1'b1; id1 <= rd; rd <= rd + 1'b1;
                 if (rd == K - 1) phase <= 4'd0;          // the pipeline carries the rest
@@ -676,7 +703,7 @@ module fabric_delta_state8 #(
             end
             va4 <= va3; ia4 <= ia3;
             if (va3)
-                for (j = 0; j < V; j = j + 1) kp4[j] = $signed(k_r[ia3*8 +: 8]) * $signed(tr3[j*8 +: 8]);
+                for (j = 0; j < V; j = j + 1) kp4[j] = $signed(k_a3) * $signed(tr3[j*8 +: 8]);
             va3 <= va2; ia3 <= ia2;
             if (va2)
                 for (j = 0; j < V; j = j + 1) begin

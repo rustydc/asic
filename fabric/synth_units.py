@@ -97,6 +97,15 @@ UNITS = [
          "the index scan, 32 codes", luts=True),
     Unit("index_scan_real", "fabric_index_scan", ("fabric_memory.sv", "fabric_norm.sv") + VEC, {"IDIM": 128, "RPB": 8},
          "the index scan at 9B: 128 codes", luts=True),
+    # The state engine's V lanes are independent, so a narrower V is
+    # representative of the path unless something shared fans out to all of
+    # them.  The sweep says which: at the real K of 128, V of 16, 32 and 64.
+    Unit("delta_state8_v16", "fabric_delta_state8", VEC + ("fabric_recurrent.sv",), {"K": 128, "V": 16, "YSH": 9},
+         "the state engine, a 128-row state, sixteen lanes", luts=True),
+    Unit("delta_state8_v32", "fabric_delta_state8", VEC + ("fabric_recurrent.sv",), {"K": 128, "V": 32, "YSH": 9},
+         "the state engine, a 128-row state, 32 lanes", luts=True),
+    Unit("delta_state8_v64", "fabric_delta_state8", VEC + ("fabric_recurrent.sv",), {"K": 128, "V": 64, "YSH": 9},
+         "the state engine, a 128-row state, 64 lanes", luts=True),
     Unit("delta_state8_real", "fabric_delta_state8", VEC + ("fabric_recurrent.sv",), {"K": 128, "V": 128, "YSH": 9},
          "the int8 state engine at 9B: a 128 x 128 state", luts=True),
     Unit("record_reader_real", "fabric_record_reader", ("fabric_memory.sv", "fabric_norm.sv") + VEC,
