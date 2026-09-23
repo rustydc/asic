@@ -34,6 +34,11 @@ endmodule
 // The tile's column datapath is built on this (fabric_tile.sv); it lives here
 // because the vector units want it for the same reason.
 // ---------------------------------------------------------------------------
+// Written as a loop over the layers rather than a module that instantiates
+// itself.  Recursion reads better and cost a module of hierarchy per layer:
+// the attention core's contribution tree is fifteen layers at the width its
+// testbench uses, which is past Icarus's recursion limit of ten and fifteen
+// levels of hierarchy for synthesis to flatten.  Same structure, one module.
 module fabric_csa_tree #(
     parameter int N = 3,
     parameter int W = 41
@@ -42,35 +47,58 @@ module fabric_csa_tree #(
     output wire [W-1:0]   s,
     output wire [W-1:0]   c
 );
+    // Operands left after `lv` layers, and the number of layers to reach two.
+    function automatic integer after;
+        input integer n;
+        input integer lv;
+        integer k;
+        begin
+            after = n;
+            for (k = 0; k < lv; k = k + 1)
+                if (after > 2) after = 2 * (after / 3) + (after % 3);
+        end
+    endfunction
+    function automatic integer layers;
+        input integer n;
+        integer m;
+        begin
+            layers = 0;
+            m = n;
+            while (m > 2) begin
+                m = 2 * (m / 3) + (m % 3);
+                layers = layers + 1;
+            end
+        end
+    endfunction
+    localparam int LV = layers(N);
+    localparam int NF = after(N, LV);        // one or two
+    // Every layer is narrower than the one before it, so one N-operand slot
+    // per layer holds all of them.
+    wire [(LV+1)*N*W-1:0] lvl;
+    assign lvl[0 +: N*W] = ops;
+    genvar v, i;
     generate
-        if (N == 1) begin : g_one
-            assign s = ops[W-1:0];
-            assign c = {W{1'b0}};
-        end else if (N == 2) begin : g_two
-            wire [W-1:0] a = ops[W-1:0];
-            wire [W-1:0] b = ops[2*W-1:W];
-            assign s = a ^ b;
-            assign c = a & b;
-        end else begin : g_layer
-            localparam int G = N / 3;
-            localparam int R = N % 3;
-            localparam int M = 2 * G + R;
-            wire [M*W-1:0] next;
-            genvar i;
-            for (i = 0; i < G; i = i + 1) begin : g_csa
-                wire [W-1:0] a = ops[(3*i)*W +: W];
-                wire [W-1:0] b = ops[(3*i+1)*W +: W];
-                wire [W-1:0] d = ops[(3*i+2)*W +: W];
+        for (v = 0; v < LV; v = v + 1) begin : g_lv
+            localparam int NI = after(N, v);
+            localparam int NG = NI / 3;
+            localparam int NR = NI % 3;
+            for (i = 0; i < NG; i = i + 1) begin : g_csa
+                wire [W-1:0] a = lvl[(v*N + 3*i)*W     +: W];
+                wire [W-1:0] b = lvl[(v*N + 3*i + 1)*W +: W];
+                wire [W-1:0] d = lvl[(v*N + 3*i + 2)*W +: W];
                 wire [W-1:0] cy = (a & b) | (a & d) | (b & d);
-                assign next[(2*i)*W +: W]   = a ^ b ^ d;
-                assign next[(2*i+1)*W +: W] = {cy[W-2:0], 1'b0};   // carry at weight 2, as a plain operand
+                assign lvl[((v+1)*N + 2*i)*W     +: W] = a ^ b ^ d;
+                assign lvl[((v+1)*N + 2*i + 1)*W +: W] = {cy[W-2:0], 1'b0};   // carry at weight 2, as a plain operand
             end
-            for (i = 0; i < R; i = i + 1) begin : g_pass
-                assign next[(2*G+i)*W +: W] = ops[(3*G+i)*W +: W];
+            for (i = 0; i < NR; i = i + 1) begin : g_pass
+                assign lvl[((v+1)*N + 2*NG + i)*W +: W] = lvl[(v*N + 3*NG + i)*W +: W];
             end
-            fabric_csa_tree #(.N(M), .W(W)) sub (.ops(next), .s(s), .c(c));
         end
     endgenerate
+    wire [W-1:0] f0 = lvl[(LV*N)*W +: W];
+    wire [W-1:0] f1 = (NF == 2) ? lvl[(LV*N + 1)*W +: W] : {W{1'b0}};
+    assign s = (NF == 2) ? (f0 ^ f1) : f0;
+    assign c = (NF == 2) ? (f0 & f1) : {W{1'b0}};
 endmodule
 
 // ---------------------------------------------------------------------------
