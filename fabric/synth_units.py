@@ -112,6 +112,15 @@ UNITS = [
     # its synthesis does not finish rather than does not time.  Kept as
     # hierarchy the table is mapped once, and OpenSTA walks through it either
     # way, so the timing is the same measurement.
+    # Thirty-two lanes is what a 32-byte beat would allow, and the question it
+    # settles is whether the clock survives it: the core measures 1,696 ps at
+    # two lanes, 1,770 at eight and 1,911 at sixteen, so the trend says the
+    # lane count costs, and a clock lost here is lost by every unit.  The RTL
+    # takes L=32 already; only the buffer beat and two constants in the
+    # sequencer hold it at sixteen.  Timing it needs neither.
+    Unit("attention_l32", "fabric_attention", VEC + ("fabric_attention.sv",), {"HD": 256, "G": 4, "L": 32, "LW": 28},
+         "the attention core at 9B with the lanes a 32-byte beat would allow", luts=True,
+         keep_hier=("fabric_lut",)),
     Unit("attention_real", "fabric_attention", VEC + ("fabric_attention.sv",), {"HD": 256, "G": 4, "L": 16, "LW": 28},
          "the attention core at the 9B geometry: four heads of 256, sixteen lanes", luts=True,
          keep_hier=("fabric_lut",)),
