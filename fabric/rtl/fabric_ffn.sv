@@ -107,6 +107,14 @@ module fabric_residual #(
     reg            v1, v2;
     reg [L*24-1:0] p1, p2;
     reg [L*16-1:0] h1, h2;
+    // The round and the saturating add at the width of the numbers.  Both
+    // went through the fx_ helpers, whose argument is a signed [63:0], so a
+    // 24-bit round-shift and a 25-bit add were done at 64 -- and the round's
+    // mux over the shift amount picked one of 64 bits where the value only
+    // has 24.
+    reg signed [23:0] pshr;
+    reg               prnd;
+    reg signed [24:0] hsum;
     wire [5:0]     sh_l [0:L-1];
     genvar gl;
     generate
@@ -114,7 +122,7 @@ module fabric_residual #(
             fabric_const_copy #(.W(6)) u_sh (.clk(clk), .d(shift), .q(sh_l[gl]));
         end
     endgenerate
-    integer c;
+    integer c, b;
     always @(posedge clk) begin
         v1 <= in_valid;
         h1 <= in_h;
@@ -123,10 +131,24 @@ module fabric_residual #(
         v2 <= v1;
         h2 <= h1;
         for (c = 0; c < L; c = c + 1)
-            p2[c*24 +: 24] <= fx_rnd_shr($signed(p1[c*24 +: 24]), sh_l[c]);
+            begin
+                pshr = $signed(p1[c*24 +: 24]) >>> sh_l[c];
+                // The round bit is bit sh-1, a mux over the shift amount.
+                // Past the width every bit is the sign, as it was when the
+                // value was sign-extended to 64 first.
+                prnd = 1'b0;
+                for (b = 1; b < 24; b = b + 1)
+                    if (sh_l[c] == b[5:0]) prnd = p1[c*24 + b - 1];
+                if (sh_l[c] >= 6'd24) prnd = p1[c*24 + 23];
+                p2[c*24 +: 24] <= pshr + {23'b0, prnd};
+            end
         out_valid <= v2;
         for (c = 0; c < L; c = c + 1)
-            out_h[c*16 +: 16] <= fx_sat($signed(h2[c*16 +: 16]) + $signed(p2[c*24 +: 24]), 16);
+            begin
+                hsum = $signed(h2[c*16 +: 16]) + $signed(p2[c*24 +: 24]);
+                out_h[c*16 +: 16] <= ((&hsum[24:15]) | (~|hsum[24:15]))
+                                     ? hsum[15:0] : (hsum[24] ? 16'sh8000 : 16'sh7FFF);
+            end
     end
 endmodule
 

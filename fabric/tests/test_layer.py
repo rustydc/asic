@@ -325,6 +325,15 @@ class VectorRtlTest(unittest.TestCase):
         # The head norm: int8 in, a Q3.13 gain, int16 out.
         self.check("tb_rmsnorm", lambda d: L.emit_rmsnorm_vectors(
             d, rng.integers(-128, 128, 32), rng.integers(4000, 12000, 32), 1, 14, xw=8, ow=16, lanes=4))
+        # The output requantizer against both of its limits.  Nothing above
+        # drives it into saturation -- the normalised value is bounded by
+        # 2^14 by construction, so only the gain and the multiplier can take
+        # it out of range -- and the clamp is the half of that stage a width
+        # change is most likely to get wrong.
+        for ow in (8, 16):
+            self.check("tb_rmsnorm", lambda d, ow=ow: L.emit_rmsnorm_vectors(
+                d, rng.integers(-128, 128, 64), np.full(64, 30000, dtype=np.int64),
+                65535, 4, xw=8, ow=ow, lanes=8))
 
     def test_conv_silu(self) -> None:
         rng = np.random.default_rng(12)

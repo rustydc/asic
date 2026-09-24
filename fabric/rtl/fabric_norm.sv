@@ -196,6 +196,15 @@ module fabric_rmsnorm #(
     reg signed [NG-1:0] p3 [0:L-1];
     reg signed [QW-1:0] q4 [0:L-1];
     reg signed [QW-1:0] s5 [0:L-1];
+    // Both requantizers ran at 64 bits.  fx_sat takes a signed [63:0], and a
+    // function argument is an assignment, so the add and the variable shift
+    // in front of it were widened to 64 as well -- on a product that is
+    // MW bits and a result that is sixteen.  They run at their own width
+    // now, and the saturate is the check the rounding primitives use: the
+    // bits above the ones kept must all match their sign, which is two
+    // reductions rather than a pair of compares against the limits.
+    reg signed [MW:0]   nsm;
+    reg signed [QW-1:0] osm;
     integer k;
     // The macro's read is a stage of its own.  Feeding its output straight
     // into the multiply put the access time and a sixteen-bit multiply in
@@ -217,7 +226,11 @@ module fabric_rmsnorm #(
         v2 <= v1;
         g2 <= g1;
         for (k = 0; k < L; k = k + 1)
-            n2[k*16 +: 16] <= fx_sat((m1[k] + rnd_r) >>> sh_l[k], 16);
+            begin
+                nsm = (m1[k] + rnd_r) >>> sh_l[k];
+                n2[k*16 +: 16] <= ((&nsm[MW:15]) | (~|nsm[MW:15]))
+                                  ? nsm[15:0] : (nsm[MW] ? 16'sh8000 : 16'sh7FFF);
+            end
         v3 <= v2;
         for (k = 0; k < L; k = k + 1)
             p3[k] <= $signed({{(NG-16){n2[k*16+15]}}, n2[k*16 +: 16]}) * $signed({{(NG-GW){g2[k*GW+GW-1]}}, g2[k*GW +: GW]});
@@ -229,7 +242,12 @@ module fabric_rmsnorm #(
             s5[k] <= q4[k] + ornd_r;
         out_valid <= v5;
         for (k = 0; k < L; k = k + 1)
-            out_y[k*OW +: OW] <= fx_sat(s5[k] >>> osh_l[k], OW);
+            begin
+                osm = s5[k] >>> osh_l[k];
+                out_y[k*OW +: OW] <= ((&osm[QW-1:OW-1]) | (~|osm[QW-1:OW-1]))
+                                     ? osm[OW-1:0]
+                                     : (osm[QW-1] ? {1'b1, {(OW-1){1'b0}}} : {1'b0, {(OW-1){1'b1}}});
+            end
     end
 endmodule
 
