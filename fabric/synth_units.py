@@ -17,7 +17,14 @@ on a one-bit flag with 780, and the norm 1.72 of 2.31 on a read address
 with 203.  A unit measured narrow can hide most of its real path, so the
 clock has to come from the ``*_real`` rows.
 
-    python -m fabric.synth_units --lib asap7=asap7.lib:800 --lib nangate45=ng45.lib:1600 \\
+What ABC is asked for is a second number, and a lower one: it area-recovers
+every path its own delay model scores as slack-positive, and that model is
+more optimistic than the timer that grades the result, so at the clock it
+trades away paths that turn out to be critical.  The state engine, same RTL,
+asked for 1600 against 900: 1,777 ps against 1,230, for 3.9 percent of area.
+Nothing below the knee at 900 is worth its area.  ``run_unit`` has the sweep.
+
+    python -m fabric.synth_units --lib asap7=asap7.lib:800 --lib nangate45=ng45.lib:1600:900 \\
         --sta /path/to/sta --out fabric/results/synth_units.json
 """
 
@@ -159,7 +166,23 @@ def path_cells(report: str) -> list[str]:
     return re.findall(r"\((\w+)\)", section)
 
 
-def run_unit(unit: Unit, lib_name: str, liberty: Path, target_ps: int, sta: Path | None, keep: Path | None = None) -> dict:
+def run_unit(unit: Unit, lib_name: str, liberty: Path, target_ps: int, sta: Path | None, keep: Path | None = None,
+             abc_target_ps: int | None = None) -> dict:
+    """``target_ps`` is the clock the slack is reported against; ``abc_target_ps``
+    is what ABC is asked for, which is not the same number.
+
+    ABC area-recovers every path its own delay model scores as slack-positive,
+    and that model is more optimistic than the timer that grades the result, so
+    it trades away paths that turn out to be critical.  Asking for less than the
+    clock buys that back.  On the state engine, at the same RTL:
+
+        asked 1600 -> 1,777 ps   asked 1200 -> 1,511 ps (+0.3% area)
+        asked  900 -> 1,230 ps (+3.9%)   asked 600 -> 1,218 ps (+5.2%)
+
+    900 is the knee.  Defaults to ``target_ps`` so an unchanged caller gets the
+    behaviour it had.
+    """
+    abc_target_ps = target_ps if abc_target_ps is None else abc_target_ps
     t0 = time.time()
     with tempfile.TemporaryDirectory() as directory:
         work = Path(directory)
@@ -172,14 +195,15 @@ def run_unit(unit: Unit, lib_name: str, liberty: Path, target_ps: int, sta: Path
             data.append(work / name)
         netlist = (keep / f"{unit.name}_{lib_name}.v") if keep else (work / "netlist.v")
         try:
-            synth = synthesize(liberty, top=unit.top, target_ps=target_ps, keep_netlist=netlist,
+            synth = synthesize(liberty, top=unit.top, target_ps=abc_target_ps, keep_netlist=netlist,
                                sources=[RTL_DIR / name for name in unit.sources], params=unit.params, data_files=data,
                                noshare=unit.noshare, keep_hier=unit.keep_hier)
         except Exception as error:  # noqa: BLE001 - the report says what failed
             return {"unit": unit.name, "library": lib_name, "error": str(error)[-1500:], "seconds": time.time() - t0}
         out = {"unit": unit.name, "library": lib_name, "top": unit.top, "params": unit.params, "note": unit.note,
                "cells": synth.cells, "flops": synth.flops, "area_um2": synth.area_um2, "abc_delay_ps": synth.abc_delay_ps,
-               "buffered": synth.buffered, "target_ps": target_ps, "seconds": time.time() - t0}
+               "buffered": synth.buffered, "target_ps": target_ps, "abc_target_ps": abc_target_ps,
+               "seconds": time.time() - t0}
         nand2 = nand2_area(liberty)
         if nand2:
             out["nand2_equiv"] = synth.area_um2 / nand2
@@ -232,7 +256,10 @@ def report_markdown(results: list[dict]) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--lib", action="append", required=True, help="name=liberty.lib:target_ps")
+    parser.add_argument("--lib", action="append", required=True,
+                        help="name=liberty.lib:target_ps[:abc_target_ps] -- the clock the slack is\n"
+                             "reported against, and optionally what ABC is asked for, which wants to\n"
+                             "be lower (see run_unit)")
     parser.add_argument("--sta", type=Path, default=None)
     parser.add_argument("--units", default=None, help="comma-separated unit names (default all)")
     parser.add_argument("--jobs", type=int, default=3)
@@ -244,13 +271,20 @@ def main() -> None:
     libs = []
     for spec in args.lib:
         name, rest = spec.split("=", 1)
-        path, target = rest.rsplit(":", 1)
-        libs.append((name, Path(path), int(target)))
+        path, _, targets = rest.rpartition(":")
+        # A second number is ABC's; with one, ABC is asked for the clock, as before.
+        if ":" in path and not Path(path).exists():
+            path, _, first = path.rpartition(":")
+            target, abc_target = int(first), int(targets)
+        else:
+            target, abc_target = int(targets), None
+        libs.append((name, Path(path), target, abc_target))
     units = [u for u in UNITS if args.units is None or u.name in args.units.split(",")]
-    jobs = [(u, name, path, target, args.sta, args.keep) for u in units for name, path, target in libs]
+    jobs = [(u, name, path, target, args.sta, args.keep, abc) for u in units
+            for name, path, target, abc in libs]
     # A rerun of some units replaces their rows in the existing file and keeps the others.
     results = [r for r in (json.loads(args.out.read_text()) if args.out.exists() else [])
-               if not any(r["unit"] == u.name and r["library"] == name for u in units for name, _, _ in libs)]
+               if not any(r["unit"] == u.name and r["library"] == name for u in units for name, *_ in libs)]
     with ProcessPoolExecutor(max_workers=args.jobs) as pool:
         for result in pool.map(_job, jobs):
             results.append(result)
