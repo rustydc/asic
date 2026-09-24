@@ -1288,8 +1288,14 @@ endmodule
 // One attention core.  src: the group's G query rows (int8, HD each); a2:
 // the first head's gate row (the heads' gates are 2 HD apart); a3: the
 // head's rows, len records of a key then a value row; dst: the G output
-// rows.  Beats are read then presented until the core
-// takes them, so its exponential stalls cost nothing but time.
+// rows.
+//
+// A beat's address goes out every cycle and the beat is presented the cycle
+// after, as the buffer answers.  One the core does not take -- it drops its
+// ready while it exponentiates a key row -- waits in a skid register, and no
+// address goes out while that register would have to take a second.  Read
+// and then presented, a beat was two cycles: every row cost twice its beats,
+// and the core, which takes a beat a cycle, was idle half of each.
 // ---------------------------------------------------------------------------
 module fabric_attn_adapter #(
     parameter int HD = 24,
@@ -1322,7 +1328,7 @@ module fabric_attn_adapter #(
     localparam int BEATS = HD / L;
     reg [65:0] consts [0:0];
     initial $readmemh("attn_consts.hex", consts);
-    localparam [2:0] S_IDLE = 0, S_START = 1, S_ISSUE = 2, S_PRESENT = 3, S_FINISH = 4, S_OUT = 5, S_DONE = 6;
+    localparam [2:0] S_IDLE = 0, S_START = 1, S_RUN = 2, S_DRAIN = 3, S_FINISH = 4, S_OUT = 5, S_DONE = 6;
     reg [2:0]    state;
     reg [AW-1:0] src, dst, gate, rows;
     reg [15:0]   n, r, o;
@@ -1333,9 +1339,21 @@ module fabric_attn_adapter #(
     assign cmd_ready = (state == S_IDLE);
     wire            in_ready, out_valid, done;
     wire [L*8-1:0]  out_data;
+    // The beat the buffer is answering (v1, of kind k1) and the one waiting
+    // in the skid register.  They are never both held: an address goes out
+    // only when the register will be empty, so what it answers has a place.
+    reg             v1, sk_v;
+    reg  [1:0]      k1, sk_k;
+    reg  [L*8-1:0]  sk_d;
+    wire            in_valid = sk_v || v1;
+    wire [1:0]      in_kind  = sk_v ? sk_k : k1;
+    wire [L*8-1:0]  in_data  = sk_v ? sk_d : rd_data[L*8-1:0];
+    wire            taken    = in_valid && in_ready;
+    wire            sk_next  = in_valid && !taken;
+    wire            issue    = (state == S_RUN) && !sk_next;
     fabric_attention #(.HD(HD), .G(G), .L(L), .LW(LW), .LUT_DIR(LUT_DIR)) u_core (
-        .clk(clk), .rst_n(rst_n), .start(start), .in_valid(state == S_PRESENT), .in_ready(in_ready), .in_kind(phase),
-        .in_data(rd_data[L*8-1:0]), .finish(finish), .mult_s(k[15:0]), .sh_s(k[21:16]), .mult_gate(k[37:22]), .sh_gate(k[43:38]),
+        .clk(clk), .rst_n(rst_n), .start(start), .in_valid(in_valid), .in_ready(in_ready), .in_kind(in_kind),
+        .in_data(in_data), .finish(finish), .mult_s(k[15:0]), .sh_s(k[21:16]), .mult_gate(k[37:22]), .sh_gate(k[43:38]),
         .mult_o(k[59:44]), .sh_o(k[65:60]), .out_valid(out_valid), .out_data(out_data), .done(done));
     always @* begin
         case (phase)
@@ -1348,28 +1366,34 @@ module fabric_attn_adapter #(
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             state <= S_IDLE; done_valid <= 1'b0; wr_en <= 1'b0; start <= 1'b0; finish <= 1'b0; phase <= 0; g <= 0; b <= 0; r <= 0; o <= 0;
+            v1 <= 1'b0; sk_v <= 1'b0;
         end else begin
             done_valid <= 1'b0; wr_en <= 1'b0; start <= 1'b0; finish <= 1'b0;
+            v1 <= issue;
+            if (issue) k1 <= phase;
+            if (sk_next && !sk_v) begin sk_d <= rd_data[L*8-1:0]; sk_k <= k1; end
+            sk_v <= sk_next;
             case (state)
                 S_IDLE: if (cmd_valid) begin
                     src <= cmd_src[AW-1:0]; dst <= cmd_dst[AW-1:0]; gate <= cmd_a2[AW-1:0]; rows <= cmd_a3[AW-1:0]; n <= cmd_len; tag <= cmd_tag;
                     k <= consts[0]; phase <= 0; g <= 0; b <= 0; r <= 0; o <= 0; start <= 1'b1; state <= S_START;
                 end
-                S_START: state <= S_ISSUE;
-                S_ISSUE: state <= S_PRESENT;
-                S_PRESENT: if (in_ready) begin
-                    state <= S_ISSUE;
+                S_START: state <= S_RUN;
+                S_RUN: if (issue) begin
+                    // The counters name the next beat to ask for.
                     if (b != BEATS - 1) b <= b + 1'b1;
                     else begin
                         b <= 0;
                         case (phase)
                             2'd0: if (g == G - 1) begin g <= 0; phase <= 2'd1; end else g <= g + 1'b1;
-                            2'd1: if (g == G - 1) begin g <= 0; phase <= 2'd2; if (n == 0) state <= S_FINISH; end else g <= g + 1'b1;
+                            2'd1: if (g == G - 1) begin g <= 0; phase <= 2'd2; if (n == 0) state <= S_DRAIN; end else g <= g + 1'b1;
                             2'd2: phase <= 2'd3;
-                            default: begin phase <= 2'd2; r <= r + 1'b1; if (r == n - 1) state <= S_FINISH; end
+                            default: begin phase <= 2'd2; r <= r + 1'b1; if (r == n - 1) state <= S_DRAIN; end
                         endcase
                     end
                 end
+                // The last beat asked for: finish once the core has taken it.
+                S_DRAIN: if (!sk_next) state <= S_FINISH;
                 S_FINISH: begin finish <= 1'b1; state <= S_OUT; end
                 S_OUT: if (done) state <= S_DONE;
                 default: begin done_valid <= 1'b1; done_tag <= tag; state <= S_IDLE; end

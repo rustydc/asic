@@ -153,9 +153,9 @@ class Timing:
     residual_latency: int = 6
     rotary_latency: int = 3
     rotary_table_latency: int = 8
-    attn_row_stall: int = 8          # in_ready drops while the core exponentiates a key row
+    attn_row_stall: int = 9          # in_ready drops while the core exponentiates a key row
     attn_out_latency: int = 29
-    attn_start_latency: int = 2
+    attn_start_latency: int = 3
     # The memory the unit talks to.  ``port_*`` is one request of the port
     # itself; the rest is what each operation does around it.
     port_request: int = 7            # accept, read latency and turnaround
@@ -226,10 +226,13 @@ class Timing:
 
     def attention(self, rows: int, group: int, head_dim: int) -> int:
         """One core's command: the queries and the gates in, then a key row
-        and a value row each, then the group's outputs."""
+        and a value row each, then the group's outputs.  A beat a cycle: the
+        adapter asks the buffer for the next beat while the core takes this
+        one (rtl/fabric_engine.sv).  It used to ask and then present, two
+        cycles a beat, and a row cost twice its beats."""
         beats = head_dim // self.head_lanes(head_dim)
-        return (self.attn_start_latency + 4 * group * beats
-                + rows * (4 * beats + self.attn_row_stall) + group * beats + self.attn_out_latency)
+        return (self.attn_start_latency + 2 * group * beats
+                + rows * (2 * beats + self.attn_row_stall) + group * beats + self.attn_out_latency)
 
     def transfer(self, beats: int) -> int:
         """Core cycles the memory needs for one transfer of ``beats``.
