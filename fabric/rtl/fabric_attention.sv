@@ -492,6 +492,25 @@ module fabric_attention #(
         end
     endgenerate
     reg signed [23:0]  gm1 [0:L-1];
+    // The gate's product is 8 bits by 16, which is 24 -- and `gm1` being 24
+    // bits is what made it a 24 by 24 multiply, because the assignment sets
+    // the width of both operands.  Twenty-four partial products of a 24-bit
+    // multiplicand where sixteen of an 8-bit one will do, on the far side of
+    // a macro read that already spends 533 ps getting out: at the real
+    // geometry this was the core's worst path, 1,945 ps of which 1,412 is
+    // here.  fabric_mul_cs takes the widths it is given.
+    wire [QW-1:0]      gsel = gate_rd[ohead];
+    wire [23:0]        gm1_s [0:L-1], gm1_c [0:L-1];
+    wire signed [23:0] gm1_n [0:L-1];
+    genvar ggm;
+    generate
+        for (ggm = 0; ggm < L; ggm = ggm + 1) begin : g_gm
+            fabric_mul_cs #(.AW(8), .BW(16), .PW(24), .ADD(1)) u_gm (
+                .a(gsel[ggm*8 +: 8]), .b(mult_gate), .addend(24'b0),
+                .s(gm1_s[ggm]), .c(gm1_c[ggm]));
+            fabric_cs_resolve #(.W(24)) u_gmr (.s(gm1_s[ggm]), .c(gm1_c[ggm]), .y(gm1_n[ggm]));
+        end
+    endgenerate
     // The output weight's requantize is two stages.  In one it was the
     // product's 54-bit resolve, a barrel shifter, a round and a saturate --
     // 2,275 ps and the core's worst path once the scale and round were split.
@@ -851,7 +870,7 @@ module fabric_attention #(
                     ov1 <= 1'b1;
                     for (l = 0; l < L; l = l + 1) begin
                         wm1_s[l] <= wm1_sn[l]; wm1_c[l] <= wm1_cn[l];
-                        gm1[l] <= $signed(gate_rd[ohead][l*8 +: 8]) * $signed({8'b0, mult_gate});
+                        gm1[l] <= gm1_n[l];
                     end
                     if (obeat == BEATS - 1) begin
                         if (ohead == G - 1) begin state <= S_DONE; drain <= 0; end
