@@ -880,7 +880,9 @@ module fabric_attention #(
     // and the output scale's, O8 the output's round.
     reg               o6v, o7v;
     reg signed [33:0] og6 [0:L-1];
-    reg signed [55:0] oq7 [0:L-1];
+    // 34 bits by 16 is 51, not 56: the five spare bits were a wider barrel
+    // shifter and five more bits of saturate in O8, on the core's worst path.
+    reg signed [50:0] oq7 [0:L-1];
     integer ol;
     always @(posedge clk) begin
         ov2 <= ov1;
@@ -894,7 +896,7 @@ module fabric_attention #(
             og6[ol] <= $signed({{18{w5[ol*16+15]}}, w5[ol*16 +: 16]}) * $signed({18'b0, sg5[ol*16 +: 16]});
         o7v <= o6v;
         for (ol = 0; ol < L; ol = ol + 1)
-            oq7[ol] <= $signed({{22{og6[ol][33]}}, og6[ol]}) * $signed({40'b0, mult_o});
+            oq7[ol] <= $signed({{17{og6[ol][33]}}, og6[ol]}) * $signed({35'b0, mult_o});
         out_valid <= o7v;
         out_data  <= od_n;
     end
@@ -918,7 +920,7 @@ module fabric_attention #(
                 .sv(wsv[go]), .rb(wrb[go]), .y(w2_n[go*16 +: 16]));
             fabric_rnd_sat #(.W(24), .SW(6), .N(16)) u_tg (
                 .v(gm1[go]), .sh(sh_gate), .y(tg2_n[go*16 +: 16]));
-            fabric_rnd_sat #(.W(56), .SW(6), .N(8)) u_od (
+            fabric_rnd_sat #(.W(51), .SW(6), .N(8)) u_od (
                 .v(oq7[go]), .sh(sh_o), .y(od_n[go*8 +: 8]));
         end
     endgenerate
