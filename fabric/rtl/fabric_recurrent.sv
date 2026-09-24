@@ -710,6 +710,14 @@ module fabric_delta_state8 #(
     reg signed [15:0] ym4 [0:VL-1];
     reg [7:0]      pk [0:V-1];
     reg [15:0]     ns [0:V-1];
+    // The eight inputs of one reduce group, zeroed past the end of the array.
+    // The reduce runs over them as a balanced tree: written as a running max
+    // and a running sum it was eight compares and eight 16-bit adds in
+    // series, three of this unit's nanoseconds at the widest group, and it is
+    // what the slice index was hiding.  A tree is three levels, not eight.
+    reg [7:0]      rpk [0:7];
+    reg [15:0]     rns [0:7];
+    integer        st;
     reg [7:0]      pk_a [0:G1N-1];
     reg [15:0]     ns_a [0:G1N-1];
     reg [7:0]      pk_b [0:G2N-1];
@@ -768,21 +776,29 @@ module fabric_delta_state8 #(
                     end
                 if (tail == 3'd2)
                     for (gg = 0; gg < G2N; gg = gg + 1) begin
-                        pk_b[gg] = 0; ns_b[gg] = 0;
-                        for (jj = 0; jj < 8; jj = jj + 1)
-                            if (gg * 8 + jj < G1N) begin
-                                if (pk_a[gg*8 + jj] > pk_b[gg]) pk_b[gg] = pk_a[gg*8 + jj];
-                                ns_b[gg] = ns_b[gg] + ns_a[gg*8 + jj];
+                        for (jj = 0; jj < 8; jj = jj + 1) begin
+                            rpk[jj] = (gg*8 + jj < G1N) ? pk_a[gg*8 + jj] : 8'd0;
+                            rns[jj] = (gg*8 + jj < G1N) ? ns_a[gg*8 + jj] : 16'd0;
+                        end
+                        for (st = 4; st >= 1; st = st >> 1)
+                            for (jj = 0; jj < st; jj = jj + 1) begin
+                                rpk[jj] = (rpk[jj] > rpk[jj+st]) ? rpk[jj] : rpk[jj+st];
+                                rns[jj] = rns[jj] + rns[jj+st];
                             end
+                        pk_b[gg] = rpk[0]; ns_b[gg] = rns[0];
                     end
                 if (tail == 3'd1)
                     for (gg = 0; gg < G1N; gg = gg + 1) begin
-                        pk_a[gg] = 0; ns_a[gg] = 0;
-                        for (jj = 0; jj < 8; jj = jj + 1)
-                            if (gg * 8 + jj < V) begin
-                                if (pk[gg*8 + jj] > pk_a[gg]) pk_a[gg] = pk[gg*8 + jj];
-                                ns_a[gg] = ns_a[gg] + ns[gg*8 + jj];
+                        for (jj = 0; jj < 8; jj = jj + 1) begin
+                            rpk[jj] = (gg*8 + jj < V) ? pk[gg*8 + jj] : 8'd0;
+                            rns[jj] = (gg*8 + jj < V) ? ns[gg*8 + jj] : 16'd0;
+                        end
+                        for (st = 4; st >= 1; st = st >> 1)
+                            for (jj = 0; jj < st; jj = jj + 1) begin
+                                rpk[jj] = (rpk[jj] > rpk[jj+st]) ? rpk[jj] : rpk[jj+st];
+                                rns[jj] = rns[jj] + rns[jj+st];
                             end
+                        pk_a[gg] = rpk[0]; ns_a[gg] = rns[0];
                     end
                 if (tail == 3'd0)
                     for (u = 0; u < VL; u = u + 1) begin
