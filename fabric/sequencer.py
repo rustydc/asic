@@ -44,6 +44,7 @@ against stub units of programmed duration.
 """
 from __future__ import annotations
 
+import collections
 import dataclasses
 import json
 import math
@@ -70,6 +71,16 @@ UNITS: dict[str, tuple[int, int]] = {   # name -> (id, engines)
 }
 NE = max(engines for _, engines in UNITS.values())    # engine ports a unit has in the controller's port map
 RELEASES = 1                 # completions the controller drains a cycle (rtl/fabric_sequencer.sv NREL)
+# Heads whose state the recurrent program reads ahead of the head it is on.
+# The controller issues in order, so a head's read placed after the previous
+# head's write-back waits out that head's update, and the port idles for it
+# every head: 12,300 cycles of a 104,751-cycle token at the 9B geometry.
+# Read ahead, the update runs under the next reads.  At most seven: the four
+# engines have two slots each, and the eighth head ahead is this head's slot.
+# Two or more gives the single token the whole saving (92,462 cycles).  Over
+# tokens 3-6 of a stream of contexts, three is the best of the depths at
+# 73,943 cycles (two to seven: 73,943-77,668), against 77,712 in order (0).
+STATE_READ_AHEAD = 3
 SHARED_PREFIX = "s_slot"     # buffers shared by every token in flight: the state engines' slots
 MEM_PREFIX = "m_"            # names of buffers in the memory image (the rest live in the vector buffer)
 
@@ -447,7 +458,7 @@ def _contrib(name: str, chunk: int) -> str:
 
 
 def recurrent_program(cfg, c: L.RecurrentConsts | None, spec: TileSpec, mm: MemoryMap, t: Timing = Timing(),
-                      chunk: int = 1) -> list[Step]:
+                      chunk: int = 1, read_ahead: int = STATE_READ_AHEAD) -> list[Step]:
     """One token through a recurrent layer, or a chunk of ``chunk``
     consecutive tokens of one context (prefill): the passes carry the whole
     chunk at once, the vector units and state engines take the tokens in
@@ -488,6 +499,22 @@ def recurrent_program(cfg, c: L.RecurrentConsts | None, spec: TileSpec, mm: Memo
     hist_beats = lay["sizes"]["hist"] // BEAT
     add("dma.hist_rd", "mem", (), ("hist",), t.move(hist_beats, write=False), lambda e: e.__setitem__("hist", e["hist_mem"]), nbytes=hist_bytes,
         ops=operands(src=("m_hist", 0), dst=("hist", 0), arg=MEM_RD, len=hist_beats))
+    # The heads over the state engines, each engine alternating two state
+    # slots; a chunk's tokens run on the slot in turn.  The first reads go
+    # here, under the norm, the input pass and the conv, which they do not
+    # depend on; each later one after the write-back of the head
+    # STATE_READ_AHEAD before it.
+    slot_beats = lay["sizes"][_slot(0, 0)] // BEAT
+
+    def s_read(h: int) -> None:
+        slot = _slot(h % n_delta, h // n_delta)
+
+        def s_rd(e, h=h, slot=slot):                       # the slot holds the rows and, for int8, the scale beat
+            e[slot] = (e["s_mem"][h], tuple(int(x) for x in e["scale_mem"][h])) if int8_state else e["s_mem"][h]
+        add(f"dma.s_rd[{h}]", "mem", (), (slot,), t.move(slot_beats, write=False), s_rd, nbytes=head_bytes,
+            ops=operands(src=(f"m_s[{h}]", 0), dst=(slot, 0), arg=MEM_RD, len=slot_beats))
+    for h in range(min(read_ahead, nv)):
+        s_read(h)
     for i in range(T):
         add(tok("norm.h", i), "norm", ("x",), (_contrib("A", chunk),), t.norm(d), lambda e, i=i: put(e, "A", i, L._norm(get(e, "x", i), c.norm)),
             ops=operands(src=("x", i * 2 * d), dst=("A", i * d), arg=NORM_RESIDUAL | NORM_INT16, len=d // t.lanes))
@@ -531,15 +558,11 @@ def recurrent_program(cfg, c: L.RecurrentConsts | None, spec: TileSpec, mm: Memo
                     engine=j % UNITS["norm"][1],
                     ops=operands(src=("conv", i * conv_dim + off + j * hk), dst=(f"qk_unit[{j}]", i * 2 * hk + (hk if which == "k" else 0)),
                                  arg=NORM_UNIT, len=hk // t.lanes))
-    # The heads over the state engines, each engine alternating two state slots; a chunk's tokens run on the slot in turn.
-    slot_beats = lay["sizes"][_slot(0, 0)] // BEAT
     for h in range(nv):
         e_id, k = h % n_delta, h // n_delta
         slot = _slot(e_id, k)
-        def s_rd(e, h=h, slot=slot):                       # the slot holds the rows and, for int8, the scale beat
-            e[slot] = (e["s_mem"][h], tuple(int(x) for x in e["scale_mem"][h])) if int8_state else e["s_mem"][h]
-        add(f"dma.s_rd[{h}]", "mem", (), (slot,), t.move(slot_beats, write=False), s_rd, nbytes=head_bytes,
-            ops=operands(src=(f"m_s[{h}]", 0), dst=(slot, 0), arg=MEM_RD, len=slot_beats))
+        if not read_ahead:
+            s_read(h)
         for i in range(T):
             def delta(e, h=h, slot=slot, i=i):
                 v = get(e, "conv", i)[2 * kd + h * hv:2 * kd + (h + 1) * hv]
@@ -563,6 +586,8 @@ def recurrent_program(cfg, c: L.RecurrentConsts | None, spec: TileSpec, mm: Memo
                 e["s_mem"][h] = e[slot]
         add(f"dma.s_wr[{h}]", "mem", (slot,), (), t.move(slot_beats, write=True), s_wr, nbytes=head_bytes,
             ops=operands(src=(slot, 0), dst=(f"m_s[{h}]", 0), arg=MEM_WR, len=slot_beats))
+        if read_ahead and h + read_ahead < nv:
+            s_read(h + read_ahead)
         for i in range(T):
             def gnorm(e, h=h, i=i):
                 gate = L.silu_fixed(L.requant(get(e, "z", i)[h * hv:(h + 1) * hv], c.z_mult, c.z_shift, 16))
@@ -853,19 +878,44 @@ def interleave(programs: list[list[Step]]) -> list[Step]:
     """Merge token programs (already retargeted) into one issue order: at
     each pick, the program whose next step could issue earliest under the
     controller's rules goes next, the older token on a tie.  The merged
-    list carries its dependencies."""
+    list carries its dependencies.
+
+    The state slots are one set of physical buffers for every program.
+    Dependencies only order a step against what is already merged, so
+    without more one program's read into a slot can land between another's
+    read of it and that program's update: its update then runs on the wrong
+    context's state.  In the in-order program at the 9B geometry a stream
+    of three did this three times a token, and the small configurations the
+    tests run never did.  A program holds a slot from its read into it to
+    its write-back, and reads into a slot only when no older program will
+    read into it again.  An older program then never waits on a younger
+    one, so the oldest always moves and nothing deadlocks; a hold per slot
+    alone deadlocks once programs read ahead."""
     lk = Linker()
     merged: list[Step] = []
     issue: list[int] = []
     end: list[int] = []
     free: dict[tuple[str, int], int] = {}
     ptr = [0] * len(programs)
+
+    def slots(names) -> list[str]:
+        return [_plain(n) for n in names if _plain(n).startswith(SHARED_PREFIX)]
+
+    def reads_into(step: Step) -> list[str]:
+        return slots(step.dst) if step.unit == "mem" else []
+
+    def writes_back(step: Step) -> list[str]:
+        return slots(step.src) if step.unit == "mem" else []
+    future = [collections.Counter(n for st in prog for n in reads_into(st)) for prog in programs]
+    owner: dict[str, int] = {}
     while any(p < len(prog) for p, prog in zip(ptr, programs)):
         best = None
         for j, prog in enumerate(programs):
             if ptr[j] >= len(prog):
                 continue
             step = prog[ptr[j]]
+            if any(owner.get(n, j) != j or any(future[i][n] for i in range(j)) for n in reads_into(step)):
+                continue
             deps = lk.deps_for(step)
             t0 = issue[-1] + 1 if issue else 0
             for d in deps:
@@ -880,6 +930,11 @@ def interleave(programs: list[list[Step]]) -> list[Step]:
         end.append(t0 + step.cycles)
         free[(step.unit, step.engine)] = t0 + step.cycles + 1
         lk.commit(step, len(merged) - 1)
+        for n in reads_into(step):
+            owner[n] = j
+        future[j].subtract(reads_into(step))
+        for n in writes_back(step):
+            owner.pop(n, None)
         ptr[j] += 1
     return merged
 

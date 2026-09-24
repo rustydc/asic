@@ -110,6 +110,30 @@ class ScheduleTest(unittest.TestCase):
                 self.assertEqual(own, [s.name for s in steps])
             self.assertEqual(S.schedule(two).cycles, S.schedule(S.stream(steps, 2)).cycles)
 
+    def test_a_stream_never_reads_into_a_slot_another_token_holds(self) -> None:
+        # The state slots are shared by every token in a stream.  From a
+        # token's read into a slot to its write-back the slot is that token's:
+        # anything another token does to it in between is the first token's
+        # update running on the wrong context's state.  Only the full-size
+        # merge ever did it -- three times a token in a stream of three -- so
+        # the small configurations' bit-exact streams could not see it.
+        from fixed_llm_poc import ASICLMConfig
+        cfg = ASICLMConfig.qwen3_5_9b()
+        mm = MemoryMap.from_config(cfg)
+        merged = S.stream(S.recurrent_program(cfg, None, TileSpec(), mm), 3)
+        held: dict[str, int] = {}
+        for step in merged:
+            for name in (*step.src, *step.dst):
+                name = S._plain(name)
+                if not name.startswith(S.SHARED_PREFIX):
+                    continue
+                if name in held:
+                    self.assertEqual(held[name], step.token, f"{step.name} of token {step.token} in a slot token {held[name]} holds")
+                if step.unit == "mem" and name in step.dst:
+                    held[name] = step.token
+                elif step.unit == "mem" and name in step.src:
+                    del held[name]
+
 
 class ProgramTest(unittest.TestCase):
     """The programs reproduce the integer layers bit for bit on the tiny geometry."""
