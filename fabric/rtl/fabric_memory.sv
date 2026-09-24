@@ -516,11 +516,19 @@ endmodule
 // ---------------------------------------------------------------------------
 // Record reader: each request names `count` consecutive key-then-value
 // records of one KV head (a page of the head-major window, or one block
-// record); they are read in one burst into a buffer of MAXR records,
+// record); they are read in one burst into a ring of 2*MAXR records,
 // unpacked from KV_BITS to int8, and streamed record by record to the
 // attention core as HD/L key beats (kind 2) then HD/L value beats (kind 3),
 // honouring its ready.  Requests arrive on a valid/ready queue; rec_done
 // pulses per record.
+//
+// A record streams out as soon as it has arrived, under the arrival of the
+// ones after it, and the next request is taken as soon as the last one's
+// records have all arrived and the ring has room for it -- so its port
+// latency and its first record's arrival run under this one's stream too.
+// With room for one request only, each request's latency and first record
+// were the stream stopped: at the 9B geometry 96 requests a group, a page
+// of 8 window records or one block each, about 25 cycles apiece.
 // ---------------------------------------------------------------------------
 module fabric_record_reader #(
     parameter int DW      = 128,
@@ -551,24 +559,28 @@ module fabric_record_reader #(
     localparam int REC_BEATS  = 2 * HALF_BEATS;
     localparam int EPB        = DW / KV_BITS;             // elements per beat
     localparam int OUT_BEATS  = 2 * (HD / L);
+    localparam int CAP        = 2 * MAXR;                  // records the ring holds
     localparam int BW         = $clog2(REC_BEATS) + 1;
     localparam int OW         = $clog2(OUT_BEATS) + 1;
     localparam int RW         = $clog2(MAXR) + 1;
+    localparam int CW         = $clog2(CAP) + 1;
     // The records are a memory, not a register array.  Read as registers,
-    // "record rrec, beat ob" is one mux over MAXR * 2 * HD bytes whose first
+    // "record rslot, beat ob" is one mux over the ring's bytes whose first
     // select bit drives five hundred loads -- two of the unit's two and a half
     // nanoseconds -- and in silicon this is a small SRAM anyway.  Its word is
     // the beat that arrives, so a write is a word; a beat out is L of the
     // word's bytes, and the address leads the data by a cycle.
     localparam int MW         = EPB * 8;                   // memory word: one unpacked beat
     localparam int OPW        = (EPB > L) ? EPB / L : 1;   // out beats a word holds
-    localparam int MD         = MAXR * REC_BEATS;
+    localparam int MD         = CAP * REC_BEATS;
     localparam int MAW        = (MD > 1) ? $clog2(MD) : 1;
-    reg              busy, inflight, emitting;
+    reg              inflight, emitting;
     reg [BW-1:0]     beat;
     reg [OW-1:0]     ob;
-    reg [RW-1:0]     count, wrec, rrec;                    // records in the request, filled, emitted
-    assign addr_ready = !busy;
+    reg [RW-1:0]     left;                                 // records of the request still to arrive
+    reg [CW-1:0]     wslot, rslot, filled;                 // ring slots being filled and emitted; arrived, not yet out
+    // A request is taken when the last one has arrived and its records fit.
+    assign addr_ready = !req_valid && !inflight && (filled + addr_count <= CAP);
     // Unpack one beat to EPB int8 elements.
     integer e;
     reg [EPB*8-1:0] unpacked;
@@ -578,7 +590,9 @@ module fabric_record_reader #(
             else              unpacked[e*8 +: 8] = {rdata[e*4 +: 4], 4'b0};
     end
     wire out_fire = out_valid && out_ready;
-    wire have_rec = (wrec != rrec);                        // a filled record awaits emission
+    wire have_rec = (filled != 0);                         // an arrived record awaits emission
+    wire arrived  = inflight && rdata_valid && (beat == REC_BEATS - 1);
+    wire retired  = !emitting && out_fire;
     // The beat the memory is asked for is the one that will be wanted: the
     // next if this cycle takes a word, the first if emission starts here.
     // Each half of a record starts at a word of its own -- HD need not be a
@@ -586,36 +600,38 @@ module fabric_record_reader #(
     // the beats that arrive are what the halves are padded to.
     localparam int HB2 = OUT_BEATS / 2;                    // out beats in a half
     wire            take   = emitting && (!out_valid || out_fire);
-    wire            begins = busy && !emitting && !out_valid && have_rec;
+    wire            begins = !emitting && !out_valid && have_rec;
     wire [OW-1:0]   ob_a   = begins ? {OW{1'b0}}
                                     : ((take && ob != OUT_BEATS - 1) ? ob + 1'b1 : ob);
     wire            hi_a   = (ob_a >= HB2);
     wire [OW-1:0]   eo_a   = hi_a ? (ob_a - HB2[OW-1:0]) : ob_a;
-    wire [MAW-1:0]  rd_w   = (rrec * REC_BEATS + (hi_a ? HALF_BEATS : 0) + (eo_a * L) / EPB);
+    wire [MAW-1:0]  rd_w   = (rslot * REC_BEATS + (hi_a ? HALF_BEATS : 0) + (eo_a * L) / EPB);
     wire [OW-1:0]   eo     = (ob >= HB2) ? (ob - HB2[OW-1:0]) : ob;
-    wire [MAW-1:0]  wr_w   = (wrec * REC_BEATS + beat);
+    wire [MAW-1:0]  wr_w   = (wslot * REC_BEATS + beat);
     wire [MW-1:0]   rec_q;
     fabric_sram #(.W(MW), .D(MD), .NRD(1), .NWR(1), .MB(MW)) u_recs (
         .clk(clk), .rd_en(1'b1), .rd_addr(rd_w), .rd_data(rec_q),
         .wr_en(inflight && rdata_valid), .wr_addr(wr_w), .wr_data(unpacked), .wr_mask(1'b1));
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            busy <= 1'b0; inflight <= 1'b0; emitting <= 1'b0; beat <= 0; ob <= 0; count <= 0; wrec <= 0; rrec <= 0;
+            inflight <= 1'b0; emitting <= 1'b0; beat <= 0; ob <= 0; left <= 0; wslot <= 0; rslot <= 0; filled <= 0;
             req_valid <= 1'b0; req_addr <= 0; req_beats <= 0; out_valid <= 1'b0; rec_done <= 1'b0;
         end else begin
             rec_done <= 1'b0;
-            if (!busy && addr_valid) begin
-                busy <= 1'b1; req_valid <= 1'b1; req_addr <= addr; req_beats <= addr_count * REC_BEATS;
-                count <= addr_count[RW-1:0]; beat <= 0; wrec <= 0; rrec <= 0;
+            if (addr_valid && addr_ready) begin
+                req_valid <= 1'b1; req_addr <= addr; req_beats <= addr_count * REC_BEATS;
+                left <= addr_count[RW-1:0]; beat <= 0;
             end
             if (req_valid && req_ready) begin req_valid <= 1'b0; inflight <= 1'b1; end
             if (inflight && rdata_valid) begin
-                // Beat b of record wrec is word wrec*REC_BEATS + b.
+                // Beat b of the record in ring slot wslot is word wslot*REC_BEATS + b.
                 if (beat == REC_BEATS - 1) begin
-                    beat <= 0; wrec <= wrec + 1'b1;
-                    if (wrec == count - 1) inflight <= 1'b0;
+                    beat <= 0; wslot <= (wslot == CAP - 1) ? 0 : wslot + 1'b1;
+                    left <= left - 1'b1;
+                    if (left == 1) inflight <= 1'b0;
                 end else beat <= beat + 1'b1;
             end
+            filled <= filled + arrived - retired;
             if (emitting) begin
                 if (!out_valid || out_fire) begin
                     out_valid <= 1'b1;
@@ -627,9 +643,8 @@ module fabric_record_reader #(
             end else if (out_fire) begin
                 out_valid <= 1'b0;
                 rec_done <= 1'b1;
-                rrec <= rrec + 1'b1;
-                if (rrec == count - 1) busy <= 1'b0;
-            end else if (busy && !out_valid && have_rec) begin
+                rslot <= (rslot == CAP - 1) ? 0 : rslot + 1'b1;
+            end else if (have_rec) begin
                 emitting <= 1'b1; ob <= 0;
             end
         end

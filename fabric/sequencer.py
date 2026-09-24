@@ -164,11 +164,14 @@ class Timing:
     mem_read_latency: int = 8
     mem_write_latency: int = 6
     reader_latency: int = 8
+    reader_arrive: int = 5           # a request taken to its first beat in the ring (the testbench memory: 2 cycles)
+    reader_gap: int = 2              # a record's emission: the cycle it starts and the one it retires
+    reader_reissue: int = 2          # the rows loop: one request taken to the next offered
     scan_latency: int = 19           # the query in and its codes, before any record is read
     scan_request: int = 5
     append_beat: int = 3             # the append's own write path, a beat at a time
-    append_latency: int = 59
-    append_index_latency: int = 34   # the block's index projection, its codes and its record
+    append_latency: int = 58
+    append_index_latency: int = 35   # the block's index projection, its codes and its record
     # The memory behind the port.  ``devices`` of 0 is the testbench's own
     # model, a beat a cycle after a short latency, which is what the engine
     # tests run against and what the constants above are measured on.  With
@@ -251,12 +254,41 @@ class Timing:
         """The beat mover: memory to the vector buffer, or back."""
         return (self.port_write_beat * beats + self.mem_write_latency) if write else (beats + self.mem_read_latency)
 
-    def read_records(self, records: int, requests: int, record_beats: int, head_dim: int) -> int:
-        """The record reader: ``records`` key and value records in ``requests``
-        bursts.  A record's beats in and its two rows out are not overlapped,
-        so they add rather than the larger of them standing."""
-        out = 2 * (head_dim // self.head_lanes(head_dim))
-        return self.reader_latency + records * (record_beats + out) + self.port_request * requests
+    def read_records(self, requests: list[int], record_beats: int, head_dim: int, maxr: int) -> int:
+        """The record reader over ``requests`` (the records in each), cycle for
+        cycle (rtl/fabric_memory.sv).  Two stages with a ring of ``2 * maxr``
+        records between them: a request's records arrive ``reader_arrive``
+        after it is taken and then a record's beats apart, and the next is
+        taken once they have all arrived and the ring has room for it; a
+        record goes out when it has arrived and the one before it is out,
+        its two rows a beat a cycle and ``reader_gap`` more.  Which stage
+        binds depends on the geometry: at the 9B one the rows out (34
+        cycles a record) are twice the beats in, and at the tests' small
+        ones a request's arrival is the longer.
+
+        This used to charge every record its beats in and its rows out one
+        after the other, and a request's latency on top.  The tests' small
+        geometries cannot tell that from the reader -- a record's two beats
+        in there are exactly the two cycles its emission starts and retires
+        in -- but at the 9B one it was 48 cycles a record where the reader
+        takes 34, and it counted a window of 512 records as one request
+        where the engine takes it a page of eight at a time."""
+        out = 2 * (head_dim // self.head_lanes(head_dim)) + self.reader_gap
+        cap = 2 * maxr
+        taken, prev, done, arrived = 0, None, [], 0
+        for count in requests:
+            if prev is not None:
+                # Taken when the last request is in and the ring has room.
+                taken = max(prev, taken + self.reader_reissue)
+                need = arrived + count - cap                  # records that must be out first
+                if need > 0:
+                    taken = max(taken, done[need - 1] + 1)
+            for k in range(count):
+                arrive = taken + self.reader_arrive + (k + 1) * record_beats
+                done.append(max(done[-1] if done else 0, arrive) + out)
+            arrived += count
+            prev = taken + self.reader_arrive + count * record_beats
+        return self.reader_latency + (done[-1] if done else 0)
 
     def scan(self, records: int, record_beats: int, selected: int) -> int:
         """The index scan: the query's codes, then every eligible record read in
@@ -308,12 +340,17 @@ def _plain(name: str) -> str:
     return name[1:] if name.startswith("+") else name
 
 
-def window_bursts(pos: int, window: int) -> int:
-    """Bursts the window records of one head take.  The window is a ring of
-    ``window`` slots written at ``pos % window``, so a context that has
-    wrapped past its start hands the reader two runs rather than one."""
-    first = max(0, pos - window + 1)
-    return 1 if (first % window) + (pos - first + 1) <= window else 2
+def window_requests(pos: int, window: int, page: int) -> list[int]:
+    """The reader requests one head's window records take, as the engine
+    issues them: the window is a ring of ``window`` slots written at
+    ``pos % window``, read as runs that stop at its wrap, each a page of
+    ``page`` records at a time."""
+    p, out = max(0, pos - window + 1), []
+    while p <= pos:
+        count = min(pos - p + 1, window - p % window, page)
+        out.append(count)
+        p += count
+    return out
 
 
 def pass_matrices(cfg, recurrent: bool) -> list[list[tuple[int, int, bool]]]:
@@ -771,7 +808,8 @@ def global_program(cfg, c: L.GlobalConsts | None, spec: TileSpec, mm: MemoryMap,
                 k_rows, v_rows = (e["k_rows"][i], e["v_rows"][i]) if chunk > 1 else (e["k_rows"], e["v_rows"])
                 put(e, f"rows[{n}]", i, (k_rows[n], v_rows[n]))
             add(tok(f"mem.rows[{n}]", i), "mem", ("sel",), (_contrib(f"rows[{n}]", chunk),),
-                t.read_records(rows, window_bursts(p, mm.local_window) + n_blocks, rec_beats, hd),
+                t.read_records(window_requests(p, mm.local_window, mm.window_burst_records) + [1] * n_blocks, rec_beats, hd,
+                               mm.window_burst_records),
                 mem_rows, nbytes=window_bytes + block_bytes,
                 ops=operands(src=("sel", i * sel_bytes), dst=(f"rows[{n}]", i * rows_bytes), a2=n, a3=ctx, arg=[(0, MEM_ROWS), (4, p)], len=rows))
 
