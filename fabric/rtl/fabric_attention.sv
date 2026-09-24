@@ -902,6 +902,29 @@ module fabric_attention #(
     // 34 bits by 16 is 51, not 56: the five spare bits were a wider barrel
     // shifter and five more bits of saturate in O8, on the core's worst path.
     reg signed [50:0] oq7 [0:L-1];
+    // The gate's product and the output scale's, built at the widths they
+    // have.  Both were written as `a * b` into a register as wide as the
+    // product, and the assignment sets the width of both operands: 16 by 16
+    // evaluated as 34 by 34, and 34 by 16 as 51 by 51.  The gate's own
+    // multiply had the same shape and took 45 ps off the core when it was
+    // built this way; at the real elaboration these two are the core's worst
+    // and fifth-worst paths.  The widths of the registers are unchanged --
+    // narrowing them measured worse -- only the multipliers are.
+    wire signed [33:0] og6_n [0:L-1];
+    wire signed [50:0] oq7_n [0:L-1];
+    genvar gom;
+    generate
+        for (gom = 0; gom < L; gom = gom + 1) begin : g_om
+            wire [33:0] o6s, o6c;
+            fabric_mul_cs #(.AW(16), .BW(16), .PW(34), .ADD(1)) u_o6 (
+                .a(w5[gom*16 +: 16]), .b(sg5[gom*16 +: 16]), .addend(34'b0), .s(o6s), .c(o6c));
+            fabric_cs_resolve #(.W(34)) u_o6r (.s(o6s), .c(o6c), .y(og6_n[gom]));
+            wire [50:0] o7s, o7c;
+            fabric_mul_cs #(.AW(34), .BW(16), .PW(51), .ADD(1)) u_o7 (
+                .a(og6[gom]), .b(mult_o), .addend(51'b0), .s(o7s), .c(o7c));
+            fabric_cs_resolve #(.W(51)) u_o7r (.s(o7s), .c(o7c), .y(oq7_n[gom]));
+        end
+    endgenerate
     integer ol;
     always @(posedge clk) begin
         ov2 <= ov1;
@@ -912,10 +935,10 @@ module fabric_attention #(
         tg2  <= tg2a;
         o6v <= sgv[0];
         for (ol = 0; ol < L; ol = ol + 1)
-            og6[ol] <= $signed({{18{w5[ol*16+15]}}, w5[ol*16 +: 16]}) * $signed({18'b0, sg5[ol*16 +: 16]});
+            og6[ol] <= og6_n[ol];
         o7v <= o6v;
         for (ol = 0; ol < L; ol = ol + 1)
-            oq7[ol] <= $signed({{17{og6[ol][33]}}, og6[ol]}) * $signed({35'b0, mult_o});
+            oq7[ol] <= oq7_n[ol];
         out_valid <= o7v;
         out_data  <= od_n;
     end
