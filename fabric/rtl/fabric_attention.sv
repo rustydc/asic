@@ -338,7 +338,7 @@ module fabric_attention #(
     // State.
     localparam [3:0] S_ACCEPT = 4'd0, S_EXP = 4'd1, S_APPLY = 4'd2, S_VALUE = 4'd3,
                      S_RECIP = 4'd4, S_OUT = 4'd5, S_DONE = 4'd6, S_EXP2 = 4'd7,
-                     S_EXP1B = 4'd8, S_ACCW = 4'd9;
+                     S_EXP1B = 4'd8, S_ACCW = 4'd9, S_ACCW2 = 4'd10;
     reg [3:0] state;
     reg signed [47:0] sm [0:G-1];
     assign in_ready = (state == S_ACCEPT) || (state == S_VALUE);
@@ -372,6 +372,7 @@ module fabric_attention #(
     reg [QW-1:0] q_rdq [0:G-1];
     reg [L*8-1:0] in_dataq;
     reg           accv;                    // a key beat landed last cycle
+    reg           accv2;                   // its products landed last cycle
     // The sixteen products stay products.  Expanding them into partial
     // products and reducing all of them in one tree does take the multiplies'
     // carry-propagate adds off the path -- but those sixteen adds are in
@@ -379,13 +380,20 @@ module fabric_attention #(
     // is twelve layers where a multiply and a tree over sixteen operands are
     // one add and seven.  A hundred picoseconds at most, bought with two and
     // a half times the logic in this block and five times the simulation.
+    //
+    // They are registered before the tree, though.  A multiply and an L+2
+    // operand tree in one cycle were 1,834 ps at the real geometry, the
+    // core's third-worst path; split, the tree waits a cycle for its last
+    // beat, which is one more cycle of stall on each key row (S_ACCW2).
     genvar gc, gl;
     generate
         for (gc = 0; gc < G; gc = gc + 1) begin : g_contrib
             wire [(L+2)*SCW-1:0] cops;
             for (gl = 0; gl < L; gl = gl + 1) begin : g_cp
                 wire signed [15:0] pr = $signed(q_rdq[gc][gl*8 +: 8]) * $signed(in_dataq[gl*8 +: 8]);
-                assign cops[gl*SCW +: SCW] = {{(SCW-16){pr[15]}}, pr};
+                reg  signed [15:0] prq;
+                always @(posedge clk) prq <= pr;
+                assign cops[gl*SCW +: SCW] = {{(SCW-16){prq[15]}}, prq};
             end
             assign cops[L*SCW +: SCW]     = score_s[gc];
             assign cops[(L+1)*SCW +: SCW] = {score_c[gc][SCW-2:0], 1'b0};
@@ -562,9 +570,19 @@ module fabric_attention #(
     // round(x + 2^15 + A*2^16, 16) and the shift is by a constant, so the
     // multiply's partial products, the rounding constant and A in its place
     // are operands of one carry-save tree and the stage resolves it once.
+    //
+    // Its factors are registered first.  The exponential's output is logic
+    // after its last register, and the select and this multiply behind it
+    // were one of the core's worst paths at the real geometry, 1,782 ps.
+    // Nothing reads l for cycles after S_APPLY -- the value beats come
+    // first, then at least a cycle of S_ACCEPT before a finish can take it
+    // -- so the update lands a cycle later for free.
     localparam int LPW = LW + 18;
     wire [15:0]   l_mul [0:G-1];
     wire [15:0]   l_add [0:G-1];
+    reg  [15:0]   lm_r [0:G-1];
+    reg  [15:0]   la_r [0:G-1];
+    reg           l_up;
     wire [LW-1:0] l_next [0:G-1];
     genvar glr;
     generate
@@ -573,10 +591,10 @@ module fabric_attention #(
             assign l_add[glr] = newmax[glr] ? 16'hFFFF : exp_y[glr];
             wire [2*LPW-1:0] lad;
             assign lad[0 +: LPW]   = {{(LPW-16){1'b0}}, 1'b1, 15'b0};            // the round's 2^15
-            assign lad[LPW +: LPW] = {{(LPW-32){1'b0}}, l_add[glr], 16'b0};      // A, above the shift
+            assign lad[LPW +: LPW] = {{(LPW-32){1'b0}}, la_r[glr], 16'b0};       // A, above the shift
             wire [LPW-1:0] ls, lc;
             fabric_mul_cs #(.AW(LW+1), .BW(16), .PW(LPW), .ADD(2)) u_l (
-                .a({1'b0, l_r[glr]}), .b(l_mul[glr]), .addend(lad), .s(ls), .c(lc));
+                .a({1'b0, l_r[glr]}), .b(lm_r[glr]), .addend(lad), .s(ls), .c(lc));
             wire [LPW-1:0] lq = ls + {lc[LPW-2:0], 1'b0};
             assign l_next[glr] = lq[LW+15:16];
         end
@@ -764,7 +782,7 @@ module fabric_attention #(
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             state <= S_ACCEPT; beat <= 0; head <= 0; exp_go <= 1'b0; rc_start <= 1'b0; done <= 1'b0;
-            accv <= 1'b0;
+            accv <= 1'b0; accv2 <= 1'b0; l_up <= 1'b0;
             ov1 <= 1'b0; out_go <= 1'b0; ohead <= 0; obeat <= 0; drain <= 0; vv <= 1'b0; o_we <= 1'b0; o_seen <= 1'b0;
             for (g = 0; g < G; g = g + 1) begin m_valid[g] <= 1'b0; l_r[g] <= 0; score_s[g] <= 0; score_c[g] <= 0; end
         end else begin
@@ -791,12 +809,16 @@ module fabric_attention #(
             for (g = 0; g < G; g = g + 1) q_rdq[g] <= q_rd[g];
             in_dataq <= in_data;
             accv <= (state == S_ACCEPT) && !finish && in_valid && (in_kind == 2'd2);
-            if (accv)
+            accv2 <= accv;
+            l_up <= 1'b0;
+            if (l_up)
+                for (g = 0; g < G; g = g + 1) l_r[g] <= l_next[g];
+            if (accv2)
                 for (g = 0; g < G; g = g + 1) begin
                     score_s[g] <= score_sn[g]; score_c[g] <= score_cn[g];
                 end
             if (start) begin
-                state <= S_ACCEPT; beat <= 0; head <= 0; o_seen <= 1'b0; accv <= 1'b0;
+                state <= S_ACCEPT; beat <= 0; head <= 0; o_seen <= 1'b0; accv <= 1'b0; accv2 <= 1'b0; l_up <= 1'b0;
                 for (g = 0; g < G; g = g + 1) begin
                     m_valid[g] <= 1'b0; l_r[g] <= 0; score_s[g] <= 0; score_c[g] <= 0;
                 end
@@ -817,7 +839,11 @@ module fabric_attention #(
                     end
                 end
                 S_ACCW: begin
-                    // The last key beat's products land this cycle.
+                    // The last key beat's products are formed this cycle.
+                    state <= S_ACCW2;
+                end
+                S_ACCW2: begin
+                    // And accumulated this one.
                     state <= S_EXP;
                 end
                 S_EXP: begin
@@ -854,9 +880,10 @@ module fabric_attention #(
                         for (g = 0; g < G; g = g + 1) begin
                             f_r[g] <= newmax[g] ? (m_valid[g] ? exp_y[g] : 16'hFFFF) : 16'hFFFF;
                             p_r[g] <= newmax[g] ? 16'hFFFF : exp_y[g];
-                            l_r[g] <= l_next[g];
+                            lm_r[g] <= l_mul[g]; la_r[g] <= l_add[g];
                             m_valid[g] <= 1'b1;
                         end
+                        l_up <= 1'b1;
                         state <= S_VALUE;
                         beat <= 0;
                     end

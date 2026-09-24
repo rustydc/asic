@@ -142,7 +142,7 @@ class Timing:
     residual_latency: int = 6
     rotary_latency: int = 3
     rotary_table_latency: int = 8
-    attn_row_stall: int = 7          # in_ready drops while the core exponentiates a key row
+    attn_row_stall: int = 8          # in_ready drops while the core exponentiates a key row
     attn_out_latency: int = 27
     attn_start_latency: int = 2
     # The memory the unit talks to.  ``port_*`` is one request of the port
