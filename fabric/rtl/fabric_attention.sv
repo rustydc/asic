@@ -370,7 +370,20 @@ module fabric_attention #(
     // macro read has a cycle of its own: it is 512 ps of one, and everything
     // below used to share it.
     reg [QW-1:0] q_rdq [0:G-1];
-    reg [L*8-1:0] in_dataq;
+    // The beat is registered once per consumer: each head's key products,
+    // each head's value products and the gate's write.  One register for
+    // all of them drove 104 loads a bit (168 fF, 690 ps before any logic)
+    // and made the gate's multiply the core's worst path, 1,727 ps.  Kept
+    // copies, so synthesis cannot merge them back.
+    wire [L*8-1:0] in_dq_s [0:G-1], in_dq_v [0:G-1], in_dq_g;
+    genvar gdq;
+    generate
+        for (gdq = 0; gdq < G; gdq = gdq + 1) begin : g_dq
+            fabric_const_copy #(.W(L*8)) u_s (.clk(clk), .d(in_data), .q(in_dq_s[gdq]));
+            fabric_const_copy #(.W(L*8)) u_v (.clk(clk), .d(in_data), .q(in_dq_v[gdq]));
+        end
+    endgenerate
+    fabric_const_copy #(.W(L*8)) u_dq_g (.clk(clk), .d(in_data), .q(in_dq_g));
     reg           accv;                    // a key beat landed last cycle
     reg           accv2;                   // its products landed last cycle
     // The sixteen products stay products.  Expanding them into partial
@@ -390,7 +403,7 @@ module fabric_attention #(
         for (gc = 0; gc < G; gc = gc + 1) begin : g_contrib
             wire [(L+2)*SCW-1:0] cops;
             for (gl = 0; gl < L; gl = gl + 1) begin : g_cp
-                wire signed [15:0] pr = $signed(q_rdq[gc][gl*8 +: 8]) * $signed(in_dataq[gl*8 +: 8]);
+                wire signed [15:0] pr = $signed(q_rdq[gc][gl*8 +: 8]) * $signed(in_dq_s[gc][gl*8 +: 8]);
                 reg  signed [15:0] prq;
                 always @(posedge clk) prq <= pr;
                 assign cops[gl*SCW +: SCW] = {{(SCW-16){prq[15]}}, prq};
@@ -530,7 +543,7 @@ module fabric_attention #(
         for (ggm = 0; ggm < L; ggm = ggm + 1) begin : g_gm
             wire [23:0] gs, gc;
             fabric_mul_cs #(.AW(8), .BW(16), .PW(24), .ADD(1)) u_gm (
-                .a(in_dataq[ggm*8 +: 8]), .b(mult_gate), .addend(24'b0), .s(gs), .c(gc));
+                .a(in_dq_g[ggm*8 +: 8]), .b(mult_gate), .addend(24'b0), .s(gs), .c(gc));
             fabric_cs_resolve #(.W(24)) u_gmr (.s(gs), .c(gc), .y(gp2_n[ggm]));
             fabric_rnd_sat_shift #(.W(24), .SW(6)) u_tgs (
                 .v(gp2[ggm]), .sh(sh_gate), .sv(gsv3_n[ggm]), .rb(grb3_n[ggm]));
@@ -728,7 +741,7 @@ module fabric_attention #(
                     .a(osel), .b(f_r_c[gv*L + lv]), .addend({{(VPW-16){1'b0}}, 1'b1, 15'b0}),
                     .s(va_sn[gv][lv]), .c(va_cn[gv][lv]));
                 fabric_mul_cs #(.AW(8), .BW(16), .PW(BPW), .ADD(1)) u_vb (
-                    .a(in_dataq[lv*8 +: 8]), .b(p_r_c[gv*L + lv]), .addend({BPW{1'b0}}),
+                    .a(in_dq_v[gv][lv*8 +: 8]), .b(p_r_c[gv*L + lv]), .addend({BPW{1'b0}}),
                     .s(vb_sn[gv][lv]), .c(vb_cn[gv][lv]));
                 // The two pairs reduce to one and that one add is the whole
                 // of the next cycle's arithmetic.
@@ -848,7 +861,6 @@ module fabric_attention #(
             // accumulate reads them the cycle after, and its own valid says
             // a key beat landed.
             for (g = 0; g < G; g = g + 1) q_rdq[g] <= q_rd[g];
-            in_dataq <= in_data;
             accv <= (state == S_ACCEPT) && !finish && in_valid && (in_kind == 2'd2);
             accv2 <= accv;
             l_up <= 1'b0;
