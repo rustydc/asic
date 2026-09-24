@@ -525,6 +525,8 @@ module fabric_delta_state8 #(
     // lane keeps that off one flop's fanout, as for the shift amounts.
     wire [15:0] g1_l [0:VL-1];
     wire [15:0]    b_r_l [0:VL-1];
+    wire [15:0]    gren_l [0:VL-1];
+    wire           resc_l [0:VL-1];
     wire [VL*50-1:0] cms_w, cmc_w;
     genvar gv;
     generate
@@ -539,6 +541,12 @@ module fabric_delta_state8 #(
             // arithmetic started -- the same shape as the shifts and the
             // scale beside it, and the same fix.
             fabric_const_copy #(.W(16)) u_b (.clk(clk), .d(b_r),   .q(b_r_l[gv]));
+            // The keep's scale multiplies every lane and its flag selects
+            // every lane's mux: 112 and 149 loads on two flops, which is the
+            // same shape again.  Both are settled well before pass 1 reaches
+            // A3, as `g1` beside them is.
+            fabric_const_copy #(.W(16)) u_gr (.clk(clk), .d(gren),    .q(gren_l[gv]));
+            fabric_const_copy #(.W(1))  u_rs (.clk(clk), .d(rescale), .q(resc_l[gv]));
         end
     endgenerate
     wire           sat_in = ({16'd0, nsat_in} > ((K * V) >> SAT_SHIFT));
@@ -843,7 +851,7 @@ module fabric_delta_state8 #(
             if (va2)
                 for (u = 0; u < VL; u = u + 1) begin
                     j = sa2 * VL + u;
-                    tr = rescale ? fx_sat((rs2[u] + rndr) >>> shr_l[u], 8)
+                    tr = resc_l[u] ? fx_sat((rs2[u] + rndr) >>> shr_l[u], 8)
                                  : $signed({{56{rowa2[j*8+7]}}, rowa2[j*8 +: 8]});
                     tr3[j*8 +: 8] <= tr[7:0];   // a register, not a blocking temp: the macro samples it
                 end
@@ -851,7 +859,7 @@ module fabric_delta_state8 #(
             if (va1)
                 for (u = 0; u < VL; u = u + 1) begin
                     j = sa1 * VL + u;
-                    rs2[u] = $signed(rowa1[j*8 +: 8]) * $signed({8'b0, gren});
+                    rs2[u] = $signed(rowa1[j*8 +: 8]) * $signed({8'b0, gren_l[u]});
                 end
             // A row is VL lanes at a time: the issue holds `va1` for SL cycles
             // and walks the slice, which is the rate the row arrived at.

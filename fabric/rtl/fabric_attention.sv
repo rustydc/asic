@@ -57,8 +57,15 @@ module fabric_rotary_table #(
     reg          v0, v1, v2;
     reg [JW-1:0] j0, j1, j2;
     wire [15:0]  s_w, c_w;
-    fabric_lut #(.IB(10), .FB(6), .W(16), .FILE({LUT_DIR, "lut_sin.hex"})) u_sin (.clk(clk), .u(turn), .y(s_w));
-    fabric_lut #(.IB(10), .FB(6), .W(16), .FILE({LUT_DIR, "lut_sin.hex"})) u_cos (.clk(clk), .u(turn + 16'h4000), .y(c_w));
+    // A copy of the turn per table.  One flop feeding both tables' address
+    // decodes and both fractions is 227 loads, and a flop's output is the one
+    // net the mapper cannot buffer.  Both copies take the same next value, so
+    // they and `turn` are one register.
+    wire [15:0] turn_s, turn_c;
+    fabric_const_copy #(.W(16)) u_ts (.clk(clk), .d(prod[31:16]), .q(turn_s));
+    fabric_const_copy #(.W(16)) u_tc (.clk(clk), .d(prod[31:16]), .q(turn_c));
+    fabric_lut #(.IB(10), .FB(6), .W(16), .FILE({LUT_DIR, "lut_sin.hex"})) u_sin (.clk(clk), .u(turn_s), .y(s_w));
+    fabric_lut #(.IB(10), .FB(6), .W(16), .FILE({LUT_DIR, "lut_sin.hex"})) u_cos (.clk(clk), .u(turn_c + 16'h4000), .y(c_w));
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             busy <= 1'b0; j <= 0; v0 <= 1'b0; v1 <= 1'b0; v2 <= 1'b0; done <= 1'b0;
