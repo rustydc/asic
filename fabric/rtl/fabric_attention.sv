@@ -935,18 +935,23 @@ module fabric_attention #(
                 end
                 S_DONE: begin
                     // Let the output pipeline drain before done: O1, O2, the
-                    // sigmoid's three and the three after it.  Its own
+                    // sigmoid's three and the four after it.  Its own
                     // counter, since obeat only spans a head's beats.
                     drain <= drain + 1'b1;
-                    if (drain == 4'd12) begin done <= 1'b1; state <= S_ACCEPT; obeat <= 0; drain <= 0; end
+                    if (drain == 4'd13) begin done <= 1'b1; state <= S_ACCEPT; obeat <= 0; drain <= 0; end
                 end
                 default: state <= S_ACCEPT;
             endcase
         end
     end
     // O2: the products' round and saturate.  O6 and O7: the gate's product
-    // and the output scale's, O8 the output's round.
-    reg               o6v, o7v;
+    // and the output scale's, O8 the output's shift and O9 its round.  In one
+    // stage the shift, round and saturate were 1,736 ps at the real geometry,
+    // the next path over the target once the four above it were split; the
+    // weight's round is two stages for the same reason.
+    reg               o6v, o7v, o8v;
+    reg signed [51:0] osv [0:L-1];
+    reg [L-1:0]       orb;
     reg signed [33:0] og6 [0:L-1];
     // 34 bits by 16 is 51, not 56: the five spare bits were a wider barrel
     // shifter and five more bits of saturate in O8, on the core's worst path.
@@ -988,7 +993,9 @@ module fabric_attention #(
         o7v <= o6v;
         for (ol = 0; ol < L; ol = ol + 1)
             oq7[ol] <= oq7_n[ol];
-        out_valid <= o7v;
+        o8v <= o7v;
+        for (ol = 0; ol < L; ol = ol + 1) begin osv[ol] <= osv_n[ol]; orb[ol] <= orb_n[ol]; end
+        out_valid <= o8v;
         out_data  <= od_n;
     end
     // The three rounds at the width their value has: 54, 24 and 56 bits, not
@@ -1001,6 +1008,8 @@ module fabric_attention #(
     wire [L-1:0]        wrb_n;
     wire [L*16-1:0] w2_n;
     wire [L*8-1:0]  od_n;
+    wire signed [51:0] osv_n [0:L-1];
+    wire [L-1:0]       orb_n;
     genvar go;
     generate
         for (go = 0; go < L; go = go + 1) begin : g_oq
@@ -1009,8 +1018,10 @@ module fabric_attention #(
                 .v(wm1q[go]), .sh(sh_w[go]), .sv(wsv_n[go]), .rb(wrb_n[go]));
             fabric_rnd_sat_round #(.W(VPW), .N(16)) u_w2 (
                 .sv(wsv[go]), .rb(wrb[go]), .y(w2_n[go*16 +: 16]));
-            fabric_rnd_sat #(.W(51), .SW(6), .N(8)) u_od (
-                .v(oq7[go]), .sh(sh_o), .y(od_n[go*8 +: 8]));
+            fabric_rnd_sat_shift #(.W(51), .SW(6)) u_os (
+                .v(oq7[go]), .sh(sh_o), .sv(osv_n[go]), .rb(orb_n[go]));
+            fabric_rnd_sat_round #(.W(51), .N(8)) u_od (
+                .sv(osv[go]), .rb(orb[go]), .y(od_n[go*8 +: 8]));
         end
     endgenerate
 endmodule
