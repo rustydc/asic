@@ -541,9 +541,20 @@ module fabric_delta_state8 #(
     integer        sl;
     wire           resc_l [0:VL-1];
     wire [VL*50-1:0] cms_w, cmc_w;
+    // `sa1` picks the lane's byte for every one of VL lanes, so it fans out
+    // to the whole row's worth of selects: 145 loads on one flop, and 662 ps
+    // of clock-to-output before a gate of the path has run -- a third of this
+    // unit's period.  A copy per lane, as the shifts and the gains take.  The
+    // next value is taken out of the always block so each copy latches the
+    // same one, which makes them and `sa1` a single register rather than a
+    // pipeline stage.
+    wire [SW-1:0] sa1_next = (va1 && sa1 != SL - 1) ? sa1 + 1'b1
+                           : ((phase == 4'd0 && row_in_valid) ? {SW{1'b0}} : sa1);
+    wire [SW-1:0] sa1_l [0:VL-1];
     genvar gv;
     generate
         for (gv = 0; gv < VL; gv = gv + 1) begin : g_sh
+            fabric_const_copy #(.W(SW)) u_sa (.clk(clk), .d(sa1_next), .q(sa1_l[gv]));
             fabric_const_copy #(.W(6))  u_p (.clk(clk), .d(shp),  .q(shp_l[gv]));
             fabric_const_copy #(.W(6))  u_c (.clk(clk), .d(shc),  .q(shc_l[gv]));
             fabric_const_copy #(.W(6))  u_y (.clk(clk), .d(shy),  .q(shy_l[gv]));
@@ -914,14 +925,15 @@ module fabric_delta_state8 #(
                     // at SL of one it folds away entirely.
                     rab = 0;
                     for (sl = 0; sl < SL; sl = sl + 1)
-                        if (sa1 == sl[SW-1:0]) rab = rowa1[(sl*VL + u)*8 +: 8];
+                        if (sa1_l[u] == sl[SW-1:0]) rab = rowa1[(sl*VL + u)*8 +: 8];
                     rs2[u] = $signed(rab) * $signed({8'b0, gren_l[u]});
                 end
             // A row is VL lanes at a time: the issue holds `va1` for SL cycles
             // and walks the slice, which is the rate the row arrived at.
-            if (va1 && sa1 != SL - 1) begin va1 <= 1'b1; sa1 <= sa1 + 1'b1; end
+            sa1 <= sa1_next;
+            if (va1 && sa1 != SL - 1) va1 <= 1'b1;
             else if (phase == 4'd0 && row_in_valid) begin
-                va1 <= 1'b1; sa1 <= 0; rowa1 <= row_in; ia1 <= wr; wr <= wr + 1'b1;
+                va1 <= 1'b1; rowa1 <= row_in; ia1 <= wr; wr <= wr + 1'b1;
             end
 
             if (start) begin
