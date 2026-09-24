@@ -524,6 +524,7 @@ module fabric_delta_state8 #(
     // The scale multiplies every lane's accumulator, twice over; a copy per
     // lane keeps that off one flop's fanout, as for the shift amounts.
     wire [15:0] g1_l [0:VL-1];
+    wire [15:0]    b_r_l [0:VL-1];
     wire [VL*50-1:0] cms_w, cmc_w;
     genvar gv;
     generate
@@ -533,6 +534,11 @@ module fabric_delta_state8 #(
             fabric_const_copy #(.W(6))  u_y (.clk(clk), .d(shy),  .q(shy_l[gv]));
             fabric_const_copy #(.W(6))  u_r (.clk(clk), .d(shr_), .q(shr_l[gv]));
             fabric_const_copy #(.W(16)) u_g (.clk(clk), .d(g1),   .q(g1_l[gv]));
+            // Beta multiplies every lane's difference, and one flop at 248
+            // loads and 394 fF was 1,021 of this unit's 2,688 ps before any
+            // arithmetic started -- the same shape as the shifts and the
+            // scale beside it, and the same fix.
+            fabric_const_copy #(.W(16)) u_b (.clk(clk), .d(b_r),   .q(b_r_l[gv]));
         end
     endgenerate
     wire           sat_in = ({16'd0, nsat_in} > ((K * V) >> SAT_SHIFT));
@@ -796,7 +802,7 @@ module fabric_delta_state8 #(
             if (phase == 4'd3) begin
                 for (u = 0; u < VL; u = u + 1) begin
                     j = ps * VL + u;
-                    bd[j] = $signed({16'b0, b_r}) * diff[j];
+                    bd[j] = $signed({16'b0, b_r_l[u]}) * diff[j];
                 end
                 if (ps == SL - 1) begin ps <= 0; phase <= 4'd4; end
                 else ps <= ps + 1'b1;
