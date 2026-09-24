@@ -383,7 +383,7 @@ module fabric_index_scan #(
     reg [IDW-1:0]    first;                                // the first block of the request
     reg [RW-1:0]     count, got;                           // records in the request, records finished
     reg [BW-1:0]     beat;
-    reg signed [31:0] acc;
+    reg [31:0] accs, accc;
     wire [IDW-1:0]   left = n_blocks - blk;
     wire [RW-1:0]    want = (left > RPB) ? RPB[RW-1:0] : left[RW-1:0];
     assign req_addr  = base + blk * REC;
@@ -445,7 +445,7 @@ module fabric_index_scan #(
     // at the accumulator's width: a product is a value and may be
     // sign-extended into it, where a carry-save pair may not.
     localparam int ACCW = 32;
-    wire [(CPB+1)*ACCW-1:0] aops;
+    wire [(CPB+2)*ACCW-1:0] aops;
     genvar ga;
     generate
         for (ga = 0; ga < CPB; ga = ga + 1) begin : g_aop
@@ -453,34 +453,52 @@ module fabric_index_scan #(
                 {{(ACCW-PWID){prod[ga*PWID + PWID-1]}}, prod[ga*PWID +: PWID]};
         end
     endgenerate
-    assign aops[CPB*ACCW +: ACCW] = acc;
+    assign aops[CPB*ACCW +: ACCW]     = accs;
+    assign aops[(CPB+1)*ACCW +: ACCW] = {accc[ACCW-2:0], 1'b0};
     wire [ACCW-1:0] asum, acar;
-    fabric_csa_tree #(.N(CPB+1), .W(ACCW)) u_acc (.ops(aops), .s(asum), .c(acar));
-    wire signed [ACCW-1:0] acc_next = $signed(asum) + $signed({acar[ACCW-2:0], 1'b0});
-    // A 32-bit accumulator by an 8-bit scale is 40 bits, and 32 are kept.
-    wire signed [39:0] final_score = acc * $signed({1'b0, rdata[7:0]});
+    fabric_csa_tree #(.N(CPB+2), .W(ACCW)) u_acc (.ops(aops), .s(asum), .c(acar));
+    // The accumulator stays carry-save, so the beat has no resolve at all --
+    // it was 600 of that stage's 2,008 ps, behind the select and the
+    // products.  The score keeps only 32 bits, and accs + 2*accc is the
+    // accumulator modulo 2^32, so scaling the pair and scaling the number
+    // agree there: the wrap that makes a carry-save multiplicand wrong in
+    // general is exactly what is discarded here.  Two products of the same
+    // 8-bit scale, merged and resolved once.
+    wire [ACCW-1:0] fs0, fc0, fs1, fc1;
+    fabric_mul_cs #(.AW(ACCW), .BW(8), .PW(ACCW), .ADD(1)) u_f0 (
+        .a(accs), .b(rdata[7:0]), .addend({ACCW{1'b0}}), .s(fs0), .c(fc0));
+    fabric_mul_cs #(.AW(ACCW), .BW(8), .PW(ACCW), .ADD(1)) u_f1 (
+        .a({accc[ACCW-2:0], 1'b0}), .b(rdata[7:0]), .addend({ACCW{1'b0}}), .s(fs1), .c(fc1));
+    wire [4*ACCW-1:0] fops;
+    assign fops[0*ACCW +: ACCW] = fs0;
+    assign fops[1*ACCW +: ACCW] = {fc0[ACCW-2:0], 1'b0};
+    assign fops[2*ACCW +: ACCW] = fs1;
+    assign fops[3*ACCW +: ACCW] = {fc1[ACCW-2:0], 1'b0};
+    wire [ACCW-1:0] fts, ftc;
+    fabric_csa_tree #(.N(4), .W(ACCW)) u_ft (.ops(fops), .s(fts), .c(ftc));
+    wire [ACCW-1:0] final_score = fts + {ftc[ACCW-2:0], 1'b0};
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            busy <= 1'b0; inflight <= 1'b0; blk <= 0; first <= 0; count <= 0; got <= 0; beat <= 0; acc <= 0;
+            busy <= 1'b0; inflight <= 1'b0; blk <= 0; first <= 0; count <= 0; got <= 0; beat <= 0; accs <= 0; accc <= 0;
             req_valid <= 1'b0; done <= 1'b0; cand_valid <= 1'b0;
         end else begin
             done <= 1'b0;
             cand_valid <= 1'b0;
             if (start) begin
-                blk <= 0; beat <= 0; acc <= 0; inflight <= 1'b0;
+                blk <= 0; beat <= 0; accs <= 0; accc <= 0; inflight <= 1'b0;
                 if (n_blocks == 0) done <= 1'b1;
                 else begin busy <= 1'b1; req_valid <= 1'b1; end
             end else if (busy) begin
                 if (req_valid && req_ready) begin
-                    req_valid <= 1'b0; inflight <= 1'b1; beat <= 0; acc <= 0; count <= want; got <= 0;
+                    req_valid <= 1'b0; inflight <= 1'b1; beat <= 0; accs <= 0; accc <= 0; count <= want; got <= 0;
                 end
                 if (inflight && rdata_valid) begin
                     if (beat < CB) begin
-                        acc <= acc_next;
+                        accs <= asum; accc <= acar;
                         beat <= beat + 1'b1;
                     end else begin
-                        cand_valid <= 1'b1; cand_id <= blk; cand_score <= final_score[31:0];
-                        beat <= 0; acc <= 0;
+                        cand_valid <= 1'b1; cand_id <= blk; cand_score <= final_score;
+                        beat <= 0; accs <= 0; accc <= 0;
                         blk <= blk + 1'b1;
                         got <= got + 1'b1;
                         if (got == count - 1) begin
