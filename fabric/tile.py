@@ -362,7 +362,21 @@ class DensityModel:
 
     node: str = "28nm-class estimate"
     nand2_um2: float = 0.30                 # 28 nm-class NAND2 area used for the column scaling
-    rom_um2_per_bit: float = 0.03           # via-programmed ROM bit cell incl. array overhead (placeholder)
+    # A via-programmed bit in a logic process, array included.  Two published
+    # numbers bracket it.  Against a logic process, a contact- or
+    # via-programmed NOR ROM cell runs about a quarter of a 6T SRAM cell, and
+    # TSMC's 28 nm high-density 6T is 0.127 um2, so a quarter is 0.032 -- which
+    # is where this sits.  Against a process built for ROM, Ye et al.'s 40 nm
+    # 16 Mb contact-programming mask ROM (IEEE JSSC) reaches a 0.017 um2 diode
+    # bitcell at 0.0225 mm2/Mb, which is 0.0215 um2 a bit including the array;
+    # an ideal shrink to 28 nm, (28/40)^2, puts that at 0.0105.
+    #
+    # The number here is the first bracket, because the premise of this design
+    # is that the weights ride in the via mask of an ordinary logic process --
+    # no trench isolation, no borderless contacts, no diode bitcell.  The
+    # second bracket is what buying a ROM process would be worth: the ROM is
+    # 43 percent of a tile, so 0.0105 would take the tile to 0.72 of its area.
+    rom_um2_per_bit: float = 0.03
     mac_um2_per_column_per_bank: float = 115.0   # 380 NAND2-eq: tap select, one's complement, CSA per bank
     acc_um2_per_column: float = 385.0       # 1280 NAND2-eq: carry-save accumulator, requantizer share, registers
     tile_overhead_um2: float = 2500.0       # multiples generator, ROM periphery, control per tile (placeholder)

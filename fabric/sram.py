@@ -65,9 +65,15 @@ class Process:
     nand2_um2: float             # to report a macro next to the standard cells
 
 
-# 45 nm: a published high-density 6T cell is about 0.35 um2 and a small
-# single-port macro answers in well under a nanosecond.  7 nm is the same
-# shape scaled by the predictive library's own ratio.
+# The bit cells are published numbers rather than guesses, which is worth
+# saying because the rest of this module is a stand-in.  Intel's 45 nm test
+# chip demonstrated a 0.346 um2 6T cell (153 Mb in 119 mm2, ISSCC 2006), so
+# 0.35 is that node's high-density cell; TSMC's N7 high-density 6T cell is
+# 0.027 um2, which is what the 7 nm row holds.  For reference at the node the
+# density model projects to, TSMC's 28 nm high-density 6T cell is 0.127 um2.
+# What stays a stand-in is the periphery multiple and the access time: a small
+# single-port macro answers in well under a nanosecond, and the shape of the
+# scaling is the point until a compiler's datasheet replaces it.
 PROCESSES = {
     "nangate45": Process("nangate45", 0.35, 1.45, 620.0, 160.0, 60.0, 0.004, 0.798),
     "asap7":     Process("asap7", 0.027, 1.55, 210.0, 55.0, 20.0, 0.0008, 0.0787),
