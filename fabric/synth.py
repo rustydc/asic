@@ -293,11 +293,21 @@ def synthesize(liberty: Path | Sequence[Path], *, rows: int = 256, cols: int = 8
         log = (work / "synth.log").read_text(encoding="utf-8") if (work / "synth.log").exists() else result.stdout
         buffered = True
         if result.returncode != 0 and target_ps and "abc.script" in script:
-            # ABC's buffer/stime script aborts on some libraries (ASAP7 in our runs);
-            # fall back to plain timing-driven mapping so OpenSTA can still time it.
-            # The result is unbuffered, so a net with a large fanout is timed with
-            # no buffer tree at all -- that is a bound, not a path, and the caller
-            # is told which it got.
+            # A kill is not a script abort, and must not fall back.  ABC's
+            # buffer/stime pass aborts on some libraries (ASAP7 in our runs)
+            # and exits with an ordinary failure; that is what the fallback is
+            # for.  Being killed returns a signal, and for ABC on a large unit
+            # that means the machine ran out of memory -- where the fallback
+            # spends hours remapping a design that would have mapped had it
+            # been given the machine to itself, and hands back a netlist whose
+            # worst net has no buffer tree at all.  The attention core came
+            # back from one of those with a single NAND2 driving 6,703 loads
+            # and a path of 28 ns, which looks like a measurement.
+            if result.returncode < 0:
+                raise RuntimeError(
+                    f"yosys killed by signal {-result.returncode} (ABC out of memory, most likely): "
+                    f"run this unit with the machine to itself rather than taking an unbuffered map.\n"
+                    f"{log[-2000:]}")
             buffered = False
             script = script.replace(abc_cmd, f"abc {lib_args} -D {target_ps}")
             (work / "synth.ys").write_text(script, encoding="utf-8")
