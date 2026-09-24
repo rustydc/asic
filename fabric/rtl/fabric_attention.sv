@@ -397,7 +397,7 @@ module fabric_attention #(
             // the accumulate above and the value update may take the pair.
             // Multiplied it is scaled by mult_s and does not vanish, so the
             // scale's multiply has to have the number: the resolve is here.
-            assign score[gc] = $signed(score_s[gc]) + $signed({score_c[gc][SCW-2:0], 1'b0});
+            fabric_cs_resolve #(.W(SCW)) u_scq (.s(score_s[gc]), .c(score_c[gc]), .y(score[gc]));
         end
     endgenerate
 
@@ -488,7 +488,7 @@ module fabric_attention #(
             fabric_mul_cs #(.AW(OW), .BW(17), .PW(VPW), .ADD(1)) u_wm (
                 .a(wsel), .b(r_c[gwm]), .addend({VPW{1'b0}}),
                 .s(wm1_sn[gwm]), .c(wm1_cn[gwm]));
-            assign wm1q[gwm] = $signed(wm1_s[gwm]) + $signed({wm1_c[gwm][VPW-2:0], 1'b0});
+            fabric_cs_resolve #(.W(VPW)) u_wm1 (.s(wm1_s[gwm]), .c(wm1_c[gwm]), .y(wm1q[gwm]));
         end
     endgenerate
     reg signed [23:0]  gm1 [0:L-1];
@@ -577,8 +577,8 @@ module fabric_attention #(
                 .s(sm_sn[gsc]), .c(sm_cn[gsc]));
             // S_EXP1B: resolve it -- a carry-save pair cannot be shifted by a
             // variable amount, the carry crosses the boundary -- then shift.
-            wire signed [SMW-1:0] smq =
-                $signed(sm_s[gsc]) + $signed({sm_c[gsc][SMW-2:0], 1'b0});
+            wire signed [SMW-1:0] smq;
+            fabric_cs_resolve #(.W(SMW)) u_smq (.s(sm_s[gsc]), .c(sm_c[gsc]), .y(smq));
             fabric_rnd_cs #(.W(SMW), .SW(6)) u_sv (
                 .v(smq), .sh(sh_s), .sv(sv_n[gsc]), .rb(rb_n[gsc]));
             // Both differences against the running maximum, reduced in
@@ -605,8 +605,9 @@ module fabric_attention #(
             assign nops[3*DW +: DW] = {DW{rb_n[gsc]}};          // -rb
             fabric_csa_tree #(.N(4), .W(DW)) u_pt (.ops(pops), .s(ps_n[gsc]), .c(pc_n[gsc]));
             fabric_csa_tree #(.N(4), .W(DW)) u_nt (.ops(nops), .s(ns_n[gsc]), .c(nc_n[gsc]));
-            wire signed [DW-1:0] dpos = $signed(ps_r[gsc]) + $signed({pc_r[gsc][DW-2:0], 1'b0});
-            wire signed [DW-1:0] dneg = $signed(ns_r[gsc]) + $signed({nc_r[gsc][DW-2:0], 1'b0});
+            wire signed [DW-1:0] dpos, dneg;
+            fabric_cs_resolve #(.W(DW)) u_dp (.s(ps_r[gsc]), .c(pc_r[gsc]), .y(dpos));
+            fabric_cs_resolve #(.W(DW)) u_dn (.s(ns_r[gsc]), .c(nc_r[gsc]), .y(dneg));
             assign scq[gsc] = sv_r[gsc] + {{(SMW-1){1'b0}}, rb_r[gsc]};
             assign nmx[gsc] = !m_valid[gsc] || dneg[DW-1];
             wire signed [DW-1:0] dd_w =
@@ -655,7 +656,8 @@ module fabric_attention #(
                 assign wops[3*VPW +: VPW] = {vb_c[gv][lv][BPW-2:0], 1'b0, 16'b0};
                 wire [VPW-1:0] ws, wc;
                 fabric_csa_tree #(.N(4), .W(VPW)) u_wt (.ops(wops), .s(ws), .c(wc));
-                wire signed [VPW-1:0] wq = $signed(ws) + $signed({wc[VPW-2:0], 1'b0});
+                wire signed [VPW-1:0] wq;
+                fabric_cs_resolve #(.W(VPW)) u_wq (.s(ws), .c(wc), .y(wq));
                 assign ow_n[gv][lv] = wq[OW+15:16];
             end
         end

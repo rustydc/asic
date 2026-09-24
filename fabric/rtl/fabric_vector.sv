@@ -193,6 +193,30 @@ module fabric_rnd_sat #(
 endmodule
 
 // ---------------------------------------------------------------------------
+// Resolve a carry-save pair: the value is s + 2c, one carry propagation.
+//
+// A module rather than the expression, and kept, because of what the mapper
+// does with the expression.  ABC is handed the whole unit at once and spends
+// its effort by its own delay model, which is more optimistic than the timer
+// that grades the result; where a unit has slack to reclaim, asking ABC for
+// less than the clock buys the difference back.  Where it has none -- the
+// attention core's paths sit inside 244 ps of each other -- there is nothing
+// to reclaim and the target makes no difference at all: -D 1600, 900 and 400
+// map that core to the same netlist, to the cell.  Kept, the resolve is a
+// small network ABC maps on its own, the way it maps one standalone: a 48-bit
+// add alone is 561 ps, where the same add inside the state engine was 1,147.
+(* keep_hierarchy *)
+module fabric_cs_resolve #(
+    parameter int W = 48
+) (
+    input  wire [W-1:0]        s,
+    input  wire [W-1:0]        c,
+    output wire signed [W-1:0] y
+);
+    assign y = $signed(s) + $signed({c[W-2:0], 1'b0});
+endmodule
+
+// ---------------------------------------------------------------------------
 // The round-shift left in two pieces: the value is sv + rb, and nothing here
 // propagates a carry.  A stage that consumes it usually has an add of its own
 // -- a difference against the running maximum, an accumulate -- and the round
