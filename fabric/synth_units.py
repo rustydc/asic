@@ -17,14 +17,26 @@ on a one-bit flag with 780, and the norm 1.72 of 2.31 on a read address
 with 203.  A unit measured narrow can hide most of its real path, so the
 clock has to come from the ``*_real`` rows.
 
-What ABC is asked for is a second number, and a lower one: it area-recovers
-every path its own delay model scores as slack-positive, and that model is
-more optimistic than the timer that grades the result, so at the clock it
-trades away paths that turn out to be critical.  The state engine, same RTL,
-asked for 1600 against 900: 1,777 ps against 1,230, for 3.9 percent of area.
-Nothing below the knee at 900 is worth its area.  ``run_unit`` has the sweep.
+What ABC is asked for is a second number, and it belongs to the unit rather
+than the library.  ABC area-recovers every path its own delay model scores
+as slack-positive, and that model is more optimistic than the timer that
+grades the result, so at the clock it trades away paths that turn out to be
+critical; asking for less buys them back.  How much less is not a constant,
+and the curve is not monotonic -- each unit has an interior best and a cliff
+past it, and they are in different places:
 
-    python -m fabric.synth_units --lib asap7=asap7.lib:800 --lib nangate45=ng45.lib:1600:900 \\
+    index scan   2000: 1,849   1600: 1,739   1400: 1,656   1200: 1,574
+                 1000: 1,965   800: 1,965      (identical -- ABC saturates)
+    state engine 1600: 1,777   1200: 1,511    900: 1,230    600: 1,218
+
+So there is no global setting to prefer: 900 is the state engine's best and
+25 percent worse than 1200 for the index scan.  A unit with nothing to
+reclaim is not helped at all -- the attention core's paths sit inside 244 ps
+of each other, and 1600, 900 and 400 map it to the same netlist, to the cell;
+what works there is keeping a hierarchy (``fabric_cs_resolve``) so ABC maps
+the block by itself.  Sweep a unit before trusting a number for it.
+
+    python -m fabric.synth_units --lib asap7=asap7.lib:800 --lib nangate45=ng45.lib:1600:1200 \\
         --sta /path/to/sta --out fabric/results/synth_units.json
 """
 
@@ -179,7 +191,13 @@ def run_unit(unit: Unit, lib_name: str, liberty: Path, target_ps: int, sta: Path
         asked 1600 -> 1,777 ps   asked 1200 -> 1,511 ps (+0.3% area)
         asked  900 -> 1,230 ps (+3.9%)   asked 600 -> 1,218 ps (+5.2%)
 
-    900 is the knee.  Defaults to ``target_ps`` so an unchanged caller gets the
+    900 is that unit's knee, and only that unit's: the curve is not monotonic
+    and the best target differs per unit.  The index scan is best at 1200 and
+    falls off a cliff below it -- 1,574 ps there against 1,965 at 1000, for
+    19 percent more gates -- so a target good for one unit is 25 percent worse
+    for another.  The module docstring has both sweeps.  Sweep before trusting.
+
+    Defaults to ``target_ps`` so an unchanged caller gets the
     behaviour it had.
     """
     abc_target_ps = target_ps if abc_target_ps is None else abc_target_ps
