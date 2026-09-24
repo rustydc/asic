@@ -79,10 +79,10 @@ module tb_layer_engine #(
 
     reg          start = 0;
     wire         running, done;
-    wire         req_valid, req_ready, req_write, wdata_valid, wdata_ready, rdata_valid;
+    wire         req_valid, req_ready, req_write, req_wide, wdata_valid, wdata_ready, rdata_valid;
     wire [31:0]  req_addr;
     wire [11:0]  req_beats;
-    wire [127:0] wdata, rdata;
+    wire [255:0] wdata, rdata;
     fabric_layer_engine #(.D(D), .NK(NK), .NV(NV), .HK(HK), .HV(HV), .KK(KK), .CONV(CONV), .NH(NH), .NKV(NKV), .HD(HD), .RD(RD), .IDIM(IDIM),
                           .W(W), .BS(BS), .TOP(TOP), .KV_BITS(KV_BITS), .REC_BYTES(REC_BYTES), .RPB(RPB), .MAXR(MAXR),
                           .WINDOW_OFF(WINDOW_OFF), .BLOCK_OFF(BLOCK_OFF), .INDEX_OFF(INDEX_OFF), .SUMS_OFF(SUMS_OFF), .ATT_L(ATT_L), .SW_L(SW_L),
@@ -90,8 +90,9 @@ module tb_layer_engine #(
                           .VB_BANKS(VB_BANKS), .VB_BANK_SHIFT(VB_BANK_SHIFT), .VB_NPR(VB_NPR), .VB_NPW(VB_NPW), .VB_RMAP0(VB_RMAP0), .VB_RMAP1(VB_RMAP1),
         .VB_WMAP0(VB_WMAP0), .VB_WMAP1(VB_WMAP1), .VB_RCAP2(VB_RCAP2), .VB_RCAP3(VB_RCAP3), .VB_WCAP2(VB_WCAP2)) dut (
         .clk(clk), .rst_n(rst_n), .start(start), .n_steps(N[15:0]), .running(running), .done(done),
-        .m_req_valid(req_valid), .m_req_ready(req_ready), .m_req_write(req_write), .m_req_addr(req_addr), .m_req_beats(req_beats),
-        .m_wdata_valid(wdata_valid), .m_wdata_ready(wdata_ready), .m_wdata(wdata), .m_rdata_valid(rdata_valid), .m_rdata(rdata));
+        .m_req_valid(req_valid), .m_req_ready(req_ready), .m_req_write(req_write), .m_req_wide(req_wide), .m_req_addr(req_addr),
+        .m_req_beats(req_beats), .m_wdata_valid(wdata_valid), .m_wdata_ready(wdata_ready), .m_wdata(wdata), .m_rdata_valid(rdata_valid),
+        .m_rdata(rdata));
     wire mem_ready;                                       // the memory can take requests
     reg  dump = 0;                                        // the memory images to their files
     reg [15:0] dimg [0:NDEV*DEV_WORDS-1];                 // every device's words in turn
@@ -103,10 +104,22 @@ module tb_layer_engine #(
             wire [31:0]   m_req_addr;
             wire [11:0]   m_req_beats;
             wire [127:0]  m_wdata, m_rdata;
+            // The bridge moves a beat a transfer; the engine's moves are two.
+            wire          n_req_valid, n_req_ready, n_req_write, n_wdata_valid, n_wdata_ready, n_rdata_valid;
+            wire [31:0]   n_req_addr;
+            wire [11:0]   n_req_beats;
+            wire [127:0]  n_wdata, n_rdata;
+            fabric_mem_narrow #(.DW(128)) narrow (
+                .clk(clk), .rst_n(rst_n), .w_req_valid(req_valid), .w_req_ready(req_ready), .w_req_write(req_write), .w_req_wide(req_wide),
+                .w_req_addr(req_addr), .w_req_beats(req_beats), .w_wdata_valid(wdata_valid), .w_wdata_ready(wdata_ready), .w_wdata(wdata),
+                .w_rdata_valid(rdata_valid), .w_rdata(rdata),
+                .n_req_valid(n_req_valid), .n_req_ready(n_req_ready), .n_req_write(n_req_write), .n_req_addr(n_req_addr),
+                .n_req_beats(n_req_beats), .n_wdata_valid(n_wdata_valid), .n_wdata_ready(n_wdata_ready), .n_wdata(n_wdata),
+                .n_rdata_valid(n_rdata_valid), .n_rdata(n_rdata));
             fabric_mem_bridge #(.DW(128)) bridge (
-                .c_clk(clk), .c_rst_n(rst_n), .c_req_valid(req_valid), .c_req_ready(req_ready), .c_req_write(req_write),
-                .c_req_addr(req_addr), .c_req_beats(req_beats), .c_wdata_valid(wdata_valid), .c_wdata_ready(wdata_ready),
-                .c_wdata(wdata), .c_rdata_valid(rdata_valid), .c_rdata(rdata),
+                .c_clk(clk), .c_rst_n(rst_n), .c_req_valid(n_req_valid), .c_req_ready(n_req_ready), .c_req_write(n_req_write),
+                .c_req_addr(n_req_addr), .c_req_beats(n_req_beats), .c_wdata_valid(n_wdata_valid), .c_wdata_ready(n_wdata_ready),
+                .c_wdata(n_wdata), .c_rdata_valid(n_rdata_valid), .c_rdata(n_rdata),
                 .m_clk(mclk), .m_rst_n(rst_n), .m_req_valid(m_req_valid), .m_req_ready(m_req_ready), .m_req_write(m_req_write),
                 .m_req_addr(m_req_addr), .m_req_beats(m_req_beats), .m_wdata_valid(m_wdata_valid), .m_wdata_ready(m_wdata_ready),
                 .m_wdata(m_wdata), .m_rdata_valid(m_rdata_valid), .m_rdata(m_rdata), .rd_overflow(rd_overflow));
@@ -155,8 +168,9 @@ module tb_layer_engine #(
             always @(posedge dump) begin #1; $writememh("devs_out.hex", dimg); end
             always @(posedge clk) if (rd_overflow) $display("FAIL: the bridge's read fifo overflowed");
         end else begin : g_model
-            fabric_mem_model #(.DW(128), .WORDS(MEM_BEATS), .LAT(2), .FILE("mem_init.hex")) u_mem (
-                .clk(clk), .rst_n(rst_n), .req_valid(req_valid), .req_ready(req_ready), .req_write(req_write), .req_addr(req_addr),
+            fabric_mem_model #(.DW(128), .XW(2), .WORDS(MEM_BEATS), .LAT(2), .FILE("mem_init.hex")) u_mem (
+                .clk(clk), .rst_n(rst_n), .req_valid(req_valid), .req_ready(req_ready), .req_write(req_write), .req_wide(req_wide),
+                .req_addr(req_addr),
                 .req_beats(req_beats), .wdata_valid(wdata_valid), .wdata_ready(wdata_ready), .wdata(wdata), .rdata_valid(rdata_valid), .rdata(rdata));
             assign mem_ready = 1'b1;
             always @(posedge dump) $writememh("mem_out.hex", u_mem.mem);

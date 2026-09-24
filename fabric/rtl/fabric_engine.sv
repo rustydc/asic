@@ -6,7 +6,9 @@
 // 32-bit argument, a tag) accepted when the engine is idle, and a done pulse
 // carrying the tag one cycle after the step's last result was written to
 // the vector buffer.  The adapters read the buffer 16 bytes per port per
-// cycle (one cycle of latency) and write 16 bytes with byte enables.
+// cycle (one cycle of latency) and write 16 bytes with byte enables; the
+// memory unit's ports are 32 bytes wide, for the beat mover, whose moves are
+// two beats a transfer on the memory port as well.
 //
 //   fabric_vb              the vector buffer (a multi-port SRAM stand-in)
 //   fabric_norm_adapter    one norm engine: int8 or int16 input, a gain of
@@ -58,16 +60,28 @@ module fabric_vb #(
     parameter [63:0] RMAP1 = 64'hFEDCBA9876543210,
     parameter [63:0] WMAP0 = 64'hFEDCBA9876543210,
     parameter [63:0] WMAP1 = 64'hFEDCBA9876543210,
+    // One read port and one write port may be 32 bytes wide: the memory
+    // unit's, for the beat mover.  Their second sixteen bytes are rd_hi and
+    // wr_hi, the word after the one the port names, and a wide access names
+    // a word boundary.  A bank's port already reads and writes a 32-byte
+    // window -- a 16-byte access at any byte offset is a word from each of
+    // its two memories -- so a wide access is that window whole, one word
+    // from each memory, and costs the banks nothing.  -1 is none.
+    parameter int WIDE_R = -1,
+    parameter int WIDE_W = -1,
     parameter     INIT_FILE = ""
 ) (
     input  wire              clk,
     input  wire [NR-1:0]     rd_en,
     input  wire [NR*AW-1:0]  rd_addr,
     output reg  [NR*128-1:0] rd_data,
+    output reg  [127:0]      rd_hi,
     input  wire [NW-1:0]     wr_en,
     input  wire [NW*AW-1:0]  wr_addr,
     input  wire [NW*128-1:0] wr_data,
-    input  wire [NW*16-1:0]  wr_be
+    input  wire [NW*16-1:0]  wr_be,
+    input  wire [127:0]      wr_hi,
+    input  wire [15:0]       wr_hi_be
 );
     // Banks of SRAM.  A buffer lives wholly in one, and a buffer's bank is the
     // high bits of its address, so an adapter's byte address carries it and no
@@ -125,8 +139,8 @@ module fabric_vb #(
     reg [NPR*AW-1:0]  p_addr;
     reg [NPW-1:0]     q_en;
     reg [NPW*AW-1:0]  q_addr;
-    reg [NPW*128-1:0] q_data;
-    reg [NPW*16-1:0]  q_be;
+    reg [NPW*128-1:0] q_data, q_hi;
+    reg [NPW*16-1:0]  q_be, q_hibe;
     integer fi;
     always @(*) begin
         p_en = 0; p_addr = 0;
@@ -135,13 +149,17 @@ module fabric_vb #(
                 p_en[rmap_of(fi)] = 1'b1;
                 p_addr[rmap_of(fi)*AW +: AW] = p_addr[rmap_of(fi)*AW +: AW] | rd_addr[fi*AW +: AW];
             end
-        q_en = 0; q_addr = 0; q_data = 0; q_be = 0;
+        q_en = 0; q_addr = 0; q_data = 0; q_be = 0; q_hi = 0; q_hibe = 0;
         for (fi = 0; fi < NW; fi = fi + 1)
             if (wr_en[fi]) begin
                 q_en[wmap_of(fi)] = 1'b1;
                 q_addr[wmap_of(fi)*AW +: AW]   = q_addr[wmap_of(fi)*AW +: AW]   | wr_addr[fi*AW +: AW];
                 q_data[wmap_of(fi)*128 +: 128] = q_data[wmap_of(fi)*128 +: 128] | wr_data[fi*128 +: 128];
                 q_be[wmap_of(fi)*16 +: 16]     = q_be[wmap_of(fi)*16 +: 16]     | wr_be[fi*16 +: 16];
+                if (fi == WIDE_W) begin
+                    q_hi[wmap_of(fi)*128 +: 128] = q_hi[wmap_of(fi)*128 +: 128] | wr_hi;
+                    q_hibe[wmap_of(fi)*16 +: 16] = q_hibe[wmap_of(fi)*16 +: 16] | wr_hi_be;
+                end
             end
     end
 `ifndef FABRIC_SYNTH
@@ -157,6 +175,8 @@ module fabric_vb #(
                 if (fj < fi && wr_en[fi] && wr_en[fj] && wmap_of(fi) == wmap_of(fj))
                     $display("FAIL: write ports %0d and %0d share crossbar port %0d and are both asking",
                              fj, fi, wmap_of(fi));
+        if (WIDE_W >= 0 && wr_en[WIDE_W] && |wr_hi_be && wr_addr[WIDE_W*AW +: 4] != 4'd0)
+            $display("FAIL: a wide write at byte %0d, not a word boundary", wr_addr[WIDE_W*AW +: AW]);
     end
 `endif
 
@@ -170,8 +190,8 @@ module fabric_vb #(
     reg          r_got [0:NPR-1];
     integer      wn [0:NB-1];
     reg [AW-1:0] wa [0:NB*WPOT-1];
-    reg [127:0]  wd [0:NB*WPOT-1];
-    reg [15:0]   wm [0:NB*WPOT-1];
+    reg [127:0]  wd [0:NB*WPOT-1], wdh [0:NB*WPOT-1];
+    reg [15:0]   wm [0:NB*WPOT-1], wmh [0:NB*WPOT-1];
     reg          wv [0:NB*WPOT-1];
     // Every port's slot, decided in parallel rather than by a scan.  Written as
     // a walk over the ports carrying rn[b] from one to the next, the allocator
@@ -257,12 +277,16 @@ module fabric_vb #(
                 wa[(b << WSH) + s] = 0;
                 wd[(b << WSH) + s] = 0;
                 wm[(b << WSH) + s] = 0;
+                wdh[(b << WSH) + s] = 0;
+                wmh[(b << WSH) + s] = 0;
                 wv[(b << WSH) + s] = 1'b0;
                 for (i = 0; i < NPW; i = i + 1)
                     if (w_use[i] && w_bank[i] == b && w_pre[i] == s && s < WMAX) begin
                         wa[(b << WSH) + s] = wa[(b << WSH) + s] | q_addr[i*AW +: AW];
                         wd[(b << WSH) + s] = wd[(b << WSH) + s] | q_data[i*128 +: 128];
                         wm[(b << WSH) + s] = wm[(b << WSH) + s] | q_be[i*16 +: 16];
+                        wdh[(b << WSH) + s] = wdh[(b << WSH) + s] | q_hi[i*128 +: 128];
+                        wmh[(b << WSH) + s] = wmh[(b << WSH) + s] | q_hibe[i*16 +: 16];
                         wv[(b << WSH) + s] = 1'b1;
                     end
             end
@@ -314,8 +338,8 @@ module fabric_vb #(
             for (gs = 0; gs < NWR; gs = gs + 1) begin : g_wr
                 wire [WIB-1:0] w   = wa[gb*WPOT + gs][BSH-1:4];
                 wire [3:0]     off = wa[gb*WPOT + gs][3:0];
-                wire [255:0]   d32 = {128'd0, wd[gb*WPOT + gs]} << {off, 3'd0};
-                wire [31:0]    m32 = {16'd0, wm[gb*WPOT + gs]} << off;
+                wire [255:0]   d32 = {wdh[gb*WPOT + gs], wd[gb*WPOT + gs]} << {off, 3'd0};
+                wire [31:0]    m32 = {wmh[gb*WPOT + gs], wm[gb*WPOT + gs]} << off;
                 // The window's low word is the one at w, the high word the next:
                 // whichever of the two is even goes to the even memory.
                 assign e_we[gs]            = wv[gb*WPOT + gs] && |(w[0] ? m32[31:16] : m32[15:0]);
@@ -349,7 +373,7 @@ module fabric_vb #(
     // written out a byte at a time rather than as a part-select of the whole
     // bank vector: a variable part-select of all NB*RPOT words is a barrel
     // shifter over every bank, and sixteen of those a port does not map.
-    reg [NPR*128-1:0] p_data;
+    reg [NPR*128-1:0] p_data, p_hi;
     genvar gp, gg, gk;
     generate
         for (gp = 0; gp < NPR; gp = gp + 1) begin : g_read
@@ -383,15 +407,20 @@ module fabric_vb #(
                     assign pick[gk*8 +: 8] = win[(gg + gk)*8 +: 8];
                 end
                 always @(*) p_data[gp*128 + gg*8 +: 8] = en_l ? pick[{off_l, 3'd0} +: 8] : 8'bx;
+                // A wide read's second word: the window's high half, which is
+                // the next word when the read names a word boundary.
+                always @(*) p_hi[gp*128 + gg*8 +: 8] = en_l ? win[128 + gg*8 +: 8] : 8'bx;
             end
         end
     endgenerate
 
     // Every logical port that folded onto a crossbar port reads its answer:
     // wires, since at most one of them asked for it.
-    always @(*)
+    always @(*) begin
         for (j = 0; j < NR; j = j + 1)
             rd_data[j*128 +: 128] = p_data[rmap_of(j)*128 +: 128];
+        rd_hi = (WIDE_R >= 0) ? p_hi[rmap_of(WIDE_R)*128 +: 128] : 128'bx;
+    end
 
 `ifndef FABRIC_SYNTH
     // The image in and out.  The memories hold it in words, the file in bytes,
@@ -1458,20 +1487,24 @@ module fabric_mem_unit #(
     output reg  [AW-1:0] rd_addr,
     output wire          rd_en,          // the loader, or a move out of the buffer; else the port is idle
     input  wire [127:0]  rd_data,
+    input  wire [127:0]  rd_hi,          // the next word, for a move out: the buffer's wide read port
     output reg           wr_en,
     output reg  [AW-1:0] wr_addr,
     output reg  [127:0]  wr_data,
     output reg  [15:0]   wr_be,
+    output reg  [127:0]  wr_hi,          // and its wide write port
+    output reg  [15:0]   wr_hi_be,
     output wire          m_req_valid,
     input  wire          m_req_ready,
     output wire          m_req_write,
+    output wire          m_req_wide,
     output wire [31:0]   m_req_addr,
     output wire [11:0]   m_req_beats,
     output wire          m_wdata_valid,
     input  wire          m_wdata_ready,
-    output wire [127:0]  m_wdata,
+    output wire [255:0]  m_wdata,
     input  wire          m_rdata_valid,
-    input  wire [127:0]  m_rdata
+    input  wire [255:0]  m_rdata
 );
     localparam int DW = 128;
     localparam int KB = (NKV * HD + 15) / 16, IB = (IDIM + 15) / 16;          // beats of the key rows, of an index vector
@@ -1488,18 +1521,21 @@ module fabric_mem_unit #(
     reg [7:0]    tag, head;
 
     // Requesters onto the port.
-    wire [NR-1:0]     r_req_valid, r_req_ready, r_req_write, r_wdata_valid, r_wdata_ready, r_rdata_valid;
+    // The port carries two beats a transfer for a wide request (the mover's
+    // moves to and from the buffer) and one, in the low half, for the rest.
+    wire [NR-1:0]     r_req_valid, r_req_ready, r_req_write, r_req_wide, r_wdata_valid, r_wdata_ready, r_rdata_valid;
     wire [NR*32-1:0]  r_req_addr;
     wire [NR*12-1:0]  r_req_beats;
-    wire [NR*DW-1:0]  r_wdata;
-    wire [DW-1:0]     r_rdata;
-    fabric_mem_arbiter #(.N(NR), .DW(DW)) u_arb (
+    wire [NR*2*DW-1:0] r_wdata;
+    wire [2*DW-1:0]   r_rdata;
+    fabric_mem_arbiter #(.N(NR), .DW(DW), .XW(2)) u_arb (
         .clk(clk), .rst_n(rst_n), .r_req_valid(r_req_valid), .r_req_ready(r_req_ready), .r_req_write(r_req_write),
-        .r_req_addr(r_req_addr), .r_req_beats(r_req_beats), .r_wdata_valid(r_wdata_valid), .r_wdata_ready(r_wdata_ready),
-        .r_wdata(r_wdata), .r_rdata_valid(r_rdata_valid), .r_rdata(r_rdata),
-        .m_req_valid(m_req_valid), .m_req_ready(m_req_ready), .m_req_write(m_req_write), .m_req_addr(m_req_addr),
-        .m_req_beats(m_req_beats), .m_wdata_valid(m_wdata_valid), .m_wdata_ready(m_wdata_ready), .m_wdata(m_wdata),
-        .m_rdata_valid(m_rdata_valid), .m_rdata(m_rdata));
+        .r_req_wide(r_req_wide), .r_req_addr(r_req_addr), .r_req_beats(r_req_beats), .r_wdata_valid(r_wdata_valid),
+        .r_wdata_ready(r_wdata_ready), .r_wdata(r_wdata), .r_rdata_valid(r_rdata_valid), .r_rdata(r_rdata),
+        .m_req_valid(m_req_valid), .m_req_ready(m_req_ready), .m_req_write(m_req_write), .m_req_wide(m_req_wide),
+        .m_req_addr(m_req_addr), .m_req_beats(m_req_beats), .m_wdata_valid(m_wdata_valid), .m_wdata_ready(m_wdata_ready),
+        .m_wdata(m_wdata), .m_rdata_valid(m_rdata_valid), .m_rdata(m_rdata));
+    assign r_req_wide[3:1] = 3'b000;
 
     // Requester 0, the mover: a burst between memory and the buffer or the sums register.
     localparam [1:0] MV_RD_VB = 0, MV_WR_VB = 1, MV_RD_REG = 2, MV_WR_REG = 3;
@@ -1515,9 +1551,17 @@ module fabric_mem_unit #(
     // address, then data, then present -- one beat at a time through all three
     // -- this was three cycles a beat, and the state DMA is most of a recurrent
     // token.
+    //
+    // Moves between memory and the buffer are wide: two beats a transfer, the
+    // buffer's two words at the address and the one after, so a move is half
+    // as many transfers and the state DMA half as long.  The sums register
+    // moves stay a beat at a time.  `mv_i` and `mv_a` still count beats.
     reg          mv_q, mv_hv;
     reg [11:0]   mv_a;
-    reg [DW-1:0] mv_hold;
+    reg [2*DW-1:0] mv_hold;
+    wire         mv_wide   = (mv_mode == MV_RD_VB) || (mv_mode == MV_WR_VB);
+    wire [11:0]  mv_istep  = (mv_wide && (mv_n - mv_i > 1)) ? 12'd2 : 12'd1;   // beats the next transfer carries
+    wire [11:0]  mv_astep  = (mv_n - mv_a > 1) ? 12'd2 : 12'd1;                 // and the next read of the buffer
     wire         mv_have   = mv_hv || mv_q;                 // a beat is ready to present
     wire         mv_take   = mv_have && r_wdata_ready[0];
     wire         mv_keep   = mv_q && !mv_take;              // it has to wait: hold it
@@ -1525,11 +1569,16 @@ module fabric_mem_unit #(
     wire         mv_issue  = mv_busy && (mv_mode == MV_WR_VB) && !mv_req && (mv_a < mv_n) && !mv_hv_nxt;
     assign r_req_valid[0]   = mv_req;
     assign r_req_write[0]   = (mv_mode == MV_WR_VB) || (mv_mode == MV_WR_REG);
+`ifndef FABRIC_SYNTH
+    always @(posedge clk) if (mv_go && mv_wide && mv_vaddr[3:0] != 4'd0)
+        $display("FAIL: a wide move at buffer byte %0d, not a word boundary", mv_vaddr);
+`endif
+    assign r_req_wide[0]    = mv_wide;
     assign r_req_addr[0*32 +: 32]  = mv_maddr;
     assign r_req_beats[0*12 +: 12] = mv_n;
     assign r_wdata_valid[0] = (mv_mode == MV_WR_VB) ? mv_have : mv_present;
-    assign r_wdata[0*DW +: DW] = (mv_mode == MV_WR_REG) ? ap_s_out_data
-                               : ((mv_mode == MV_WR_VB) && mv_hv) ? mv_hold : rd_data;
+    assign r_wdata[0 +: 2*DW] = (mv_mode == MV_WR_REG) ? {{DW{1'b0}}, ap_s_out_data}
+                              : ((mv_mode == MV_WR_VB) && mv_hv) ? mv_hold : {rd_hi, rd_data};
 
     // Requester 1, the append.
     reg [NKV*HD*8-1:0] k_r, v_r;
@@ -1544,10 +1593,11 @@ module fabric_mem_unit #(
     fabric_kv_append #(.DW(DW), .HD(HD), .NKV(NKV), .IDIM(IDIM), .BS(BS), .KV_BITS(KV_BITS), .W(W), .LUT_DIR(LUT_DIR)) u_append (
         .clk(clk), .rst_n(rst_n), .start(ap_start), .pos(pos), .window_base(ctx_base + WINDOW_OFF), .block_base(ctx_base + BLOCK_OFF),
         .index_base(ctx_base + INDEX_OFF), .k_rows(k_r), .v_rows(v_r), .idx_k(idx_r),
-        .s_in_valid(ap_s_in_valid), .s_in_addr({{(16-$clog2(SUMS_BEATS+1)){1'b0}}, mv_i[$clog2(SUMS_BEATS+1)-1:0]}), .s_in_data(r_rdata),
+        .s_in_valid(ap_s_in_valid), .s_in_addr({{(16-$clog2(SUMS_BEATS+1)){1'b0}}, mv_i[$clog2(SUMS_BEATS+1)-1:0]}), .s_in_data(r_rdata[DW-1:0]),
         .s_out_addr({{(16-$clog2(SUMS_BEATS+1)){1'b0}}, mv_i[$clog2(SUMS_BEATS+1)-1:0]}), .s_out_data(ap_s_out_data), .done(ap_done),
         .req_valid(r_req_valid[1]), .req_ready(r_req_ready[1]), .req_addr(r_req_addr[1*32 +: 32]), .req_beats(r_req_beats[1*12 +: 12]),
-        .wdata_valid(r_wdata_valid[1]), .wdata_ready(r_wdata_ready[1]), .wdata(r_wdata[1*DW +: DW]));
+        .wdata_valid(r_wdata_valid[1]), .wdata_ready(r_wdata_ready[1]), .wdata(r_wdata[1*2*DW +: DW]));
+    assign r_wdata[1*2*DW + DW +: DW] = 0;
     assign r_req_write[1] = 1'b1;
 
     // Requester 2, the index scan with its top-K.
@@ -1561,10 +1611,10 @@ module fabric_mem_unit #(
         .clk(clk), .rst_n(rst_n), .start(sc_start), .base(ctx_base + INDEX_OFF), .n_blocks(n_blocks), .q_codes(q_codes), .done(sc_done),
         .cand_valid(cand_valid), .cand_id(cand_id), .cand_score(cand_score),
         .req_valid(r_req_valid[2]), .req_ready(r_req_ready[2]), .req_addr(r_req_addr[2*32 +: 32]), .req_beats(r_req_beats[2*12 +: 12]),
-        .rdata_valid(r_rdata_valid[2]), .rdata(r_rdata));
+        .rdata_valid(r_rdata_valid[2]), .rdata(r_rdata[DW-1:0]));
     assign r_req_write[2] = 1'b0;
     assign r_wdata_valid[2] = 1'b0;
-    assign r_wdata[2*DW +: DW] = 0;
+    assign r_wdata[2*2*DW +: 2*DW] = 0;
     fabric_topk #(.K(TOP), .IDW(16), .SW(32)) u_topk (
         .clk(clk), .rst_n(rst_n), .clear(tk_clear), .cand_valid(cand_valid), .cand_id(cand_id), .cand_score(cand_score),
         .finish(tk_finish), .out_valid(tk_out_valid), .out_id(tk_out_id), .out_score(tk_out_score), .out_last(tk_out_last), .done(tk_done));
@@ -1589,11 +1639,11 @@ module fabric_mem_unit #(
     fabric_record_reader #(.DW(DW), .HD(HD), .KV_BITS(KV_BITS), .L(L), .MAXR(MAXR)) u_reader (
         .clk(clk), .rst_n(rst_n), .addr_valid(rr_addr_valid), .addr_ready(rr_addr_ready), .addr(rr_addr), .addr_count(rr_count),
         .req_valid(r_req_valid[3]), .req_ready(r_req_ready[3]), .req_addr(r_req_addr[3*32 +: 32]), .req_beats(r_req_beats[3*12 +: 12]),
-        .rdata_valid(r_rdata_valid[3]), .rdata(r_rdata), .out_valid(rr_out_valid), .out_ready(1'b1), .out_kind(rr_kind),
+        .rdata_valid(r_rdata_valid[3]), .rdata(r_rdata[DW-1:0]), .out_valid(rr_out_valid), .out_ready(1'b1), .out_kind(rr_kind),
         .out_data(rr_data), .rec_done(rr_rec_done));
     assign r_req_write[3] = 1'b0;
     assign r_wdata_valid[3] = 1'b0;
-    assign r_wdata[3*DW +: DW] = 0;
+    assign r_wdata[3*2*DW +: 2*DW] = 0;
     reg [15:0] rw_p, rw_last, rw_j, rw_total, rw_rec;
     reg [7:0]  rw_ob;
     reg        rw_blocks, rw_reqs_done;
@@ -1641,13 +1691,13 @@ module fabric_mem_unit #(
     reg signed [63:0] t, mx;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            state <= S_IDLE; done_valid <= 1'b0; wr_en <= 1'b0; ld_on <= 1'b0; ldv <= 1'b0; ld_i <= 0; ld_n <= 0;
+            state <= S_IDLE; done_valid <= 1'b0; wr_en <= 1'b0; wr_hi_be <= 16'd0; ld_on <= 1'b0; ldv <= 1'b0; ld_i <= 0; ld_n <= 0;
             mv_go <= 1'b0; mv_busy <= 1'b0; mv_req <= 1'b0; mv_done <= 1'b0; mv_present <= 1'b0; mv_i <= 0;
             mv_a <= 0; mv_q <= 1'b0; mv_hv <= 1'b0;
             ap_start <= 1'b0; sc_start <= 1'b0; tk_clear <= 1'b0; tk_finish <= 1'b0; sc_done_d <= 1'b0; rc_start <= 1'b0;
             rr_addr_valid <= 1'b0; rw_p <= 0; rw_j <= 0; rw_rec <= 0; rw_ob <= 0; rw_blocks <= 1'b0; rw_reqs_done <= 1'b0; sel_count <= 0;
         end else begin
-            done_valid <= 1'b0; wr_en <= 1'b0; ap_start <= 1'b0; sc_start <= 1'b0; tk_clear <= 1'b0; tk_finish <= 1'b0; rc_start <= 1'b0;
+            done_valid <= 1'b0; wr_en <= 1'b0; wr_hi_be <= 16'd0; ap_start <= 1'b0; sc_start <= 1'b0; tk_clear <= 1'b0; tk_finish <= 1'b0; rc_start <= 1'b0;
             mv_go <= 1'b0; mv_done <= 1'b0;
             // Loader data lands a cycle after its issue.
             ldv <= ld_on; ld_i_d <= ld_i; ld_tgt_d <= ld_tgt;
@@ -1671,9 +1721,10 @@ module fabric_mem_unit #(
                 if (mv_req && r_req_ready[0]) mv_req <= 1'b0;
                 case (mv_mode)
                     MV_RD_VB: if (r_rdata_valid[0]) begin
-                        wr_en <= 1'b1; wr_addr <= mv_vaddr + mv_i * 16; wr_data <= r_rdata; wr_be <= 16'hFFFF;
-                        mv_i <= mv_i + 1'b1;
-                        if (mv_i == mv_n - 1) begin mv_busy <= 1'b0; mv_done <= 1'b1; end
+                        wr_en <= 1'b1; wr_addr <= mv_vaddr + mv_i * 16; wr_data <= r_rdata[DW-1:0]; wr_be <= 16'hFFFF;
+                        wr_hi <= r_rdata[2*DW-1:DW]; wr_hi_be <= (mv_istep == 2) ? 16'hFFFF : 16'd0;
+                        mv_i <= mv_i + mv_istep;
+                        if (mv_i + mv_istep == mv_n) begin mv_busy <= 1'b0; mv_done <= 1'b1; end
                     end
                     MV_RD_REG: if (r_rdata_valid[0]) begin
                         mv_i <= mv_i + 1'b1;             // the append takes the beat; see ap_s_in_valid
@@ -1685,11 +1736,11 @@ module fabric_mem_unit #(
                         // waits in `mv_hold` rather than being read again.
                         mv_q <= mv_issue;
                         mv_hv <= mv_hv_nxt;
-                        if (mv_keep) mv_hold <= rd_data;
-                        if (mv_issue) mv_a <= mv_a + 1'b1;
+                        if (mv_keep) mv_hold <= {rd_hi, rd_data};
+                        if (mv_issue) mv_a <= mv_a + mv_astep;
                         if (mv_take) begin
-                            mv_i <= mv_i + 1'b1;
-                            if (mv_i == mv_n - 1) begin mv_busy <= 1'b0; mv_done <= 1'b1; end
+                            mv_i <= mv_i + mv_istep;
+                            if (mv_i + mv_istep == mv_n) begin mv_busy <= 1'b0; mv_done <= 1'b1; end
                         end
                     end
                     default: begin
@@ -1856,13 +1907,14 @@ module fabric_layer_engine #(
     output wire         m_req_valid,
     input  wire         m_req_ready,
     output wire         m_req_write,
+    output wire         m_req_wide,          // two beats a transfer: see fabric_memory.sv
     output wire [31:0]  m_req_addr,
     output wire [11:0]  m_req_beats,
     output wire         m_wdata_valid,
     input  wire         m_wdata_ready,
-    output wire [127:0] m_wdata,
+    output wire [255:0] m_wdata,
     input  wire         m_rdata_valid,
-    input  wire [127:0] m_rdata
+    input  wire [255:0] m_rdata
 );
     // A buffer beat is sixteen bytes: a unit whose operands are int16 takes
     // eight of them a beat, one whose operands are int8 takes sixteen.  NL is
@@ -1923,11 +1975,14 @@ module fabric_layer_engine #(
         end
     endgenerate
 
+    wire [127:0] mem_rd_hi, mem_wr_hi;               // the memory unit's second word: the buffer's wide port
+    wire [15:0]  mem_wr_hi_be;
     fabric_vb #(.BYTES(VB_BYTES), .NR(NR), .NW(NW), .AW(AW), .NB(VB_BANKS), .BSH(VB_BANK_SHIFT),
                 .RCAP2(VB_RCAP2), .RCAP3(VB_RCAP3), .WCAP2(VB_WCAP2),
                 .NPR(VB_NPR), .NPW(VB_NPW), .RMAP0(VB_RMAP0), .RMAP1(VB_RMAP1),
-                .WMAP0(VB_WMAP0), .WMAP1(VB_WMAP1), .INIT_FILE(VB_FILE)) u_vb (
-        .clk(clk), .rd_en(rd_en), .rd_addr(rd_addr), .rd_data(rd_data), .wr_en(wr_en), .wr_addr(wr_addr), .wr_data(wr_data), .wr_be(wr_be));
+                .WMAP0(VB_WMAP0), .WMAP1(VB_WMAP1), .WIDE_R(R_MEM), .WIDE_W(W_MEM), .INIT_FILE(VB_FILE)) u_vb (
+        .clk(clk), .rd_en(rd_en), .rd_addr(rd_addr), .rd_data(rd_data), .rd_hi(mem_rd_hi), .wr_en(wr_en), .wr_addr(wr_addr),
+        .wr_data(wr_data), .wr_be(wr_be), .wr_hi(mem_wr_hi), .wr_hi_be(mem_wr_hi_be));
 
     wire [NE-1:0] ready_norm, ready_delta, ready_rotary, ready_attn;
     wire ready_tiles, ready_conv, ready_gates, ready_swiglu, ready_residual, ready_mem;
@@ -2035,9 +2090,11 @@ module fabric_layer_engine #(
                       .AW(AW), .LUT_DIR(LUT_DIR)) u_mem (
         .clk(clk), .rst_n(rst_n), .cmd_valid(cmd_valid[U_MEM] && cmd_engine == 0), .cmd_len(cmd_len), .cmd_src(cmd_src), .cmd_dst(cmd_dst),
         .cmd_a2(cmd_a2), .cmd_a3(cmd_a3), .cmd_arg(cmd_arg), .cmd_tag(cmd_tag), .cmd_ready(ready_mem), .done_valid(done_valid[U_MEM*NE]), .done_tag(done_tag[U_MEM*NE*8 +: 8]),
-        .rd_addr(rd_addr[R_MEM*AW +: AW]), .rd_en(rd_en[R_MEM]), .rd_data(rd_data[R_MEM*128 +: 128]),
+        .rd_addr(rd_addr[R_MEM*AW +: AW]), .rd_en(rd_en[R_MEM]), .rd_data(rd_data[R_MEM*128 +: 128]), .rd_hi(mem_rd_hi),
         .wr_en(wr_en[W_MEM]), .wr_addr(wr_addr[W_MEM*AW +: AW]), .wr_data(wr_data[W_MEM*128 +: 128]), .wr_be(wr_be[W_MEM*16 +: 16]),
-        .m_req_valid(m_req_valid), .m_req_ready(m_req_ready), .m_req_write(m_req_write), .m_req_addr(m_req_addr), .m_req_beats(m_req_beats),
+        .wr_hi(mem_wr_hi), .wr_hi_be(mem_wr_hi_be),
+        .m_req_valid(m_req_valid), .m_req_ready(m_req_ready), .m_req_write(m_req_write), .m_req_wide(m_req_wide), .m_req_addr(m_req_addr),
+        .m_req_beats(m_req_beats),
         .m_wdata_valid(m_wdata_valid), .m_wdata_ready(m_wdata_ready), .m_wdata(m_wdata), .m_rdata_valid(m_rdata_valid), .m_rdata(m_rdata));
 endmodule
 

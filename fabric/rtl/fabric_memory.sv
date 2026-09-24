@@ -6,6 +6,11 @@
 //   wdata_valid / wdata_ready / wdata; read beats return in order on
 //   rdata_valid / rdata.  One request in flight per requester.
 //
+// A port of XW beats a transfer carries, for a request with req_wide, XW
+// beats on each wdata / rdata handshake, the first in the low DW bits, and
+// fewer on the last when the count is not a multiple; req_beats still counts
+// beats.  A narrow request is a beat a handshake in the low bits.
+//
 // Golden model: fabric/memory.py.
 
 `default_nettype none
@@ -17,58 +22,67 @@
 // ---------------------------------------------------------------------------
 module fabric_mem_model #(
     parameter int DW    = 128,
+    parameter int XW    = 1,                    // beats a wide transfer carries (1 or 2)
     parameter int WORDS = 4096,
     parameter int LAT   = 4,
     parameter     FILE  = ""
 ) (
-    input  wire          clk,
-    input  wire          rst_n,
-    input  wire          req_valid,
-    output wire          req_ready,
-    input  wire          req_write,
-    input  wire [31:0]   req_addr,
-    input  wire [11:0]   req_beats,
-    input  wire          wdata_valid,
-    output wire          wdata_ready,
-    input  wire [DW-1:0] wdata,
-    output reg           rdata_valid,
-    output reg  [DW-1:0] rdata
+    input  wire             clk,
+    input  wire             rst_n,
+    input  wire             req_valid,
+    output wire             req_ready,
+    input  wire             req_write,
+    input  wire             req_wide,
+    input  wire [31:0]      req_addr,
+    input  wire [11:0]      req_beats,
+    input  wire             wdata_valid,
+    output wire             wdata_ready,
+    input  wire [XW*DW-1:0] wdata,
+    output reg              rdata_valid,
+    output wire [XW*DW-1:0] rdata
 );
     localparam int AW = $clog2(WORDS);
     reg [DW-1:0] mem [0:WORDS-1];
     initial begin
         if (FILE != "") $readmemh(FILE, mem);
     end
-    reg        busy, is_write;
+    reg        busy, is_write, wide;
     reg [AW-1:0] addr;
     reg [11:0] left;
     reg [3:0]  wait_r;
+    reg  [2*DW-1:0] rd2;
+    wire [2*DW-1:0] wd2  = wdata;
+    wire            two  = wide && (left > 1);        // this transfer carries two beats
+    wire [11:0]     step = two ? 12'd2 : 12'd1;
+    assign rdata       = rd2[XW*DW-1:0];
     assign req_ready   = !busy;
     assign wdata_ready = busy && is_write;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            busy <= 1'b0; rdata_valid <= 1'b0; is_write <= 1'b0; left <= 0; wait_r <= 0;
+            busy <= 1'b0; rdata_valid <= 1'b0; is_write <= 1'b0; wide <= 1'b0; left <= 0; wait_r <= 0;
         end else begin
             rdata_valid <= 1'b0;
             if (!busy) begin
                 if (req_valid) begin
                     busy <= 1'b1; is_write <= req_write; addr <= req_addr[AW+3:4]; left <= req_beats; wait_r <= LAT;
+                    wide <= (XW > 1) && (req_wide === 1'b1);
                 end
             end else if (is_write) begin
                 if (wdata_valid) begin
-                    mem[addr] <= wdata;
-                    addr <= addr + 1'b1;
-                    left <= left - 1'b1;
-                    if (left == 1) busy <= 1'b0;
+                    mem[addr] <= wd2[DW-1:0];
+                    if (two) mem[addr + 1'b1] <= wd2[2*DW-1:DW];
+                    addr <= addr + step;
+                    left <= left - step;
+                    if (left == step) busy <= 1'b0;
                 end
             end else begin
                 if (wait_r != 0) wait_r <= wait_r - 1'b1;
                 else begin
                     rdata_valid <= 1'b1;
-                    rdata <= mem[addr];
-                    addr <= addr + 1'b1;
-                    left <= left - 1'b1;
-                    if (left == 1) busy <= 1'b0;
+                    rd2 <= {two ? mem[addr + 1'b1] : {DW{1'b0}}, mem[addr]};
+                    addr <= addr + step;
+                    left <= left - step;
+                    if (left == step) busy <= 1'b0;
                 end
             end
         end
@@ -81,38 +95,42 @@ endmodule
 // ---------------------------------------------------------------------------
 module fabric_mem_arbiter #(
     parameter int N  = 2,
-    parameter int DW = 128
+    parameter int DW = 128,
+    parameter int XW = 1                        // beats a wide transfer carries (1 or 2)
 ) (
-    input  wire            clk,
-    input  wire            rst_n,
+    input  wire               clk,
+    input  wire               rst_n,
     // requesters
-    input  wire [N-1:0]    r_req_valid,
-    output wire [N-1:0]    r_req_ready,
-    input  wire [N-1:0]    r_req_write,
-    input  wire [N*32-1:0] r_req_addr,
-    input  wire [N*12-1:0] r_req_beats,
-    input  wire [N-1:0]    r_wdata_valid,
-    output wire [N-1:0]    r_wdata_ready,
-    input  wire [N*DW-1:0] r_wdata,
-    output wire [N-1:0]    r_rdata_valid,
-    output wire [DW-1:0]   r_rdata,
+    input  wire [N-1:0]       r_req_valid,
+    output wire [N-1:0]       r_req_ready,
+    input  wire [N-1:0]       r_req_write,
+    input  wire [N-1:0]       r_req_wide,
+    input  wire [N*32-1:0]    r_req_addr,
+    input  wire [N*12-1:0]    r_req_beats,
+    input  wire [N-1:0]       r_wdata_valid,
+    output wire [N-1:0]       r_wdata_ready,
+    input  wire [N*XW*DW-1:0] r_wdata,
+    output wire [N-1:0]       r_rdata_valid,
+    output wire [XW*DW-1:0]   r_rdata,
     // memory
-    output wire            m_req_valid,
-    input  wire            m_req_ready,
-    output wire            m_req_write,
-    output wire [31:0]     m_req_addr,
-    output wire [11:0]     m_req_beats,
-    output wire            m_wdata_valid,
-    input  wire            m_wdata_ready,
-    output wire [DW-1:0]   m_wdata,
-    input  wire            m_rdata_valid,
-    input  wire [DW-1:0]   m_rdata
+    output wire               m_req_valid,
+    input  wire               m_req_ready,
+    output wire               m_req_write,
+    output wire               m_req_wide,
+    output wire [31:0]        m_req_addr,
+    output wire [11:0]        m_req_beats,
+    output wire               m_wdata_valid,
+    input  wire               m_wdata_ready,
+    output wire [XW*DW-1:0]   m_wdata,
+    input  wire               m_rdata_valid,
+    input  wire [XW*DW-1:0]   m_rdata
 );
     localparam int IW = $clog2(N) + 1;
     reg          locked;
     reg [IW-1:0] owner, last;
-    reg          own_write;
+    reg          own_write, own_wide;
     reg [11:0]   left;
+    wire [11:0]  step = (own_wide && left > 1) ? 12'd2 : 12'd1;   // beats this handshake carries
     // Pick the next requester after `last` with a request.
     integer i;
     reg [IW-1:0] pick;
@@ -125,6 +143,7 @@ module fabric_mem_arbiter #(
     wire grant = !locked && found && m_req_ready;
     assign m_req_valid = grant;
     assign m_req_write = r_req_write[pick];
+    assign m_req_wide  = (XW > 1) && (r_req_wide[pick] === 1'b1);
     assign m_req_addr  = r_req_addr[pick*32 +: 32];
     assign m_req_beats = r_req_beats[pick*12 +: 12];
     genvar g;
@@ -136,18 +155,19 @@ module fabric_mem_arbiter #(
         end
     endgenerate
     assign m_wdata_valid = locked && own_write && r_wdata_valid[owner];
-    assign m_wdata       = r_wdata[owner*DW +: DW];
+    assign m_wdata       = r_wdata[owner*XW*DW +: XW*DW];
     assign r_rdata       = m_rdata;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            locked <= 1'b0; owner <= 0; last <= N - 1; own_write <= 1'b0; left <= 0;
+            locked <= 1'b0; owner <= 0; last <= N - 1; own_write <= 1'b0; own_wide <= 1'b0; left <= 0;
         end else begin
             if (grant) begin
                 locked <= 1'b1; owner <= pick; last <= pick; own_write <= r_req_write[pick]; left <= r_req_beats[pick*12 +: 12];
+                own_wide <= m_req_wide;
             end else if (locked) begin
                 if ((own_write && m_wdata_valid && m_wdata_ready) || (!own_write && m_rdata_valid)) begin
-                    left <= left - 1'b1;
-                    if (left == 1) locked <= 1'b0;
+                    left <= left - step;
+                    if (left == step) locked <= 1'b0;
                 end
             end
         end
@@ -1091,6 +1111,77 @@ module fabric_kv_append #(
                 S_DONE: begin done <= 1'b1; state <= S_IDLE; end
                 default: state <= S_IDLE;
             endcase
+        end
+    end
+endmodule
+
+// ---------------------------------------------------------------------------
+// A port of two-beat transfers onto one of a beat a transfer: a wide
+// request's transfers go through as two beats each, a narrow one's as one.
+// One transaction at a time, which is what the engine's arbiter issues -- it
+// holds the port until a transaction's last beat.
+// ---------------------------------------------------------------------------
+module fabric_mem_narrow #(
+    parameter int DW = 128
+) (
+    input  wire            clk,
+    input  wire            rst_n,
+    // the wide side
+    input  wire            w_req_valid,
+    output wire            w_req_ready,
+    input  wire            w_req_write,
+    input  wire            w_req_wide,
+    input  wire [31:0]     w_req_addr,
+    input  wire [11:0]     w_req_beats,
+    input  wire            w_wdata_valid,
+    output wire            w_wdata_ready,
+    input  wire [2*DW-1:0] w_wdata,
+    output reg             w_rdata_valid,
+    output reg  [2*DW-1:0] w_rdata,
+    // the narrow side
+    output wire            n_req_valid,
+    input  wire            n_req_ready,
+    output wire            n_req_write,
+    output wire [31:0]     n_req_addr,
+    output wire [11:0]     n_req_beats,
+    output wire            n_wdata_valid,
+    input  wire            n_wdata_ready,
+    output wire [DW-1:0]   n_wdata,
+    input  wire            n_rdata_valid,
+    input  wire [DW-1:0]   n_rdata
+);
+    reg          busy, wide, wr, half;             // half: a pair's first beat has gone (or come)
+    reg [11:0]   left;                             // beats of the transaction still to move
+    reg [DW-1:0] lo;
+    wire         two = wide && (half || left > 1);  // the transfer in hand carries two beats
+    assign n_req_valid   = w_req_valid && !busy;
+    assign w_req_ready   = n_req_ready && !busy;
+    assign n_req_write   = w_req_write;
+    assign n_req_addr    = w_req_addr;
+    assign n_req_beats   = w_req_beats;
+    assign n_wdata_valid = busy && wr && w_wdata_valid;
+    assign n_wdata       = half ? w_wdata[2*DW-1:DW] : w_wdata[DW-1:0];
+    assign w_wdata_ready = busy && wr && n_wdata_ready && (!two || half);
+    wire   moved = busy && (wr ? (n_wdata_valid && n_wdata_ready) : n_rdata_valid);
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            busy <= 1'b0; wide <= 1'b0; wr <= 1'b0; half <= 1'b0; left <= 0; w_rdata_valid <= 1'b0;
+        end else begin
+            w_rdata_valid <= 1'b0;
+            if (w_req_valid && w_req_ready) begin
+                busy <= 1'b1; wide <= w_req_wide; wr <= w_req_write; half <= 1'b0; left <= w_req_beats;
+            end else if (moved) begin
+                left <= left - 1'b1;
+                if (left == 1) busy <= 1'b0;
+                half <= two && !half;
+                if (!wr) begin
+                    if (two && !half) lo <= n_rdata;
+                    else begin
+                        w_rdata_valid <= 1'b1;
+                        w_rdata <= two ? {n_rdata, lo} : {{DW{1'b0}}, n_rdata};
+                    end
+                end
+            end
         end
     end
 endmodule

@@ -79,7 +79,11 @@ class ScheduleTest(unittest.TestCase):
         glob = S.global_program(cfg, None, TileSpec(), mm, mm.context_tokens - 1)
         for steps in (rec, glob):
             sched = S.schedule(steps)
-            self.assertGreater(sched.busy("mem") / sched.cycles, 0.6)
+            # The port is still the busiest unit by far, though the mover's two
+            # beats a transfer took a recurrent token from two thirds of it to
+            # just under three fifths.
+            self.assertGreater(sched.busy("mem") / sched.cycles, 0.55)
+            self.assertEqual(max(S.UNITS, key=lambda u: sched.busy(u) / S.UNITS[u][1]), "mem")
             self.assertEqual(sched.busy("tiles"), sum(s.cycles for s in steps if s.unit == "tiles"))
         self.assertEqual(len([s for s in rec if s.unit == "tiles"]), 4)              # four passes
         self.assertEqual(len([s for s in rec if s.name.startswith("delta")]), cfg.linear_num_value_heads)
@@ -95,11 +99,15 @@ class ScheduleTest(unittest.TestCase):
             single = S.schedule(steps)
             interval = S.token_interval(steps)
             port = single.busy("mem")
-            # The stream sits on the port.  Not a floor: a command's span is its
+            # The port bounds the stream.  Not a floor: a command's span is its
             # beats and its latency, and consecutive commands overlap the latency,
             # so the interval can come in a little under the sum of the spans.
+            # The global layer's stream sits on it; since the mover moves two
+            # beats a transfer the recurrent one no longer does -- its port time
+            # halved, and the in-order issue of its passes and heads now leaves
+            # the port idle for about a sixth of the interval.
             self.assertGreater(interval, 0.97 * port)
-            self.assertLess(interval, 1.1 * port)                       # and the stream sits on it
+            self.assertLess(interval, 1.25 * port)
             self.assertLess(interval, 0.85 * single.cycles)             # below one token at a time
             two = S.stream(steps, 2)
             self.assertEqual(len(two), 2 * len(steps))

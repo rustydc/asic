@@ -254,8 +254,10 @@ class Timing:
         return int(max(load) * self.ctrl_ratio)
 
     def move(self, beats: int, write: bool) -> int:
-        """The beat mover: memory to the vector buffer, or back."""
-        return (self.port_write_beat * beats + self.mem_write_latency) if write else (beats + self.mem_read_latency)
+        """The beat mover: memory to the vector buffer, or back, two beats a
+        transfer -- the port's wide requests and the buffer's wide port."""
+        transfers = -(-beats // 2)
+        return (self.port_write_beat * transfers + self.mem_write_latency) if write else (transfers + self.mem_read_latency)
 
     def read_records(self, requests: list[int], record_beats: int, head_dim: int, maxr: int) -> int:
         """The record reader over ``requests`` (the records in each), cycle for
