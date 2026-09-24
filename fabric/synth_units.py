@@ -94,6 +94,15 @@ UNITS = [
     Unit("rotary_table", "fabric_rotary_table", VEC + ("fabric_attention.sv",), {"R": 16}, "the rotary table", luts=True),
     Unit("attention", "fabric_attention", VEC + ("fabric_attention.sv",), {"HD": 32, "G": 1, "L": 2, "LW": 28},
          "the attention core, one head of 32, two lanes", luts=True),
+    # Two lanes cannot see a fanout: the copies this design puts on a constant
+    # that every lane reads are pure overhead there and a win at sixteen, so a
+    # change measured only on the narrow row reads backwards.  The real row
+    # takes an hour and a half in ABC, which is no way to iterate.  Eight lanes
+    # over one head of 64 is the smallest elaboration where a per-lane fanout
+    # is a fanout, and it maps in minutes.
+    Unit("attention_lanes", "fabric_attention", VEC + ("fabric_attention.sv",),
+         {"HD": 64, "G": 1, "L": 8, "LW": 28},
+         "the attention core, one head of 64, eight lanes", luts=True),
     # The real elaboration, to test whether a unit's worst stage is the same at
     # any lane count: the 9B attention core is one group of four heads of 256,
     # sixteen lanes, against the representative geometry's one head of 32 and
