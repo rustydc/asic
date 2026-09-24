@@ -274,7 +274,11 @@ def synthesize(liberty: Path | Sequence[Path], *, rows: int = 256, cols: int = 8
             # synthesis does not finish rather than why it does not time.
             # Timing is unaffected: OpenSTA reads the hierarchy and walks
             # through it either way.
-            *[f"setattr -mod -set keep_hierarchy 1 {m}" for m in keep_hier],
+            # Matched with wildcards: `hierarchy` renames a parameterized
+            # module to $paramod\<name>\<params>, so the bare name selects
+            # nothing and yosys says so in a warning that is easy to miss
+            # among its others.
+            *[f"setattr -mod -set keep_hierarchy 1 *{m}*" for m in keep_hier],
             f"synth -top {top} -flatten" + (" -noshare" if noshare else ""),
             f"dfflibmap {lib_args}",
             abc_cmd,
