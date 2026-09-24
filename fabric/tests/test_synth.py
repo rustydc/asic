@@ -14,7 +14,7 @@ import tempfile
 
 from fabric.pnr import PLATFORMS, filter_pdn_script, merge_pin_ports, parse_results
 from fabric.sta import parse_report
-from fabric.synth import filter_liberty, map_ties, merge_liberty, nand2_area, parse_stat, synthesize
+from fabric.synth import abc_was_killed, filter_liberty, map_ties, merge_liberty, nand2_area, parse_stat, synthesize
 
 LIBERTY = os.environ.get("FABRIC_LIBERTY")
 HAVE_YOSYS = shutil.which("yosys") or shutil.which("yowasp-yosys")
@@ -257,3 +257,24 @@ class SynthesisTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AbcKillTest(unittest.TestCase):
+    """The unbuffered fallback is for ABC aborting, never for ABC being killed.
+
+    The first version of this guard looked for a signal in yosys's return
+    code, and yosys is not what gets killed: the attention core at 32 lanes
+    was killed for memory twice, buffered and then unbuffered, 42 minutes
+    apart, because the kill only ever showed up in the log."""
+
+    def test_a_killed_child_is_a_kill(self) -> None:
+        log = ("ABC: + dretime \nABC: Killed\nERROR: ABC: execution of command "
+               "\"/usr/bin/yosys-abc\" failed: return code 137.")
+        self.assertTrue(abc_was_killed(1, log))
+
+    def test_a_killed_yosys_is_a_kill(self) -> None:
+        self.assertTrue(abc_was_killed(-9, ""))
+
+    def test_an_abort_is_not(self) -> None:
+        log = "ABC: Error: node 42 has no fanout\nERROR: ABC: execution of command failed: return code 1."
+        self.assertFalse(abc_was_killed(1, log))

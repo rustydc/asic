@@ -49,6 +49,18 @@ class SynthResult:
         return asdict(self)
 
 
+def abc_was_killed(returncode: int, log: str) -> bool:
+    """Whether a failed run failed because ABC was killed rather than aborted.
+
+    yosys is not the process that dies: ABC runs as its child, and when the
+    kernel kills it for memory yosys reports the child's status and exits
+    with an ordinary error of its own.  So yosys's return code carries no
+    signal -- the kill is only in the log, as the shell's 128 + 9.  A
+    negative return code is checked as well, for a yosys killed outright.
+    """
+    return returncode < 0 or "return code 137" in log or "ABC: Killed" in log
+
+
 def merge_liberty(paths: Sequence[Path], output: Path) -> int:
     """Concatenate the cell groups of several liberty files into one library block.
 
@@ -303,10 +315,10 @@ def synthesize(liberty: Path | Sequence[Path], *, rows: int = 256, cols: int = 8
             # worst net has no buffer tree at all.  The attention core came
             # back from one of those with a single NAND2 driving 6,703 loads
             # and a path of 28 ns, which looks like a measurement.
-            if result.returncode < 0:
+            if abc_was_killed(result.returncode, log):
                 raise RuntimeError(
-                    f"yosys killed by signal {-result.returncode} (ABC out of memory, most likely): "
-                    f"run this unit with the machine to itself rather than taking an unbuffered map.\n"
+                    "ABC was killed (out of memory, most likely): run this unit with the "
+                    "machine to itself rather than taking an unbuffered map.\n"
                     f"{log[-2000:]}")
             buffered = False
             script = script.replace(abc_cmd, f"abc {lib_args} -D {target_ps}")
