@@ -496,8 +496,16 @@ module fabric_delta_state8 #(
     reg [3:0]      phase;            // 0 pass 1, 1 pred, 2 diff, 3 beta*diff, 4 c*r, 5 c, 6 pass 2, 7 y, 8 reduce
     reg signed [31:0] pred_acc [0:V-1];
     reg signed [31:0] y_acc [0:V-1];
-    reg signed [47:0] pm [0:V-1];
-    reg signed [47:0] ym [0:V-1];   // the y stage's own, so no stage reads another's write
+    // The scale's two products are left carry-save, each with its own
+    // rounding constant as one more operand of its tree.  Resolved where they
+    // are formed, the stage is a 32 by 16 multiply and then the add of that
+    // constant -- two carry propagations, and 2,010 ps of this unit once the
+    // fanout came off it.  The stages that read them shift by a constant, so
+    // resolving there costs the one add that was already going to happen.
+    localparam int PMW = 48;
+    reg [PMW-1:0] pms [0:V-1], pmc [0:V-1];
+    reg [PMW-1:0] yms [0:V-1], ymc [0:V-1];   // the y stage's own, so no stage reads another's write
+    wire [PMW-1:0] pms_n [0:VL-1], pmc_n [0:VL-1], yms_n [0:VL-1], ymc_n [0:VL-1];
     reg signed [15:0] diff [0:V-1];
     reg signed [31:0] bd [0:V-1];
     // The rescale's product is left carry-save: bd by the 17-bit reciprocal
@@ -528,6 +536,7 @@ module fabric_delta_state8 #(
     wire [15:0]    gren_l [0:VL-1];
     wire signed [23:0] rndr_l [0:VL-1];
     wire signed [47:0] rndp_l [0:VL-1];
+    wire signed [47:0] rndy_l [0:VL-1];
     reg  [7:0]     rab;
     integer        sl;
     wire           resc_l [0:VL-1];
@@ -554,6 +563,13 @@ module fabric_delta_state8 #(
             // the same shape on `rndp`.
             fabric_const_copy #(.W(24)) u_rr (.clk(clk), .d(rndr),    .q(rndr_l[gv]));
             fabric_const_copy #(.W(48)) u_rp (.clk(clk), .d(rndp),    .q(rndp_l[gv]));
+            fabric_const_copy #(.W(48)) u_ry (.clk(clk), .d(rndy),    .q(rndy_l[gv]));
+            fabric_mul_cs #(.AW(32), .BW(16), .PW(PMW), .ADD(1)) u_pm (
+                .a(pred_acc[ps * VL + gv]), .b(g1_l[gv]), .addend(rndp_l[gv]),
+                .s(pms_n[gv]), .c(pmc_n[gv]));
+            fabric_mul_cs #(.AW(32), .BW(16), .PW(PMW), .ADD(1)) u_ym (
+                .a(y_acc[ps * VL + gv]), .b(g1_l[gv]), .addend(rndy_l[gv]),
+                .s(yms_n[gv]), .c(ymc_n[gv]));
             fabric_const_copy #(.W(1))  u_rs (.clk(clk), .d(rescale), .q(resc_l[gv]));
         end
     endgenerate
@@ -723,7 +739,8 @@ module fabric_delta_state8 #(
                 if (tail == 3'd1)
                     for (u = 0; u < VL; u = u + 1) begin
                         j = ps * VL + u;
-                        y[j*16 +: 16] <= fx_sat((ym[j] + rndy) >>> shy_l[u], 16);
+                        y[j*16 +: 16] <= fx_sat(
+                            ($signed(yms[j]) + $signed({ymc[j][PMW-2:0], 1'b0})) >>> shy_l[u], 16);
                     end
                 if (tail == 3'd2)
                     for (gg = 0; gg < G2N; gg = gg + 1) begin
@@ -746,7 +763,7 @@ module fabric_delta_state8 #(
                 if (tail == 3'd0)
                     for (u = 0; u < VL; u = u + 1) begin
                         j = ps * VL + u;
-                        ym[j] = y_acc[j] * $signed({16'b0, g1_l[u]});
+                        yms[j] = yms_n[u]; ymc[j] = ymc_n[u];
                     end
             end
 
@@ -826,7 +843,7 @@ module fabric_delta_state8 #(
             if (phase == 4'd2) begin
                 for (u = 0; u < VL; u = u + 1) begin
                     j = ps * VL + u;
-                    pr = (pm[j] + rndp_l[u]) >>> shp_l[u];
+                    pr = ($signed(pms[j]) + $signed({pmc[j][PMW-2:0], 1'b0})) >>> shp_l[u];
                     diff[j] = fx_sat($signed({{56{v_r[j*8+7]}}, v_r[j*8 +: 8]}) - pr, 16);
                 end
                 if (ps == SL - 1) begin ps <= 0; phase <= 4'd3; end
@@ -835,7 +852,7 @@ module fabric_delta_state8 #(
             if (phase == 4'd1 && r_ready) begin
                 for (u = 0; u < VL; u = u + 1) begin
                     j = ps * VL + u;
-                    pm[j] = pred_acc[j] * $signed({16'b0, g1_l[u]});
+                    pms[j] = pms_n[u]; pmc[j] = pmc_n[u];
                 end
                 if (ps == SL - 1) begin ps <= 0; phase <= 4'd2; end
                 else ps <= ps + 1'b1;
