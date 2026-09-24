@@ -48,7 +48,8 @@ class Unit:
     params: dict
     note: str
     luts: bool = False
-    noshare: bool = False              # skip yosys's SAT-based resource sharing
+    noshare: bool = False
+    keep_hier: tuple[str, ...] = ()              # modules mapped once rather than per instance
     files: tuple[tuple[str, str], ...] = ()      # (name, contents) written next to the sources
 
 
@@ -78,8 +79,14 @@ UNITS = [
     # any lane count: the 9B attention core is one group of four heads of 256,
     # sixteen lanes, against the representative geometry's one head of 32 and
     # two lanes.
+    # Sixteen sigmoids and four exponentials, an interpolated table each:
+    # flattened they are most of the 778,111 gates this unit hands ABC, and
+    # its synthesis does not finish rather than does not time.  Kept as
+    # hierarchy the table is mapped once, and OpenSTA walks through it either
+    # way, so the timing is the same measurement.
     Unit("attention_real", "fabric_attention", VEC + ("fabric_attention.sv",), {"HD": 256, "G": 4, "L": 16, "LW": 28},
-         "the attention core at the 9B geometry: four heads of 256, sixteen lanes", luts=True),
+         "the attention core at the 9B geometry: four heads of 256, sixteen lanes", luts=True,
+         keep_hier=("fabric_lut",)),
     # The same units at the 9B elaboration, to see how much of each unit's
     # path the representative geometry hides.  Lanes are NL=8, CL=4,
     # ATT_L=SW_L=16; the head is 256 wide and the hidden width 4096.
@@ -167,7 +174,7 @@ def run_unit(unit: Unit, lib_name: str, liberty: Path, target_ps: int, sta: Path
         try:
             synth = synthesize(liberty, top=unit.top, target_ps=target_ps, keep_netlist=netlist,
                                sources=[RTL_DIR / name for name in unit.sources], params=unit.params, data_files=data,
-                               noshare=unit.noshare)
+                               noshare=unit.noshare, keep_hier=unit.keep_hier)
         except Exception as error:  # noqa: BLE001 - the report says what failed
             return {"unit": unit.name, "library": lib_name, "error": str(error)[-1500:], "seconds": time.time() - t0}
         out = {"unit": unit.name, "library": lib_name, "top": unit.top, "params": unit.params, "note": unit.note,

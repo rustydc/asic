@@ -211,7 +211,7 @@ def synthesize(liberty: Path | Sequence[Path], *, rows: int = 256, cols: int = 8
                act_bits: int = 8, acc_bits: int = 24, top: str = "fabric_columns",
                target_ps: int | None = None, keep_netlist: Path | None = None,
                sources: Sequence[Path] | None = None, params: dict | None = None, data_files: Sequence[Path] = (),
-               noshare: bool = False) -> SynthResult:
+               noshare: bool = False, keep_hier: Sequence[str] = ()) -> SynthResult:
     """Synthesize ``top`` against one liberty file, or several (e.g. ASAP7 splits cells across files).
 
     By default the column datapath of ``fabric_tile.sv`` with the tile
@@ -266,6 +266,15 @@ def synthesize(liberty: Path | Sequence[Path], *, rows: int = 256, cols: int = 8
             *[f"read_verilog -sv -defer -DFABRIC_SYNTH {path.name}" for path in sources],
             *([f"chparam {chparam} {top}"] if chparam else []),   # a module with no parameters takes none
             f"hierarchy -check -top {top}",
+            # A module named in `keep_hier` is mapped once and instantiated,
+            # rather than flattened and optimized again per instance.  The
+            # attention core holds sixteen sigmoids and four exponentials,
+            # each an interpolated table, and flattened they are most of the
+            # 778,111 gates ABC is handed -- which is why that unit's
+            # synthesis does not finish rather than why it does not time.
+            # Timing is unaffected: OpenSTA reads the hierarchy and walks
+            # through it either way.
+            *[f"setattr -mod -set keep_hierarchy 1 {m}" for m in keep_hier],
             f"synth -top {top} -flatten" + (" -noshare" if noshare else ""),
             f"dfflibmap {lib_args}",
             abc_cmd,
