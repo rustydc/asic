@@ -704,7 +704,16 @@ module fabric_delta_state8 #(
     reg [7:0]      pk_b [0:G2N-1];
     reg [15:0]     ns_b [0:G2N-1];
     reg [2:0]      tail;
-    reg signed [63:0] tr, tn, dl, pr, mag, nsat;
+    reg signed [63:0] tr, tn, dl, mag, nsat;
+    // The pair's resolve, its shift and the saturate that follows, each at
+    // the width of the value rather than at 64.  Both stages held their
+    // result in a 64-bit temp, and the assignment context sets the width of
+    // everything on the right of it: a 48-bit add, a 48-bit shift and a
+    // 16-bit compare were all done at 64, three carry chains a third longer
+    // than the data, in series, in one cycle.
+    reg signed [PMW-1:0] prs, yrs;
+    reg                  prfit;
+    reg signed [18:0]    pdif;
     integer        gg, jj;
     // The per-element arrays are written with blocking assignments inside the
     // lane loops (each element reads and writes only itself, in one phase), so
@@ -739,8 +748,12 @@ module fabric_delta_state8 #(
                 if (tail == 3'd1)
                     for (u = 0; u < VL; u = u + 1) begin
                         j = ps * VL + u;
-                        y[j*16 +: 16] <= fx_sat(
-                            ($signed(yms[j]) + $signed({ymc[j][PMW-2:0], 1'b0})) >>> shy_l[u], 16);
+                        // As the difference: resolve and shift at the pair's
+                        // width, and saturate on the sign bits above the
+                        // sixteen that are kept.
+                        yrs = ($signed(yms[j]) + $signed({ymc[j][PMW-2:0], 1'b0})) >>> shy_l[u];
+                        y[j*16 +: 16] <= ((&yrs[PMW-1:15]) | (~|yrs[PMW-1:15]))
+                                         ? yrs[15:0] : (yrs[PMW-1] ? 16'sh8000 : 16'sh7FFF);
                     end
                 if (tail == 3'd2)
                     for (gg = 0; gg < G2N; gg = gg + 1) begin
@@ -843,8 +856,19 @@ module fabric_delta_state8 #(
             if (phase == 4'd2) begin
                 for (u = 0; u < VL; u = u + 1) begin
                     j = ps * VL + u;
-                    pr = ($signed(pms[j]) + $signed({pmc[j][PMW-2:0], 1'b0})) >>> shp_l[u];
-                    diff[j] = fx_sat($signed({{56{v_r[j*8+7]}}, v_r[j*8 +: 8]}) - pr, 16);
+                    // v is int8 and the difference int16, so a prediction
+                    // beyond 18 bits can never come back inside the range:
+                    // it saturates on its sign alone.  The subtract needs
+                    // only those 18 bits, and the 31 above them are a check
+                    // that they all match the sign -- an and-or tree that
+                    // runs beside the subtract instead of in front of it.
+                    prs   = ($signed(pms[j]) + $signed({pmc[j][PMW-2:0], 1'b0})) >>> shp_l[u];
+                    prfit = (&prs[PMW-1:17]) | (~|prs[PMW-1:17]);
+                    pdif  = $signed({{11{v_r[j*8+7]}}, v_r[j*8 +: 8]}) - $signed(prs[17:0]);
+                    diff[j] = !prfit                ? (prs[PMW-1] ? 16'sh7FFF : 16'sh8000)
+                            : (pdif > 19'sd32767)   ? 16'sh7FFF
+                            : (pdif < -19'sd32768)  ? 16'sh8000
+                            : pdif[15:0];
                 end
                 if (ps == SL - 1) begin ps <= 0; phase <= 4'd3; end
                 else ps <= ps + 1'b1;
