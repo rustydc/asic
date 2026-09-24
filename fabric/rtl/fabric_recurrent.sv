@@ -526,6 +526,10 @@ module fabric_delta_state8 #(
     wire [15:0] g1_l [0:VL-1];
     wire [15:0]    b_r_l [0:VL-1];
     wire [15:0]    gren_l [0:VL-1];
+    wire signed [23:0] rndr_l [0:VL-1];
+    wire signed [47:0] rndp_l [0:VL-1];
+    reg  [7:0]     rab;
+    integer        sl;
     wire           resc_l [0:VL-1];
     wire [VL*50-1:0] cms_w, cmc_w;
     genvar gv;
@@ -546,6 +550,10 @@ module fabric_delta_state8 #(
             // same shape again.  Both are settled well before pass 1 reaches
             // A3, as `g1` beside them is.
             fabric_const_copy #(.W(16)) u_gr (.clk(clk), .d(gren),    .q(gren_l[gv]));
+            // The rounds are added in every lane too: 97 loads on `rndr` and
+            // the same shape on `rndp`.
+            fabric_const_copy #(.W(24)) u_rr (.clk(clk), .d(rndr),    .q(rndr_l[gv]));
+            fabric_const_copy #(.W(48)) u_rp (.clk(clk), .d(rndp),    .q(rndp_l[gv]));
             fabric_const_copy #(.W(1))  u_rs (.clk(clk), .d(rescale), .q(resc_l[gv]));
         end
     endgenerate
@@ -818,7 +826,7 @@ module fabric_delta_state8 #(
             if (phase == 4'd2) begin
                 for (u = 0; u < VL; u = u + 1) begin
                     j = ps * VL + u;
-                    pr = (pm[j] + rndp) >>> shp_l[u];
+                    pr = (pm[j] + rndp_l[u]) >>> shp_l[u];
                     diff[j] = fx_sat($signed({{56{v_r[j*8+7]}}, v_r[j*8 +: 8]}) - pr, 16);
                 end
                 if (ps == SL - 1) begin ps <= 0; phase <= 4'd3; end
@@ -851,15 +859,22 @@ module fabric_delta_state8 #(
             if (va2)
                 for (u = 0; u < VL; u = u + 1) begin
                     j = sa2 * VL + u;
-                    tr = resc_l[u] ? fx_sat((rs2[u] + rndr) >>> shr_l[u], 8)
+                    tr = resc_l[u] ? fx_sat((rs2[u] + rndr_l[u]) >>> shr_l[u], 8)
                                  : $signed({{56{rowa2[j*8+7]}}, rowa2[j*8 +: 8]});
                     tr3[j*8 +: 8] <= tr[7:0];   // a register, not a blocking temp: the macro samples it
                 end
             va2 <= va1; ia2 <= ia1; sa2 <= sa1; rowa2 <= rowa1;
             if (va1)
                 for (u = 0; u < VL; u = u + 1) begin
-                    j = sa1 * VL + u;
-                    rs2[u] = $signed(rowa1[j*8 +: 8]) * $signed({8'b0, gren_l[u]});
+                    // The lane's byte as a select over the slices, not a
+                    // part-select at `sa1 * VL + u`: a variable part-select is
+                    // a barrel shifter over the whole row, and `sa1` carried
+                    // 151 loads for it.  Over SL slices it is a small mux, and
+                    // at SL of one it folds away entirely.
+                    rab = 0;
+                    for (sl = 0; sl < SL; sl = sl + 1)
+                        if (sa1 == sl[SW-1:0]) rab = rowa1[(sl*VL + u)*8 +: 8];
+                    rs2[u] = $signed(rab) * $signed({8'b0, gren_l[u]});
                 end
             // A row is VL lanes at a time: the issue holds `va1` for SL cycles
             // and walks the slice, which is the rate the row arrived at.
