@@ -503,17 +503,22 @@ module fabric_attention #(
     // command's constants, so its multiply, round and saturate can be done
     // as the gate arrives instead of as it leaves: read, they were a macro's
     // 533 ps and then a multiply on the core's second-worst path, 1,869 ps
-    // at the real geometry.  Written, they are three stages of their own --
-    // the beat registered, the product, its round -- behind a memory that is
-    // not read until the output pass, hundreds of cycles after the last beat
-    // is written.  The memory holds 16 bits a lane instead of 8.
+    // at the real geometry.  Written, they are four stages of their own --
+    // the beat registered, the product, its shift, its round -- behind a
+    // memory that is not read until the output pass, hundreds of cycles
+    // after the last beat is written.  The memory holds 16 bits a lane
+    // instead of 8.
     localparam int TW = L * 16;
-    reg  [G-1:0]              gwe1, gwe2, gwe3;
-    reg  [$clog2(BEATS)-1:0]  gwa1, gwa2, gwa3;
+    reg  [G-1:0]              gwe1, gwe2, gwe3, gwe4;
+    reg  [$clog2(BEATS)-1:0]  gwa1, gwa2, gwa3, gwa4;
     reg  signed [23:0]        gp2 [0:L-1];
-    reg  [TW-1:0]             gt3;
+    reg  signed [24:0]        gsv3 [0:L-1];
+    reg  [L-1:0]              grb3;
+    reg  [TW-1:0]             gt4;
     wire signed [23:0]        gp2_n [0:L-1];
-    wire [TW-1:0]             gt3_n;
+    wire signed [24:0]        gsv3_n [0:L-1];
+    wire [L-1:0]              grb3_n;
+    wire [TW-1:0]             gt4_n;
     genvar ggm;
     generate
         for (ggm = 0; ggm < L; ggm = ggm + 1) begin : g_gm
@@ -521,22 +526,26 @@ module fabric_attention #(
             fabric_mul_cs #(.AW(8), .BW(16), .PW(24), .ADD(1)) u_gm (
                 .a(in_dataq[ggm*8 +: 8]), .b(mult_gate), .addend(24'b0), .s(gs), .c(gc));
             fabric_cs_resolve #(.W(24)) u_gmr (.s(gs), .c(gc), .y(gp2_n[ggm]));
-            fabric_rnd_sat #(.W(24), .SW(6), .N(16)) u_tg (
-                .v(gp2[ggm]), .sh(sh_gate), .y(gt3_n[ggm*16 +: 16]));
+            fabric_rnd_sat_shift #(.W(24), .SW(6)) u_tgs (
+                .v(gp2[ggm]), .sh(sh_gate), .sv(gsv3_n[ggm]), .rb(grb3_n[ggm]));
+            fabric_rnd_sat_round #(.W(24), .N(16)) u_tg (
+                .sv(gsv3[ggm]), .rb(grb3[ggm]), .y(gt4_n[ggm*16 +: 16]));
         end
     endgenerate
     integer gl2;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            gwe1 <= 0; gwe2 <= 0; gwe3 <= 0;
+            gwe1 <= 0; gwe2 <= 0; gwe3 <= 0; gwe4 <= 0;
         end else begin
-            gwe1 <= gate_we; gwe2 <= gwe1; gwe3 <= gwe2;
+            gwe1 <= gate_we; gwe2 <= gwe1; gwe3 <= gwe2; gwe4 <= gwe3;
         end
     end
     always @(posedge clk) begin
-        gwa1 <= beat[$clog2(BEATS)-1:0]; gwa2 <= gwa1; gwa3 <= gwa2;
-        for (gl2 = 0; gl2 < L; gl2 = gl2 + 1) gp2[gl2] <= gp2_n[gl2];
-        gt3 <= gt3_n;
+        gwa1 <= beat[$clog2(BEATS)-1:0]; gwa2 <= gwa1; gwa3 <= gwa2; gwa4 <= gwa3;
+        for (gl2 = 0; gl2 < L; gl2 = gl2 + 1) begin
+            gp2[gl2] <= gp2_n[gl2]; gsv3[gl2] <= gsv3_n[gl2]; grb3[gl2] <= grb3_n[gl2];
+        end
+        gt4 <= gt4_n;
     end
     // Read, it is a register: the head's word, then the two stages the round
     // used to be, so it still meets the output weight at `og6`.
@@ -577,12 +586,20 @@ module fabric_attention #(
     // Nothing reads l for cycles after S_APPLY -- the value beats come
     // first, then at least a cycle of S_ACCEPT before a finish can take it
     // -- so the update lands a cycle later for free.
+    //
+    // And it takes two cycles: the multiply to carry-save, then the resolve.
+    // With only the factors registered the multiply and its 46-bit final
+    // add were the core's worst path alone, 1,894 ps.  A finish can come two
+    // cycles after S_APPLY when a row is one beat, so the reciprocal's load
+    // takes the resolve directly while it is still pending.
     localparam int LPW = LW + 18;
     wire [15:0]   l_mul [0:G-1];
     wire [15:0]   l_add [0:G-1];
     reg  [15:0]   lm_r [0:G-1];
     reg  [15:0]   la_r [0:G-1];
-    reg           l_up;
+    reg           l_up, l_up2;
+    wire [LPW-1:0] ls_n [0:G-1], lc_n [0:G-1];
+    reg  [LPW-1:0] ls_r [0:G-1], lc_r [0:G-1];
     wire [LW-1:0] l_next [0:G-1];
     genvar glr;
     generate
@@ -592,10 +609,10 @@ module fabric_attention #(
             wire [2*LPW-1:0] lad;
             assign lad[0 +: LPW]   = {{(LPW-16){1'b0}}, 1'b1, 15'b0};            // the round's 2^15
             assign lad[LPW +: LPW] = {{(LPW-32){1'b0}}, la_r[glr], 16'b0};       // A, above the shift
-            wire [LPW-1:0] ls, lc;
             fabric_mul_cs #(.AW(LW+1), .BW(16), .PW(LPW), .ADD(2)) u_l (
-                .a({1'b0, l_r[glr]}), .b(lm_r[glr]), .addend(lad), .s(ls), .c(lc));
-            wire [LPW-1:0] lq = ls + {lc[LPW-2:0], 1'b0};
+                .a({1'b0, l_r[glr]}), .b(lm_r[glr]), .addend(lad), .s(ls_n[glr]), .c(lc_n[glr]));
+            wire signed [LPW-1:0] lq;
+            fabric_cs_resolve #(.W(LPW)) u_lq (.s(ls_r[glr]), .c(lc_r[glr]), .y(lq));
             assign l_next[glr] = lq[LW+15:16];
         end
     endgenerate
@@ -773,7 +790,7 @@ module fabric_attention #(
                 .wr_en(q_we[gm]), .wr_addr(beat[$clog2(BEATS)-1:0]), .wr_data(q_wd), .wr_mask(1'b1));
             fabric_sram #(.W(L*16), .D(BEATS), .MB(L*16)) u_gate (
                 .clk(clk), .rd_en(1'b1), .rd_addr(onext[$clog2(BEATS)-1:0]), .rd_data(gate_rd[gm]),
-                .wr_en(gwe3[gm]), .wr_addr(gwa3), .wr_data(gt3), .wr_mask(1'b1));
+                .wr_en(gwe4[gm]), .wr_addr(gwa4), .wr_data(gt4), .wr_mask(1'b1));
             fabric_sram #(.W(OWW), .D(BEATS), .MB(OWW)) u_o (
                 .clk(clk), .rd_en(1'b1), .rd_addr(oaddr[$clog2(BEATS)-1:0]), .rd_data(o_rd[gm]),
                 .wr_en(o_we), .wr_addr(o_waddr[$clog2(BEATS)-1:0]), .wr_data(o_wd[gm*OWW +: OWW]), .wr_mask(1'b1));
@@ -782,7 +799,7 @@ module fabric_attention #(
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             state <= S_ACCEPT; beat <= 0; head <= 0; exp_go <= 1'b0; rc_start <= 1'b0; done <= 1'b0;
-            accv <= 1'b0; accv2 <= 1'b0; l_up <= 1'b0;
+            accv <= 1'b0; accv2 <= 1'b0; l_up <= 1'b0; l_up2 <= 1'b0;
             ov1 <= 1'b0; out_go <= 1'b0; ohead <= 0; obeat <= 0; drain <= 0; vv <= 1'b0; o_we <= 1'b0; o_seen <= 1'b0;
             for (g = 0; g < G; g = g + 1) begin m_valid[g] <= 1'b0; l_r[g] <= 0; score_s[g] <= 0; score_c[g] <= 0; end
         end else begin
@@ -811,14 +828,17 @@ module fabric_attention #(
             accv <= (state == S_ACCEPT) && !finish && in_valid && (in_kind == 2'd2);
             accv2 <= accv;
             l_up <= 1'b0;
+            l_up2 <= l_up;
             if (l_up)
+                for (g = 0; g < G; g = g + 1) begin ls_r[g] <= ls_n[g]; lc_r[g] <= lc_n[g]; end
+            if (l_up2)
                 for (g = 0; g < G; g = g + 1) l_r[g] <= l_next[g];
             if (accv2)
                 for (g = 0; g < G; g = g + 1) begin
                     score_s[g] <= score_sn[g]; score_c[g] <= score_cn[g];
                 end
             if (start) begin
-                state <= S_ACCEPT; beat <= 0; head <= 0; o_seen <= 1'b0; accv <= 1'b0; accv2 <= 1'b0; l_up <= 1'b0;
+                state <= S_ACCEPT; beat <= 0; head <= 0; o_seen <= 1'b0; accv <= 1'b0; accv2 <= 1'b0; l_up <= 1'b0; l_up2 <= 1'b0;
                 for (g = 0; g < G; g = g + 1) begin
                     m_valid[g] <= 1'b0; l_r[g] <= 0; score_s[g] <= 0; score_c[g] <= 0;
                 end
@@ -826,7 +846,7 @@ module fabric_attention #(
             case (state)
                 S_ACCEPT: begin
                     if (finish) begin
-                        state <= S_RECIP; ohead <= 0; rc_l <= l_r[0]; rc_start <= 1'b1;
+                        state <= S_RECIP; ohead <= 0; rc_l <= l_up2 ? l_next[0] : l_r[0]; rc_start <= 1'b1;
                     end else if (in_valid) begin
                         // The accumulate is off the registered beat above.
                         if (beat == BEATS - 1) begin
