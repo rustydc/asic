@@ -28,31 +28,31 @@ module fabric_rotary_table #(
     localparam int JW = $clog2(H) + 1;
     reg          busy;
     reg [JW-1:0] j;
-    // The frequency this cycle, as a one-hot select rather than
-    // `inv_freq[j*32 +: 32]`.  A variable part-select of the whole vector is
-    // a barrel shifter over all H*32 bits, and `j` addresses twice as many
-    // positions as there are frequencies, so one bit of `j` reached 132
-    // loads: 651 ps of clock-to-output, 31 percent of this unit's path.  An
-    // or of masks is the structure the index actually has, and it costs `j`
-    // H comparators.
-    wire [H-1:0] jsel;
-    genvar gjs;
-    generate
-        for (gjs = 0; gjs < H; gjs = gjs + 1) begin : g_jsel
-            assign jsel[gjs] = (j == gjs[JW-1:0]);
-        end
-    endgenerate
-    reg [31:0] inv_sel;
-    integer qj;
+    // The frequency, selected a cycle before the multiply wants it.  An
+    // `inv_freq[j*32 +: 32]` is a barrel shifter over all H*32 bits, and `j`
+    // addresses twice as many positions as there are frequencies, so one bit
+    // of `j` reached 132 loads: 651 ps of clock-to-output.  Oring H masks is
+    // the structure the index actually has, but it still costs seven levels
+    // to decode `j` and five to or the masks -- 524 of this unit's 1,783 ps,
+    // sitting in front of a multiply that cannot start until it lands.
+    // `j` is a counter, so the index is known a cycle early: walk a one-hot
+    // instead of comparing against `j`, select on it, and register the
+    // result.  The mask or now ends at a flop and the multiply now starts at
+    // one, for no extra latency and no extra cycle.
+    localparam [H-1:0] JH0 = 1;               // the one-hot for index 0
+    reg [H-1:0]  jh;                          // the one-hot for the cycle after this
+    reg [31:0]   inv_r;                       // inv_freq[j], already selected
+    reg [31:0]   inv_nx;
+    integer      qj;
     always @* begin
-        inv_sel = 0;
-        for (qj = 0; qj < H; qj = qj + 1) inv_sel = inv_sel | (inv_freq[qj*32 +: 32] & {32{jsel[qj]}});
+        inv_nx = 0;
+        for (qj = 0; qj < H; qj = qj + 1) inv_nx = inv_nx | (inv_freq[qj*32 +: 32] & {32{jh[qj]}});
     end
     // The turn is the fraction of a revolution, so only bits 31:16 of the
     // product are wanted and the upper half of the multiplier is not built.
     // It is a stage of its own: the multiply and then the table's own index,
     // read and interpolation in one cycle were two multiplies and a table.
-    wire [31:0]  prod = pos * inv_sel;
+    wire [31:0]  prod = pos * inv_r;
     reg  [15:0]  turn;
     reg          v0, v1, v2;
     reg [JW-1:0] j0, j1, j2;
@@ -71,9 +71,14 @@ module fabric_rotary_table #(
             busy <= 1'b0; j <= 0; v0 <= 1'b0; v1 <= 1'b0; v2 <= 1'b0; done <= 1'b0;
         end else begin
             done <= 1'b0;
-            if (start) begin busy <= 1'b1; j <= 0; end
-            else if (busy) begin
+            if (start) begin
+                busy <= 1'b1; j <= 0;
+                inv_r <= inv_freq[31:0];      // index 0 is a slice, not a select
+                jh    <= JH0 << 1;
+            end else if (busy) begin
                 j <= j + 1'b1;
+                inv_r <= inv_nx;
+                jh    <= jh << 1;
                 if (j == H - 1) busy <= 1'b0;
             end
             turn <= prod[31:16];
