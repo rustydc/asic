@@ -480,7 +480,13 @@ module fabric_attention #(
     // O3..O5 the sigmoid, then the gate's product, the scale's and the
     // output's round.  One multiply, or one round with its saturate, to a
     // stage.
-    reg                ov1, ov2;
+    reg                ov0, ov1, ov2;
+    // The accumulator memory's word for the output, registered before the
+    // product (O0).  The macro read is 645 ps, and with the multiply behind
+    // it this was 1,683 ps at the real geometry; the value update's read
+    // below is registered for the same reason.
+    reg  [OWW-1:0] o_rdo;
+    reg  [TW-1:0]  tg0;
     // The output weight's product is carry-save for the same reason as the
     // value update's: it is the same 54-bit add behind the same macro read,
     // and this was the core's worst path.  The resolve belongs to O2, where
@@ -492,7 +498,7 @@ module fabric_attention #(
     generate
         for (gwm = 0; gwm < L; gwm = gwm + 1) begin : g_wm
             wire signed [OW-1:0] wsel =
-                o_seen_o[gwm] ? $signed(o_rd[ohead][gwm*OW +: OW]) : {OW{1'b0}};
+                o_seen_o[gwm] ? $signed(o_rdo[gwm*OW +: OW]) : {OW{1'b0}};
             fabric_mul_cs #(.AW(OW), .BW(17), .PW(VPW), .ADD(1)) u_wm (
                 .a(wsel), .b(r_c[gwm]), .addend({VPW{1'b0}}),
                 .s(wm1_sn[gwm]), .c(wm1_cn[gwm]));
@@ -717,12 +723,12 @@ module fabric_attention #(
         for (gv = 0; gv < G; gv = gv + 1) begin : g_vm
             for (lv = 0; lv < L; lv = lv + 1) begin : g_vl
                 wire signed [OW-1:0] osel =
-                    o_seen_v[gv*L + lv] ? $signed(o_rd[gv][lv*OW +: OW]) : {OW{1'b0}};
+                    o_seen_v[gv*L + lv] ? $signed(o_rdv[gv][lv*OW +: OW]) : {OW{1'b0}};
                 fabric_mul_cs #(.AW(OW), .BW(16), .PW(VPW), .ADD(1)) u_va (
                     .a(osel), .b(f_r_c[gv*L + lv]), .addend({{(VPW-16){1'b0}}, 1'b1, 15'b0}),
                     .s(va_sn[gv][lv]), .c(va_cn[gv][lv]));
                 fabric_mul_cs #(.AW(8), .BW(16), .PW(BPW), .ADD(1)) u_vb (
-                    .a(in_data[lv*8 +: 8]), .b(p_r_c[gv*L + lv]), .addend({BPW{1'b0}}),
+                    .a(in_dataq[lv*8 +: 8]), .b(p_r_c[gv*L + lv]), .addend({BPW{1'b0}}),
                     .s(vb_sn[gv][lv]), .c(vb_cn[gv][lv]));
                 // The two pairs reduce to one and that one add is the whole
                 // of the next cycle's arithmetic.
@@ -739,8 +745,12 @@ module fabric_attention #(
             end
         end
     endgenerate
-    reg                  vv;
-    reg [BW-1:0]         vbeat;
+    reg                  vv0, vv;
+    reg [BW-1:0]         vbeat0, vbeat;
+    // The accumulator's words for the beat that arrived, registered: the
+    // products are formed from them, and from the registered beat, a cycle
+    // later.  Read into the multiply directly they were 1,680 ps.
+    reg  [OWW-1:0]       o_rdv [0:G-1];
     reg [GW-1:0] ohead;
     reg [BW-1:0] obeat;
     reg [BW-1:0] o_waddr;
@@ -800,13 +810,18 @@ module fabric_attention #(
         if (!rst_n) begin
             state <= S_ACCEPT; beat <= 0; head <= 0; exp_go <= 1'b0; rc_start <= 1'b0; done <= 1'b0;
             accv <= 1'b0; accv2 <= 1'b0; l_up <= 1'b0; l_up2 <= 1'b0;
-            ov1 <= 1'b0; out_go <= 1'b0; ohead <= 0; obeat <= 0; drain <= 0; vv <= 1'b0; o_we <= 1'b0; o_seen <= 1'b0;
+            ov0 <= 1'b0; ov1 <= 1'b0; out_go <= 1'b0; ohead <= 0; obeat <= 0; drain <= 0; vv0 <= 1'b0; vv <= 1'b0; o_we <= 1'b0; o_seen <= 1'b0;
             for (g = 0; g < G; g = g + 1) begin m_valid[g] <= 1'b0; l_r[g] <= 0; score_s[g] <= 0; score_c[g] <= 0; end
         end else begin
             exp_go <= 1'b0;
             rc_start <= 1'b0;
             done <= 1'b0;
-            ov1 <= 1'b0;
+            ov0 <= 1'b0;
+            ov1 <= ov0;
+            tg1 <= tg0;
+            for (l = 0; l < L; l = l + 1) begin
+                wm1_s[l] <= wm1_sn[l]; wm1_c[l] <= wm1_cn[l];
+            end
             // The value update's second half, before the state machine below
             // forms the next beat's products.
             o_we <= 1'b0;
@@ -819,7 +834,16 @@ module fabric_attention #(
                 o_waddr <= vbeat;
                 if (vbeat == BEATS - 1) o_seen <= 1'b1;   // every beat written: the memory may be read
             end
-            vv <= 1'b0;
+            vv0 <= 1'b0;
+            vv <= vv0;
+            vbeat <= vbeat0;
+            if (vv0)
+                for (g = 0; g < G; g = g + 1)
+                    for (l = 0; l < L; l = l + 1) begin
+                        va_s[g][l] <= va_sn[g][l]; va_c[g][l] <= va_cn[g][l];
+                        vb_s[g][l] <= vb_sn[g][l]; vb_c[g][l] <= vb_cn[g][l];
+                    end
+            for (g = 0; g < G; g = g + 1) o_rdv[g] <= o_rd[g];
             // The memory's output and the beat it pairs with, registered; the
             // accumulate reads them the cycle after, and its own valid says
             // a key beat landed.
@@ -910,16 +934,13 @@ module fabric_attention #(
                 end
                 S_VALUE: begin
                     if (in_valid) begin
-                        // The two products here, their round and add a cycle
-                        // later: consecutive beats touch different elements,
-                        // so the read and the write never meet.
-                        for (g = 0; g < G; g = g + 1)
-                            for (l = 0; l < L; l = l + 1) begin
-                                va_s[g][l] <= va_sn[g][l]; va_c[g][l] <= va_cn[g][l];
-                                vb_s[g][l] <= vb_sn[g][l]; vb_c[g][l] <= vb_cn[g][l];
-                            end
-                        vv    <= 1'b1;
-                        vbeat <= beat;
+                        // The beat and its words are registered here, the two
+                        // products formed the cycle after and their round and
+                        // add the cycle after that: consecutive beats touch
+                        // different elements, so the read and the write never
+                        // meet.
+                        vv0    <= 1'b1;
+                        vbeat0 <= beat;
                         if (beat == BEATS - 1) begin
                             beat <= 0;
                             state <= S_ACCEPT;
@@ -936,11 +957,9 @@ module fabric_attention #(
                 end
                 S_OUT: begin
                     // One beat per cycle into the output pipeline.
-                    ov1 <= 1'b1;
-                    tg1 <= gsel;
-                    for (l = 0; l < L; l = l + 1) begin
-                        wm1_s[l] <= wm1_sn[l]; wm1_c[l] <= wm1_cn[l];
-                    end
+                    ov0 <= 1'b1;
+                    o_rdo <= o_rd[ohead];
+                    tg0 <= gsel;
                     if (obeat == BEATS - 1) begin
                         if (ohead == G - 1) begin state <= S_DONE; drain <= 0; end
                         else begin
@@ -955,10 +974,10 @@ module fabric_attention #(
                 end
                 S_DONE: begin
                     // Let the output pipeline drain before done: O1, O2, the
-                    // sigmoid's three and the four after it.  Its own
+                    // sigmoid's three and the five after it, and O0.  Its own
                     // counter, since obeat only spans a head's beats.
                     drain <= drain + 1'b1;
-                    if (drain == 4'd13) begin done <= 1'b1; state <= S_ACCEPT; obeat <= 0; drain <= 0; end
+                    if (drain == 4'd14) begin done <= 1'b1; state <= S_ACCEPT; obeat <= 0; drain <= 0; end
                 end
                 default: state <= S_ACCEPT;
             endcase
