@@ -268,7 +268,7 @@ class Context:
     params: SamplingParams
     slot: int | None = None
     next_pos: int = 0                # the next position to inject
-    in_flight: bool = False
+    in_flight: int = 0               # its tokens in the ring: a prompt's go in back to back
     fresh: bool = True               # the slot has not seen this context yet
     done: bool = False
     logprobs: list[float] = field(default_factory=list)
@@ -416,7 +416,8 @@ class Controller:
         """End the turn after the token in flight; the context stays open."""
         ctx = self.contexts[cid]
         if not ctx.done:
-            ctx.max_new = len(ctx.tokens) - ctx.prompt_len + (1 if ctx.in_flight and ctx.next_pos >= ctx.prompt_len - 1 else 0)
+            sampling = ctx.in_flight and ctx.next_pos - 1 >= ctx.prompt_len - 1     # the token in flight will be drawn from
+            ctx.max_new = len(ctx.tokens) - ctx.prompt_len + int(bool(sampling))
             if not ctx.in_flight:
                 self._end_turn(ctx)
 
@@ -438,13 +439,19 @@ class Controller:
         one slot would each keep evicting the other.  Only a resident context
         between turns is taken, and its next turn starts from its first token."""
         c = self.contexts[ctx]
-        return c.in_flight or not c.done
+        return c.in_flight > 0 or not c.done
 
     def _inject(self) -> bool:
+        """One item into the ring: the next known token of the next context in
+        turn.  A prompt's tokens are all known, so a context's prompt goes in
+        back to back and fills the ring by itself -- its tokens follow one
+        another through every stage in order, as the ring keeps them -- while
+        a sampled token is known only when it comes back.  One token in
+        flight a context was a prompt at the speed of decode."""
         for _ in range(len(self.queue)):
             cid = self.queue.popleft()
             ctx = self.contexts[cid]
-            if ctx.done or ctx.in_flight:
+            if ctx.done or (ctx.next_pos >= len(ctx.tokens) and not ctx.fresh):
                 self.queue.append(cid)
                 continue
             slot = self.table.acquire(cid, self._busy)
@@ -464,7 +471,8 @@ class Controller:
                 flags |= FLAG_SAMPLE
             item = WorkItem(slot, pos, self.embedding.lookup(ctx.tokens[pos]), flags)
             self.ring.inject(pack_item(item))
-            ctx.in_flight, ctx.fresh = True, False
+            ctx.in_flight += 1
+            ctx.next_pos, ctx.fresh = pos + 1, False
             self.queue.append(cid)
             return True
         return False
@@ -473,10 +481,9 @@ class Controller:
         item, lists = unpack_item(packet, self.embedding.hidden)
         cid = self.table.holder.get(item.context)
         ctx = self.contexts[cid]
-        ctx.in_flight = False
-        ctx.next_pos = item.position + 1
+        ctx.in_flight -= 1
         if ctx.done:                                        # closed while in flight
-            if not ctx.keep:
+            if not ctx.keep and not ctx.in_flight:
                 self.table.release(cid)
             return
         if item.flags & FLAG_SAMPLE:

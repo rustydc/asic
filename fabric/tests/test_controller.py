@@ -140,6 +140,30 @@ class ControllerTest(unittest.TestCase):
         self.assertEqual(ctl.table.holder, {})                       # every slot given back
         self.assertLess(ctl.steps, 3 * (2 + 1 + 3 + 5) * 6 + 50)     # the ring kept more than one item in flight
 
+    def test_a_prompt_fills_the_ring_by_itself(self):
+        # A prompt's tokens are all known, so one context's go in back to back
+        # rather than one per trip round the ring: in order, the last of them
+        # drawn from, and a sampled token sent only once it has been drawn.
+        rng = np.random.default_rng(16)
+        emb, _, head = fake_model(rng)
+        ring = C.Ring(8, lambda item: item.hidden, [head(0), head(1)])
+        sent, inject = [], ring.inject
+        ring.inject = lambda packet: (sent.append(C.unpack_item(packet, emb.hidden)[0]), inject(packet))[1]
+        ctl = C.Controller(emb, ring, slots=4, seed=17)
+        prompt = list(range(1, 41))
+        cid = ctl.submit(prompt, max_new=3)
+        ctl.run()
+        self.assertEqual(len(ctl.generated(cid)), 3)
+        self.assertEqual([s.position for s in sent], list(range(len(prompt) + 2)))
+        self.assertEqual([s.position for s in sent if s.flags & C.FLAG_SAMPLE], [39, 40, 41])
+        self.assertEqual([s.flags & C.FLAG_FIRST for s in sent][:2], [C.FLAG_FIRST, 0])
+        # Forty prompt tokens through a ten-stage ring: about forty steps and a
+        # trip, not forty trips; then each sampled token a trip of its own.
+        self.assertLess(ctl.steps, len(prompt) + 4 * 10 + 5)
+        # The sampled tokens went in only after they were drawn: the item for
+        # position 40 is the first sampled token.
+        self.assertEqual(emb.lookup(ctl.contexts[cid].tokens[40]).tolist(), sent[40].hidden.tolist())
+
     def test_a_short_table_waits_rather_than_evict_mid_turn(self):
         # One slot, two contexts: the second waits for the first's turn to
         # end.  Taking the slot mid-turn would send the first back to its
