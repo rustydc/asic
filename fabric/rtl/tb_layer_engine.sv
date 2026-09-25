@@ -232,6 +232,11 @@ module tb_layer_engine #(
         $fflush(trace);                                    // a full-size run takes hours: the trace is its progress
         issues = issues + 1;
     end
+    // And each step's done, for calibrating the timing model a step at a time.
+    integer dtrace, dk;
+    initial dtrace = $fopen("done.txt", "w");
+    always @(posedge clk) for (dk = 0; dk < 40; dk = dk + 1)
+        if (dut.done_valid[dk]) $fdisplay(dtrace, "%0d %0d", dut.done_tag[dk*8 +: 8], cycle);
 
     // Vector-buffer port demand, for the banking question.  fabric_vb has no
     // read enable, so a unit's read ports are counted as live from the cycle

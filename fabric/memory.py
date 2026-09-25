@@ -576,26 +576,29 @@ def emit_topk_vectors(directory: Path, rng: np.random.Generator, k: int, n: int)
     return _params(directory, K=k, N=n, EXPECTED=len(ranked))
 
 
-def emit_index_scan_vectors(directory: Path, rng: np.random.Generator, mm: MemoryMap, blocks: int, k: int) -> dict:
-    """An index region of ``blocks`` records and a query; expected top-K."""
+def emit_index_scan_vectors(directory: Path, rng: np.random.Generator, mm: MemoryMap, blocks: int, k: int, queries: int = 1) -> dict:
+    """An index region of ``blocks`` records and ``queries`` queries, the
+    q-th taking the first ``blocks - 2 (queries - 1 - q)`` blocks, as a
+    chunk's tokens do at their positions; each query's expected top-K."""
     directory.mkdir(parents=True, exist_ok=True)
     image = MemoryImage(mm.index_record_addr(0, blocks))
-    candidates = []
-    q_unit = index_unit(rng.integers(-128, 128, mm.index_dim))
-    q_codes, _ = index_codes(q_unit)
+    qs = [index_codes(index_unit(rng.integers(-128, 128, mm.index_dim)))[0] for _ in range(queries)]
+    records = []
     for b in range(blocks):
         codes, scale = index_codes(index_unit(rng.integers(-128, 128, mm.index_dim)))
         record = index_codes_pack(codes, mm.index_code_beats * BEAT) + bytes([scale]) + bytes(BEAT - 1)
         image.write(mm.index_record_addr(0, b), record)
-        candidates.append((b, index_score(q_codes, codes, scale)))
-    ranked = topk_stream(candidates, k)
+        records.append((codes, scale))
+    counts = [max(0, blocks - 2 * (queries - 1 - q)) for q in range(queries)]
+    ranked = [topk_stream([(b, index_score(qs[q], *records[b])) for b in range(counts[q])], k) for q in range(queries)]
     image.to_hex(directory / "mem.hex")
-    write_hex(directory / "q_codes.hex", [int(sum(int(c) << (4 * e) for e, c in enumerate(q_codes)))], 4 * mm.index_dim)
-    write_hex(directory / "expected_id.hex", [i for i, _ in ranked], 16)
-    write_hex(directory / "expected_score.hex", [s for _, s in ranked], 32)
-    return _params(directory, IDIM=mm.index_dim, BLOCKS=blocks, K=k, BASE=mm.index_record_addr(0, 0),
-                   REC_BEATS=mm.index_code_beats + 1, RPB=mm.index_burst_records, WORDS=len(image.data) // BEAT,
-                   EXPECTED=len(ranked))
+    write_hex(directory / "q_codes.hex", [int(sum(int(c) << (4 * e) for e, c in enumerate(q))) for q in qs], 4 * mm.index_dim)
+    write_hex(directory / "counts.hex", counts, 16)
+    write_hex(directory / "expected_n.hex", [len(r) for r in ranked], 16)
+    write_hex(directory / "expected_id.hex", [i for r in ranked for i, _ in r + [(0, 0)] * (k - len(r))], 16)
+    write_hex(directory / "expected_score.hex", [sc for r in ranked for _, sc in r + [(0, 0)] * (k - len(r))], 32)
+    return _params(directory, IDIM=mm.index_dim, BLOCKS=blocks, K=k, NQ=queries, BASE=mm.index_record_addr(0, 0),
+                   REC_BEATS=mm.index_code_beats + 1, RPB=mm.index_burst_records, WORDS=len(image.data) // BEAT)
 
 
 def emit_kv_append_vectors(directory: Path, rng: np.random.Generator, mm: MemoryMap, tokens: int, top: int) -> dict:

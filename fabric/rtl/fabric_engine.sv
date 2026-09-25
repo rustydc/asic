@@ -1338,7 +1338,12 @@ endmodule
 // One attention core.  src: the group's G query rows (int8, HD each); a2:
 // the first head's gate row (the heads' gates are 2 HD apart); a3: the
 // head's rows, len records of a key then a value row; dst: the G output
-// rows.
+// rows.  With arg[30] the rows are a chunk's, shared by its T = arg[23:16]
+// tokens (fabric.sequencer.global_layout): W - 1 records before the chunk
+// and the chunk's own, a position q at row q - p0 + W - 1 for the chunk's
+// first position p0, then each token's TOP blocks.  Token i = arg[15:0]
+// reads its window from row max(W - 1 - p0, i) and its blocks from row
+// W - 1 + T + i TOP.
 //
 // A beat's address goes out every cycle and the beat is presented the cycle
 // after, as the buffer answers.  One the core does not take -- it drops its
@@ -1389,6 +1394,9 @@ module fabric_attn_adapter #(
     reg [AW-1:0] src, dst, gate, rows;
     reg [15:0]   n, r, o;
     reg [7:0]    tag, g, b;
+    reg          shared;
+    reg [31:0]   p0;
+    reg [15:0]   ci, ct, rslot, bslot;       // the token's place and the chunk's size; the row read and where its blocks are
     // The row count.  With arg[31] it is the position's, which the program
     // cannot know: min(pos + 1, W) window rows and min(TOP, eligible)
     // blocks, where a block is eligible once its last position is W before
@@ -1426,8 +1434,8 @@ module fabric_attn_adapter #(
         case (phase)
             2'd0: rd_addr = src + g * HD + b * L;
             2'd1: rd_addr = gate + g * 2 * HD + b * L;
-            2'd2: rd_addr = rows + r * 2 * HD + b * L;
-            default: rd_addr = rows + r * 2 * HD + HD + b * L;
+            2'd2: rd_addr = rows + rslot * 2 * HD + b * L;
+            default: rd_addr = rows + rslot * 2 * HD + HD + b * L;
         endcase
     end
     always @(posedge clk or negedge rst_n) begin
@@ -1446,10 +1454,14 @@ module fabric_attn_adapter #(
                     k <= consts[layer]; phase <= 0; g <= 0; b <= 0; r <= 0; o <= 0; start <= 1'b1; state <= S_START;
                     at_pos <= cmd_arg[31];
                     rp <= position[32*cmd_arg[29:28] +: 32] + {16'd0, cmd_arg[15:0]};
+                    p0 <= position[32*cmd_arg[29:28] +: 32];
+                    shared <= cmd_arg[30]; ci <= cmd_arg[15:0]; ct <= {8'd0, cmd_arg[23:16]};
                 end
                 S_START: begin
                     span <= $signed({1'b0, rp}) - W + 1;
                     wn <= (rp + 1 > W) ? 16'(W) : 16'(rp + 1);
+                    rslot <= (shared && rp < W - 1) ? 16'(W - 1 - p0) : (shared ? ci : 16'd0);
+                    bslot <= W - 1 + ct + ci * TOP;
                     state <= S_RUN;
                 end
                 S_RUN: if (issue) begin
@@ -1463,7 +1475,10 @@ module fabric_attn_adapter #(
                             2'd0: if (g == G - 1) begin g <= 0; phase <= 2'd1; end else g <= g + 1'b1;
                             2'd1: if (g == G - 1) begin g <= 0; phase <= 2'd2; if (n == 0) state <= S_DRAIN; end else g <= g + 1'b1;
                             2'd2: phase <= 2'd3;
-                            default: begin phase <= 2'd2; r <= r + 1'b1; if (r == n - 1) state <= S_DRAIN; end
+                            default: begin
+                                phase <= 2'd2; r <= r + 1'b1; if (r == n - 1) state <= S_DRAIN;
+                                rslot <= (shared && r + 1'b1 == wn) ? bslot : rslot + 1'b1;
+                            end
                         endcase
                     end
                 end
@@ -1493,9 +1508,16 @@ endmodule
 //      its sums record
 //   3  scan: the int8 unit index query at src coded and scored over the
 //      eligible index records; the top-K ids (a count then the ids, int16)
-//      to dst
+//      to dst.  A chunk's len queries, one after another at src, are
+//      scored in one pass, each over its own eligible records, and their
+//      selections written one after another
 //   4  rows: the selection at src; KV head a2's window records then its
 //      selected block records, as int8 key and value rows, to dst
+//   5, 6  a chunk's window, into its shared rows at dst: KV head a2's
+//      records before the chunk (before its appends overwrite them), or
+//      the chunk's own len (after them)
+//   7  a chunk's blocks: each of its len tokens' selections at src, the
+//      token's chosen block records into the shared rows at dst
 // The four requesters (a beat mover, the append, the scan, the record
 // reader) share the port through fabric_mem_arbiter.
 // ---------------------------------------------------------------------------
@@ -1517,6 +1539,7 @@ module fabric_mem_unit #(
     parameter int SUMS_OFF   = 8192,
     parameter int AW      = 16,
     parameter int STATE_ONE = 16'hFFFF,         // a fresh state slot's scale: 1.0 in U16 (fabric.layer.ONE_U)
+    parameter int TMAX    = 1,                  // a chunk's tokens: queries the scan scores at once
     parameter     LUT_DIR = "./"
 ) (
     input  wire          clk,
@@ -1567,6 +1590,11 @@ module fabric_mem_unit #(
     localparam int SEL_BYTES = 2 * (1 + TOP), SEL_BEATS = (SEL_BYTES + 15) / 16;
     localparam int LOG_BS = $clog2(BS), BEATS = HD / L;
     localparam int NR = 4;
+    localparam int RB = 2 * HD;                 // a row in the buffer: a key then a value, int8
+    // A chunk's rows, shared (fabric.sequencer.global_layout): the window's
+    // W - 1 records before the chunk's first token and the chunk's own, by
+    // position -- a position q at row q - p0 + W - 1 -- then each token's
+    // TOP blocks.
 
     // The command.
     reg [3:0]    op;
@@ -1667,33 +1695,52 @@ module fabric_mem_unit #(
     assign r_req_write[1] = 1'b1;
 
     // Requester 2, the index scan with its top-K.
+    // A chunk's queries are scored in one pass over the index, each into its own top-K.
     reg              sc_start, tk_clear, tk_finish, sc_done_d;
     reg [15:0]       n_blocks;
-    reg [IDIM*4-1:0] q_codes;
-    wire             sc_done, cand_valid, tk_out_valid, tk_out_last, tk_done;
-    wire [15:0]      cand_id, tk_out_id;
-    wire signed [31:0] cand_score, tk_out_score;
-    fabric_index_scan #(.DW(DW), .IDIM(IDIM), .IDW(16), .RPB(RPB)) u_scan (
-        .clk(clk), .rst_n(rst_n), .start(sc_start), .base(ctx_base + INDEX_OFF), .n_blocks(n_blocks), .q_codes(q_codes), .done(sc_done),
+    reg [TMAX*16-1:0] n_q;
+    reg [TMAX*IDIM*4-1:0] q_codes;
+    wire             sc_done;
+    wire [TMAX-1:0]  cand_valid, tk_out_valid, tk_done;
+    wire [15:0]      cand_id;
+    wire [TMAX*16-1:0] tk_out_id;
+    wire [TMAX*32-1:0] cand_score;
+    fabric_index_scan #(.DW(DW), .IDIM(IDIM), .IDW(16), .RPB(RPB), .NQ(TMAX)) u_scan (
+        .clk(clk), .rst_n(rst_n), .start(sc_start), .base(ctx_base + INDEX_OFF), .n_blocks(n_blocks), .n_q(n_q), .q_codes(q_codes), .done(sc_done),
         .cand_valid(cand_valid), .cand_id(cand_id), .cand_score(cand_score),
         .req_valid(r_req_valid[2]), .req_ready(r_req_ready[2]), .req_addr(r_req_addr[2*32 +: 32]), .req_beats(r_req_beats[2*12 +: 12]),
         .rdata_valid(r_rdata_valid[2]), .rdata(r_rdata[DW-1:0]));
     assign r_req_write[2] = 1'b0;
     assign r_wdata_valid[2] = 1'b0;
     assign r_wdata[2*2*DW +: 2*DW] = 0;
-    fabric_topk #(.K(TOP), .IDW(16), .SW(32)) u_topk (
-        .clk(clk), .rst_n(rst_n), .clear(tk_clear), .cand_valid(cand_valid), .cand_id(cand_id), .cand_score(cand_score),
-        .finish(tk_finish), .out_valid(tk_out_valid), .out_id(tk_out_id), .out_score(tk_out_score), .out_last(tk_out_last), .done(tk_done));
+    genvar gk;
+    generate
+        for (gk = 0; gk < TMAX; gk = gk + 1) begin : g_topk
+            fabric_topk #(.K(TOP), .IDW(16), .SW(32)) u_topk (
+                .clk(clk), .rst_n(rst_n), .clear(tk_clear), .cand_valid(cand_valid[gk]), .cand_id(cand_id),
+                .cand_score($signed(cand_score[gk*32 +: 32])), .finish(tk_finish), .out_valid(tk_out_valid[gk]),
+                .out_id(tk_out_id[gk*16 +: 16]), .out_score(), .out_last(), .done(tk_done[gk]));
+        end
+    endgenerate
     reg [7:0]  scale;
     reg        rc_start;
     wire       rc_done;
     wire [16:0] rc_r;
     wire [5:0]  rc_lz;
     fabric_recip #(.LW(9), .LUT_DIR(LUT_DIR)) u_rc (.clk(clk), .start(rc_start), .l({scale, 1'b0}), .done(rc_done), .r(rc_r), .lz_out(rc_lz));
-    reg [SEL_BEATS*128-1:0] sel_r;             // the selection: count then ids as int16
-    reg [7:0]  sel_count;
-    wire signed [31:0] span = $signed(pos) - W + 1;
-    wire [15:0] eligible = (span < 0) ? 16'd0 : span[LOG_BS +: 16];
+    reg [SEL_BEATS*128-1:0] sel_r;             // a token's selection as the rows read it: count then ids as int16
+    reg [TMAX*SEL_BEATS*128-1:0] sel_all;      // and each query's, as the scan collects them
+    reg [TMAX*8-1:0] sel_cnt;
+    reg [TMAX-1:0]   tk_seen;
+    reg [7:0]        sq, ntok;                 // the query or token of a chunk command, and how many
+    // Blocks eligible at a position: those whose last position is at least W before it.
+    function automatic [15:0] elig(input [31:0] p);
+        reg signed [32:0] sp;
+        begin
+            sp = $signed({1'b0, p}) - W + 1;
+            elig = (sp < 0) ? 16'd0 : sp[LOG_BS +: 16];
+        end
+    endfunction
 
     // Requester 3, the record reader.
     reg          rr_addr_valid;
@@ -1713,6 +1760,7 @@ module fabric_mem_unit #(
     reg [15:0] rw_p, rw_last, rw_j, rw_total, rw_rec;
     reg [7:0]  rw_ob;
     reg        rw_blocks, rw_reqs_done;
+    reg [AW-1:0] rw_base;                      // where the command's rows go
     wire [15:0] rw_wrap  = W - (rw_p % W);                                  // records before the window wraps
     wire [15:0] rw_left  = rw_last - rw_p + 1;
     wire [15:0] rw_run   = (rw_left < rw_wrap) ? rw_left : rw_wrap;
@@ -1750,18 +1798,21 @@ module fabric_mem_unit #(
     localparam [4:0] S_IDLE = 0, S_MV = 1, S_DONE = 2,
                      S_AP_LOAD = 3, S_AP_SUMS_RD = 4, S_AP_START = 5, S_AP_WAIT = 6, S_AP_SUMS_WR = 7,
                      S_SC_LOAD = 8, S_SC_SCALE = 9, S_SC_RECIP = 10, S_SC_CODES = 11, S_SC_RUN = 12, S_SC_COLLECT = 13, S_SC_WRITE = 14,
-                     S_RW_LOAD = 15, S_RW_REQ = 16, S_RW_WAIT = 17;
+                     S_RW_LOAD = 15, S_RW_REQ = 16, S_RW_WAIT = 17, S_WN = 18;
     reg [4:0] state;
     assign cmd_ready = (state == S_IDLE);
     integer j;
     reg signed [63:0] t, mx;
+    reg [IDIM*4-1:0]  q_codes_one;
+    wire [15:0]       ntok_len = (n == 0) ? 16'd1 : n;   // a chunk command's tokens (its length)
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             state <= S_IDLE; done_valid <= 1'b0; wr_en <= 1'b0; wr_hi_be <= 16'd0; ld_on <= 1'b0; cmd_first <= 1'b0; ldv <= 1'b0; ld_i <= 0; ld_n <= 0;
             mv_go <= 1'b0; mv_busy <= 1'b0; mv_req <= 1'b0; mv_done <= 1'b0; mv_present <= 1'b0; mv_i <= 0; mv_fill <= 1'b0; mv_hdr <= 1'b0;
             mv_a <= 0; mv_q <= 1'b0; mv_hv <= 1'b0;
             ap_start <= 1'b0; sc_start <= 1'b0; tk_clear <= 1'b0; tk_finish <= 1'b0; sc_done_d <= 1'b0; rc_start <= 1'b0;
-            rr_addr_valid <= 1'b0; rw_p <= 0; rw_j <= 0; rw_rec <= 0; rw_ob <= 0; rw_blocks <= 1'b0; rw_reqs_done <= 1'b0; sel_count <= 0;
+            rr_addr_valid <= 1'b0; rw_p <= 0; rw_j <= 0; rw_rec <= 0; rw_ob <= 0; rw_blocks <= 1'b0; rw_reqs_done <= 1'b0; sel_cnt <= 0;
+            sq <= 0; ntok <= 1; tk_seen <= 0;
         end else begin
             done_valid <= 1'b0; wr_en <= 1'b0; wr_hi_be <= 16'd0; ap_start <= 1'b0; sc_start <= 1'b0; tk_clear <= 1'b0; tk_finish <= 1'b0; rc_start <= 1'b0;
             mv_go <= 1'b0; mv_done <= 1'b0;
@@ -1821,10 +1872,15 @@ module fabric_mem_unit #(
             end
             // Top-K collection and the row writes run whenever their units produce.
             sc_done_d <= sc_done;
-            if (tk_out_valid) begin sel_r[16 + sel_count*16 +: 16] <= tk_out_id; sel_count <= sel_count + 1'b1; end
+            for (j = 0; j < TMAX; j = j + 1)
+                if (tk_out_valid[j]) begin
+                    sel_all[j*SEL_BEATS*128 + 16 + sel_cnt[j*8 +: 8]*16 +: 16] <= tk_out_id[j*16 +: 16];
+                    sel_cnt[j*8 +: 8] <= sel_cnt[j*8 +: 8] + 1'b1;
+                end
+            tk_seen <= tk_seen | tk_done;
             if (rr_out_valid) begin
                 wr_en <= 1'b1; wr_be <= (16'd1 << L) - 1'b1; wr_data <= {{(128-L*8){1'b0}}, rr_data};
-                wr_addr <= dst + rw_rec * 2 * HD + ((rr_kind == 2'd3) ? HD : 0) + ((rw_ob < BEATS) ? rw_ob : rw_ob - BEATS) * L;
+                wr_addr <= rw_base + rw_rec * RB + ((rr_kind == 2'd3) ? HD : 0) + ((rw_ob < BEATS) ? rw_ob : rw_ob - BEATS) * L;
                 rw_ob <= rw_ob + 1'b1;
             end
             if (rr_rec_done) begin rw_rec <= rw_rec + 1'b1; rw_ob <= 0; end
@@ -1838,8 +1894,13 @@ module fabric_mem_unit #(
                               mv_fill <= first[cmd_tok] && (cmd_arg[5:4] != 2'b00); mv_hdr <= cmd_arg[5]; end
                         4'd1: begin mv_go <= 1'b1; mv_fill <= 1'b0; mv_mode <= MV_WR_VB; mv_maddr <= {cmd_dst[27:0], 4'd0} + cmd_slot; mv_vaddr <= cmd_src[AW-1:0]; mv_n <= cmd_len[11:0]; state <= S_MV; end
                         4'd2: begin ld_on <= 1'b1; ld_tgt <= T_K; ld_base <= cmd_src[AW-1:0]; ld_i <= 0; ld_n <= KB; state <= S_AP_LOAD; end
-                        4'd3: begin ld_on <= 1'b1; ld_tgt <= T_U; ld_base <= cmd_src[AW-1:0]; ld_i <= 0; ld_n <= IB; state <= S_SC_LOAD; end
-                        default: begin ld_on <= 1'b1; ld_tgt <= T_SEL; ld_base <= cmd_src[AW-1:0]; ld_i <= 0; ld_n <= SEL_BEATS; state <= S_RW_LOAD; end
+                        4'd3: begin ld_on <= 1'b1; ld_tgt <= T_U; ld_base <= cmd_src[AW-1:0]; ld_i <= 0; ld_n <= IB; state <= S_SC_LOAD;
+                              sq <= 0; ntok <= (cmd_len == 0) ? 8'd1 : cmd_len[7:0]; n_q <= 0; end
+                        4'd5, 4'd6: state <= S_WN;              // a chunk's window, before its appends or after them
+                        4'd7: begin ld_on <= 1'b1; ld_tgt <= T_SEL; ld_base <= cmd_src[AW-1:0]; ld_i <= 0; ld_n <= SEL_BEATS; state <= S_RW_LOAD;
+                              sq <= 0; ntok <= (cmd_len == 0) ? 8'd1 : cmd_len[7:0]; end
+                        default: begin ld_on <= 1'b1; ld_tgt <= T_SEL; ld_base <= cmd_src[AW-1:0]; ld_i <= 0; ld_n <= SEL_BEATS; state <= S_RW_LOAD;
+                              sq <= 0; ntok <= 8'd1; end
                     endcase
                 end
                 S_MV: if (mv_done) state <= S_DONE;
@@ -1866,24 +1927,60 @@ module fabric_mem_unit #(
                         t = fx_rnd_shr(64'sd15 * ($signed(u_r[j*8 +: 8]) + $signed({56'b0, scale})) * $signed({47'b0, rc_r}), 24 - rc_lz);
                         if (t < 0) t = 0;
                         if (t > 15) t = 15;
-                        q_codes[j*4 +: 4] <= t[3:0];
+                        q_codes_one[j*4 +: 4] = t[3:0];
                     end
-                    n_blocks <= eligible; tk_clear <= 1'b1; sel_count <= 0; sel_r <= 0; state <= S_SC_CODES;
+                    for (j = 0; j < TMAX; j = j + 1)
+                        if (j == sq) q_codes[j*IDIM*4 +: IDIM*4] <= q_codes_one;
+                    n_q[sq*16 +: 16] <= elig(pos + sq);
+                    if (sq == ntok - 1) begin
+                        n_blocks <= elig(pos + sq); tk_clear <= 1'b1; sel_cnt <= 0; sel_all <= 0; tk_seen <= 0; state <= S_SC_CODES;
+                    end else begin                              // the chunk's next query
+                        sq <= sq + 1'b1; ld_on <= 1'b1; ld_tgt <= T_U; ld_base <= src + (sq + 1'b1) * IDIM; ld_i <= 0; ld_n <= IB;
+                        state <= S_SC_LOAD;
+                    end
                 end
                 S_SC_CODES: begin sc_start <= 1'b1; state <= S_SC_RUN; end
                 S_SC_RUN: if (sc_done_d) begin tk_finish <= 1'b1; state <= S_SC_COLLECT; end   // after the last candidate entered
-                S_SC_COLLECT: if (tk_done) begin rw_j <= 0; state <= S_SC_WRITE; end
-                S_SC_WRITE: begin
-                    wr_en <= 1'b1; wr_addr <= dst + rw_j * 16; wr_be <= (SEL_BYTES - rw_j * 16 >= 16) ? 16'hFFFF : ((16'd1 << (SEL_BYTES - rw_j * 16)) - 1'b1);
-                    wr_data <= (rw_j == 0) ? {sel_r[127:16], 8'd0, sel_count} : sel_r[rw_j*128 +: 128];
+                S_SC_COLLECT: if ((tk_seen | tk_done) == {TMAX{1'b1}}) begin rw_j <= 0; sq <= 0; state <= S_SC_WRITE; end
+                S_SC_WRITE: begin                       // each query's selection, one after another
+                    wr_en <= 1'b1; wr_addr <= dst + sq * SEL_BYTES + rw_j * 16;
+                    wr_be <= (SEL_BYTES - rw_j * 16 >= 16) ? 16'hFFFF : ((16'd1 << (SEL_BYTES - rw_j * 16)) - 1'b1);
+                    wr_data <= (rw_j == 0) ? {sel_all[sq*SEL_BEATS*128 + 16 +: 112], 8'd0, sel_cnt[sq*8 +: 8]}
+                                           : sel_all[sq*SEL_BEATS*128 + rw_j*128 +: 128];
                     rw_j <= rw_j + 1'b1;
-                    if (rw_j == SEL_BEATS - 1) state <= S_DONE;
+                    if (rw_j == SEL_BEATS - 1) begin
+                        rw_j <= 0; sq <= sq + 1'b1;
+                        if (sq == ntok - 1) state <= S_DONE;
+                    end
                 end
                 // Rows: the window run by run, then one request per selected block.
                 S_RW_LOAD: if (!ld_on && !ldv) begin
-                    rw_p <= (pos + 1 > W) ? pos + 1 - W : 0; rw_last <= pos[15:0]; rw_j <= 0; rw_rec <= 0; rw_ob <= 0;
-                    rw_blocks <= 1'b0; rw_reqs_done <= 1'b0; rw_total <= ((pos + 1 > W) ? W : pos[15:0] + 1) + sel_r[7:0];
+                    rw_j <= 0; rw_rec <= 0; rw_ob <= 0; rw_blocks <= 1'b0; rw_reqs_done <= 1'b0;
+                    if (op == 4'd7) begin
+                        // A chunk's blocks: token sq's, behind the window and the tokens before it.
+                        rw_p <= 16'd1; rw_last <= 16'd0; rw_total <= {8'd0, sel_r[7:0]};
+                        rw_base <= dst + (W - 1 + ntok + sq * TOP) * RB;
+                    end else begin
+                        rw_p <= (pos + 1 > W) ? pos + 1 - W : 0; rw_last <= pos[15:0];
+                        rw_total <= ((pos + 1 > W) ? W : pos[15:0] + 1) + sel_r[7:0]; rw_base <= dst;
+                    end
                     state <= S_RW_REQ;
+                end
+                // A chunk's window: before its appends, the W - 1 records before
+                // its first token (fewer at the start of a context), after them
+                // its own; each at its row by position.
+                S_WN: begin
+                    if (op == 4'd5) begin
+                        rw_p <= (pos + 1 > W) ? pos + 1 - W : 0; rw_last <= pos[15:0] - 1'b1;
+                        rw_total <= (pos + 1 > W) ? W - 1 : pos[15:0];
+                        rw_base <= dst + ((pos + 1 > W) ? 0 : W - 1 - pos[15:0]) * RB;
+                    end else begin
+                        rw_p <= pos[15:0]; rw_last <= pos[15:0] + ntok_len - 1'b1; rw_total <= ntok_len;
+                        rw_base <= dst + (W - 1) * RB;
+                    end
+                    sel_r[7:0] <= 8'd0;
+                    rw_j <= 0; rw_rec <= 0; rw_ob <= 0; rw_blocks <= 1'b0; rw_reqs_done <= 1'b0;
+                    state <= (op == 4'd5 && pos == 0) ? S_DONE : S_RW_REQ;
                 end
                 S_RW_REQ: begin
                     if (rr_addr_valid && rr_addr_ready) begin
@@ -1901,7 +1998,12 @@ module fabric_mem_unit #(
                         end else state <= S_RW_WAIT;
                     end
                 end
-                S_RW_WAIT: if (rw_rec == rw_total) state <= S_DONE;
+                S_RW_WAIT: if (rw_rec == rw_total) begin
+                    if (op == 4'd7 && sq != ntok - 1) begin      // the chunk's next token's blocks
+                        sq <= sq + 1'b1; ld_on <= 1'b1; ld_tgt <= T_SEL; ld_base <= src + (sq + 1'b1) * SEL_BYTES; ld_i <= 0; ld_n <= SEL_BEATS;
+                        state <= S_RW_LOAD;
+                    end else state <= S_DONE;
+                end
                 default: begin done_valid <= 1'b1; done_tag <= tag; state <= S_IDLE; end
             endcase
         end
@@ -2192,7 +2294,7 @@ module fabric_layer_engine #(
     assign mem_wr_hi_be              = ext_sel ? 16'h0000    : mu_wr_hi_be;
     assign ext_rd_data               = rd_data[R_MEM*128 +: 128];
 
-    fabric_mem_unit #(.HD(HD), .NKV(NKV), .IDIM(IDIM), .BS(BS), .W(W), .TOP(TOP), .KV_BITS(KV_BITS), .L(ATT_L), .REC_BYTES(REC_BYTES),
+    fabric_mem_unit #(.TMAX(TMAX), .HD(HD), .NKV(NKV), .IDIM(IDIM), .BS(BS), .W(W), .TOP(TOP), .KV_BITS(KV_BITS), .L(ATT_L), .REC_BYTES(REC_BYTES),
                       .RPB(RPB), .MAXR(MAXR), .WINDOW_OFF(WINDOW_OFF), .BLOCK_OFF(BLOCK_OFF), .INDEX_OFF(INDEX_OFF), .SUMS_OFF(SUMS_OFF),
                       .AW(AW), .LUT_DIR(LUT_DIR)) u_mem (
         .clk(clk), .rst_n(rst_n), .slot_page(slot_r), .first(first_r), .position(pos_r), .cmd_valid(cmd_valid[U_MEM] && cmd_engine == 0), .cmd_len(cmd_len), .cmd_src(cmd_src), .cmd_dst(cmd_dst),

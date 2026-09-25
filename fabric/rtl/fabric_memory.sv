@@ -369,23 +369,31 @@ endmodule
 // scale beat) and score it against the query's codes,
 //   score = scale * sum (2q - 15)(2k - 15),
 // emitting one candidate per block.  done after the last candidate.
+//
+// NQ queries at once: a chunk's tokens scan the same index, so each record
+// is read once and scored against every token's query as it goes by, each
+// query by its own scorer; query k takes only the blocks below its own
+// count (n_q[k]), which is the blocks eligible at its token's position, and
+// the scan reads as many as the last of them.
 // ---------------------------------------------------------------------------
 module fabric_index_scan #(
     parameter int DW   = 128,
     parameter int IDIM = 128,
     parameter int IDW  = 16,
-    parameter int RPB  = 25                                // records per request (a page)
+    parameter int RPB  = 25,                               // records per request (a page)
+    parameter int NQ   = 1                                 // queries scored at once
 ) (
     input  wire              clk,
     input  wire              rst_n,
     input  wire              start,
     input  wire [31:0]       base,
-    input  wire [IDW-1:0]    n_blocks,
-    input  wire [IDIM*4-1:0] q_codes,
+    input  wire [IDW-1:0]    n_blocks,                     // the most any query takes
+    input  wire [NQ*IDW-1:0] n_q,                          // each query's own
+    input  wire [NQ*IDIM*4-1:0] q_codes,
     output reg               done,
-    output reg               cand_valid,
+    output reg  [NQ-1:0]     cand_valid,
     output reg  [IDW-1:0]    cand_id,
-    output reg  signed [31:0] cand_score,
+    output reg  [NQ*32-1:0]  cand_score,
     output reg               req_valid,
     input  wire              req_ready,
     output wire [31:0]       req_addr,
@@ -403,7 +411,7 @@ module fabric_index_scan #(
     reg [IDW-1:0]    first;                                // the first block of the request
     reg [RW-1:0]     count, got;                           // records in the request, records finished
     reg [BW-1:0]     beat;
-    reg [31:0] accs, accc;
+    reg [NQ*32-1:0] accs, accc;
     wire [IDW-1:0]   left = n_blocks - blk;
     wire [RW-1:0]    want = (left > RPB) ? RPB[RW-1:0] : left[RW-1:0];
     assign req_addr  = base + blk * REC;
@@ -413,11 +421,6 @@ module fabric_index_scan #(
     // 64; the sum is a balanced tree, since a chain of CPB adds is CPB carry
     // chains deep and ABC cannot restructure them.
     localparam int PWID = 16;
-    // The beat's slice of the query codes, as a one-hot select.  Indexing
-    // q_codes with `beat` is a barrel shifter over all IDIM*4 bits, once per
-    // code of the beat, which put 263 loads on one bit of `beat` and a third
-    // of this unit's path on that flop's clock-to-output.  An or of masks is
-    // the structure the index has, and costs `beat` CB comparators.
     wire [CB-1:0] bsel;
     genvar gb;
     generate
@@ -425,85 +428,88 @@ module fabric_index_scan #(
             assign bsel[gb] = (beat == gb[BW-1:0]);
         end
     endgenerate
-    reg [CPB*4-1:0] q_beat;
-    reg [CPB-1:0]   q_live;                                // codes of this beat inside IDIM
-    integer c, b;
-    always @* begin
-        q_beat = 0;
-        q_live = 0;
-        for (b = 0; b < CB; b = b + 1)
-            for (c = 0; c < CPB; c = c + 1)
-                if (b * CPB + c < IDIM) begin
-                    q_beat[c*4 +: 4] = q_beat[c*4 +: 4] | (q_codes[(b*CPB + c)*4 +: 4] & {4{bsel[b]}});
-                    q_live[c] = q_live[c] | bsel[b];
-                end
-    end
-    // The products, reduced carry-save rather than by an adder tree.  Five
-    // levels of sixteen-bit adds is five ripple carries in series -- sixty
-    // gates of this unit's path -- where a carry-save layer is one.  One
-    // real add resolves the pair at the end.
-    wire [CPB*PWID-1:0] prod;
-    genvar gp;
-    generate
-        for (gp = 0; gp < CPB; gp = gp + 1) begin : g_prod
-            // A code is four bits, so its level 2c - 15 is six and the
-            // product of two of them is twelve.  Written against 16-bit
-            // literals the levels were 16 bits and every code bought a 16 by
-            // 16 multiply, CPB of them to a beat, for a number that never
-            // leaves [-225, 225].
-            wire signed [5:0]  ql = {1'b0, q_beat[gp*4 +: 4], 1'b0} - 6'sd15;
-            wire signed [5:0]  rl = {1'b0, rdata[gp*4 +: 4], 1'b0} - 6'sd15;
-            wire signed [11:0] pr = ql * rl;
-            assign prod[gp*PWID +: PWID] =
-                q_live[gp] ? {{(PWID-12){pr[11]}}, pr} : {PWID{1'b0}};
-        end
-    endgenerate
-    // The accumulator is one more operand of the same tree.  Reduced to a
-    // pair and then resolved and added into `acc`, the beat spends two carry
-    // propagations -- the tree's own and a 32-bit add -- and that was 2,248
-    // ps of a unit whose next path is 1,664.  One tree, one resolve.  It runs
-    // at the accumulator's width: a product is a value and may be
-    // sign-extended into it, where a carry-save pair may not.
     localparam int ACCW = 32;
-    wire [(CPB+2)*ACCW-1:0] aops;
-    genvar ga;
+    wire [NQ*32-1:0] final_score, asum_q, acar_q;
+    genvar gq, gp, ga;
     generate
-        for (ga = 0; ga < CPB; ga = ga + 1) begin : g_aop
-            assign aops[ga*ACCW +: ACCW] =
-                {{(ACCW-PWID){prod[ga*PWID + PWID-1]}}, prod[ga*PWID +: PWID]};
+        for (gq = 0; gq < NQ; gq = gq + 1) begin : g_q
+            integer c, b;
+        reg [CPB*4-1:0] q_beat;
+        reg [CPB-1:0]   q_live;                                // codes of this beat inside IDIM
+        always @* begin
+            q_beat = 0;
+            q_live = 0;
+            for (b = 0; b < CB; b = b + 1)
+                for (c = 0; c < CPB; c = c + 1)
+                    if (b * CPB + c < IDIM) begin
+                        q_beat[c*4 +: 4] = q_beat[c*4 +: 4] | (q_codes[gq*IDIM*4 + (b*CPB + c)*4 +: 4] & {4{bsel[b]}});
+                        q_live[c] = q_live[c] | bsel[b];
+                    end
+        end
+        // The products, reduced carry-save rather than by an adder tree.  Five
+        // levels of sixteen-bit adds is five ripple carries in series -- sixty
+        // gates of this unit's path -- where a carry-save layer is one.  One
+        // real add resolves the pair at the end.
+        wire [CPB*PWID-1:0] prod;
+            for (gp = 0; gp < CPB; gp = gp + 1) begin : g_prod
+                // A code is four bits, so its level 2c - 15 is six and the
+                // product of two of them is twelve.  Written against 16-bit
+                // literals the levels were 16 bits and every code bought a 16 by
+                // 16 multiply, CPB of them to a beat, for a number that never
+                // leaves [-225, 225].
+                wire signed [5:0]  ql = {1'b0, q_beat[gp*4 +: 4], 1'b0} - 6'sd15;
+                wire signed [5:0]  rl = {1'b0, rdata[gp*4 +: 4], 1'b0} - 6'sd15;
+                wire signed [11:0] pr = ql * rl;
+                assign prod[gp*PWID +: PWID] =
+                    q_live[gp] ? {{(PWID-12){pr[11]}}, pr} : {PWID{1'b0}};
+            end
+        // The accumulator is one more operand of the same tree.  Reduced to a
+        // pair and then resolved and added into `acc`, the beat spends two carry
+        // propagations -- the tree's own and a 32-bit add -- and that was 2,248
+        // ps of a unit whose next path is 1,664.  One tree, one resolve.  It runs
+        // at the accumulator's width: a product is a value and may be
+        // sign-extended into it, where a carry-save pair may not.
+        wire [(CPB+2)*ACCW-1:0] aops;
+            for (ga = 0; ga < CPB; ga = ga + 1) begin : g_aop
+                assign aops[ga*ACCW +: ACCW] =
+                    {{(ACCW-PWID){prod[ga*PWID + PWID-1]}}, prod[ga*PWID +: PWID]};
+            end
+        assign aops[CPB*ACCW +: ACCW]     = accs[gq*32 +: 32];
+        assign aops[(CPB+1)*ACCW +: ACCW] = {accc[gq*32 +: ACCW-1], 1'b0};
+        wire [ACCW-1:0] asum, acar;
+        fabric_csa_tree #(.N(CPB+2), .W(ACCW)) u_acc (.ops(aops), .s(asum), .c(acar));
+        // The accumulator stays carry-save, so the beat has no resolve at all --
+        // it was 600 of that stage's 2,008 ps, behind the select and the
+        // products.  The score keeps only 32 bits, and accs + 2*accc is the
+        // accumulator modulo 2^32, so scaling the pair and scaling the number
+        // agree there: the wrap that makes a carry-save multiplicand wrong in
+        // general is exactly what is discarded here.  Two products of the same
+        // 8-bit scale, merged and resolved once.
+        wire [ACCW-1:0] fs0, fc0, fs1, fc1;
+        fabric_mul_cs #(.AW(ACCW), .BW(8), .PW(ACCW), .ADD(1)) u_f0 (
+            .a(accs[gq*32 +: 32]), .b(rdata[7:0]), .addend({ACCW{1'b0}}), .s(fs0), .c(fc0));
+        fabric_mul_cs #(.AW(ACCW), .BW(8), .PW(ACCW), .ADD(1)) u_f1 (
+            .a({accc[gq*32 +: ACCW-1], 1'b0}), .b(rdata[7:0]), .addend({ACCW{1'b0}}), .s(fs1), .c(fc1));
+        wire [4*ACCW-1:0] fops;
+        assign fops[0*ACCW +: ACCW] = fs0;
+        assign fops[1*ACCW +: ACCW] = {fc0[ACCW-2:0], 1'b0};
+        assign fops[2*ACCW +: ACCW] = fs1;
+        assign fops[3*ACCW +: ACCW] = {fc1[ACCW-2:0], 1'b0};
+        wire [ACCW-1:0] fts, ftc;
+        fabric_csa_tree #(.N(4), .W(ACCW)) u_ft (.ops(fops), .s(fts), .c(ftc));
+        assign final_score[gq*32 +: 32] = fts + {ftc[ACCW-2:0], 1'b0};
+        assign asum_q[gq*32 +: 32] = asum;
+        assign acar_q[gq*32 +: 32] = acar;
         end
     endgenerate
-    assign aops[CPB*ACCW +: ACCW]     = accs;
-    assign aops[(CPB+1)*ACCW +: ACCW] = {accc[ACCW-2:0], 1'b0};
-    wire [ACCW-1:0] asum, acar;
-    fabric_csa_tree #(.N(CPB+2), .W(ACCW)) u_acc (.ops(aops), .s(asum), .c(acar));
-    // The accumulator stays carry-save, so the beat has no resolve at all --
-    // it was 600 of that stage's 2,008 ps, behind the select and the
-    // products.  The score keeps only 32 bits, and accs + 2*accc is the
-    // accumulator modulo 2^32, so scaling the pair and scaling the number
-    // agree there: the wrap that makes a carry-save multiplicand wrong in
-    // general is exactly what is discarded here.  Two products of the same
-    // 8-bit scale, merged and resolved once.
-    wire [ACCW-1:0] fs0, fc0, fs1, fc1;
-    fabric_mul_cs #(.AW(ACCW), .BW(8), .PW(ACCW), .ADD(1)) u_f0 (
-        .a(accs), .b(rdata[7:0]), .addend({ACCW{1'b0}}), .s(fs0), .c(fc0));
-    fabric_mul_cs #(.AW(ACCW), .BW(8), .PW(ACCW), .ADD(1)) u_f1 (
-        .a({accc[ACCW-2:0], 1'b0}), .b(rdata[7:0]), .addend({ACCW{1'b0}}), .s(fs1), .c(fc1));
-    wire [4*ACCW-1:0] fops;
-    assign fops[0*ACCW +: ACCW] = fs0;
-    assign fops[1*ACCW +: ACCW] = {fc0[ACCW-2:0], 1'b0};
-    assign fops[2*ACCW +: ACCW] = fs1;
-    assign fops[3*ACCW +: ACCW] = {fc1[ACCW-2:0], 1'b0};
-    wire [ACCW-1:0] fts, ftc;
-    fabric_csa_tree #(.N(4), .W(ACCW)) u_ft (.ops(fops), .s(fts), .c(ftc));
-    wire [ACCW-1:0] final_score = fts + {ftc[ACCW-2:0], 1'b0};
+    integer qi;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             busy <= 1'b0; inflight <= 1'b0; blk <= 0; first <= 0; count <= 0; got <= 0; beat <= 0; accs <= 0; accc <= 0;
-            req_valid <= 1'b0; done <= 1'b0; cand_valid <= 1'b0;
+            req_valid <= 1'b0; done <= 1'b0; cand_valid <= {NQ{1'b0}};
         end else begin
             done <= 1'b0;
-            cand_valid <= 1'b0;
+            cand_valid <= {NQ{1'b0}};
             if (start) begin
                 blk <= 0; beat <= 0; accs <= 0; accc <= 0; inflight <= 1'b0;
                 if (n_blocks == 0) done <= 1'b1;
@@ -514,10 +520,11 @@ module fabric_index_scan #(
                 end
                 if (inflight && rdata_valid) begin
                     if (beat < CB) begin
-                        accs <= asum; accc <= acar;
+                        accs <= asum_q; accc <= acar_q;
                         beat <= beat + 1'b1;
                     end else begin
-                        cand_valid <= 1'b1; cand_id <= blk; cand_score <= final_score;
+                        for (qi = 0; qi < NQ; qi = qi + 1) cand_valid[qi] <= (blk < n_q[qi*IDW +: IDW]);
+                        cand_id <= blk; cand_score <= final_score;
                         beat <= 0; accs <= 0; accc <= 0;
                         blk <= blk + 1'b1;
                         got <= got + 1'b1;

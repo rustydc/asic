@@ -1203,7 +1203,10 @@ and writes the sums back; the scan command codes the unit index query
 exactly as the append codes its keys, scores the eligible index records
 and writes the top-K ids; the rows command turns the selection into
 requests, the window in page runs then one record per chosen block, and
-lays the reader's int8 rows into the head's buffer. The block sums moved
+lays the reader's int8 rows into the head's buffer. A prefill chunk has
+three more (below): a head's window records before the chunk, the chunk's
+own, and every token's blocks, all into one rows buffer the chunk's tokens
+share, and its scan takes all the chunk's queries. The block sums moved
 into the memory map for this (`sums0`, one record per context): the
 append unit had kept them in registers, which no interleaving of
 contexts could share.
@@ -1257,22 +1260,62 @@ stride, and the tile array is built with `TMAX` tokens. Both layers'
 three-token chunks run on the engine bit for bit: the recurrent layer
 from a running context (71 steps, 3,165 cycles against 1,568 for one
 token) and the global layer from position 30, where the middle token
-closes a block and each token's rows include the earlier tokens' records.
+closes a block and each token's rows include the earlier tokens' records,
+and from position 1, where the window before the chunk is one record and
+no token has a block to choose.
+
+The global layer's chunk shares its memory side. Consecutive tokens'
+windows are nearly the same records, and the index they scan is the
+same index, so the chunk reads each once:
+
+* **One rows buffer a KV head.** It holds the W - 1 records before the
+  chunk and the chunk's own, a position q at row q - p0 + W - 1 for the
+  chunk's first position p0, then each token's TOP blocks. Token i's
+  window is the min(p0 + i + 1, W) rows from row max(W - 1 - p0, i), and
+  its blocks are at row W - 1 + T + i TOP. The attention adapter, told
+  the rows are shared (`ATTN_SHARED`, and the chunk's size), works those
+  rows out from the position as it already worked out the count, and
+  jumps from the window to the blocks when the window is done.
+* **The window in two parts.** `MEM_WINDOW_OLD` reads the records before
+  the chunk and must come before the appends, which overwrite their ring
+  slots; it reads only the memory, so it goes first in the program and
+  runs under the norm and the first pass. `MEM_WINDOW_NEW` reads the
+  chunk's own records after the appends.
+* **One scan for every query.** `fabric_index_scan` scores a beat
+  against `NQ` queries at once, each with its own count of eligible
+  blocks, into its own top-K, in one pass over the records the chunk's
+  last token may choose from. `MEM_BLOCKS` then reads each token's
+  chosen blocks. The memory unit is built with `TMAX` scorers and top-Ks.
+
+The timing model knows the three commands and the multi-query scan, and
+the chunks at positions 30 and 1 run in the model's cycles, step for step
+(3,489 and 2,544). At the 9B geometry a chunk of eight takes the global
+layer from 118,669 cycles a token alone to 43,635 at 4K and from 158,349
+to 48,595 at 128K, and its memory traffic from 1,191 KB a token to 186 KB
+at 128K. A head's rows buffer is 387 KB against 272 KB for one token, and
+not eight of those. Most of what is left is the attention: 22,527 cycles
+a token, the four cores each running their head's eight tokens one after
+another, each over its own rows. A chunk of sixteen gets 41,983 at 128K,
+so the next lever is the cores: one pass over the shared window for all
+the chunk's queries.
+
+Per die, at 600 MHz, a chunk of eight in every layer now prefills at
+4,403 tokens a second at 128K on the ideal port (2,787 before) and 3,815
+on sixteen PSRAMs with the pipelined controller asking ahead (2,730). It
+had been better to run the global layer streamed while the recurrent
+layers were chunked; now the chunk wins in every layer.
 
 At the 9B geometry a chunk of eight gives the recurrent layer 26,033
 cycles per token (32.5 µs) and 134 KB of memory traffic per token
 against 58,143 cycles and 1,073 KB streamed one token at a time; the
 tiles' four passes are 12,352 cycles of that and the rest is the
 vector units and the state engines running the eight tokens in turn
-under the in-order issue. The global layer's prefill gains nothing
-(70,738 cycles per token): its traffic is each token's own window and
-blocks, and the chunk only serialises the tokens' memory steps behind
-one another, so a prefilling die runs its recurrent layers chunked and
-its global layer streamed. A die prefilling at the chunk rate takes
-3 x 32.5 + 80 = 178 µs per token, 5,600 tokens/s, against 3,400 decoding
-at the end of the context; a larger chunk moves the recurrent layer no
-further, the passes being a fifth of it, and the next lever is the
-vector units' lanes.
+under the in-order issue. A larger chunk moves the recurrent layer no
+further, the passes being a fifth of it, and the next lever there is the
+vector units' lanes. The global layer's chunk, at first, gained nothing
+(70,738 cycles per token): each token read its own window and blocks,
+and the chunk only put the tokens' memory steps behind one another. The
+shared window and scan, above, changed that.
 
 ## The controller
 
@@ -1565,7 +1608,7 @@ context afterwards are the chained model's bit for bit.
 The program store holds 4,096 steps, every program a die runs one after
 another, and the die link starts one at its first step. At the 9B
 geometry the recurrent program is 173 steps and the global 41; a batch of
-four is 692 and 164, a chunk of eight 894 and 300, so single tokens at
+four is 692 and 164, a chunk of eight 894 and 273, so single tokens at
 one, two and four lanes and chunks a lane at a time -- about 2,700 steps
 -- fit with room. It is 128 KB of SRAM, next to about 500 MB of weights
 in the die's ROM. Every shape the table can name would be over ten

@@ -206,6 +206,9 @@ class MemoryRtlTest(unittest.TestCase):
         rng = np.random.default_rng(21)
         self.check("tb_index_scan", lambda d: M.emit_index_scan_vectors(d, rng, M.MemoryMap(**SMALL), 40, 8))
         self.check("tb_index_scan", lambda d: M.emit_index_scan_vectors(d, rng, M.MemoryMap(context_tokens=2048), 100, 32))
+        # A chunk's queries in one pass over the index, each over the blocks its position allows.
+        self.check("tb_index_scan", lambda d: M.emit_index_scan_vectors(d, rng, M.MemoryMap(**SMALL), 40, 8, queries=3))
+        self.check("tb_index_scan", lambda d: M.emit_index_scan_vectors(d, rng, M.MemoryMap(context_tokens=2048), 60, 32, queries=8))
 
     def test_kv_append(self) -> None:
         rng = np.random.default_rng(22)

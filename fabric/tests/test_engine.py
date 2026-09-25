@@ -336,6 +336,17 @@ class GlobalEngineRtlTest(unittest.TestCase):
         inputs, images = self.chunk_at(30, 3)
         prog = S.global_program(self.cfg, self.c, self.spec, self.mm, 30, chunk=3)
         run_engine(self, self.cfg, self.c, self.spec, self.mm, prog, inputs, {"m_ctx": images})
+        # The tokens share their rows: the window records they have in common are read once.
+        single = S.global_program(self.cfg, self.c, self.spec, self.mm, 30)
+        rows = lambda steps: sum(s.nbytes for s in steps if s.name.startswith(("mem.rows", "mem.window", "mem.blocks")))
+        self.assertLess(rows(prog), 1.5 * rows(single))
+
+    def test_a_chunk_at_the_start_of_a_context(self) -> None:
+        # From position 1: one record before the chunk, so its rows start part
+        # way down the shared buffer, and no block is eligible to any token.
+        inputs, images = self.chunk_at(1, 3)
+        prog = S.global_program(self.cfg, self.c, self.spec, self.mm, 1, chunk=3)
+        run_engine(self, self.cfg, self.c, self.spec, self.mm, prog, inputs, {"m_ctx": images})
 
     def test_one_program_serves_every_position(self) -> None:
         # The position is the engine's to know, as the slot is: the program's

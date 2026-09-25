@@ -104,6 +104,11 @@ RD_PORTS = {"tiles": 1, "norm": 2, "conv": 2, "gates": 2, "delta": 1,
 WR_PORTS = {"tiles": 1, "norm": 1, "conv": 2, "gates": 1, "delta": 1,
             "swiglu": 1, "residual": 1, "rotary": 1, "attn": 1, "mem": 1}
 MEM_APPEND, MEM_SCAN, MEM_ROWS = 2, 3, 4   # the global layer's: append the token, scan the index, stream a head's rows
+# And a chunk's, whose tokens share one rows buffer a KV head (``global_layout``):
+# the window's records before the chunk (read before the appends overwrite
+# them), the chunk's own after, and each token's blocks.  The scan takes the
+# chunk's queries (its length) in one pass over the index.
+MEM_WINDOW_OLD, MEM_WINDOW_NEW, MEM_BLOCKS = 5, 6, 7
 MEM_PAGE_SHIFT = 7           # a memory page (the map's alignment) in beats: the context base travels as a page number
 MAX_TOKENS = 4               # tokens in flight the engine holds a slot and a position for
 SLOT_TOKEN_SHIFT = 28        # a memory or rotary-table command's token in flight, in a3's top bits
@@ -113,6 +118,7 @@ SLOT_TOKEN_SHIFT = 28        # a memory or rotary-table command's token in fligh
 # in arg[15:0].  The engine is started with each token's position; nothing
 # in the program depends on it, so one image serves every position.
 ATTN_ROWS_AT = 1 << 31
+ATTN_SHARED = 1 << 30        # the rows are a chunk's shared buffer, of arg[23:16] tokens
 POS_TOKEN_SHIFT = 28
 ROT_TABLE, ROT_HEAD = 0, 1   # the rotary unit's operations (arg[3:0]); arg[7:4] the head kind, 0 q and 1 k
 NORM_INT16 = 1 << 8          # the norm's input elements are int16 (else int8)
@@ -185,6 +191,12 @@ class Timing:
     reader_reissue: int = 2          # the rows loop: one request taken to the next offered
     scan_latency: int = 19           # the query in and its codes, before any record is read
     scan_request: int = 5
+    scan_query: int = 11             # a chunk's further query: its codes, and its selection written
+    window_empty: int = 3            # a chunk's window before it at position 0: nothing to read
+    window_saving: int = 2           # a chunk's window part against a rows command: no selection to load
+    blocks_token: int = -1           # a chunk's blocks: a token's, against a rows command of those blocks alone
+    blocks_none: int = 6             # a token with none: its selection loaded and found empty
+    blocks_latency: int = 2
     append_beat: int = 3             # the append's own write path, a beat at a time
     append_latency: int = 58
     append_index_latency: int = 35   # the block's index projection, its codes and its record
@@ -379,6 +391,27 @@ class Timing:
             return self.scan_latency + each + selected - 1
         return self.scan_latency + self.scan_request + record_beats * records + selected - 1
 
+    def window_part(self, requests: list[int], record_beats: int, head_dim: int, maxr: int) -> int:
+        """A chunk's window records before its appends or after them: the
+        record reader over their runs, started without the selection a
+        rows command loads first."""
+        if not requests:
+            return self.window_empty
+        return self.read_records(requests, record_beats, head_dim, maxr) - self.window_saving
+
+    def blocks(self, counts: list[int], record_beats: int, head_dim: int, maxr: int) -> int:
+        """A chunk's blocks: each token's selection loaded, then its blocks a
+        request each."""
+        return sum(self.read_records([1] * n, record_beats, head_dim, maxr) + self.blocks_token if n else self.blocks_none
+                   for n in counts) + self.blocks_latency
+
+    def scan_chunk(self, records: int, record_beats: int, selected: list[int], per_request: int = 0) -> int:
+        """A chunk's scan: each query's codes in turn, one pass over the
+        records the last token may choose from, and each query's selection
+        written."""
+        q = len(selected)
+        return self.scan(records, record_beats, max(selected), per_request) + (q - 1) * self.scan_query
+
     def write_record(self, record_beats: int) -> int:
         """A record the append writes.  It has its own path to the port, not
         the mover's, and still takes three cycles a beat: the same address,
@@ -456,12 +489,13 @@ def _plain(name: str) -> str:
     return name[1:] if name.startswith("+") else name
 
 
-def window_requests(pos: int, window: int, page: int) -> list[int]:
+def window_requests(pos: int, window: int, page: int, first: int | None = None) -> list[int]:
     """The reader requests one head's window records take, as the engine
     issues them: the window is a ring of ``window`` slots written at
     ``pos % window``, read as runs that stop at its wrap, each a page of
-    ``page`` records at a time."""
-    p, out = max(0, pos - window + 1), []
+    ``page`` records at a time.  The records are positions ``first`` to
+    ``pos``, by default the window's."""
+    p, out = max(0, pos - window + 1) if first is None else first, []
     while p <= pos:
         count = min(pos - p + 1, window - p % window, page)
         out.append(count)
@@ -877,6 +911,15 @@ def global_program(cfg, c: L.GlobalConsts | None, spec: TileSpec, mm: MemoryMap,
     def tok(name: str, i: int) -> str:
         return name if chunk == 1 else f"{name}<{i}>"
 
+    if chunk > 1:
+        # A chunk's window before it, first: it reads only the memory, and the
+        # appends will overwrite it.  The port is idle through the norm and
+        # the first pass.
+        for n in range(nkv):
+            old = window_requests(pos - 1, mm.local_window, mm.window_burst_records, max(0, pos - mm.local_window + 1)) if pos else []
+            add(f"mem.window_old[{n}]", "mem", (), (f"+rows[{n}]",), t.window_part(old, rec_beats, hd, mm.window_burst_records),
+                nbytes=sum(old) * mm.kv_record_bytes,
+                ops=operands(dst=(f"rows[{n}]", 0), a2=n, a3=ctx, arg=MEM_WINDOW_OLD, position=pos))
     for i in range(T):
         add(tok("norm.h", i), "norm", ("x",), (_contrib("A", chunk),), t.norm(d), lambda e, i=i: put(e, "A", i, L._norm(get(e, "x", i), c.norm)),
             ops=operands(src=("x", i * 2 * d), dst=("A", i * d), arg=NORM_RESIDUAL | NORM_INT16, len=d // t.lanes))
@@ -916,8 +959,10 @@ def global_program(cfg, c: L.GlobalConsts | None, spec: TileSpec, mm: MemoryMap,
             add(tok(f"rotary.q[{h}]", i), "rotary", ("P1", "rot"), (f"+qg[{h // group}]",), rot_cycles, qrot, engine=h % UNITS["rotary"][1],
                 ops=operands(src=("P1", i * p1 + h * 2 * hd), dst=(f"qg[{h // group}]", i * group * hd + (h % group) * hd), arg=ROT_HEAD,
                              a2=("rot", i * 2 * rd), len=hd // rot_l))
+    if chunk > 1:
+        _chunk_memory(add, cfg, c, mm, pos, t, T, lay, first, ctx, rec_beats, get, put)
     # The memory side, token by token: append this token's records, scan the index, then stream rows to the cores.
-    for i in range(T):
+    for i in range(T if chunk == 1 else 0):
         p = pos + i
         append_bytes = nkv * mm.kv_record_bytes + (nkv * mm.kv_record_bytes + mm.index_record_bytes) // mm.block + 2 * mm.sums_bytes
         add(tok("mem.append", i), "mem", ("k", "P1"), (), t.append(nkv, rec_beats, (p + 1) % mm.block == 0, first and p == 0,
@@ -973,6 +1018,59 @@ def global_program(cfg, c: L.GlobalConsts | None, spec: TileSpec, mm: MemoryMap,
     return steps
 
 
+def _chunk_memory(add, cfg, c, mm: MemoryMap, pos: int, t: Timing, T: int, lay: dict, first: bool, ctx, rec_beats: int,
+                  get, put) -> None:
+    """A chunk's memory side, after its window before it: every token's
+    append, the chunk's own window records, one scan for all its queries,
+    each head's blocks for all its tokens, then the cores, each token's
+    rows read in place from its head's shared buffer (``global_layout``)."""
+    nh, nkv, hd = cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim
+    group, idim = nh // nkv, cfg.index_dim
+    off_ik, off_v, p1, sel_bytes = lay["off_ik"], lay["off_v"], lay["p1"], lay["sel"]
+    W = mm.local_window
+    for i in range(T):
+        p = pos + i
+        append_bytes = nkv * mm.kv_record_bytes + (nkv * mm.kv_record_bytes + mm.index_record_bytes) // mm.block + 2 * mm.sums_bytes
+        add(f"mem.append<{i}>", "mem", ("k", "P1"), (), t.append(nkv, rec_beats, (p + 1) % mm.block == 0, first and p == 0,
+                                                             -(-mm.sums_bytes // BEAT), -(-mm.index_record_bytes // BEAT)), nbytes=append_bytes,
+            ops=operands(src=("k", i * nkv * hd), dst=("P1", i * p1 + off_ik), a2=("P1", i * p1 + off_v), a3=ctx,
+                         arg=[(0, MEM_APPEND), (4, i)], position=pos))
+    new = window_requests(pos + T - 1, W, mm.window_burst_records, pos)
+    for n in range(nkv):
+        add(f"mem.window_new[{n}]", "mem", (), (f"+rows[{n}]",), t.window_part(new, rec_beats, hd, mm.window_burst_records),
+            nbytes=T * mm.kv_record_bytes,
+            ops=operands(dst=(f"rows[{n}]", 0), a2=n, a3=ctx, arg=MEM_WINDOW_NEW, len=T, position=pos))
+    # One pass over the index for every query: the records the last token may choose from.
+    eligible = [eligible_blocks(pos + i, W, mm.block) for i in range(T)]
+    chosen = [min(cfg.top_blocks, e) for e in eligible]
+    add("mem.scan", "mem", ("iq",), ("sel",),
+        t.scan_chunk(eligible[-1], mm.index_record_bytes // BEAT, chosen, mm.index_burst_records),
+        lambda e: e.__setitem__("selected", None), nbytes=eligible[-1] * mm.index_record_bytes,
+        ops=operands(src=("iq", 0), dst=("sel", 0), a3=ctx, arg=MEM_SCAN, len=T, position=pos))
+    for n in range(nkv):
+        def rows(e, n=n):
+            for i in range(T):
+                put(e, f"rows[{n}]", i, (e["k_rows"][i][n], e["v_rows"][i][n]))
+        add(f"mem.blocks[{n}]", "mem", ("sel",), (f"+rows[{n}]",), t.blocks(chosen, rec_beats, hd, mm.window_burst_records),
+            rows, nbytes=sum(chosen) * mm.kv_record_bytes,
+            ops=operands(src=("sel", 0), dst=(f"rows[{n}]", 0), a2=n, a3=ctx, arg=MEM_BLOCKS, len=T, position=pos))
+    for i in range(T):
+        rows_i = min(pos + i + 1, W) + chosen[i]
+        for n in range(nkv):
+            heads = list(range(n * group, (n + 1) * group))
+
+            def attn(e, n=n, heads=heads, i=i):
+                q = np.stack([get(e, f"q[{h}]", i) for h in heads])
+                k_rows, v_rows = get(e, f"rows[{n}]", i)
+                put(e, f"att[{n}]", i, L.attention_int(q, get(e, "gate", i)[heads], k_rows, v_rows, mult_s=c.mult_s, sh_s=c.sh_s,
+                                                       mult_gate=c.mult_gate, sh_gate=c.sh_gate, mult_o=c.mult_o, sh_o=c.sh_o))
+            add(f"attn[{n}]<{i}>", "attn", (f"qg[{n}]", "P1", f"rows[{n}]"), ("+att",),
+                t.attention(rows_i, group, hd), attn, engine=n % UNITS["attn"][1],
+                ops=operands(src=(f"qg[{n}]", i * group * hd), dst=("att", i * nh * hd + n * group * hd),
+                             a2=("P1", i * p1 + n * group * 2 * hd + hd), a3=(f"rows[{n}]", 0),
+                             arg=ATTN_ROWS_AT | ATTN_SHARED | (T << 16) | i))
+
+
 def global_layout(cfg, spec: TileSpec, mm: MemoryMap, chunk: int = 1) -> dict:
     """The global program's buffers as the layer engine holds them: byte
     sizes of every vector-buffer name and of the context's memory image
@@ -983,7 +1081,10 @@ def global_layout(cfg, spec: TileSpec, mm: MemoryMap, chunk: int = 1) -> dict:
     cosines of the rotary frequencies as int16; ``sel`` the count then the
     ids of the selected blocks as int16; ``rows[n]`` the head's key and
     value records as int8.  A chunk's buffers hold its tokens' vectors in
-    turn."""
+    turn, but for the rows: a chunk's tokens share each head's, the W - 1
+    records before the chunk and the chunk's own by position -- a position
+    q at row q - pos + W - 1 -- then each token's TOP blocks, so a record
+    the tokens' windows share is read once for all of them."""
     nh, nkv, hd, rd = cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim, cfg.rotary_dim
     d, ffn, group, idim = cfg.hidden_size, cfg.layer_intermediate_size(cfg.global_layer_offset), nh // nkv, cfg.index_dim
     align = lambda n: -(-n // BEAT) * BEAT
@@ -1000,7 +1101,7 @@ def global_layout(cfg, spec: TileSpec, mm: MemoryMap, chunk: int = 1) -> dict:
              "ffn": T * d, "x2": T * 2 * d, "m_ctx": mm.context_bytes}
     for n in range(nkv):
         sizes[f"qg[{n}]"] = T * group * hd
-        sizes[f"rows[{n}]"] = T * rows
+        sizes[f"rows[{n}]"] = (mm.local_window - 1 + T + T * cfg.top_blocks) * 2 * hd if T > 1 else rows
     return {"sizes": sizes, "off_k": off_k, "off_v": off_v, "off_iq": off_iq, "off_ik": off_ik, "p1": p1, "sel": sel, "rows": rows}
 
 
@@ -1350,7 +1451,7 @@ def encode(steps: list[Step], layout=None) -> list[int]:
             fields["a3"] |= token << SLOT_TOKEN_SHIFT
         elif step.unit == "attn" and fields["arg"] & ATTN_ROWS_AT:
             token = step.token or 0
-            assert token < MAX_TOKENS and (fields["arg"] & ~ATTN_ROWS_AT) < (1 << POS_TOKEN_SHIFT), step.name
+            assert token < MAX_TOKENS and (fields["arg"] & ~(ATTN_ROWS_AT | ATTN_SHARED)) < (1 << POS_TOKEN_SHIFT), step.name
             fields["arg"] |= token << POS_TOKEN_SHIFT
         assert length < (1 << 16) and fields["arg"] < (1 << 32), step.name
         assert all(fields[k] < (1 << ADDR_BITS) for k in ("src", "dst", "a2", "a3")), step.name

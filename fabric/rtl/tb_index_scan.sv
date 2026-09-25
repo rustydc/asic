@@ -1,5 +1,7 @@
 // Self-checking testbench for fabric_index_scan feeding fabric_topk over the
-// memory model, against fabric.memory.emit_index_scan_vectors.
+// memory model, against fabric.memory.emit_index_scan_vectors: NQ queries
+// scored in one pass over the index, each against its own blocks and into
+// its own top-K.
 
 `timescale 1ns/1ps
 `default_nettype none
@@ -8,18 +10,20 @@ module tb_index_scan #(
     parameter int IDIM      = 128,
     parameter int BLOCKS    = 40,
     parameter int K         = 8,
+    parameter int NQ        = 1,
     parameter int BASE      = 0,
     parameter int REC_BEATS = 5,
     parameter int RPB       = 25,
-    parameter int WORDS     = 256,
-    parameter int EXPECTED  = 8
+    parameter int WORDS     = 256
 );
     localparam int DW = 128;
     reg clk = 0, rst_n = 0;
     always #5 clk = ~clk;
-    reg [IDIM*4-1:0] qm [0:0];
-    reg [15:0] eid [0:EXPECTED-1];
-    reg [31:0] esc [0:EXPECTED-1];
+    reg [IDIM*4-1:0] qm [0:NQ-1];
+    reg [15:0] counts [0:NQ-1];
+    reg [15:0] en [0:NQ-1];
+    reg [15:0] eid [0:NQ*K-1];
+    reg [31:0] esc [0:NQ*K-1];
 
     wire          req_valid, req_ready, rdata_valid;
     wire [31:0]   req_addr;
@@ -30,42 +34,62 @@ module tb_index_scan #(
         .req_beats(req_beats), .wdata_valid(1'b0), .wdata_ready(), .wdata({DW{1'b0}}), .rdata_valid(rdata_valid), .rdata(rdata));
 
     reg              start = 0;
-    wire             scan_done, cand_valid;
+    wire             scan_done;
+    wire [NQ-1:0]    cand_valid;
     wire [15:0]      cand_id;
-    wire signed [31:0] cand_score;
-    fabric_index_scan #(.DW(DW), .IDIM(IDIM), .IDW(16), .RPB(RPB)) scan (
-        .clk(clk), .rst_n(rst_n), .start(start), .base(BASE[31:0]), .n_blocks(BLOCKS[15:0]), .q_codes(qm[0]),
+    wire [NQ*32-1:0] cand_score;
+    reg  [NQ*IDIM*4-1:0] q_all;
+    reg  [NQ*16-1:0]     n_all;
+    fabric_index_scan #(.DW(DW), .IDIM(IDIM), .IDW(16), .RPB(RPB), .NQ(NQ)) scan (
+        .clk(clk), .rst_n(rst_n), .start(start), .base(BASE[31:0]), .n_blocks(BLOCKS[15:0]), .n_q(n_all), .q_codes(q_all),
         .done(scan_done), .cand_valid(cand_valid), .cand_id(cand_id), .cand_score(cand_score),
         .req_valid(req_valid), .req_ready(req_ready), .req_addr(req_addr), .req_beats(req_beats),
         .rdata_valid(rdata_valid), .rdata(rdata));
 
     reg clear = 0, finish = 0;
-    wire out_valid, out_last, done;
-    wire [15:0] out_id;
-    wire signed [31:0] out_score;
-    fabric_topk #(.K(K), .IDW(16), .SW(32)) topk (
-        .clk(clk), .rst_n(rst_n), .clear(clear), .cand_valid(cand_valid), .cand_id(cand_id), .cand_score(cand_score),
-        .finish(finish), .out_valid(out_valid), .out_id(out_id), .out_score(out_score), .out_last(out_last), .done(done));
-
-    integer errors, got, guard;
-    reg seen_scan = 0, seen_done = 0;
-    always @(posedge clk) begin
-        if (scan_done) seen_scan <= 1;
-        if (done) seen_done <= 1;
-        if (out_valid) begin
-            if (got >= EXPECTED || out_id !== eid[got] || out_score !== $signed(esc[got])) begin
-                errors = errors + 1;
-                if (errors <= 5) $display("rank %0d: got %0d/%0d expected %0d/%0d", got, out_id, out_score, eid[got], $signed(esc[got]));
+    wire [NQ-1:0] out_valid, out_last, done;
+    wire [NQ*16-1:0] out_id;
+    wire [NQ*32-1:0] out_score;
+    integer errors, guard, q;
+    integer got [0:NQ-1];
+    reg [NQ-1:0] seen_done = 0;
+    reg seen_scan = 0;
+    genvar gq;
+    generate
+        for (gq = 0; gq < NQ; gq = gq + 1) begin : g_q
+            fabric_topk #(.K(K), .IDW(16), .SW(32)) topk (
+                .clk(clk), .rst_n(rst_n), .clear(clear), .cand_valid(cand_valid[gq]), .cand_id(cand_id),
+                .cand_score($signed(cand_score[gq*32 +: 32])), .finish(finish), .out_valid(out_valid[gq]), .out_id(out_id[gq*16 +: 16]),
+                .out_score(out_score[gq*32 +: 32]), .out_last(out_last[gq]), .done(done[gq]));
+            always @(posedge clk) begin
+                if (done[gq]) seen_done[gq] <= 1'b1;
+                if (out_valid[gq]) begin
+                    if (got[gq] >= en[gq] || out_id[gq*16 +: 16] !== eid[gq*K + got[gq]]
+                        || out_score[gq*32 +: 32] !== esc[gq*K + got[gq]]) begin
+                        errors = errors + 1;
+                        if (errors <= 5) $display("query %0d rank %0d: got %0d/%0d expected %0d/%0d", gq, got[gq],
+                                                  out_id[gq*16 +: 16], $signed(out_score[gq*32 +: 32]),
+                                                  eid[gq*K + got[gq]], $signed(esc[gq*K + got[gq]]));
+                    end
+                    got[gq] = got[gq] + 1;
+                end
             end
-            got = got + 1;
         end
-    end
+    endgenerate
+    always @(posedge clk) if (scan_done) seen_scan <= 1;
 
     initial begin
         $readmemh("q_codes.hex", qm);
+        $readmemh("counts.hex", counts);
+        $readmemh("expected_n.hex", en);
         $readmemh("expected_id.hex", eid);
         $readmemh("expected_score.hex", esc);
-        errors = 0; got = 0;
+        errors = 0;
+        for (q = 0; q < NQ; q = q + 1) begin
+            got[q] = 0;
+            q_all[q*IDIM*4 +: IDIM*4] = qm[q];
+            n_all[q*16 +: 16] = counts[q];
+        end
         repeat (2) @(posedge clk);
         rst_n = 1;
         @(negedge clk);
@@ -80,10 +104,11 @@ module tb_index_scan #(
         @(negedge clk);
         finish = 0;
         guard = 0;
-        while (!seen_done && guard < K + 10) begin @(posedge clk); #1; guard = guard + 1; end
-        if (!seen_done) $display("FAIL: never done");
-        else if (got != EXPECTED) $display("FAIL: %0d entries, expected %0d", got, EXPECTED);
-        else if (errors == 0) $display("PASS: top %0d of %0d blocks, %0d records per request", K, BLOCKS, RPB);
+        while (seen_done != {NQ{1'b1}} && guard < K + 10) begin @(posedge clk); #1; guard = guard + 1; end
+        if (seen_done != {NQ{1'b1}}) $display("FAIL: never done");
+        for (q = 0; q < NQ; q = q + 1)
+            if (got[q] != en[q]) begin errors = errors + 1; $display("FAIL: query %0d: %0d entries, expected %0d", q, got[q], en[q]); end
+        if (errors == 0) $display("PASS: %0d queries, top %0d of %0d blocks, %0d records per request", NQ, K, BLOCKS, RPB);
         else $display("FAIL: %0d mismatches", errors);
         $finish;
     end
