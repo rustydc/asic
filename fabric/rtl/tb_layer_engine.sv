@@ -72,7 +72,17 @@ module tb_layer_engine #(
     parameter int DEV_WORDS = 4096,
     parameter int MR0       = 8'h18,
     parameter int MR4       = 8'h60,
-    parameter int MR8       = 8'h43
+    parameter int MR8       = 8'h43,
+    // RING: the tokens come in as packets through fabric_die_link, which
+    // starts the engine; what leaves is checked against ring_out.hex.
+    parameter int RING            = 0,
+    parameter int RING_PACKETS    = 1,
+    parameter int RING_IN         = 1,
+    parameter int RING_OUT        = 1,
+    parameter int RING_LANES      = 1,
+    parameter int RING_CHUNK      = 1,
+    parameter int RING_SLOT_PAGES = 1,
+    parameter int RING_PAGE_BASE  = 0
 );
     reg clk = 0, rst_n = 0;
     always #0.625 clk = ~clk;
@@ -81,6 +91,23 @@ module tb_layer_engine #(
 
     reg          start = 0;
     wire         running, done;
+    // The ring link, when the tokens come that way.
+    wire         l_start, l_sel, l_wr_en, l_rd_en, u_ready, d_valid, d_sop;
+    wire [15:0]  l_pc, l_steps, l_crc, l_bad;
+    wire [3:0]   l_first;
+    wire [4*21-1:0] l_slot;
+    wire [AW-1:0] l_wr_addr, l_rd_addr;
+    wire [127:0] l_wr_data, l_rd_data;
+    wire [31:0]  d_data;
+    reg          u_valid = 0, u_sop = 0;
+    reg  [31:0]  u_data = 0;
+    fabric_die_link #(.D(D), .CHUNK(RING_CHUNK), .LANES(RING_LANES), .SLOT_PAGES(RING_SLOT_PAGES), .PAGE_BASE(RING_PAGE_BASE),
+                      .AW(AW), .TABLE_FILE(RING ? "die_table.hex" : "")) u_link (
+        .clk(clk), .rst_n(rst_n), .u_valid(u_valid), .u_data(u_data), .u_sop(u_sop), .u_ready(u_ready),
+        .d_valid(d_valid), .d_data(d_data), .d_sop(d_sop), .d_ready(1'b1),
+        .e_start(l_start), .e_pc(l_pc), .e_steps(l_steps), .e_first(l_first), .e_slot_page(l_slot), .e_done(done),
+        .v_sel(l_sel), .v_wr_en(l_wr_en), .v_wr_addr(l_wr_addr), .v_wr_data(l_wr_data),
+        .v_rd_en(l_rd_en), .v_rd_addr(l_rd_addr), .v_rd_data(l_rd_data), .crc_errors(l_crc), .malformed(l_bad));
     wire         req_valid, req_ready, req_write, req_wide, wdata_valid, wdata_ready, rdata_valid;
     wire [31:0]  req_addr;
     wire [11:0]  req_beats;
@@ -91,11 +118,25 @@ module tb_layer_engine #(
                           .ROWS(ROWS), .COLS(COLS), .P(P), .NT(NT), .TMAX(TMAX), .MODEL_TILES(MODEL_TILES), .WB(WB), .ACC(ACC), .SB(SB), .SHB(SHB), .SW(SW), .YSH(YSH), .VB_BYTES(VB_BYTES), .AW(AW),
                           .VB_BANKS(VB_BANKS), .VB_BANK_SHIFT(VB_BANK_SHIFT), .VB_NPR(VB_NPR), .VB_NPW(VB_NPW), .VB_RMAP0(VB_RMAP0), .VB_RMAP1(VB_RMAP1),
         .VB_WMAP0(VB_WMAP0), .VB_WMAP1(VB_WMAP1), .VB_RCAP2(VB_RCAP2), .VB_RCAP3(VB_RCAP3), .VB_WCAP2(VB_WCAP2)) dut (
-        .clk(clk), .rst_n(rst_n), .start(start), .first(FIRST[3:0]),
-        .slot_page({SLOT3[20:0], SLOT2[20:0], SLOT1[20:0], SLOT0[20:0]}), .n_steps(N[15:0]), .running(running), .done(done),
+        .clk(clk), .rst_n(rst_n), .start(RING ? l_start : start), .first(RING ? l_first : FIRST[3:0]),
+        .slot_page(RING ? l_slot : {SLOT3[20:0], SLOT2[20:0], SLOT1[20:0], SLOT0[20:0]}),
+        .pc_start(RING ? l_pc : 16'd0), .n_steps(RING ? l_steps : N[15:0]), .running(running), .done(done),
         .m_req_valid(req_valid), .m_req_ready(req_ready), .m_req_write(req_write), .m_req_wide(req_wide), .m_req_addr(req_addr),
         .m_req_beats(req_beats), .m_wdata_valid(wdata_valid), .m_wdata_ready(wdata_ready), .m_wdata(wdata), .m_rdata_valid(rdata_valid),
-        .m_rdata(rdata));
+        .m_rdata(rdata),
+        .ext_sel(RING != 0 && l_sel), .ext_wr_en(l_wr_en), .ext_wr_addr(l_wr_addr), .ext_wr_data(l_wr_data),
+        .ext_rd_en(l_rd_en), .ext_rd_addr(l_rd_addr), .ext_rd_data(l_rd_data));
+
+    // The packets out, against the model's.
+    reg  [31:0] ring_out [0:RING_OUT-1];
+    integer     r_ow = 0, r_err = 0;
+    always @(posedge clk) if (RING && d_valid) begin
+        if (r_ow >= RING_OUT || d_data !== ring_out[r_ow]) begin
+            r_err = r_err + 1;
+            if (r_err <= 5) $display("ring out word %0d: got %h expected %h", r_ow, d_data, r_ow < RING_OUT ? ring_out[r_ow] : 0);
+        end
+        r_ow = r_ow + 1;
+    end
     wire mem_ready;                                       // the memory can take requests
     wire mem_quiet;                                       // no request or write beat still on its way to the devices
     reg  dump = 0;                                        // the memory images to their files
@@ -282,6 +323,29 @@ module tb_layer_engine #(
         end
     endtask
 
+    // The packets in, a word a cycle as the link takes them.
+    reg [31:0] ring_in [0:RING_IN-1];
+    reg [15:0] ring_len [0:RING_PACKETS-1];
+    integer    r_p, r_j, r_w;
+    task ring_send;
+        begin
+            $readmemh("ring_in.hex", ring_in);
+            $readmemh("ring_len.hex", ring_len);
+            $readmemh("ring_out.hex", ring_out);
+            r_w = 0;
+            for (r_p = 0; r_p < RING_PACKETS; r_p = r_p + 1) begin
+                for (r_j = 0; r_j < ring_len[r_p]; r_j = r_j + 1) begin
+                    u_valid = 1; u_sop = (r_j == 0); u_data = ring_in[r_w + r_j];
+                    @(posedge clk);
+                    while (!u_ready) @(posedge clk);
+                    #0.1;
+                end
+                r_w = r_w + ring_len[r_p];
+            end
+            u_valid = 0; u_sop = 0;
+        end
+    endtask
+
     initial begin
         span = $fopen("span.txt", "w");
         trace = $fopen("issue.txt", "w");
@@ -291,11 +355,20 @@ module tb_layer_engine #(
         while (!mem_ready && guard < 200000) begin @(posedge clk); guard = guard + 1; end
         if (!mem_ready) begin $display("FAIL: the memory never came up"); $finish; end
         @(posedge clk); #0.1;
-        start = 1; @(posedge clk); #0.1; start = 0;
+        if (RING) ring_send;
+        else begin start = 1; @(posedge clk); #0.1; start = 0; end
         guard = 0;
         while (!done && guard < 4000000) begin @(posedge clk); guard = guard + 1; end
         finished = done;
         took = cycle - t0;                        // here, not after the dumps: those take clocks of their own
+        if (RING) begin                           // the packets leave
+            guard = 0;
+            while (r_ow < RING_OUT && guard < 100000) begin @(posedge clk); guard = guard + 1; end
+            if (r_ow != RING_OUT || r_err != 0 || l_crc != 0 || l_bad != 0) begin
+                $display("FAIL: the ring: %0d words out of %0d, %0d wrong, %0d dropped", r_ow, RING_OUT, r_err, l_crc + l_bad);
+                $finish;
+            end
+        end
         $fclose(trace);
         dump_ports;
         $fclose(span);

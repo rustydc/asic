@@ -18,17 +18,20 @@ from fabric.tile import TileSpec
 RTL = Path(__file__).parents[1] / "rtl"
 SOURCES = [RTL / name for name in ("fabric_sram.sv", "fabric_vector.sv", "fabric_norm.sv", "fabric_recurrent.sv", "fabric_ffn.sv", "fabric_attention.sv",
                                    "fabric_memory.sv", "fabric_tile.sv", "fabric_sequencer.sv", "fabric_engine.sv",
-                                   "fabric_phy.sv", "fabric_cdc.sv", "fabric_hpi.sv", "tb_layer_engine.sv")]
+                                   "fabric_phy.sv", "fabric_cdc.sv", "fabric_hpi.sv", "fabric_controller.sv", "fabric_ring.sv",
+                                   "fabric_die_link.sv", "tb_layer_engine.sv")]
 
 
 def run_engine(case: unittest.TestCase, cfg, c, spec, mm, steps: list[S.Step], inputs: dict, memory=None, ndev: int = 0,
-               model_tiles: bool = False, log=None, first: bool = False, base_page: int = 0) -> int:
+               model_tiles: bool = False, log=None, first: bool = False, base_page: int = 0, ring: bool = False,
+               position: int = 0) -> int:
     """Emit, simulate and check one program; returns the engine's cycle count.  With ``ndev`` the memory is the HPI path,
-    with ``model_tiles`` the tiles' behavioural columns (full-size runs), with ``first`` the token is FIRST."""
+    with ``model_tiles`` the tiles' behavioural columns (full-size runs), with ``first`` the token is FIRST, with ``ring``
+    the tokens come and go as packets through the die's ring link."""
     with tempfile.TemporaryDirectory() as directory:
         work = Path(directory)
         t0 = time.time()
-        run = E.EngineRun(work, cfg, c, spec, mm, steps, inputs, memory, ndev, model_tiles, first, base_page)
+        run = E.EngineRun(work, cfg, c, spec, mm, steps, inputs, memory, ndev, model_tiles, first, base_page, ring, position)
         args = [f"-Ptb_layer_engine.{name}={value}" for name, value in run.params.items()]
         t1 = time.time()
         subprocess.run(["iverilog", "-g2012", "-I", str(RTL), "-s", "tb_layer_engine", "-o", "sim.vvp", *args, *map(str, SOURCES)],
@@ -234,6 +237,17 @@ class EngineRtlTest(unittest.TestCase):
             inputs.update({f"{k}@{token}": v for k, v in self.context_after(tokens).items()})
         self.run_engine(two, inputs)
 
+    def test_two_contexts_through_the_ring(self) -> None:
+        # The die as the ring sees it: two packets in, a lane each, from
+        # contexts in slots other than the first; the link writes their
+        # vectors into the buffer, starts the stream's program with their
+        # slots, and sends their outputs on as the model's packets.
+        two = S.stream(self.prog, 2)
+        inputs = {}
+        for token, tokens in ((0, 3), (1, 1)):
+            inputs.update({f"{k}@{token}": v for k, v in self.context_after(tokens).items()})
+        run_engine(self, self.cfg, self.c, self.spec, self.mm, two, inputs, base_page=37, ring=True, position=3)
+
 
 @unittest.skipUnless(shutil.which("iverilog") and shutil.which("vvp"), "iverilog not installed")
 class GlobalEngineRtlTest(unittest.TestCase):
@@ -311,6 +325,13 @@ class GlobalEngineRtlTest(unittest.TestCase):
         inputs, images = self.chunk_at(30, 3)
         prog = S.global_program(self.cfg, self.c, self.spec, self.mm, 30, chunk=3)
         run_engine(self, self.cfg, self.c, self.spec, self.mm, prog, inputs, {"m_ctx": images})
+
+    def test_a_chunk_through_the_ring(self) -> None:
+        # A prompt's chunk as one packet of three tokens: its three vectors
+        # into the buffer, the chunk's program, and three out.
+        inputs, images = self.chunk_at(30, 3)
+        prog = S.global_program(self.cfg, self.c, self.spec, self.mm, 30, chunk=3)
+        run_engine(self, self.cfg, self.c, self.spec, self.mm, prog, inputs, {"m_ctx": images}, ring=True, position=30)
 
     def test_a_first_token_over_a_used_slot(self) -> None:
         # FIRST at position 0 in a context image another context left behind:

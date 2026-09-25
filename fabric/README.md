@@ -1372,11 +1372,60 @@ slot, and a stream's tokens -- up to four in flight -- each in its own.
 A test emits the same program with the context at page 0 and at page 37,
 checks the two images are the same byte for byte, and runs the second.
 
+### The ring link on the die
+
+`rtl/fabric_die_link.sv` is a layer die's front end, between the ring and
+the engine; `die.py` is its model. Packets come off the ring into lanes,
+up to four, each lane's vectors written into the engine's vector buffer
+as they arrive. The lanes are a batch the engine runs as one program --
+the sequencer's streams, the tokens of different contexts interleaved --
+so a batch is one shape, a token a lane or a chunk a lane, and it runs
+when it is full, when a packet of the other shape arrives, or when the
+link has been quiet for sixteen cycles. The engine is started with:
+
+* the program for the batch's shape and size, from a table of eight
+  entries, each a first step and a length; the sequencer now takes a
+  first step, so a die holds all its programs in one program memory;
+* each lane's slot as a page: the packet's context field is the
+  controller's slot number, and a slot is a fixed number of pages from a
+  base;
+* each lane's FIRST, from the packet's flag.
+
+When the engine is done each lane's packet leaves with the output vectors
+in place of the input and the header as it came. The link reaches the
+vector buffer through the memory unit's ports, which nothing else uses
+while the engine is idle, so a batch's successors wait on the link while
+it runs: a few thousand cycles of words against the few hundred thousand
+a token spends in a die's four layers. A packet whose CRC fails takes no
+lane (its vectors are overwritten by the next), and one the die has no
+program for -- not a work item, a token count other than one or the
+chunk, a length other than the vectors -- is read off and dropped; both
+are counted.
+
+`tb_die_link` runs 24 packets in seven groups through a stand-in engine
+-- a full batch and a part one, a change of shape, CRC failures, packets
+with no program, a chunk batch, the next die stalling -- against the
+model's batches, engine starts and packets out. And the engine test runs
+the real thing: with `ring` the vector buffer starts with no input in it,
+the tokens come in as packets, the link starts the engine, and what leaves
+is the model's packets bit for bit -- two recurrent contexts as two lanes
+in slots away from the base, and a global chunk of three as one packet.
+
+Two things the table assumes and the compiler does not yet provide. A
+lane is written before the batch's size is known, so every program of a
+shape must put lane k's input and output at the same buffer addresses;
+`engine.Layout` lays out one program, and a die's program set wants one
+layout over all of them (it wants that anyway: the buffer's banks are one
+set of parameters). And the global layer's program is compiled for a
+position -- the rotary table, the append and the scan take it as an
+operand, and the attention takes the row count it implies -- so the
+position in the packet has to reach those operands at run time the way the
+slot now does before one global program serves every position.
+
 What is not covered yet: the ring's physical layer below the words (the
 source-synchronous clocking, the retry on a CRC failure), the management
-SPI that loads the dies' constants, the die's ring receiver handing a
-packet's slot and flags to the engine, the queue engine in the gateware,
-and the Linux driver.
+SPI that loads the dies' constants, the two above, the head dies' side of
+the ring, the queue engine in the gateware, and the Linux driver.
 
 ## RTL
 

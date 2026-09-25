@@ -593,11 +593,17 @@ class EngineRun:
     ``run_program``'s (a stream's carry the token suffix); for the global
     layer ``memory`` maps each token's ``m_ctx`` to its initial image and
     the image expected after the run (``GlobalContextMemory`` before and
-    after the token's append)."""
+    after the token's append).
+
+    With ``ring`` the tokens come in as packets on the die's ring link, a
+    lane each, and the engine is started by ``fabric_die_link`` rather than
+    the testbench: the buffer starts with no input in it, and what leaves
+    on the link is checked against the model's packets (``ring_out.hex``).
+    ``position`` is the packets' position field."""
 
     def __init__(self, directory: Path, cfg, c, spec: TileSpec, mm: MemoryMap, steps: list[S.Step], inputs: dict,
                  memory: dict[str, tuple[bytes, bytes]] | None = None, ndev: int = 0, model_tiles: bool = False,
-                 first: bool = False, base_page: int = 0) -> None:
+                 first: bool = False, base_page: int = 0, ring: bool = False, position: int = 0) -> None:
         directory.mkdir(parents=True, exist_ok=True)
         self.cfg, self.steps, self.mm, self.ndev = cfg, steps, mm, ndev
         self.recurrent = isinstance(c, L.RecurrentConsts)
@@ -615,7 +621,8 @@ class EngineRun:
         mem = bytearray(self.layout.mem_beats * BEAT)
         self.expected_memory: dict[str, bytes] = {}
         for sfx in self.suffixes:
-            self._place(vb, "x" + sfx, _int16(inputs["x" + sfx]))
+            if not ring:                                             # through the ring, the packet brings it
+                self._place(vb, "x" + sfx, _int16(inputs["x" + sfx]))
             if self.recurrent:
                 assert mm.state_bits == 8, "the engine holds the int8 state"
                 self._place(mem, "m_hist" + sfx, _hist_bytes(inputs["hist_mem" + sfx]))
@@ -665,7 +672,46 @@ class EngineRun:
                        # The tokens in flight: each one's slot, and FIRST for all of them or none.
                        **{f"SLOT{k}": page for k, page in self.layout.slot_pages().items()},
                        "FIRST": ((1 << len(self.layout.region)) - 1) if first else 0}
+        if ring:
+            self.params.update(self._ring(directory, inputs, first, base_page, position))
         (directory / "params.json").write_text(json.dumps(self.params))
+
+    def _ring(self, directory: Path, inputs: dict, first: bool, base_page: int, position: int) -> dict:
+        """The packets in, a lane per token in flight, and the ones the model
+        says leave; the die's program table; the link's parameters.  A lane's
+        slot number is where its context's region is in the memory image: the
+        regions are a slot each, the same size, from ``base_page`` on."""
+        from fabric import controller as C
+        starts = sorted(self.layout.region.values())
+        sizes = {b - a for a, b in zip(starts, starts[1:] + [self.layout.mem_beats])}
+        assert len(sizes) == 1 and min(sizes) % PAGE_BEATS == 0, "the lanes' regions differ in size"
+        per_slot = min(sizes) // PAGE_BEATS
+        lanes = sorted(self.suffixes, key=_token_index)
+        assert [_token_index(sfx) for sfx in lanes] == list(range(len(lanes))), lanes
+        page_base = base_page % per_slot
+        slot = {sfx: (self.layout.region[sfx] // PAGE_BEATS - page_base) // per_slot for sfx in lanes}
+        flags = C.FLAG_FIRST if first else 0
+        words = lambda packet: [int.from_bytes(packet[i:i + 4], "little") for i in range(0, len(packet), 4)]
+        ins, lengths, outs = [], [], []
+        for k, sfx in enumerate(lanes):
+            x = np.asarray(inputs["x" + sfx], dtype=np.int64).astype(np.int16)
+            packet = C.pack_item(C.WorkItem(slot[sfx], position, x, flags))
+            ins += words(packet)
+            lengths.append(len(packet) // 4)
+            y = np.asarray(self.expected["x2" + sfx], dtype=np.int64).reshape(x.shape).astype(np.int16)
+            outs += words(C.pack_item(C.WorkItem(slot[sfx], position, y, flags)))
+        addresses = 0
+        for k, sfx in enumerate(lanes):
+            addresses |= self.layout.vb["x" + sfx] << (32 + 24 * k)
+            addresses |= self.layout.vb["x2" + sfx] << (128 + 24 * k)
+        shape = ((int(self.chunk > 1)) << 2) | (len(lanes) - 1)
+        table = [addresses | ((len(self.steps) << 16) if e == shape else 0) for e in range(8)]
+        write_hex(directory / "die_table.hex", table, 256)
+        write_hex(directory / "ring_in.hex", ins, 32)
+        write_hex(directory / "ring_len.hex", lengths, 16)
+        write_hex(directory / "ring_out.hex", outs, 32)
+        return {"RING": 1, "RING_PACKETS": len(lanes), "RING_IN": len(ins), "RING_OUT": len(outs), "RING_LANES": len(lanes),
+                "RING_CHUNK": self.chunk, "RING_SLOT_PAGES": per_slot, "RING_PAGE_BASE": page_base}
 
     def _place(self, image: bytearray, name: str, data: bytes) -> None:
         base = self.layout.address(name) * (BEAT if name.startswith(S.MEM_PREFIX) else 1)
@@ -728,8 +774,11 @@ class EngineRun:
             if f[0] != "bank":
                 continue
             b, reads, writes = (int(v) for v in f[1:4])
-            if reads > self.layout.bank_reads[b]:
-                problems.append(f"bank {b}: {reads} reads at once, the colouring gave it {self.layout.bank_reads[b]}")
-            if writes > self.layout.bank_writes[b]:
-                problems.append(f"bank {b}: {writes} writes at once, the colouring gave it {self.layout.bank_writes[b]}")
+            # A bank has a port of each kind whatever the program asks of it:
+            # the ring link loads the input and takes the output through them.
+            gave_r, gave_w = max(1, self.layout.bank_reads[b]), max(1, self.layout.bank_writes[b])
+            if reads > gave_r:
+                problems.append(f"bank {b}: {reads} reads at once, the colouring gave it {gave_r}")
+            if writes > gave_w:
+                problems.append(f"bank {b}: {writes} writes at once, the colouring gave it {gave_w}")
         return problems

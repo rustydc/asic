@@ -1923,6 +1923,7 @@ module fabric_layer_engine #(
     input  wire         start,
     input  wire [3:0]   first,               // FIRST, per token in flight (latched at start)
     input  wire [4*21-1:0] slot_page,        // each token in flight's slot, in 2 KB pages (latched at start)
+    input  wire [15:0]  pc_start,            // the program's first step
     input  wire [15:0]  n_steps,
     output wire         running,
     output wire         done,
@@ -1937,7 +1938,17 @@ module fabric_layer_engine #(
     input  wire         m_wdata_ready,
     output wire [255:0] m_wdata,
     input  wire         m_rdata_valid,
-    input  wire [255:0] m_rdata
+    input  wire [255:0] m_rdata,
+    // The vector buffer from outside, while the engine is idle: the die's
+    // ring link writes a packet's vectors in and reads the output out on the
+    // memory unit's ports, which nothing else uses then.
+    input  wire         ext_sel,
+    input  wire         ext_wr_en,
+    input  wire [AW-1:0] ext_wr_addr,
+    input  wire [127:0] ext_wr_data,
+    input  wire         ext_rd_en,
+    input  wire [AW-1:0] ext_rd_addr,
+    output wire [127:0] ext_rd_data
 );
     // A buffer beat is sixteen bytes: a unit whose operands are int16 takes
     // eight of them a beat, one whose operands are int8 takes sixteen.  NL is
@@ -1961,7 +1972,7 @@ module fabric_layer_engine #(
     wire [NU*NE-1:0]   done_valid;
     wire [NU*NE*8-1:0] done_tag;
     fabric_sequencer #(.NU(NU), .NE(NE), .PROG_FILE(PROG_FILE)) u_seq (
-        .clk(clk), .rst_n(rst_n), .start(start), .n_steps(n_steps), .running(running), .done(done),
+        .clk(clk), .rst_n(rst_n), .start(start), .pc_start(pc_start), .n_steps(n_steps), .running(running), .done(done),
         .cmd_valid(cmd_valid), .cmd_engine(cmd_engine), .cmd_len(cmd_len), .cmd_src(cmd_src), .cmd_dst(cmd_dst),
         .cmd_a2(cmd_a2), .cmd_a3(cmd_a3), .cmd_arg(cmd_arg), .cmd_tag(cmd_tag), .cmd_ready(cmd_ready), .done_valid(done_valid), .done_tag(done_tag));
 
@@ -2113,14 +2124,28 @@ module fabric_layer_engine #(
         .rd_data_h(rd_data[R_RESIDUAL*128 +: 128]), .rd_data_y(rd_data[(R_RESIDUAL+1)*128 +: 128]),
         .wr_en(wr_en[W_RESIDUAL]), .wr_addr(wr_addr[W_RESIDUAL*AW +: AW]), .wr_data(wr_data[W_RESIDUAL*128 +: 128]), .wr_be(wr_be[W_RESIDUAL*16 +: 16]));
 
+    // The memory unit's buffer ports, or the ring link's while the engine is idle.
+    wire          mu_rd_en, mu_wr_en;
+    wire [AW-1:0] mu_rd_addr, mu_wr_addr;
+    wire [127:0]  mu_wr_data;
+    wire [15:0]   mu_wr_be, mu_wr_hi_be;
+    assign rd_en[R_MEM]              = ext_sel ? ext_rd_en   : mu_rd_en;
+    assign rd_addr[R_MEM*AW +: AW]   = ext_sel ? ext_rd_addr : mu_rd_addr;
+    assign wr_en[W_MEM]              = ext_sel ? ext_wr_en   : mu_wr_en;
+    assign wr_addr[W_MEM*AW +: AW]   = ext_sel ? ext_wr_addr : mu_wr_addr;
+    assign wr_data[W_MEM*128 +: 128] = ext_sel ? ext_wr_data : mu_wr_data;
+    assign wr_be[W_MEM*16 +: 16]     = ext_sel ? 16'hFFFF    : mu_wr_be;
+    assign mem_wr_hi_be              = ext_sel ? 16'h0000    : mu_wr_hi_be;
+    assign ext_rd_data               = rd_data[R_MEM*128 +: 128];
+
     fabric_mem_unit #(.HD(HD), .NKV(NKV), .IDIM(IDIM), .BS(BS), .W(W), .TOP(TOP), .KV_BITS(KV_BITS), .L(ATT_L), .REC_BYTES(REC_BYTES),
                       .RPB(RPB), .MAXR(MAXR), .WINDOW_OFF(WINDOW_OFF), .BLOCK_OFF(BLOCK_OFF), .INDEX_OFF(INDEX_OFF), .SUMS_OFF(SUMS_OFF),
                       .AW(AW), .LUT_DIR(LUT_DIR)) u_mem (
         .clk(clk), .rst_n(rst_n), .slot_page(slot_r), .first(first_r), .cmd_valid(cmd_valid[U_MEM] && cmd_engine == 0), .cmd_len(cmd_len), .cmd_src(cmd_src), .cmd_dst(cmd_dst),
         .cmd_a2(cmd_a2), .cmd_a3(cmd_a3), .cmd_arg(cmd_arg), .cmd_tag(cmd_tag), .cmd_ready(ready_mem), .done_valid(done_valid[U_MEM*NE]), .done_tag(done_tag[U_MEM*NE*8 +: 8]),
-        .rd_addr(rd_addr[R_MEM*AW +: AW]), .rd_en(rd_en[R_MEM]), .rd_data(rd_data[R_MEM*128 +: 128]), .rd_hi(mem_rd_hi),
-        .wr_en(wr_en[W_MEM]), .wr_addr(wr_addr[W_MEM*AW +: AW]), .wr_data(wr_data[W_MEM*128 +: 128]), .wr_be(wr_be[W_MEM*16 +: 16]),
-        .wr_hi(mem_wr_hi), .wr_hi_be(mem_wr_hi_be),
+        .rd_addr(mu_rd_addr), .rd_en(mu_rd_en), .rd_data(rd_data[R_MEM*128 +: 128]), .rd_hi(mem_rd_hi),
+        .wr_en(mu_wr_en), .wr_addr(mu_wr_addr), .wr_data(mu_wr_data), .wr_be(mu_wr_be),
+        .wr_hi(mem_wr_hi), .wr_hi_be(mu_wr_hi_be),
         .m_req_valid(m_req_valid), .m_req_ready(m_req_ready), .m_req_write(m_req_write), .m_req_wide(m_req_wide), .m_req_addr(m_req_addr),
         .m_req_beats(m_req_beats),
         .m_wdata_valid(m_wdata_valid), .m_wdata_ready(m_wdata_ready), .m_wdata(m_wdata), .m_rdata_valid(m_rdata_valid), .m_rdata(m_rdata));

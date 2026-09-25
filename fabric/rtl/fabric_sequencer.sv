@@ -50,6 +50,7 @@ module fabric_sequencer #(
     input  wire                 clk,
     input  wire                 rst_n,
     input  wire                 start,
+    input  wire [15:0]          pc_start,       // the program's first step: a die holds several
     input  wire [15:0]          n_steps,
     output reg                  running,
     output reg                  done,
@@ -81,6 +82,7 @@ module fabric_sequencer #(
     // every cycle and a one-deep queue would give up every other one.
     reg  [15:0]  pc;                                    // the step being checked
     reg  [PAW-1:0] fpc;                                 // the step being fetched
+    reg  [15:0]  fend;                                  // and the one after the program
     reg  [255:0] q0, q1;
     reg  [1:0]   qn;                                    // steps in hand
     reg          fetched_v;                             // the memory answers this cycle
@@ -89,7 +91,7 @@ module fabric_sequencer #(
     // Room for what a fetch started now would bring: the memory answers the
     // cycle after its address, so one step may already be on its way.
     wire [2:0]   after = {1'b0, qn} + {2'b0, fetched_v} - {2'b0, issue};
-    wire         fetch = running && (after < 3'd2) && ({16'd0, fpc} != n_steps);
+    wire         fetch = running && (after < 3'd2) && ({16'd0, fpc} != {16'd0, fend});
     // `fetched_v` selects what each of the queue's 512 bits takes, so one flop
     // held 490 loads and 798 fF: two nanoseconds of clock-to-output, and the
     // whole of this module's path once the counting above came off it.  The
@@ -302,14 +304,14 @@ module fabric_sequencer #(
         if (!rst_n) begin
             pc <= 0; running <= 1'b0; done <= 1'b0; outstanding <= 0; finishing <= 1'b0; tab_live <= 0; pend <= 0; busy <= 0;
                 d_en <= 0; d_now <= 0;
-            fpc <= 0; qn <= 0; fetched_v <= 1'b0;
+            fpc <= 0; fend <= 0; qn <= 0; fetched_v <= 1'b0;
             for (id = 0; id < NID; id = id + 1) begin wr_cnt[id] = 0; rd_cnt[id] = 0; end
         end else begin
             done <= 1'b0;
             if (start && !running) begin
                 pc <= 0; running <= 1'b1; outstanding <= 0; finishing <= 1'b0; tab_live <= 0; pend <= 0; busy <= 0;
                 d_en <= 0; d_now <= 0;
-                fpc <= 0; qn <= 0; fetched_v <= 1'b0;
+                fpc <= pc_start[PAW-1:0]; fend <= pc_start + n_steps; qn <= 0; fetched_v <= 1'b0;
                 for (id = 0; id < NID; id = id + 1) begin wr_cnt[id] = 0; rd_cnt[id] = 0; end
             end else begin
                 // Not gated on `running`: when it is low nothing issues and no
