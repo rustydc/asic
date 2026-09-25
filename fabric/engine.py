@@ -306,26 +306,49 @@ class Layout:
     offsets and memory-image names (``m_...``) to beat addresses, in order
     of first reference, each buffer beat-aligned in the vector buffer and
     page-aligned in memory.  A stream's names carry their token suffix;
-    sizes are looked up by the plain name."""
+    sizes are looked up by the plain name.
 
-    def __init__(self, steps: list[S.Step], sizes: dict[str, int], chunk: int = 1) -> None:
+    A token's memory names are one region, its context's slot: page-aligned
+    and contiguous, from ``base_page`` on.  The program carries a memory
+    operand as its offset in the region and the engine adds the slot's page
+    at run time (``slot_pages``), so one program image serves a context in
+    any slot."""
+
+    def __init__(self, steps: list[S.Step], sizes: dict[str, int], chunk: int = 1, base_page: int = 0) -> None:
         self.sizes, self.chunk = sizes, chunk
         self.vb: dict[str, int] = {}
         self.mem: dict[str, int] = {}
         names: list[str] = []
-        mem_next = 0
+        regions: dict[str, list[str]] = {}
         for step in steps:
             for value in (step.ops or {}).values():
                 for name in _refs(value):
                     if name.startswith(S.MEM_PREFIX):
-                        if name not in self.mem:
-                            beats = -(-self.size(name) // BEAT)
-                            self.mem[name] = mem_next
-                            mem_next += -(-beats // PAGE_BEATS) * PAGE_BEATS
+                        region = regions.setdefault(_suffix(name), [])
+                        if name not in region:
+                            region.append(name)
                     elif name not in names:
                         names.append(name)
+        self.region: dict[str, int] = {}             # token suffix -> the first beat of its slot
+        mem_next = base_page * PAGE_BEATS
+        for sfx, region in regions.items():
+            self.region[sfx] = mem_next
+            for name in region:
+                beats = -(-self.size(name) // BEAT)
+                self.mem[name] = mem_next
+                mem_next += -(-beats // PAGE_BEATS) * PAGE_BEATS
         self.mem_beats = mem_next
         self._place(steps, names)
+
+    def slot_pages(self) -> dict[int, int]:
+        """Each token in flight's slot, as a page: what the engine is started with."""
+        return {_token_index(sfx): start // PAGE_BEATS for sfx, start in self.region.items()}
+
+    def operand(self, name: str) -> int:
+        """What the program carries: a memory name's offset in its slot, a buffer's address."""
+        if name.startswith(S.MEM_PREFIX):
+            return self.mem[name] - self.region[_suffix(name)]
+        return self.vb[name]
 
     def _place(self, steps: list[S.Step], names: list[str]) -> None:
         """The vector buffer in banks: each buffer takes one, and a buffer's
@@ -384,6 +407,14 @@ class Layout:
 # --------------------------------------------------------------------------
 # Byte packing
 # --------------------------------------------------------------------------
+
+def _suffix(name: str) -> str:
+    return "" if "@" not in name else "@" + name.split("@")[1]
+
+
+def _token_index(sfx: str) -> int:
+    return int(sfx[1:]) if sfx else 0
+
 
 def _int8(values) -> bytes:
     return np.asarray(values, dtype=np.int64).astype(np.int8).tobytes()
@@ -566,7 +597,7 @@ class EngineRun:
 
     def __init__(self, directory: Path, cfg, c, spec: TileSpec, mm: MemoryMap, steps: list[S.Step], inputs: dict,
                  memory: dict[str, tuple[bytes, bytes]] | None = None, ndev: int = 0, model_tiles: bool = False,
-                 first: bool = False) -> None:
+                 first: bool = False, base_page: int = 0) -> None:
         directory.mkdir(parents=True, exist_ok=True)
         self.cfg, self.steps, self.mm, self.ndev = cfg, steps, mm, ndev
         self.recurrent = isinstance(c, L.RecurrentConsts)
@@ -577,7 +608,7 @@ class EngineRun:
         self.chunk = xs[0].shape[0] if np.ndim(xs[0]) == 2 else 1          # tokens per pass: the residual's shape says
         lay = S.recurrent_layout(cfg, spec, mm, self.chunk) if self.recurrent else S.global_layout(cfg, spec, mm, self.chunk)
         _LAYOUTS[id(c)] = lay
-        self.layout = Layout(steps, lay["sizes"], self.chunk)
+        self.layout = Layout(steps, lay["sizes"], self.chunk, base_page)
         self.suffixes = sorted({"" if "@" not in key else "@" + key.split("@")[1] for key in inputs})
         # Images: the vector buffer holds each token's x, the memory its context.
         vb = bytearray(self.layout.vb_bytes)
@@ -630,7 +661,10 @@ class EngineRun:
                        "VB_RCAP3": self.layout.cap_mask(self.layout.bank_reads, 3),
                        "VB_WCAP2": self.layout.cap_mask(self.layout.bank_writes, 2),
                        **port_params(steps, self.chunk),
-                       "SCHEDULE_CYCLES": S.schedule(steps).cycles, "FIRST": int(first), **hpi_params}
+                       "SCHEDULE_CYCLES": S.schedule(steps).cycles, **hpi_params,
+                       # The tokens in flight: each one's slot, and FIRST for all of them or none.
+                       **{f"SLOT{k}": page for k, page in self.layout.slot_pages().items()},
+                       "FIRST": ((1 << len(self.layout.region)) - 1) if first else 0}
         (directory / "params.json").write_text(json.dumps(self.params))
 
     def _place(self, image: bytearray, name: str, data: bytes) -> None:

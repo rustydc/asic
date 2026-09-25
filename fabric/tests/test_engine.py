@@ -22,13 +22,13 @@ SOURCES = [RTL / name for name in ("fabric_sram.sv", "fabric_vector.sv", "fabric
 
 
 def run_engine(case: unittest.TestCase, cfg, c, spec, mm, steps: list[S.Step], inputs: dict, memory=None, ndev: int = 0,
-               model_tiles: bool = False, log=None, first: bool = False) -> int:
+               model_tiles: bool = False, log=None, first: bool = False, base_page: int = 0) -> int:
     """Emit, simulate and check one program; returns the engine's cycle count.  With ``ndev`` the memory is the HPI path,
     with ``model_tiles`` the tiles' behavioural columns (full-size runs), with ``first`` the token is FIRST."""
     with tempfile.TemporaryDirectory() as directory:
         work = Path(directory)
         t0 = time.time()
-        run = E.EngineRun(work, cfg, c, spec, mm, steps, inputs, memory, ndev, model_tiles, first)
+        run = E.EngineRun(work, cfg, c, spec, mm, steps, inputs, memory, ndev, model_tiles, first, base_page)
         args = [f"-Ptb_layer_engine.{name}={value}" for name, value in run.params.items()]
         t1 = time.time()
         subprocess.run(["iverilog", "-g2012", "-I", str(RTL), "-s", "tb_layer_engine", "-o", "sim.vvp", *args, *map(str, SOURCES)],
@@ -181,6 +181,23 @@ class EngineRtlTest(unittest.TestCase):
         # The same token with the bridge, the stripe unit and four PSRAM models behind the memory port.
         cycles = self.run_engine(self.prog, self.context_after(2), ndev=4)
         self.assertGreater(cycles, S.schedule(self.prog).cycles // 2)
+
+    def test_the_same_program_serves_any_slot(self) -> None:
+        # The program carries its memory operands as offsets in the token's
+        # slot, and the engine adds the slot's page: the image is the same
+        # byte for byte wherever the context lives, and the token is exact there.
+        with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as b:
+            images = []
+            for directory, page in ((a, 0), (b, 37)):
+                run = E.EngineRun(Path(directory), self.cfg, self.c, self.spec, self.mm, self.prog, self.context_after(2),
+                                  base_page=page)
+                self.assertEqual(run.params["SLOT0"], page)
+                images.append((Path(directory) / "program.hex").read_text())
+            self.assertEqual(images[0], images[1])
+        self.run_engine_at(37)
+
+    def run_engine_at(self, page: int) -> None:
+        run_engine(self, self.cfg, self.c, self.spec, self.mm, self.prog, self.context_after(2), base_page=page)
 
     def test_a_first_token_over_a_used_slot(self) -> None:
         # FIRST: a new context's first token in a slot that holds another's

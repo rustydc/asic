@@ -104,6 +104,8 @@ WR_PORTS = {"tiles": 1, "norm": 1, "conv": 2, "gates": 1, "delta": 1,
             "swiglu": 1, "residual": 1, "rotary": 1, "attn": 1, "mem": 1}
 MEM_APPEND, MEM_SCAN, MEM_ROWS = 2, 3, 4   # the global layer's: append the token, scan the index, stream a head's rows
 MEM_PAGE_SHIFT = 7           # a memory page (the map's alignment) in beats: the context base travels as a page number
+MAX_TOKENS = 4               # tokens in flight the engine holds a slot for
+SLOT_TOKEN_SHIFT = 28        # a memory command's token in flight, in a3's top bits
 ROT_TABLE, ROT_HEAD = 0, 1   # the rotary unit's operations (arg[3:0]); arg[7:4] the head kind, 0 q and 1 k
 NORM_INT16 = 1 << 8          # the norm's input elements are int16 (else int8)
 NORM_GATED = 1 << 9          # the norm's gain is silu of the requantized int8 vector at arg[31:16]
@@ -435,7 +437,8 @@ def resolve_value(value, layout) -> int:
     if value is None:
         return 0
     if isinstance(value, tuple):
-        return (layout.address(value[0]) + value[1]) >> (value[2] if len(value) > 2 else 0)
+        lookup = getattr(layout, "operand", layout.address)      # a memory name: its offset in the token's slot
+        return (lookup(value[0]) + value[1]) >> (value[2] if len(value) > 2 else 0)
     if isinstance(value, list):
         return sum(resolve_value(v, layout) << sh for sh, v in value)
     return int(value)
@@ -1178,6 +1181,12 @@ def encode(steps: list[Step], layout=None) -> list[int]:
         fields = {k: resolve_value(ops.get(k), layout) for k in ("arg", "src", "dst", "a2", "a3")}
         if layout is None:
             fields["arg"] = step.cycles
+        elif step.unit == "mem":
+            # Which token in flight the command is for: the engine adds that
+            # token's slot page to its memory addresses.
+            token = step.token or 0
+            assert token < MAX_TOKENS and fields["a3"] < (1 << SLOT_TOKEN_SHIFT), step.name
+            fields["a3"] |= token << SLOT_TOKEN_SHIFT
         assert length < (1 << 16) and fields["arg"] < (1 << 32), step.name
         assert all(fields[k] < (1 << ADDR_BITS) for k in ("src", "dst", "a2", "a3")), step.name
         w = UNITS[step.unit][0] | (step.engine << 4) | (int(i == len(steps) - 1) << 8) | (length << 16)

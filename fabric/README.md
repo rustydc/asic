@@ -1360,15 +1360,23 @@ context left behind -- its state and history, and a global context's sums
 and window records, all garbage -- and check it bit for bit against the
 integer layers from zero state, and cycle for cycle against the model.
 
-The slot itself is not yet a runtime quantity on the die: a program is
-emitted with its context's memory addresses in it. Serving whichever slot
-a packet names wants a slot base added to the memory operands at the
-engine, which is the die's side of the ring protocol still to be done.
+### The slot at run time
+
+A program does not know which slot its context is in. Its memory operands
+are offsets within the context's region, and each command to the memory
+unit names which token in flight it is for, in the top bits of its `a3`;
+the engine is started with each token in flight's slot, as a 2 KB page,
+and its FIRST bit, and the memory unit adds the named token's page to
+every address it forms. So one program image serves a context in any
+slot, and a stream's tokens -- up to four in flight -- each in its own.
+A test emits the same program with the context at page 0 and at page 37,
+checks the two images are the same byte for byte, and runs the second.
 
 What is not covered yet: the ring's physical layer below the words (the
 source-synchronous clocking, the retry on a CRC failure), the management
-SPI that loads the dies' constants, the slot base above, the queue engine
-in the gateware, and the Linux driver.
+SPI that loads the dies' constants, the die's ring receiver handing a
+packet's slot and flags to the engine, the queue engine in the gateware,
+and the Linux driver.
 
 ## RTL
 

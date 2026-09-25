@@ -1474,7 +1474,12 @@ module fabric_mem_unit #(
 ) (
     input  wire          clk,
     input  wire          rst_n,
-    input  wire          first,          // FIRST: this token starts its slot's state from zero
+    // The tokens in flight: each one's slot, as a page (2 KB), and whether it
+    // is FIRST.  A command names its token in a3[29:28]; its memory addresses
+    // are offsets in that token's slot, and the page is added here, so one
+    // program image serves a context in any slot.
+    input  wire [4*21-1:0] slot_page,
+    input  wire [3:0]    first,
     input  wire          cmd_valid,
     input  wire [15:0]   cmd_len,
     input  wire [29:0]   cmd_src,
@@ -1521,6 +1526,10 @@ module fabric_mem_unit #(
     reg [15:0]   n;
     reg [AW-1:0] src, dst, arg_lo;
     reg [7:0]    tag, head;
+    reg          cmd_first;                 // the command's token is FIRST
+    wire [1:0]   cmd_tok  = cmd_a3[29:28];
+    wire [20:0]  cmd_page = slot_page[cmd_tok*21 +: 21];
+    wire [31:0]  cmd_slot = {cmd_page, 11'd0};
 
     // Requesters onto the port.
     // The port carries two beats a transfer for a wide request (the mover's
@@ -1700,7 +1709,7 @@ module fabric_mem_unit #(
     reg signed [63:0] t, mx;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            state <= S_IDLE; done_valid <= 1'b0; wr_en <= 1'b0; wr_hi_be <= 16'd0; ld_on <= 1'b0; ldv <= 1'b0; ld_i <= 0; ld_n <= 0;
+            state <= S_IDLE; done_valid <= 1'b0; wr_en <= 1'b0; wr_hi_be <= 16'd0; ld_on <= 1'b0; cmd_first <= 1'b0; ldv <= 1'b0; ld_i <= 0; ld_n <= 0;
             mv_go <= 1'b0; mv_busy <= 1'b0; mv_req <= 1'b0; mv_done <= 1'b0; mv_present <= 1'b0; mv_i <= 0; mv_fill <= 1'b0; mv_hdr <= 1'b0;
             mv_a <= 0; mv_q <= 1'b0; mv_hv <= 1'b0;
             ap_start <= 1'b0; sc_start <= 1'b0; tk_clear <= 1'b0; tk_finish <= 1'b0; sc_done_d <= 1'b0; rc_start <= 1'b0;
@@ -1773,12 +1782,13 @@ module fabric_mem_unit #(
             if (rr_rec_done) begin rw_rec <= rw_rec + 1'b1; rw_ob <= 0; end
             case (state)
                 S_IDLE: if (cmd_valid) begin
-                    op <= cmd_arg[3:0]; pos <= {4'd0, cmd_arg[31:4]}; ctx_base <= {cmd_a3[20:0], 11'd0};
+                    op <= cmd_arg[3:0]; pos <= {4'd0, cmd_arg[31:4]}; ctx_base <= {cmd_a3[20:0] + cmd_page, 11'd0};
+                    cmd_first <= first[cmd_tok];
                     n <= cmd_len; src <= cmd_src[AW-1:0]; dst <= cmd_dst[AW-1:0]; arg_lo <= cmd_a2[AW-1:0]; head <= cmd_a2[7:0]; tag <= cmd_tag;
                     case (cmd_arg[3:0])
-                        4'd0: begin mv_go <= 1'b1; mv_mode <= MV_RD_VB; mv_maddr <= {cmd_src[27:0], 4'd0}; mv_vaddr <= cmd_dst[AW-1:0]; mv_n <= cmd_len[11:0]; state <= S_MV;
-                              mv_fill <= first && (cmd_arg[5:4] != 2'b00); mv_hdr <= cmd_arg[5]; end
-                        4'd1: begin mv_go <= 1'b1; mv_fill <= 1'b0; mv_mode <= MV_WR_VB; mv_maddr <= {cmd_dst[27:0], 4'd0}; mv_vaddr <= cmd_src[AW-1:0]; mv_n <= cmd_len[11:0]; state <= S_MV; end
+                        4'd0: begin mv_go <= 1'b1; mv_mode <= MV_RD_VB; mv_maddr <= {cmd_src[27:0], 4'd0} + cmd_slot; mv_vaddr <= cmd_dst[AW-1:0]; mv_n <= cmd_len[11:0]; state <= S_MV;
+                              mv_fill <= first[cmd_tok] && (cmd_arg[5:4] != 2'b00); mv_hdr <= cmd_arg[5]; end
+                        4'd1: begin mv_go <= 1'b1; mv_fill <= 1'b0; mv_mode <= MV_WR_VB; mv_maddr <= {cmd_dst[27:0], 4'd0} + cmd_slot; mv_vaddr <= cmd_src[AW-1:0]; mv_n <= cmd_len[11:0]; state <= S_MV; end
                         4'd2: begin ld_on <= 1'b1; ld_tgt <= T_K; ld_base <= cmd_src[AW-1:0]; ld_i <= 0; ld_n <= KB; state <= S_AP_LOAD; end
                         4'd3: begin ld_on <= 1'b1; ld_tgt <= T_U; ld_base <= cmd_src[AW-1:0]; ld_i <= 0; ld_n <= IB; state <= S_SC_LOAD; end
                         default: begin ld_on <= 1'b1; ld_tgt <= T_SEL; ld_base <= cmd_src[AW-1:0]; ld_i <= 0; ld_n <= SEL_BEATS; state <= S_RW_LOAD; end
@@ -1790,7 +1800,7 @@ module fabric_mem_unit #(
                     if (ld_tgt == T_K) begin ld_on <= 1'b1; ld_tgt <= T_V; ld_base <= arg_lo; ld_i <= 0; ld_n <= KB; end
                     else if (ld_tgt == T_V) begin ld_on <= 1'b1; ld_tgt <= T_I; ld_base <= dst; ld_i <= 0; ld_n <= IB; end
                     else begin
-                        mv_go <= 1'b1; mv_mode <= MV_RD_REG; mv_fill <= first && (pos == 0); mv_maddr <= ctx_base + SUMS_OFF; mv_n <= SUMS_BEATS; state <= S_AP_SUMS_RD;
+                        mv_go <= 1'b1; mv_mode <= MV_RD_REG; mv_fill <= cmd_first && (pos == 0); mv_maddr <= ctx_base + SUMS_OFF; mv_n <= SUMS_BEATS; state <= S_AP_SUMS_RD;
                     end
                 end
                 S_AP_SUMS_RD: if (mv_done) begin ap_start <= 1'b1; state <= S_AP_WAIT; end
@@ -1911,7 +1921,8 @@ module fabric_layer_engine #(
     input  wire         clk,
     input  wire         rst_n,
     input  wire         start,
-    input  wire         first,               // FIRST: the token starts its slot's state from zero (latched at start)
+    input  wire [3:0]   first,               // FIRST, per token in flight (latched at start)
+    input  wire [4*21-1:0] slot_page,        // each token in flight's slot, in 2 KB pages (latched at start)
     input  wire [15:0]  n_steps,
     output wire         running,
     output wire         done,
@@ -1988,10 +1999,11 @@ module fabric_layer_engine #(
     endgenerate
 
     wire [127:0] mem_rd_hi, mem_wr_hi;               // the memory unit's second word: the buffer's wide port
-    reg          first_r;
+    reg  [3:0]      first_r;
+    reg  [4*21-1:0] slot_r;
     always @(posedge clk or negedge rst_n)
-        if (!rst_n) first_r <= 1'b0;
-        else if (start) first_r <= first;
+        if (!rst_n) begin first_r <= 4'd0; slot_r <= 0; end
+        else if (start) begin first_r <= first; slot_r <= slot_page; end
     wire [15:0]  mem_wr_hi_be;
     fabric_vb #(.BYTES(VB_BYTES), .NR(NR), .NW(NW), .AW(AW), .NB(VB_BANKS), .BSH(VB_BANK_SHIFT),
                 .RCAP2(VB_RCAP2), .RCAP3(VB_RCAP3), .WCAP2(VB_WCAP2),
@@ -2104,7 +2116,7 @@ module fabric_layer_engine #(
     fabric_mem_unit #(.HD(HD), .NKV(NKV), .IDIM(IDIM), .BS(BS), .W(W), .TOP(TOP), .KV_BITS(KV_BITS), .L(ATT_L), .REC_BYTES(REC_BYTES),
                       .RPB(RPB), .MAXR(MAXR), .WINDOW_OFF(WINDOW_OFF), .BLOCK_OFF(BLOCK_OFF), .INDEX_OFF(INDEX_OFF), .SUMS_OFF(SUMS_OFF),
                       .AW(AW), .LUT_DIR(LUT_DIR)) u_mem (
-        .clk(clk), .rst_n(rst_n), .first(first_r), .cmd_valid(cmd_valid[U_MEM] && cmd_engine == 0), .cmd_len(cmd_len), .cmd_src(cmd_src), .cmd_dst(cmd_dst),
+        .clk(clk), .rst_n(rst_n), .slot_page(slot_r), .first(first_r), .cmd_valid(cmd_valid[U_MEM] && cmd_engine == 0), .cmd_len(cmd_len), .cmd_src(cmd_src), .cmd_dst(cmd_dst),
         .cmd_a2(cmd_a2), .cmd_a3(cmd_a3), .cmd_arg(cmd_arg), .cmd_tag(cmd_tag), .cmd_ready(ready_mem), .done_valid(done_valid[U_MEM*NE]), .done_tag(done_tag[U_MEM*NE*8 +: 8]),
         .rd_addr(rd_addr[R_MEM*AW +: AW]), .rd_en(rd_en[R_MEM]), .rd_data(rd_data[R_MEM*128 +: 128]), .rd_hi(mem_rd_hi),
         .wr_en(wr_en[W_MEM]), .wr_addr(wr_addr[W_MEM*AW +: AW]), .wr_data(wr_data[W_MEM*128 +: 128]), .wr_be(wr_be[W_MEM*16 +: 16]),
