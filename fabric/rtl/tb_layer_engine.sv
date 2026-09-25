@@ -12,6 +12,7 @@
 
 module tb_layer_engine #(
     parameter int N    = 33,
+    parameter int FIRST = 0,                              // the token is FIRST: its slot starts from zero
     parameter int D    = 96,
     parameter int NK   = 2,
     parameter int NV   = 4,
@@ -89,7 +90,7 @@ module tb_layer_engine #(
                           .ROWS(ROWS), .COLS(COLS), .P(P), .NT(NT), .TMAX(TMAX), .MODEL_TILES(MODEL_TILES), .WB(WB), .ACC(ACC), .SB(SB), .SHB(SHB), .SW(SW), .YSH(YSH), .VB_BYTES(VB_BYTES), .AW(AW),
                           .VB_BANKS(VB_BANKS), .VB_BANK_SHIFT(VB_BANK_SHIFT), .VB_NPR(VB_NPR), .VB_NPW(VB_NPW), .VB_RMAP0(VB_RMAP0), .VB_RMAP1(VB_RMAP1),
         .VB_WMAP0(VB_WMAP0), .VB_WMAP1(VB_WMAP1), .VB_RCAP2(VB_RCAP2), .VB_RCAP3(VB_RCAP3), .VB_WCAP2(VB_WCAP2)) dut (
-        .clk(clk), .rst_n(rst_n), .start(start), .n_steps(N[15:0]), .running(running), .done(done),
+        .clk(clk), .rst_n(rst_n), .start(start), .first(FIRST[0]), .n_steps(N[15:0]), .running(running), .done(done),
         .m_req_valid(req_valid), .m_req_ready(req_ready), .m_req_write(req_write), .m_req_wide(req_wide), .m_req_addr(req_addr),
         .m_req_beats(req_beats), .m_wdata_valid(wdata_valid), .m_wdata_ready(wdata_ready), .m_wdata(wdata), .m_rdata_valid(rdata_valid),
         .m_rdata(rdata));

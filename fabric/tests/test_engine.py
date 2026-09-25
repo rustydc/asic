@@ -22,13 +22,13 @@ SOURCES = [RTL / name for name in ("fabric_sram.sv", "fabric_vector.sv", "fabric
 
 
 def run_engine(case: unittest.TestCase, cfg, c, spec, mm, steps: list[S.Step], inputs: dict, memory=None, ndev: int = 0,
-               model_tiles: bool = False, log=None) -> int:
+               model_tiles: bool = False, log=None, first: bool = False) -> int:
     """Emit, simulate and check one program; returns the engine's cycle count.  With ``ndev`` the memory is the HPI path,
-    with ``model_tiles`` the tiles' behavioural columns (full-size runs)."""
+    with ``model_tiles`` the tiles' behavioural columns (full-size runs), with ``first`` the token is FIRST."""
     with tempfile.TemporaryDirectory() as directory:
         work = Path(directory)
         t0 = time.time()
-        run = E.EngineRun(work, cfg, c, spec, mm, steps, inputs, memory, ndev, model_tiles)
+        run = E.EngineRun(work, cfg, c, spec, mm, steps, inputs, memory, ndev, model_tiles, first)
         args = [f"-Ptb_layer_engine.{name}={value}" for name, value in run.params.items()]
         t1 = time.time()
         subprocess.run(["iverilog", "-g2012", "-I", str(RTL), "-s", "tb_layer_engine", "-o", "sim.vvp", *args, *map(str, SOURCES)],
@@ -182,6 +182,24 @@ class EngineRtlTest(unittest.TestCase):
         cycles = self.run_engine(self.prog, self.context_after(2), ndev=4)
         self.assertGreater(cycles, S.schedule(self.prog).cycles // 2)
 
+    def test_a_first_token_over_a_used_slot(self) -> None:
+        # FIRST: a new context's first token in a slot that holds another's
+        # state and history.  It must start from zero -- the integer layer's
+        # fresh state -- whatever the slot held, and write that back.
+        cfg, nv, hk, hv = self.cfg, self.cfg.linear_num_value_heads, self.cfg.linear_key_head_dim, self.cfg.linear_value_head_dim
+        inputs = self.context_after(2)
+        inputs["x"] = np.rint(self.xs[0] / self.c.s_h).astype(np.int64)
+        self.assertGreater(np.abs(inputs["s_mem"]).max(), 0)
+        self.assertGreater(np.abs(inputs["hist_mem"]).max(), 0)
+        fresh = L.recurrent_layer_int(self.c, cfg, self.spec, inputs["x"], np.zeros((nv, hk, hv), dtype=np.int64),
+                                      np.zeros_like(inputs["hist_mem"]), scale=np.tile([L.ONE_U, 0, 0, 0], (nv, 1)).astype(np.int64))
+        prog = S.recurrent_program(cfg, self.c, self.spec, self.mm, first=True)
+        env = S.run_program(prog, {k: (v.copy() if isinstance(v, np.ndarray) else v) for k, v in inputs.items()})
+        np.testing.assert_array_equal(env["x2"], fresh["x2"])
+        np.testing.assert_array_equal(env["s_mem"], fresh["s_next"])
+        np.testing.assert_array_equal(env["hist_mem"], fresh["hist_next"])
+        run_engine(self, cfg, self.c, self.spec, self.mm, prog, inputs, first=True)
+
     def test_a_chunk_of_three_tokens(self) -> None:
         # Prefill: three tokens of one context through the multi-token tiles, each head's state moved once.
         inputs = self.context_after(1)
@@ -276,6 +294,28 @@ class GlobalEngineRtlTest(unittest.TestCase):
         inputs, images = self.chunk_at(30, 3)
         prog = S.global_program(self.cfg, self.c, self.spec, self.mm, 30, chunk=3)
         run_engine(self, self.cfg, self.c, self.spec, self.mm, prog, inputs, {"m_ctx": images})
+
+    def test_a_first_token_over_a_used_slot(self) -> None:
+        # FIRST at position 0 in a context image another context left behind:
+        # its block sums are garbage, and must be taken as zero, and so are
+        # the window records the token never reads.  The sums are written back
+        # whole; the rest stays as it was.
+        inputs, (before, after) = self.context_at(0)
+        rng = np.random.default_rng(9)
+        before, after = bytearray(before), bytearray(after)
+        regions = self.mm.regions()
+        off, size = regions["sums0"]
+        before[off:off + size] = rng.integers(0, 256, size, dtype=np.uint8).tobytes()
+        woff, _ = regions["window0"]
+        rec = self.mm.kv_record_bytes
+        for n in range(self.cfg.num_key_value_heads):
+            for p in range(1, self.mm.local_window):
+                a = woff + (n * self.mm.local_window + p) * rec
+                junk = rng.integers(0, 256, rec, dtype=np.uint8).tobytes()
+                before[a:a + rec] = junk
+                after[a:a + rec] = junk
+        prog = S.global_program(self.cfg, self.c, self.spec, self.mm, 0, first=True)
+        run_engine(self, self.cfg, self.c, self.spec, self.mm, prog, inputs, {"m_ctx": (bytes(before), bytes(after))}, first=True)
 
     def test_one_token_at_a_block_end(self) -> None:
         pos = 31                                     # four blocks eligible, two chosen; this token closes a block

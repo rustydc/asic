@@ -88,6 +88,10 @@ MEM_PREFIX = "m_"            # names of buffers in the memory image (the rest li
 HIST_REC = 4                 # bytes per channel of the conv history in the vector buffer (kernel - 1 used)
 SLOT_HEADER = BEAT           # the state slot: one beat of scale, exponent, peak, saturated count, then the rows
 MEM_RD, MEM_WR = 0, 1        # the memory unit's operations (arg[3:0]): memory to vector buffer, vector buffer to memory
+# A read of a context's state flagged fresh is, on a FIRST token, a fill instead:
+# zeros for the conv history, and a state slot's header beat with the scale at
+# 1.0 then zero rows.  The flags are in every program; the token's FIRST decides.
+MEM_FRESH_ZERO, MEM_FRESH_SLOT = 1 << 4, 1 << 5
 ADDR_BITS = 30               # the program word's address operands (src, dst, a2, a3)
 # Vector-buffer ports each adapter has.  A step names every buffer it consumes,
 # but a one-port unit reads them in turn -- the state engine takes its slot, its
@@ -162,6 +166,8 @@ class Timing:
     port_read_beat: int = 1          # a read beat a cycle
     port_write_beat: int = 1         # the mover's addresses run a beat ahead of its data
     mem_read_latency: int = 8
+    fill_latency: int = 4            # FIRST: a fresh read's fill, two beats a cycle with no request on the port
+    append_first_saving: int = 4     # FIRST: the append's block sums filled rather than read
     mem_write_latency: int = 6
     reader_latency: int = 8
     reader_arrive: int = 5           # a request taken to its first beat in the ring (the testbench memory: 2 cycles)
@@ -308,10 +314,15 @@ class Timing:
         data, present that the mover used to."""
         return self.port_request + record_beats * self.append_beat
 
-    def append(self, heads: int, record_beats: int, block_end: bool) -> int:
+    def fill(self, beats: int) -> int:
+        """A fresh read on a FIRST token: the buffer filled, two beats a cycle."""
+        return -(-beats // 2) + self.fill_latency
+
+    def append(self, heads: int, record_beats: int, block_end: bool, first: bool = False) -> int:
         """The token's window records, and at a block's end its block means and index record."""
         one = heads * self.write_record(record_beats)
-        return self.append_latency + one + (one + self.append_index_latency if block_end else 0)
+        return (self.append_latency - (self.append_first_saving if first else 0) + one
+                + (one + self.append_index_latency if block_end else 0))
 
     def memory(self, nbytes: int, burst_bytes: int) -> int:
         """Cycles the port is busy moving nbytes in bursts of burst_bytes, at the HPI burst efficiency."""
@@ -500,7 +511,7 @@ def _contrib(name: str, chunk: int) -> str:
 
 
 def recurrent_program(cfg, c: L.RecurrentConsts | None, spec: TileSpec, mm: MemoryMap, t: Timing = Timing(),
-                      chunk: int = 1, read_ahead: int = STATE_READ_AHEAD) -> list[Step]:
+                      chunk: int = 1, read_ahead: int = STATE_READ_AHEAD, first: bool = False) -> list[Step]:
     """One token through a recurrent layer, or a chunk of ``chunk``
     consecutive tokens of one context (prefill): the passes carry the whole
     chunk at once, the vector units and state engines take the tokens in
@@ -539,8 +550,14 @@ def recurrent_program(cfg, c: L.RecurrentConsts | None, spec: TileSpec, mm: Memo
 
     hist_bytes = _beats(conv_dim * (cfg.linear_conv_kernel - 1)) * BEAT
     hist_beats = lay["sizes"]["hist"] // BEAT
-    add("dma.hist_rd", "mem", (), ("hist",), t.move(hist_beats, write=False), lambda e: e.__setitem__("hist", e["hist_mem"]), nbytes=hist_bytes,
-        ops=operands(src=("m_hist", 0), dst=("hist", 0), arg=MEM_RD, len=hist_beats))
+    # With ``first`` the token is FIRST: the history and every head's state
+    # are fills rather than reads (the program image is the same; only what
+    # the token does, and how long it takes, differ).
+    def hist_rd(e):
+        e["hist"] = np.zeros_like(e["hist_mem"]) if first else e["hist_mem"]
+    add("dma.hist_rd", "mem", (), ("hist",), t.fill(hist_beats) if first else t.move(hist_beats, write=False), hist_rd,
+        nbytes=0 if first else hist_bytes,
+        ops=operands(src=("m_hist", 0), dst=("hist", 0), arg=MEM_RD | MEM_FRESH_ZERO, len=hist_beats))
     # The heads over the state engines, each engine alternating two state
     # slots; a chunk's tokens run on the slot in turn.  The first reads go
     # here, under the norm, the input pass and the conv, which they do not
@@ -552,9 +569,14 @@ def recurrent_program(cfg, c: L.RecurrentConsts | None, spec: TileSpec, mm: Memo
         slot = _slot(h % n_delta, h // n_delta)
 
         def s_rd(e, h=h, slot=slot):                       # the slot holds the rows and, for int8, the scale beat
-            e[slot] = (e["s_mem"][h], tuple(int(x) for x in e["scale_mem"][h])) if int8_state else e["s_mem"][h]
-        add(f"dma.s_rd[{h}]", "mem", (), (slot,), t.move(slot_beats, write=False), s_rd, nbytes=head_bytes,
-            ops=operands(src=(f"m_s[{h}]", 0), dst=(slot, 0), arg=MEM_RD, len=slot_beats))
+            rows = np.zeros_like(e["s_mem"][h]) if first else e["s_mem"][h]
+            if int8_state:
+                e[slot] = (rows, (L.ONE_U, 0, 0, 0) if first else tuple(int(x) for x in e["scale_mem"][h]))
+            else:
+                e[slot] = rows
+        add(f"dma.s_rd[{h}]", "mem", (), (slot,), t.fill(slot_beats) if first else t.move(slot_beats, write=False), s_rd,
+            nbytes=0 if first else head_bytes,
+            ops=operands(src=(f"m_s[{h}]", 0), dst=(slot, 0), arg=MEM_RD | MEM_FRESH_SLOT, len=slot_beats))
     for h in range(min(read_ahead, nv)):
         s_read(h)
     for i in range(T):
@@ -723,7 +745,7 @@ def _ffn_steps(add, f: L.FfnConsts | None, spec: TileSpec, d: int, ffn: int, t: 
 
 
 def global_program(cfg, c: L.GlobalConsts | None, spec: TileSpec, mm: MemoryMap, pos: int, t: Timing = Timing(),
-                   chunk: int = 1) -> list[Step]:
+                   chunk: int = 1, first: bool = False) -> list[Step]:
     """One token through a global layer at position ``pos``, or a chunk of
     ``chunk`` consecutive tokens from ``pos`` (prefill): the passes carry
     the chunk, everything else takes the tokens in turn.  Inputs in the
@@ -793,7 +815,7 @@ def global_program(cfg, c: L.GlobalConsts | None, spec: TileSpec, mm: MemoryMap,
     for i in range(T):
         p = pos + i
         append_bytes = nkv * mm.kv_record_bytes + (nkv * mm.kv_record_bytes + mm.index_record_bytes) // mm.block + 2 * mm.sums_bytes
-        add(tok("mem.append", i), "mem", ("k", "P1"), (), t.append(nkv, rec_beats, (p + 1) % mm.block == 0), nbytes=append_bytes,
+        add(tok("mem.append", i), "mem", ("k", "P1"), (), t.append(nkv, rec_beats, (p + 1) % mm.block == 0, first and p == 0), nbytes=append_bytes,
             ops=operands(src=("k", i * nkv * hd), dst=("P1", i * p1 + off_ik), a2=("P1", i * p1 + off_v), a3=ctx,
                          arg=[(0, MEM_APPEND), (4, p)]))
         # The scan reads the index a page of records per request; the rows are the

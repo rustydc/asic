@@ -1298,11 +1298,56 @@ sampler's candidate arrays map to flip-flops rather than block RAM at
 these depths, which is most of the register count and the first thing to
 change if the part is tight. `fabric.fpga` runs that measurement.
 
+### The host's queues
+
+`host.py` is how software on the host drives the appliance, the way it
+drives an NVMe drive: a submission ring of 64-byte commands and a
+completion ring of 16-byte entries in host memory, a doorbell each, and a
+phase bit on every completion so the host reads new entries without a count
+from the device. The commands are IDENTIFY, OPEN (a context, with its
+sampling parameters and up to four stop tokens), APPEND (a turn: tokens from
+a host buffer, then up to `max_new` sampled), CANCEL and CLOSE. Every
+sampled token is a completion of its own, posted as soon as it is drawn,
+with its log-probability; the last of a turn is marked. The device never
+writes over a completion the host has not consumed -- tokens wait on the
+device instead -- so a slow reader costs latency, not data.
+
+A context is resident between turns: its state stays on the dies and the
+next APPEND carries only what is new. It keeps its slot until the slot is
+needed and it is between turns; a context is never evicted mid-turn, since
+it would have to start over and two contexts on one slot would evict each
+other for ever. One that lost its slot starts its next turn from its first
+token, marked FIRST -- even when it is given the same slot back -- which
+the controller does by itself, since it keeps every context's tokens.
+`host.Device` and `host.Driver` model the two sides over a byte array
+standing in for host memory, for the gateware and the Linux driver to be
+checked against.
+
+### FIRST on the die
+
+The engine takes FIRST with its start. The recurrent program's reads of a
+slot's state and conv history are flagged fresh in the program image, and
+on a FIRST token each is a fill instead: zeros, and for a state slot its
+header beat with the scale at 1.0 -- the integer model's fresh state --
+two beats a cycle into the buffer with nothing asked of the port. The
+global layer's append takes its block sums as zero rather than reading
+them. Nothing else of a global context can leak: the token is at position
+0, and every read is of records at or before it. The program image is the
+same with and without FIRST; what the token does, and how long it takes,
+is the flag's. The engine tests run a FIRST token over a slot another
+context left behind -- its state and history, and a global context's sums
+and window records, all garbage -- and check it bit for bit against the
+integer layers from zero state, and cycle for cycle against the model.
+
+The slot itself is not yet a runtime quantity on the die: a program is
+emitted with its context's memory addresses in it. Serving whichever slot
+a packet names wants a slot base added to the memory operands at the
+engine, which is the die's side of the ring protocol still to be done.
+
 What is not covered yet: the ring's physical layer below the words (the
 source-synchronous clocking, the retry on a CRC failure), the management
-SPI that loads the dies' constants, the host's PCIe queue format, and the
-die's side of FIRST, which wants a sequencer program that starts a slot's
-state from zero.
+SPI that loads the dies' constants, the slot base above, the queue engine
+in the gateware, and the Linux driver.
 
 ## RTL
 

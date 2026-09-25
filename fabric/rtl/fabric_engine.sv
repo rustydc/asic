@@ -1469,10 +1469,12 @@ module fabric_mem_unit #(
     parameter int INDEX_OFF  = 6144,
     parameter int SUMS_OFF   = 8192,
     parameter int AW      = 16,
+    parameter int STATE_ONE = 16'hFFFF,         // a fresh state slot's scale: 1.0 in U16 (fabric.layer.ONE_U)
     parameter     LUT_DIR = "./"
 ) (
     input  wire          clk,
     input  wire          rst_n,
+    input  wire          first,          // FIRST: this token starts its slot's state from zero
     input  wire          cmd_valid,
     input  wire [15:0]   cmd_len,
     input  wire [29:0]   cmd_src,
@@ -1540,6 +1542,13 @@ module fabric_mem_unit #(
     // Requester 0, the mover: a burst between memory and the buffer or the sums register.
     localparam [1:0] MV_RD_VB = 0, MV_WR_VB = 1, MV_RD_REG = 2, MV_WR_REG = 3;
     reg          mv_go, mv_busy, mv_req, mv_done, mv_present;
+    // FIRST.  A move into the buffer flagged fresh, or the append's read of
+    // the block sums, on a FIRST token is a fill instead of a read: the slot
+    // may hold another context's state, or whatever the devices powered up
+    // with, and this token starts from nothing.  Zeros, and for a state slot
+    // its header beat with the scale at 1.0 -- the integer model's fresh
+    // state -- two beats a cycle into the buffer and no request on the port.
+    reg          mv_fill, mv_hdr;
     reg [1:0]    mv_mode;
     reg [31:0]   mv_maddr;
     reg [AW-1:0] mv_vaddr;
@@ -1588,12 +1597,12 @@ module fabric_mem_unit #(
     // The sums move a beat at a time between the memory and the append's own
     // memory: the mover reads one, the append adds the rows to it and keeps
     // it; the mover writes one back, and the append hands it over.
-    wire        ap_s_in_valid = mv_busy && (mv_mode == MV_RD_REG) && r_rdata_valid[0];
+    wire        ap_s_in_valid = mv_busy && (mv_mode == MV_RD_REG) && (r_rdata_valid[0] || mv_fill);
     wire [DW-1:0] ap_s_out_data;
     fabric_kv_append #(.DW(DW), .HD(HD), .NKV(NKV), .IDIM(IDIM), .BS(BS), .KV_BITS(KV_BITS), .W(W), .LUT_DIR(LUT_DIR)) u_append (
         .clk(clk), .rst_n(rst_n), .start(ap_start), .pos(pos), .window_base(ctx_base + WINDOW_OFF), .block_base(ctx_base + BLOCK_OFF),
         .index_base(ctx_base + INDEX_OFF), .k_rows(k_r), .v_rows(v_r), .idx_k(idx_r),
-        .s_in_valid(ap_s_in_valid), .s_in_addr({{(16-$clog2(SUMS_BEATS+1)){1'b0}}, mv_i[$clog2(SUMS_BEATS+1)-1:0]}), .s_in_data(r_rdata[DW-1:0]),
+        .s_in_valid(ap_s_in_valid), .s_in_addr({{(16-$clog2(SUMS_BEATS+1)){1'b0}}, mv_i[$clog2(SUMS_BEATS+1)-1:0]}), .s_in_data(mv_fill ? {DW{1'b0}} : r_rdata[DW-1:0]),
         .s_out_addr({{(16-$clog2(SUMS_BEATS+1)){1'b0}}, mv_i[$clog2(SUMS_BEATS+1)-1:0]}), .s_out_data(ap_s_out_data), .done(ap_done),
         .req_valid(r_req_valid[1]), .req_ready(r_req_ready[1]), .req_addr(r_req_addr[1*32 +: 32]), .req_beats(r_req_beats[1*12 +: 12]),
         .wdata_valid(r_wdata_valid[1]), .wdata_ready(r_wdata_ready[1]), .wdata(r_wdata[1*2*DW +: DW]));
@@ -1692,7 +1701,7 @@ module fabric_mem_unit #(
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             state <= S_IDLE; done_valid <= 1'b0; wr_en <= 1'b0; wr_hi_be <= 16'd0; ld_on <= 1'b0; ldv <= 1'b0; ld_i <= 0; ld_n <= 0;
-            mv_go <= 1'b0; mv_busy <= 1'b0; mv_req <= 1'b0; mv_done <= 1'b0; mv_present <= 1'b0; mv_i <= 0;
+            mv_go <= 1'b0; mv_busy <= 1'b0; mv_req <= 1'b0; mv_done <= 1'b0; mv_present <= 1'b0; mv_i <= 0; mv_fill <= 1'b0; mv_hdr <= 1'b0;
             mv_a <= 0; mv_q <= 1'b0; mv_hv <= 1'b0;
             ap_start <= 1'b0; sc_start <= 1'b0; tk_clear <= 1'b0; tk_finish <= 1'b0; sc_done_d <= 1'b0; rc_start <= 1'b0;
             rr_addr_valid <= 1'b0; rw_p <= 0; rw_j <= 0; rw_rec <= 0; rw_ob <= 0; rw_blocks <= 1'b0; rw_reqs_done <= 1'b0; sel_count <= 0;
@@ -1714,19 +1723,20 @@ module fabric_mem_unit #(
             endcase
             // The mover.
             if (mv_go) begin
-                mv_busy <= 1'b1; mv_req <= 1'b1; mv_i <= 0; mv_present <= 1'b0;
+                mv_busy <= 1'b1; mv_req <= !mv_fill; mv_i <= 0; mv_present <= 1'b0;
                 mv_a <= 0; mv_q <= 1'b0; mv_hv <= 1'b0;
             end
             else if (mv_busy) begin
                 if (mv_req && r_req_ready[0]) mv_req <= 1'b0;
                 case (mv_mode)
-                    MV_RD_VB: if (r_rdata_valid[0]) begin
-                        wr_en <= 1'b1; wr_addr <= mv_vaddr + mv_i * 16; wr_data <= r_rdata[DW-1:0]; wr_be <= 16'hFFFF;
-                        wr_hi <= r_rdata[2*DW-1:DW]; wr_hi_be <= (mv_istep == 2) ? 16'hFFFF : 16'd0;
+                    MV_RD_VB: if (r_rdata_valid[0] || mv_fill) begin
+                        wr_en <= 1'b1; wr_addr <= mv_vaddr + mv_i * 16; wr_be <= 16'hFFFF;
+                        wr_data <= !mv_fill ? r_rdata[DW-1:0] : ((mv_hdr && mv_i == 0) ? STATE_ONE[15:0] : {DW{1'b0}});
+                        wr_hi <= mv_fill ? {DW{1'b0}} : r_rdata[2*DW-1:DW]; wr_hi_be <= (mv_istep == 2) ? 16'hFFFF : 16'd0;
                         mv_i <= mv_i + mv_istep;
                         if (mv_i + mv_istep == mv_n) begin mv_busy <= 1'b0; mv_done <= 1'b1; end
                     end
-                    MV_RD_REG: if (r_rdata_valid[0]) begin
+                    MV_RD_REG: if (r_rdata_valid[0] || mv_fill) begin
                         mv_i <= mv_i + 1'b1;             // the append takes the beat; see ap_s_in_valid
                         if (mv_i == mv_n - 1) begin mv_busy <= 1'b0; mv_done <= 1'b1; end
                     end
@@ -1766,8 +1776,9 @@ module fabric_mem_unit #(
                     op <= cmd_arg[3:0]; pos <= {4'd0, cmd_arg[31:4]}; ctx_base <= {cmd_a3[20:0], 11'd0};
                     n <= cmd_len; src <= cmd_src[AW-1:0]; dst <= cmd_dst[AW-1:0]; arg_lo <= cmd_a2[AW-1:0]; head <= cmd_a2[7:0]; tag <= cmd_tag;
                     case (cmd_arg[3:0])
-                        4'd0: begin mv_go <= 1'b1; mv_mode <= MV_RD_VB; mv_maddr <= {cmd_src[27:0], 4'd0}; mv_vaddr <= cmd_dst[AW-1:0]; mv_n <= cmd_len[11:0]; state <= S_MV; end
-                        4'd1: begin mv_go <= 1'b1; mv_mode <= MV_WR_VB; mv_maddr <= {cmd_dst[27:0], 4'd0}; mv_vaddr <= cmd_src[AW-1:0]; mv_n <= cmd_len[11:0]; state <= S_MV; end
+                        4'd0: begin mv_go <= 1'b1; mv_mode <= MV_RD_VB; mv_maddr <= {cmd_src[27:0], 4'd0}; mv_vaddr <= cmd_dst[AW-1:0]; mv_n <= cmd_len[11:0]; state <= S_MV;
+                              mv_fill <= first && (cmd_arg[5:4] != 2'b00); mv_hdr <= cmd_arg[5]; end
+                        4'd1: begin mv_go <= 1'b1; mv_fill <= 1'b0; mv_mode <= MV_WR_VB; mv_maddr <= {cmd_dst[27:0], 4'd0}; mv_vaddr <= cmd_src[AW-1:0]; mv_n <= cmd_len[11:0]; state <= S_MV; end
                         4'd2: begin ld_on <= 1'b1; ld_tgt <= T_K; ld_base <= cmd_src[AW-1:0]; ld_i <= 0; ld_n <= KB; state <= S_AP_LOAD; end
                         4'd3: begin ld_on <= 1'b1; ld_tgt <= T_U; ld_base <= cmd_src[AW-1:0]; ld_i <= 0; ld_n <= IB; state <= S_SC_LOAD; end
                         default: begin ld_on <= 1'b1; ld_tgt <= T_SEL; ld_base <= cmd_src[AW-1:0]; ld_i <= 0; ld_n <= SEL_BEATS; state <= S_RW_LOAD; end
@@ -1779,12 +1790,12 @@ module fabric_mem_unit #(
                     if (ld_tgt == T_K) begin ld_on <= 1'b1; ld_tgt <= T_V; ld_base <= arg_lo; ld_i <= 0; ld_n <= KB; end
                     else if (ld_tgt == T_V) begin ld_on <= 1'b1; ld_tgt <= T_I; ld_base <= dst; ld_i <= 0; ld_n <= IB; end
                     else begin
-                        mv_go <= 1'b1; mv_mode <= MV_RD_REG; mv_maddr <= ctx_base + SUMS_OFF; mv_n <= SUMS_BEATS; state <= S_AP_SUMS_RD;
+                        mv_go <= 1'b1; mv_mode <= MV_RD_REG; mv_fill <= first && (pos == 0); mv_maddr <= ctx_base + SUMS_OFF; mv_n <= SUMS_BEATS; state <= S_AP_SUMS_RD;
                     end
                 end
                 S_AP_SUMS_RD: if (mv_done) begin ap_start <= 1'b1; state <= S_AP_WAIT; end
                 S_AP_WAIT: if (ap_done) begin
-                    mv_go <= 1'b1; mv_mode <= MV_WR_REG; mv_maddr <= ctx_base + SUMS_OFF; mv_n <= SUMS_BEATS; state <= S_AP_SUMS_WR;
+                    mv_go <= 1'b1; mv_mode <= MV_WR_REG; mv_fill <= 1'b0; mv_maddr <= ctx_base + SUMS_OFF; mv_n <= SUMS_BEATS; state <= S_AP_SUMS_WR;
                 end
                 S_AP_SUMS_WR: if (mv_done) state <= S_DONE;
                 // Scan: the query's codes, then the scan and the top-K, then the selection.
@@ -1900,6 +1911,7 @@ module fabric_layer_engine #(
     input  wire         clk,
     input  wire         rst_n,
     input  wire         start,
+    input  wire         first,               // FIRST: the token starts its slot's state from zero (latched at start)
     input  wire [15:0]  n_steps,
     output wire         running,
     output wire         done,
@@ -1976,6 +1988,10 @@ module fabric_layer_engine #(
     endgenerate
 
     wire [127:0] mem_rd_hi, mem_wr_hi;               // the memory unit's second word: the buffer's wide port
+    reg          first_r;
+    always @(posedge clk or negedge rst_n)
+        if (!rst_n) first_r <= 1'b0;
+        else if (start) first_r <= first;
     wire [15:0]  mem_wr_hi_be;
     fabric_vb #(.BYTES(VB_BYTES), .NR(NR), .NW(NW), .AW(AW), .NB(VB_BANKS), .BSH(VB_BANK_SHIFT),
                 .RCAP2(VB_RCAP2), .RCAP3(VB_RCAP3), .WCAP2(VB_WCAP2),
@@ -2088,7 +2104,7 @@ module fabric_layer_engine #(
     fabric_mem_unit #(.HD(HD), .NKV(NKV), .IDIM(IDIM), .BS(BS), .W(W), .TOP(TOP), .KV_BITS(KV_BITS), .L(ATT_L), .REC_BYTES(REC_BYTES),
                       .RPB(RPB), .MAXR(MAXR), .WINDOW_OFF(WINDOW_OFF), .BLOCK_OFF(BLOCK_OFF), .INDEX_OFF(INDEX_OFF), .SUMS_OFF(SUMS_OFF),
                       .AW(AW), .LUT_DIR(LUT_DIR)) u_mem (
-        .clk(clk), .rst_n(rst_n), .cmd_valid(cmd_valid[U_MEM] && cmd_engine == 0), .cmd_len(cmd_len), .cmd_src(cmd_src), .cmd_dst(cmd_dst),
+        .clk(clk), .rst_n(rst_n), .first(first_r), .cmd_valid(cmd_valid[U_MEM] && cmd_engine == 0), .cmd_len(cmd_len), .cmd_src(cmd_src), .cmd_dst(cmd_dst),
         .cmd_a2(cmd_a2), .cmd_a3(cmd_a3), .cmd_arg(cmd_arg), .cmd_tag(cmd_tag), .cmd_ready(ready_mem), .done_valid(done_valid[U_MEM*NE]), .done_tag(done_tag[U_MEM*NE*8 +: 8]),
         .rd_addr(rd_addr[R_MEM*AW +: AW]), .rd_en(rd_en[R_MEM]), .rd_data(rd_data[R_MEM*128 +: 128]), .rd_hi(mem_rd_hi),
         .wr_en(wr_en[W_MEM]), .wr_addr(wr_addr[W_MEM*AW +: AW]), .wr_data(wr_data[W_MEM*128 +: 128]), .wr_be(wr_be[W_MEM*16 +: 16]),

@@ -565,7 +565,8 @@ class EngineRun:
     after the token's append)."""
 
     def __init__(self, directory: Path, cfg, c, spec: TileSpec, mm: MemoryMap, steps: list[S.Step], inputs: dict,
-                 memory: dict[str, tuple[bytes, bytes]] | None = None, ndev: int = 0, model_tiles: bool = False) -> None:
+                 memory: dict[str, tuple[bytes, bytes]] | None = None, ndev: int = 0, model_tiles: bool = False,
+                 first: bool = False) -> None:
         directory.mkdir(parents=True, exist_ok=True)
         self.cfg, self.steps, self.mm, self.ndev = cfg, steps, mm, ndev
         self.recurrent = isinstance(c, L.RecurrentConsts)
@@ -629,7 +630,7 @@ class EngineRun:
                        "VB_RCAP3": self.layout.cap_mask(self.layout.bank_reads, 3),
                        "VB_WCAP2": self.layout.cap_mask(self.layout.bank_writes, 2),
                        **port_params(steps, self.chunk),
-                       "SCHEDULE_CYCLES": S.schedule(steps).cycles, **hpi_params}
+                       "SCHEDULE_CYCLES": S.schedule(steps).cycles, "FIRST": int(first), **hpi_params}
         (directory / "params.json").write_text(json.dumps(self.params))
 
     def _place(self, image: bytearray, name: str, data: bytes) -> None:
