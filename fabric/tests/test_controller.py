@@ -140,16 +140,42 @@ class ControllerTest(unittest.TestCase):
         self.assertEqual(ctl.table.holder, {})                       # every slot given back
         self.assertLess(ctl.steps, 3 * (2 + 1 + 3 + 5) * 6 + 50)     # the ring kept more than one item in flight
 
-    def test_a_short_table_evicts_and_the_evicted_start_over(self):
+    def test_a_short_table_waits_rather_than_evict_mid_turn(self):
+        # One slot, two contexts: the second waits for the first's turn to
+        # end.  Taking the slot mid-turn would send the first back to its
+        # first token, and the two would take it from each other for ever.
         rng = np.random.default_rng(12)
         emb, _, head = fake_model(rng)
         ring = C.Ring(2, lambda item: item.hidden, [head(0), head(1)])
         ctl = C.Controller(emb, ring, slots=1, seed=13)
         a, b = ctl.submit([1, 2, 3], 3), ctl.submit([4, 5], 3)
         ctl.run()
-        self.assertGreater(len(ctl.table.evicted), 0)
+        self.assertEqual(ctl.table.evicted, [])
         self.assertEqual(len(ctl.generated(a)), 3)
         self.assertEqual(len(ctl.generated(b)), 3)
+
+    def test_an_idle_resident_context_is_evicted_and_starts_over(self):
+        # Resident contexts keep their slot between turns until it is needed.
+        # One that lost it -- even if it gets the same slot back -- starts its
+        # next turn from its first token, marked FIRST.
+        rng = np.random.default_rng(14)
+        emb, _, head = fake_model(rng)
+        sent = []
+        ring = C.Ring(2, lambda item: item.hidden, [head(0), head(1)])
+        inject = ring.inject
+        ring.inject = lambda packet: (sent.append(C.unpack_item(packet, emb.hidden)[0]), inject(packet))[1]
+        ctl = C.Controller(emb, ring, slots=1, seed=15)
+        a = ctl.open()
+        ctl.append(a, [1, 2], 2)
+        ctl.run()
+        b = ctl.submit([7], 1)                       # takes the one slot from a, idle
+        ctl.run()
+        self.assertEqual(ctl.table.evicted, [(a, 0)])
+        sent.clear()
+        ctl.append(a, [3], 1)                        # a's second turn, back in slot 0
+        ctl.run()
+        self.assertEqual([(s.position, s.flags & C.FLAG_FIRST) for s in sent][:2], [(0, C.FLAG_FIRST), (1, 0)])
+        self.assertEqual(len(ctl.contexts[a].tokens), 2 + 2 + 1 + 1)
 
 
 import shutil

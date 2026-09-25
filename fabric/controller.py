@@ -273,6 +273,8 @@ class Context:
     done: bool = False
     logprobs: list[float] = field(default_factory=list)
     seed: int = 0
+    stops: tuple[int, ...] = ()      # tokens that end a turn when sampled
+    keep: bool = False               # resident between turns: its slot is kept until closed or evicted
 
 
 class ContextTable:
@@ -288,13 +290,16 @@ class ContextTable:
         self.holder: dict[int, int] = {}                 # slot -> context id
         self.lru: OrderedDict[int, None] = OrderedDict()  # slots by last use, oldest first
         self.evicted: list[tuple[int, int]] = []          # (context, slot)
+        self.kept = False                                 # the last acquire gave the context the slot it already held
 
     def acquire(self, ctx: int, busy: Callable[[int], bool]) -> int | None:
         """A slot for ``ctx``: its own if it has one, else a free one, else the
         oldest whose holder is not in flight.  None if every slot is busy."""
+        self.kept = False
         for slot, holder in self.holder.items():
             if holder == ctx:
                 self.lru.move_to_end(slot)
+                self.kept = True
                 return slot
         free = [s for s in range(self.slots) if s not in self.holder]
         if free:
@@ -368,23 +373,72 @@ class Controller:
     ring: a prompt token's lists are dropped, a sampled one's are merged and
     drawn from, the token appended, and the context goes back in the queue."""
 
-    def __init__(self, embedding: EmbeddingTable, ring: Ring, slots: int, seed: int = 1) -> None:
+    def __init__(self, embedding: EmbeddingTable, ring: Ring, slots: int, seed: int = 1,
+                 on_token: Callable[[int, int, float, int, bool], None] | None = None) -> None:
         self.embedding, self.ring, self.table = embedding, ring, ContextTable(slots)
         self.contexts: dict[int, Context] = {}
         self.queue: deque[int] = deque()
         self.rng = np.random.default_rng(seed)
         self.next_id = 0
         self.steps = 0
+        # Each sampled token as it is drawn: (context, token, log-probability,
+        # its position, whether it ends the turn).  The host's completions.
+        self.on_token = on_token
 
     def submit(self, prompt: Sequence[int], max_new: int, params: SamplingParams = SamplingParams()) -> int:
-        ctx = Context(self.next_id, list(prompt), len(prompt), max_new, params)
+        """A one-turn context: the prompt, max_new tokens, then its slot is given back."""
+        cid = self.open(params)
+        self.append(cid, prompt, max_new)
+        self.contexts[cid].keep = False
+        return cid
+
+    def open(self, params: SamplingParams = SamplingParams(), stops: Sequence[int] = ()) -> int:
+        """A context that stays resident between turns: its state is kept on
+        the dies until it is closed or its slot is taken for another."""
+        ctx = Context(self.next_id, [], 0, 0, params, stops=tuple(stops), keep=True, done=True)
         self.contexts[ctx.id] = ctx
-        self.queue.append(ctx.id)
         self.next_id += 1
         return ctx.id
 
+    def append(self, cid: int, tokens: Sequence[int], max_new: int) -> None:
+        """A turn: tokens after what the context has seen, then up to max_new
+        sampled.  The last token sampled before, if any, goes in first -- it
+        was drawn but never fed through the layers."""
+        ctx = self.contexts[cid]
+        if not ctx.done:
+            raise ValueError("the context is mid-turn")
+        ctx.tokens += list(tokens)
+        ctx.prompt_len, ctx.max_new, ctx.done = len(ctx.tokens), max_new, False
+        if cid not in self.queue:
+            self.queue.append(cid)
+
+    def cancel(self, cid: int) -> None:
+        """End the turn after the token in flight; the context stays open."""
+        ctx = self.contexts[cid]
+        if not ctx.done:
+            ctx.max_new = len(ctx.tokens) - ctx.prompt_len + (1 if ctx.in_flight and ctx.next_pos >= ctx.prompt_len - 1 else 0)
+            if not ctx.in_flight:
+                self._end_turn(ctx)
+
+    def close(self, cid: int) -> None:
+        """Forget the context and give its slot back."""
+        ctx = self.contexts[cid]
+        ctx.done, ctx.keep = True, False
+        if not ctx.in_flight:
+            self.table.release(cid)
+
+    def _end_turn(self, ctx: Context) -> None:
+        ctx.done = True
+        if not ctx.keep:
+            self.table.release(ctx.id)
+
     def _busy(self, ctx: int) -> bool:
-        return self.contexts[ctx].in_flight
+        """A slot is not taken from a context in flight or in the middle of a
+        turn -- evicted mid-turn it would start over, and two contexts sharing
+        one slot would each keep evicting the other.  Only a resident context
+        between turns is taken, and its next turn starts from its first token."""
+        c = self.contexts[ctx]
+        return c.in_flight or not c.done
 
     def _inject(self) -> bool:
         for _ in range(len(self.queue)):
@@ -395,10 +449,10 @@ class Controller:
                 continue
             slot = self.table.acquire(cid, self._busy)
             if slot is None:
-                self.queue.appendleft(cid)                  # it keeps its turn: else the holder always goes first
-                return False
-            if ctx.slot is not None and ctx.slot != slot:
-                ctx.fresh, ctx.next_pos = True, 0            # evicted meanwhile: start over
+                self.queue.append(cid)                      # every slot is mid-turn: it waits, the holders go on
+                continue
+            if ctx.slot is not None and not self.table.kept:
+                ctx.fresh, ctx.next_pos = True, 0            # evicted meanwhile, even if given the same slot back: start over
             if ctx.fresh:
                 ctx.next_pos = 0
             ctx.slot = slot
@@ -421,15 +475,21 @@ class Controller:
         ctx = self.contexts[cid]
         ctx.in_flight = False
         ctx.next_pos = item.position + 1
+        if ctx.done:                                        # closed while in flight
+            if not ctx.keep:
+                self.table.release(cid)
+            return
         if item.flags & FLAG_SAMPLE:
             rows, logits, total = merge_lists(lists)
             rnd = int(self.rng.integers(0, 1 << 32))
             token, i = sample(rows, logits, ctx.params, rnd)
             ctx.tokens.append(token)
             ctx.logprobs.append(logprob(int(logits[i]), total))
-            if len(ctx.tokens) - ctx.prompt_len >= ctx.max_new:
-                ctx.done = True
-                self.table.release(cid)
+            last = len(ctx.tokens) - ctx.prompt_len >= ctx.max_new or token in ctx.stops
+            if self.on_token is not None:
+                self.on_token(cid, token, ctx.logprobs[-1], item.position + 1, last)
+            if last:
+                self._end_turn(ctx)
 
     def step(self) -> None:
         out = self.ring.step(self.embedding.hidden)
