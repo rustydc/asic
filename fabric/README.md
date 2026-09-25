@@ -1220,11 +1220,14 @@ specification.
 Three contracts are fixed here that the dies must honour, because they are
 the ring's protocol and not the controller's alone.
 
-* **The packet.** A 16-byte header (kind, flags, the slot, the position, a
-  length, a CRC-32), then the hidden vector as int16 at the residual scale
-  `s_h`, 8 KB for the 9B, then whatever the head dies have appended. A
-  layer die replaces the vector; a head die appends its list and brings
-  the length and the CRC up to date; nothing else on the item is touched.
+* **The packet.** A 16-byte header (kind, flags, the slot, the position of
+  its first token, the token count and a 24-bit length, a CRC-32), then
+  the hidden vectors as int16 at the residual scale `s_h`, 8 KB a token
+  for the 9B, then whatever the head dies have appended. A packet is one
+  token, or a chunk of a prompt's consecutive tokens with their vectors
+  back to back. A layer die replaces the vectors; a head die appends its
+  list for the last token and brings the length and the CRC up to date;
+  nothing else on the item is touched.
 * **The head list.** K rows and their logits as signed fixed point of ten
   fraction bits, in descending order, and the log-sum-exp of the die's
   whole half of the vocabulary in the same format. The rows are global.
@@ -1260,8 +1263,23 @@ first token with FIRST set, which is the host's to avoid by sizing the
 resident set and the table's to report. The scheduler is round robin over
 the contexts with a token to send, one item into the ring whenever its
 first die is free, so every die works on a different context's token and
-one conversation sees the ring's latency. A prompt goes in a token at a
-time; only the last one's lists are drawn from.
+one conversation sees the ring's latency.
+
+A prompt's tokens are all known, so a context's prompt does not wait for
+each to come back: its packets go in back to back and fill the ring by
+themselves, in order, and the ring keeps them in order through every
+stage, which is all a die's state needs. And they go a chunk a packet,
+`chunk` tokens while that many are known and then one at a time, so a
+100-token prompt at a chunk of 32 is three chunks and four single tokens.
+Only the packet that ends the prompt is drawn from, from its last token,
+and a sampled token goes in only once it has been drawn. A die holds a
+program for each of the two sizes and the packet's token count picks one:
+the chunk's recurrent layers run the chunked program, which reads a
+head's state once for the chunk, and its global layer runs the chunk's
+tokens one after another, which is where the chunk gains nothing (see
+*Prefill* above). Chunked or not, the dies see the same tokens in the same
+order, so a chunked prompt draws what an unchunked one does; the model's
+test runs a layer with state both ways and gets the same tokens.
 
 ### The link and the datapath
 
@@ -1280,10 +1298,13 @@ last. The header is 12 bytes now and the trailer 4, so the overhead is the
 16 bytes the simulator already assumed.
 
 `rtl/fabric_controller_top.sv` is the three pieces together and is what has
-to be gateware, because it is a stream: a request fetches the token's row
-of the embedding table and sends it as the payload; the packet that comes
-back has its hidden vector skipped, its lists parsed out into the sampler
-and the token drawn for the slot it belongs to. The embedding fetch takes
+to be gateware, because it is a stream: a request -- a slot, a position,
+flags, a token count and the sampling parameters -- takes its tokens off a
+stream of their own, one per row, fetches each token's row of the
+embedding table and sends the rows as the payload; the packet that comes
+back has its hidden vectors skipped, the count read from its header, its
+lists parsed out into the sampler and the token drawn for the slot it
+belongs to. The embedding fetch takes
 three cycles a word, since the table answers the cycle after its address
 and the word is held until the link takes it; a real part is read in bursts
 and that is where the burst goes.

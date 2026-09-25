@@ -1,6 +1,6 @@
 // Self-checking testbench for fabric_controller_top against
-// fabric.controller.emit_top_vectors: a request becomes the packet the model
-// says it should, and the reply that comes back becomes the token the model
+// fabric.controller.emit_top_vectors: a request -- one token or a chunk of
+// them -- becomes the packet the model says it should, and the reply that comes back becomes the token the model
 // draws, for the slot it belongs to.
 
 `timescale 1ns/1ps
@@ -12,7 +12,8 @@ module tb_controller_top #(
     parameter int CASES  = 8,
     parameter int EWORDS = 256,
     parameter int OWORDS = 64,
-    parameter int RWORDS = 352
+    parameter int RWORDS = 352,
+    parameter int TWORDS = 8
 );
     reg clk = 0, rst_n = 0;
     always #5 clk = ~clk;
@@ -22,12 +23,14 @@ module tb_controller_top #(
     reg [31:0]  rm [0:RWORDS-1];
     reg [15:0]  rc [0:CASES-1];
     reg [63:0]  tm [0:CASES-1];
+    reg [31:0]  km [0:TWORDS-1];
 
     reg         req_valid = 0;
     reg [15:0]  req_slot = 0, req_inv_t = 0, req_top_p = 0;
-    reg [31:0]  req_position = 0, req_token = 0, req_rnd = 0;
-    reg [7:0]   req_flags = 8'h01, req_top_k = 0;
-    wire        req_ready, emb_en, l_valid, l_sop, r_ready;
+    reg [31:0]  req_position = 0, req_rnd = 0;
+    reg [7:0]   req_flags = 8'h01, req_top_k = 0, req_count = 0;
+    wire        req_ready, in_ready, emb_en, l_valid, l_sop, r_ready;
+    integer     ti = 0;                                   // the tokens stream in order, one a row
     wire [31:0] emb_addr, l_data;
     reg  [31:0] emb_data;
     reg         r_valid = 0, r_sop = 0;
@@ -38,17 +41,21 @@ module tb_controller_top #(
     wire [7:0]  tok_index;
 
     always @(posedge clk) emb_data <= em[emb_addr];       // the table answers a cycle later
+    wire        in_valid = ti < TWORDS;
+    wire [31:0] in_token = km[ti < TWORDS ? ti : 0];
+    always @(posedge clk) if (in_valid && in_ready) ti <= ti + 1;
 
     fabric_controller_top #(.D(D), .K(K), .LUT_DIR("./")) dut (
         .clk(clk), .rst_n(rst_n), .req_valid(req_valid), .req_ready(req_ready), .req_slot(req_slot),
-        .req_position(req_position), .req_flags(req_flags), .req_token(req_token), .req_inv_t(req_inv_t),
+        .req_position(req_position), .req_flags(req_flags), .req_count(req_count),
+        .in_valid(in_valid), .in_ready(in_ready), .in_token(in_token), .req_inv_t(req_inv_t),
         .req_top_k(req_top_k), .req_top_p(req_top_p), .req_rnd(req_rnd),
         .emb_en(emb_en), .emb_addr(emb_addr), .emb_data(emb_data),
         .l_valid(l_valid), .l_data(l_data), .l_sop(l_sop), .l_ready(1'b1),
         .r_valid(r_valid), .r_data(r_data), .r_sop(r_sop), .r_ready(r_ready),
         .tok_valid(tok_valid), .tok_row(tok_row), .tok_slot(tok_slot), .tok_index(tok_index));
 
-    integer c, i, errors, ow, rbase, guard, seen_tok;
+    integer c, i, errors, ow, obase, rbase, guard, seen_tok;
     reg [31:0] got_row;
     reg [15:0] got_slot;
     reg [7:0]  got_index;
@@ -78,19 +85,21 @@ module tb_controller_top #(
         $readmemh("reply.hex", rm);
         $readmemh("rcount.hex", rc);
         $readmemh("token.hex", tm);
-        errors = 0; ow = 0; rbase = 0; seen_tok = 0;
+        $readmemh("tokens.hex", km);
+        errors = 0; ow = 0; obase = 0; rbase = 0; seen_tok = 0;
         repeat (2) @(posedge clk);
         #1 rst_n = 1;
         for (c = 0; c < CASES; c = c + 1) begin
             req_valid = 1;
-            req_slot = rq[c][15:0]; req_position = rq[c][47:16]; req_token = rq[c][55:48];
+            req_slot = rq[c][15:0]; req_position = rq[c][47:16]; req_count = rq[c][55:48];
             req_inv_t = rq[c][71:56]; req_top_k = rq[c][79:72]; req_top_p = rq[c][95:80]; req_rnd = rq[c][127:96];
             @(posedge clk);
             while (!req_ready) @(posedge clk);
             #1 req_valid = 0;
             // Let the packet go out, then hand back the reply a word a cycle.
             guard = 0;
-            while (ow < (c + 1) * (D/2 + 4) && guard < 2000) begin @(posedge clk); guard = guard + 1; end
+            obase = obase + req_count * (D/2) + 4;
+            while (ow < obase && guard < 4000) begin @(posedge clk); guard = guard + 1; end
             for (i = 0; i < rc[c]; i = i + 1) begin
                 r_valid = 1; r_sop = (i == 0); r_data = rm[rbase + i];
                 @(posedge clk);
@@ -109,7 +118,8 @@ module tb_controller_top #(
                              c, got_row, got_index, got_slot, tm[c][63:24], tm[c][23:16], tm[c][15:0]);
             end
         end
-        if (errors == 0) $display("PASS: %0d requests", CASES);
+        if (ti != TWORDS) begin errors = errors + 1; $display("FAIL: %0d tokens taken of %0d", ti, TWORDS); end
+        if (errors == 0) $display("PASS: %0d requests, %0d tokens", CASES, TWORDS);
         else $display("FAIL: %0d errors", errors);
         $finish;
     end

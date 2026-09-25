@@ -16,8 +16,9 @@ CRC, the packet) and step for step where it is control (the scheduler).
 Three contracts are fixed here that the dies must honour, since they are
 the ring's protocol rather than the controller's alone:
 
-* the packet: a 16-byte header, the hidden vector as int16 at the residual
-  scale, and, after the head dies, their lists, all under one CRC-32;
+* the packet: a 16-byte header, the hidden vectors of its tokens as int16
+  at the residual scale -- one, or a chunk of a prompt's consecutive
+  tokens -- and, after the head dies, their lists, all under one CRC-32;
 * the head list: K candidates of (row, logit) with the logit a signed
   fixed-point value of ``LOGIT_FRAC`` fraction bits, and the log-sum-exp of
   the die's whole half in the same format, so the two halves can be merged
@@ -53,8 +54,13 @@ KIND_ITEM = 0x57                 # a work item
 # The CRC is a trailer, not a header field, because the link is a stream: a
 # head die appending its list, and the sender of a packet whose payload is
 # 8 KB, would both have to hold the whole thing to fill a header CRC in.
-HEADER = struct.Struct("<BBHIHH")    # kind, flags, context, position, length, reserved
+# The last word is the payload length in its low 24 bits and the number of
+# tokens in the top 8: a chunk of a prompt is one packet, its tokens at
+# ``position`` on, their vectors back to back.
+HEADER = struct.Struct("<BBHII")     # kind, flags, context, position, tokens << 24 | length
 HEADER_BYTES = HEADER.size      # 12; with the 4-byte trailer, 16 of overhead
+MAX_LENGTH = (1 << 24) - 1
+MAX_TOKENS = 255
 TRAILER_BYTES = 4
 FLAG_SAMPLE = 0x01               # the controller wants a token from this item
 FLAG_FIRST  = 0x02               # first token of a new context in this slot: zero the state
@@ -68,9 +74,28 @@ ENTRY = struct.Struct("<Ii")            # row, logit
 @dataclass(frozen=True)
 class WorkItem:
     context: int
-    position: int
-    hidden: np.ndarray               # int16, the residual at scale s_h
+    position: int                    # of its first token
+    hidden: np.ndarray               # int16, the residual at scale s_h: [d], or [tokens, d] for a chunk
     flags: int = 0
+
+    @property
+    def tokens(self) -> int:
+        return 1 if np.ndim(self.hidden) == 1 else len(self.hidden)
+
+    @property
+    def last(self) -> "WorkItem":
+        """The item's last token alone: what a head die reads, since only the
+        last token of a chunk is sampled from."""
+        if np.ndim(self.hidden) == 1:
+            return self
+        return WorkItem(self.context, self.position + self.tokens - 1, self.hidden[-1], self.flags)
+
+    def split(self) -> list["WorkItem"]:
+        """One item a token, in order: what a layer die's arithmetic is, the
+        tokens of a chunk each seeing the state the ones before it left."""
+        if np.ndim(self.hidden) == 1:
+            return [self]
+        return [WorkItem(self.context, self.position + i, h, self.flags) for i, h in enumerate(self.hidden)]
 
 
 @dataclass(frozen=True)
@@ -89,13 +114,24 @@ def crc32(data: bytes) -> int:
     return zlib.crc32(data) & 0xFFFFFFFF
 
 
+def _header(flags: int, context: int, position: int, tokens: int, length: int) -> bytes:
+    if not 1 <= tokens <= MAX_TOKENS or length > MAX_LENGTH:
+        raise ValueError(f"{tokens} tokens, {length} bytes: not a packet")
+    return HEADER.pack(KIND_ITEM, flags, context, position, tokens << 24 | length)
+
+
+def _unheader(packet: bytes) -> tuple[int, int, int, int, int, int]:
+    kind, flags, context, position, word = HEADER.unpack(packet[:HEADER_BYTES])
+    return kind, flags, context, position, word >> 24, word & MAX_LENGTH
+
+
 def pack_item(item: WorkItem, lists: Sequence[HeadList] = ()) -> bytes:
-    """A work item as it travels the ring: header, hidden vector, and the
+    """A work item as it travels the ring: header, hidden vectors, and the
     lists the head dies have appended so far."""
     hidden = np.asarray(item.hidden, dtype="<i2").tobytes()
     tail = b"".join(pack_head_list(hl) for hl in lists)
     payload = hidden + tail
-    head = HEADER.pack(KIND_ITEM, item.flags, item.context, item.position, len(payload), 0)
+    head = _header(item.flags, item.context, item.position, item.tokens, len(payload))
     return head + payload + struct.pack("<I", crc32(head + payload))
 
 
@@ -107,23 +143,25 @@ def pack_head_list(hl: HeadList) -> bytes:
 def append_head_list(packet: bytes, hl: HeadList) -> bytes:
     """What a head die does to a passing item: its list on the end, the length
     and the CRC brought up to date, nothing else touched."""
-    kind, flags, context, position, length, _ = HEADER.unpack(packet[:HEADER_BYTES])
+    kind, flags, context, position, tokens, length = _unheader(packet)
     payload = packet[HEADER_BYTES:HEADER_BYTES + length] + pack_head_list(hl)
-    head = HEADER.pack(kind, flags, context, position, len(payload), 0)
+    head = _header(flags, context, position, tokens, len(payload))
     return head + payload + struct.pack("<I", crc32(head + payload))
 
 
 def unpack_item(packet: bytes, d: int) -> tuple[WorkItem, list[HeadList]]:
     """The item and its lists, or a ValueError if the CRC does not hold."""
-    kind, flags, context, position, length, _ = HEADER.unpack(packet[:HEADER_BYTES])
+    kind, flags, context, position, tokens, length = _unheader(packet)
     payload = packet[HEADER_BYTES:HEADER_BYTES + length]
     if kind != KIND_ITEM:
         raise ValueError(f"not a work item: kind {kind:#x}")
     crc, = struct.unpack("<I", packet[HEADER_BYTES + length:HEADER_BYTES + length + TRAILER_BYTES])
     if crc32(packet[:HEADER_BYTES + length]) != crc:
         raise ValueError("CRC mismatch")
-    hidden = np.frombuffer(payload[:2 * d], dtype="<i2").astype(np.int64)
-    lists, at = [], 2 * d
+    hidden = np.frombuffer(payload[:2 * d * tokens], dtype="<i2").astype(np.int64)
+    if tokens > 1:
+        hidden = hidden.reshape(tokens, d)
+    lists, at = [], 2 * d * tokens
     while at < len(payload):
         die, k, _, _, lse = LIST_HEADER.unpack(payload[at:at + LIST_HEADER.size])
         at += LIST_HEADER.size
@@ -268,7 +306,7 @@ class Context:
     params: SamplingParams
     slot: int | None = None
     next_pos: int = 0                # the next position to inject
-    in_flight: int = 0               # its tokens in the ring: a prompt's go in back to back
+    in_flight: int = 0               # its packets in the ring: a prompt's go in back to back
     fresh: bool = True               # the slot has not seen this context yet
     done: bool = False
     logprobs: list[float] = field(default_factory=list)
@@ -327,8 +365,9 @@ class ContextTable:
 
 class Ring:
     """A pipeline of dies, one item each, advancing a stage per step: the
-    layer dies transform the hidden vector, the head dies append their lists.
-    ``layer`` and ``head`` are the dies' models, so a test can be exact."""
+    layer dies transform the hidden vectors, a chunk's token by token, the
+    head dies append their lists for its last token.  ``layer`` and ``head``
+    are the dies' models, for one token, so a test can be exact."""
 
     def __init__(self, n_layer_dies: int, layer: Callable[[WorkItem], np.ndarray],
                  heads: Sequence[Callable[[WorkItem], HeadList]]) -> None:
@@ -355,9 +394,11 @@ class Ring:
                 continue
             item, lists = unpack_item(packet, d)
             if i < self.n_layer:
-                self.stages[i] = pack_item(WorkItem(item.context, item.position, self.layer(item), item.flags), lists)
+                out_hidden = [self.layer(one) for one in item.split()]
+                hidden = out_hidden[0] if item.tokens == 1 else np.stack(out_hidden)
+                self.stages[i] = pack_item(WorkItem(item.context, item.position, hidden, item.flags), lists)
             else:
-                self.stages[i] = append_head_list(packet, self.heads[i - self.n_layer](item))
+                self.stages[i] = append_head_list(packet, self.heads[i - self.n_layer](item.last))
         return out
 
 
@@ -374,8 +415,15 @@ class Controller:
     drawn from, the token appended, and the context goes back in the queue."""
 
     def __init__(self, embedding: EmbeddingTable, ring: Ring, slots: int, seed: int = 1,
-                 on_token: Callable[[int, int, float, int, bool], None] | None = None) -> None:
+                 on_token: Callable[[int, int, float, int, bool], None] | None = None,
+                 chunk: int = 1) -> None:
         self.embedding, self.ring, self.table = embedding, ring, ContextTable(slots)
+        # A prompt goes in ``chunk`` tokens a packet while that many are
+        # known, then a token a packet: the dies hold a program for each of
+        # the two sizes, and the packet's token count picks one.
+        if not 1 <= chunk <= MAX_TOKENS:
+            raise ValueError(f"chunk {chunk}")
+        self.chunk = chunk
         self.contexts: dict[int, Context] = {}
         self.queue: deque[int] = deque()
         self.rng = np.random.default_rng(seed)
@@ -442,12 +490,14 @@ class Controller:
         return c.in_flight > 0 or not c.done
 
     def _inject(self) -> bool:
-        """One item into the ring: the next known token of the next context in
+        """One item into the ring: the next known tokens of the next context in
         turn.  A prompt's tokens are all known, so a context's prompt goes in
-        back to back and fills the ring by itself -- its tokens follow one
+        back to back and fills the ring by itself -- its packets follow one
         another through every stage in order, as the ring keeps them -- while
         a sampled token is known only when it comes back.  One token in
-        flight a context was a prompt at the speed of decode."""
+        flight a context was a prompt at the speed of decode.  And a prompt
+        goes in a chunk a packet: a die reads its weights and a context's
+        state once for the chunk, not once a token."""
         for _ in range(len(self.queue)):
             cid = self.queue.popleft()
             ctx = self.contexts[cid]
@@ -464,15 +514,17 @@ class Controller:
                 ctx.next_pos = 0
             ctx.slot = slot
             pos = ctx.next_pos
+            n = self.chunk if len(ctx.tokens) - pos >= self.chunk else 1
             flags = 0
             if ctx.fresh:
                 flags |= FLAG_FIRST
-            if pos >= ctx.prompt_len - 1:
+            if pos + n - 1 >= ctx.prompt_len - 1:
                 flags |= FLAG_SAMPLE
-            item = WorkItem(slot, pos, self.embedding.lookup(ctx.tokens[pos]), flags)
+            rows = [self.embedding.lookup(t) for t in ctx.tokens[pos:pos + n]]
+            item = WorkItem(slot, pos, rows[0] if n == 1 else np.stack(rows), flags)
             self.ring.inject(pack_item(item))
             ctx.in_flight += 1
-            ctx.next_pos, ctx.fresh = pos + 1, False
+            ctx.next_pos, ctx.fresh = pos + n, False
             self.queue.append(cid)
             return True
         return False
@@ -494,7 +546,7 @@ class Controller:
             ctx.logprobs.append(logprob(int(logits[i]), total))
             last = len(ctx.tokens) - ctx.prompt_len >= ctx.max_new or token in ctx.stops
             if self.on_token is not None:
-                self.on_token(cid, token, ctx.logprobs[-1], item.position + 1, last)
+                self.on_token(cid, token, ctx.logprobs[-1], item.position + item.tokens, last)
             if last:
                 self._end_turn(ctx)
 
@@ -606,7 +658,8 @@ def emit_ring_vectors(directory, rng: np.random.Generator, cases: int, d: int = 
     directory.mkdir(parents=True, exist_ok=True)
     heads, payloads, packets, counts = [], [], [], []
     for c in range(cases):
-        hidden = rng.integers(-32768, 32767, size=d).astype(np.int16)
+        tokens = 1 if c % 3 == 0 else int(rng.integers(2, 5))           # every third a single token, the rest chunks
+        hidden = rng.integers(-32768, 32767, size=(tokens, d) if tokens > 1 else d).astype(np.int16)
         flags = int(rng.integers(0, 8))
         item = WorkItem(int(rng.integers(0, 1 << 16)), int(rng.integers(0, 1 << 20)), hidden, flags)
         lists = []
@@ -616,12 +669,12 @@ def emit_ring_vectors(directory, rng: np.random.Generator, cases: int, d: int = 
                                   rng.integers(-5000, 5000, size=n).astype(np.int32), int(rng.integers(-1000, 1000))))
         packet = pack_item(item, lists)
         payload = packet[HEADER_BYTES:-TRAILER_BYTES]
-        heads.append((KIND_ITEM, flags, item.context, item.position, len(payload)))
+        heads.append((KIND_ITEM, flags, item.context, item.position, len(payload), tokens))
         payloads += [int.from_bytes(payload[i:i + 4], "little") for i in range(0, len(payload), 4)]
         packets += [int.from_bytes(packet[i:i + 4], "little") for i in range(0, len(packet), 4)]
         counts.append(len(payload) // 4)
     write_hex(directory / "hdr.hex",
-              [(k) | (f << 8) | (ctx << 16) | (pos << 32) | (ln << 64) for k, f, ctx, pos, ln in heads], 80)
+              [(k) | (f << 8) | (ctx << 16) | (pos << 32) | (ln << 64) | (n << 88) for k, f, ctx, pos, ln, n in heads], 96)
     write_hex(directory / "payload.hex", payloads, 32)
     write_hex(directory / "packet.hex", packets, 32)
     return _write_params(directory, CASES=cases, PWORDS=len(payloads), KWORDS=len(packets))
@@ -629,7 +682,7 @@ def emit_ring_vectors(directory, rng: np.random.Generator, cases: int, d: int = 
 
 def emit_top_vectors(directory, rng: np.random.Generator, cases: int, d: int = 8, k: int = 8) -> dict:
     """Requests for tb_controller_top: an embedding table, the requests the
-    soft side makes, the packets the model says go out, the replies that come
+    soft side makes -- single tokens and chunks -- and their tokens, the packets the model says go out, the replies that come
     back with the head dies' lists, and the tokens the model draws."""
     from pathlib import Path
     from fabric import layer as L
@@ -639,37 +692,43 @@ def emit_top_vectors(directory, rng: np.random.Generator, cases: int, d: int = 8
     L.write_luts(directory)
     vocab = 64
     table = EmbeddingTable(rng.integers(-3000, 3000, size=(vocab, d)).astype(np.int16))
-    reqs, outs, reps, tokens, rep_counts = [], [], [], [], []
+    reqs, outs, reps, tokens, rep_counts, fed = [], [], [], [], [], []
     for c in range(cases):
-        token = int(rng.integers(0, vocab))
+        count = 1 if c % 2 == 0 else int(rng.integers(2, 5))             # a decode step, then a chunk of a prompt
+        chunk = [int(t) for t in rng.integers(0, vocab, size=count)]
         slot = int(rng.integers(0, 1 << 12))
         position = int(rng.integers(0, 1 << 16))
         temperature = float(np.exp(rng.uniform(np.log(0.3), np.log(3.0))))
         p = SamplingParams(int(round((1 << FF) / temperature)), int(rng.integers(1, 2 * k + 1)),
                            0xFFFF if c % 2 else int(rng.integers(2000, 0xFFFF)))
         rnd = int(rng.integers(0, 1 << 32))
-        # What goes out: the token's row, at the request's slot and position.
-        item = WorkItem(slot, position, table.lookup(token), FLAG_SAMPLE)
-        outs += [int.from_bytes(pack_item(item)[i:i + 4], "little") for i in range(0, len(pack_item(item)), 4)]
-        # What comes back: some other hidden vector, and the two dies' lists.
+        # What goes out: the tokens' rows, at the request's slot and position.
+        rows = [table.lookup(t) for t in chunk]
+        item = WorkItem(slot, position, rows[0] if count == 1 else np.stack(rows), FLAG_SAMPLE)
+        packet = pack_item(item)
+        outs += [int.from_bytes(packet[i:i + 4], "little") for i in range(0, len(packet), 4)]
+        fed += chunk
+        # What comes back: other hidden vectors, and the two dies' lists.
         logits = to_fixed(rng.standard_normal(2 * k * 4) * rng.uniform(0.5, 4.0))
         half = len(logits) // 2
         lists = [head_list(0, logits[:half], k, 0), head_list(1, logits[half:], k, half)]
-        reply = pack_item(WorkItem(slot, position, rng.integers(-1000, 1000, size=d).astype(np.int16), FLAG_SAMPLE), lists)
+        back = rng.integers(-1000, 1000, size=(count, d) if count > 1 else d).astype(np.int16)
+        reply = pack_item(WorkItem(slot, position, back, FLAG_SAMPLE), lists)
         reps += [int.from_bytes(reply[i:i + 4], "little") for i in range(0, len(reply), 4)]
         rep_counts.append(len(reply) // 4)
         rows, merged, _ = merge_lists(lists)
         row, index = sample(rows, merged, p, rnd)
-        reqs.append((slot, position, token, p, rnd))
+        reqs.append((slot, position, count, p, rnd))
         tokens.append((row, index, slot))
     write_hex(directory / "emb.hex", [int(np.uint16(v)) | (int(np.uint16(w)) << 16)
                                       for row in table.rows for v, w in zip(row[0::2], row[1::2])], 32)
     write_hex(directory / "req.hex",
-              [(slot) | (pos << 16) | (tok << 48) | (p.inv_t << 56) | (p.top_k << 72) | (p.top_p << 80) | (rnd << 96)
-               for slot, pos, tok, p, rnd in reqs], 128)
+              [(slot) | (pos << 16) | (count << 48) | (p.inv_t << 56) | (p.top_k << 72) | (p.top_p << 80) | (rnd << 96)
+               for slot, pos, count, p, rnd in reqs], 128)
+    write_hex(directory / "tokens.hex", fed, 32)
     write_hex(directory / "out.hex", outs, 32)
     write_hex(directory / "reply.hex", reps, 32)
     write_hex(directory / "rcount.hex", rep_counts, 16)
     write_hex(directory / "token.hex", [(row << 24) | (index << 16) | slot for row, index, slot in tokens], 64)
     return _write_params(directory, D=d, K=k, CASES=cases, EWORDS=vocab * d // 2,
-                         OWORDS=len(outs), RWORDS=len(reps))
+                         OWORDS=len(outs), RWORDS=len(reps), TWORDS=len(fed))

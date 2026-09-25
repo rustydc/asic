@@ -13,20 +13,21 @@ module tb_ring #(
 );
     reg clk = 0, rst_n = 0;
     always #5 clk = ~clk;
-    reg [79:0] hm [0:CASES-1];
+    reg [95:0] hm [0:CASES-1];
     reg [31:0] pm [0:PWORDS-1];
     reg [31:0] km [0:KWORDS-1];
 
     reg         hdr_valid = 0, p_valid = 0;
-    reg [7:0]   hdr_kind = 0, hdr_flags = 0;
-    reg [15:0]  hdr_context = 0, hdr_length = 0;
+    reg [7:0]   hdr_kind = 0, hdr_flags = 0, hdr_tokens = 0;
+    reg [15:0]  hdr_context = 0;
+    reg [23:0]  hdr_length = 0;
     reg [31:0]  hdr_position = 0, p_data = 0;
     wire        hdr_ready, p_ready, l_valid, l_sop, l_ready;
     wire [31:0] l_data;
     fabric_ring_tx tx (
         .clk(clk), .rst_n(rst_n), .hdr_valid(hdr_valid), .hdr_ready(hdr_ready), .hdr_kind(hdr_kind),
-        .hdr_flags(hdr_flags), .hdr_context(hdr_context), .hdr_position(hdr_position), .hdr_length(hdr_length),
-        .p_valid(p_valid), .p_ready(p_ready), .p_data(p_data),
+        .hdr_flags(hdr_flags), .hdr_context(hdr_context), .hdr_position(hdr_position),
+        .hdr_tokens(hdr_tokens), .hdr_length(hdr_length), .p_valid(p_valid), .p_ready(p_ready), .p_data(p_data),
         .l_valid(l_valid), .l_data(l_data), .l_sop(l_sop), .l_ready(l_ready));
 
     // The link, with a bit flipped in one word of one packet when asked.
@@ -37,13 +38,14 @@ module tb_ring #(
 
     reg         rx_ready = 1;
     wire        r_hdr_valid, r_p_valid, r_p_last, r_done, r_ok;
-    wire [7:0]  r_kind, r_flags;
-    wire [15:0] r_context, r_length;
+    wire [7:0]  r_kind, r_flags, r_tokens;
+    wire [15:0] r_context;
+    wire [23:0] r_length;
     wire [31:0] r_position, r_p_data;
     fabric_ring_rx rx (
         .clk(clk), .rst_n(rst_n), .l_valid(l_valid), .l_data(rx_data), .l_sop(l_sop), .l_ready(l_ready),
         .rx_ready(rx_ready), .hdr_valid(r_hdr_valid), .hdr_kind(r_kind), .hdr_flags(r_flags),
-        .hdr_context(r_context), .hdr_position(r_position), .hdr_length(r_length),
+        .hdr_context(r_context), .hdr_position(r_position), .hdr_tokens(r_tokens), .hdr_length(r_length),
         .p_valid(r_p_valid), .p_data(r_p_data), .p_last(r_p_last), .done(r_done), .ok(r_ok));
 
     integer c, i, errors, pbase, kbase, at, guard, got_p, seen_done, seen_hdr;
@@ -59,7 +61,14 @@ module tb_ring #(
         lword = lword + 1;
     end
     always @(posedge clk) begin
-        if (r_hdr_valid) seen_hdr = seen_hdr + 1;
+        if (r_hdr_valid) begin
+            if (seen_hdr < CASES && {r_tokens, r_length, r_position, r_context, r_flags, r_kind} !== hm[seen_hdr]) begin
+                errors = errors + 1;
+                if (errors <= 5) $display("header %0d: got %h expected %h", seen_hdr,
+                                          {r_tokens, r_length, r_position, r_context, r_flags, r_kind}, hm[seen_hdr]);
+            end
+            seen_hdr = seen_hdr + 1;
+        end
         if (r_p_valid) begin seen_pay[got_p] = r_p_data; got_p = got_p + 1; end
         if (r_done) begin seen_done = seen_done + 1; last_ok = r_ok; end
     end
@@ -71,7 +80,7 @@ module tb_ring #(
     task send(input integer c, input integer pbase, input integer n);
         begin
             hdr_valid = 1; hdr_kind = hm[c][7:0]; hdr_flags = hm[c][15:8]; hdr_context = hm[c][31:16];
-            hdr_position = hm[c][63:32]; hdr_length = hm[c][79:64];
+            hdr_position = hm[c][63:32]; hdr_length = hm[c][87:64]; hdr_tokens = hm[c][95:88];
             @(posedge clk);
             while (!hdr_ready) @(posedge clk);
             #1 hdr_valid = 0;
@@ -110,8 +119,8 @@ module tb_ring #(
         repeat (2) @(posedge clk);
         #1 rst_n = 1;
         for (c = 0; c < CASES; c = c + 1) begin
-            send(c, pbase, hm[c][79:64] / 4);
-            pbase = pbase + hm[c][79:64] / 4;
+            send(c, pbase, hm[c][87:64] / 4);
+            pbase = pbase + hm[c][87:64] / 4;
         end
         guard = 0;
         while (seen_done < CASES && guard < 20000) begin @(posedge clk); guard = guard + 1; end
@@ -127,7 +136,7 @@ module tb_ring #(
         // The same packet again with one bit of its payload flipped.
         #1 corrupt = 1; corrupt_at = lword + 4;
         seen_done = 0;
-        send(0, 0, hm[0][79:64] / 4);
+        send(0, 0, hm[0][87:64] / 4);
         guard = 0;
         while (seen_done < 1 && guard < 4000) begin @(posedge clk); guard = guard + 1; end
         if (seen_done != 1) $display("FAIL: the corrupted packet never finished");

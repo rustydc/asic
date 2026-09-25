@@ -54,6 +54,24 @@ class PacketTest(unittest.TestCase):
         self.assertTrue(np.array_equal(lists[0].logits, l0.logits))
         self.assertEqual(len(packet), C.HEADER_BYTES + 32 + 2 * C.LIST_HEADER.size + 5 * C.ENTRY.size + C.TRAILER_BYTES)
 
+    def test_a_chunk_is_one_packet(self):
+        # A chunk's vectors back to back, its token count in the header's top
+        # byte; a head die appends to it as to any other.
+        rng = np.random.default_rng(3)
+        hidden = rng.integers(-32768, 32767, size=(5, 16)).astype(np.int16)
+        packet = C.pack_item(C.WorkItem(2, 100, hidden, C.FLAG_SAMPLE))
+        self.assertEqual(len(packet), C.HEADER_BYTES + 5 * 32 + C.TRAILER_BYTES)
+        self.assertEqual(packet[11], 5)
+        self.assertEqual(int.from_bytes(packet[8:11], "little"), 5 * 32)
+        l0 = C.HeadList(0, np.array([4], dtype=np.uint32), np.array([7], dtype=np.int32), 3)
+        back, lists = C.unpack_item(C.append_head_list(packet, l0), 16)
+        self.assertEqual((back.position, back.tokens, back.last.position), (100, 5, 104))
+        self.assertTrue(np.array_equal(back.hidden, hidden.astype(np.int64)))
+        self.assertTrue(np.array_equal(back.last.hidden, hidden[-1].astype(np.int64)))
+        self.assertEqual([hl.lse for hl in lists], [3])
+        with self.assertRaises(ValueError):
+            C.pack_item(C.WorkItem(2, 100, np.zeros((256, 16), dtype=np.int16)))
+
 
 class MergeTest(unittest.TestCase):
     def test_merged_lists_are_the_global_top_and_the_lse_is_the_whole(self):
@@ -163,6 +181,61 @@ class ControllerTest(unittest.TestCase):
         # The sampled tokens went in only after they were drawn: the item for
         # position 40 is the first sampled token.
         self.assertEqual(emb.lookup(ctl.contexts[cid].tokens[40]).tolist(), sent[40].hidden.tolist())
+
+    def test_a_prompt_goes_in_chunks(self):
+        # Eight tokens a packet while eight are known, then one: the dies see
+        # the same tokens in the same order, so a layer with state -- here a
+        # running sum a slot, from zero at FIRST -- gives the same draws as a
+        # token a packet, in a fraction of the packets.
+        def run(chunk):
+            rng = np.random.default_rng(18)
+            emb, _, head = fake_model(rng)
+            sums = {}
+            def layer(item):
+                if item.flags & C.FLAG_FIRST and item.position == 0:
+                    sums[item.context] = np.zeros(emb.hidden, dtype=np.int64)
+                sums[item.context] = sums[item.context] + item.hidden
+                return np.clip(sums[item.context] // 4, -32768, 32767)
+            ring = C.Ring(1, layer, [head(0), head(1)])          # one layer die: the state is its
+            sent, inject = [], ring.inject
+            ring.inject = lambda packet: (sent.append(C.unpack_item(packet, emb.hidden)[0]), inject(packet))[1]
+            positions = []
+            ctl = C.Controller(emb, ring, slots=4, seed=19, chunk=chunk,
+                               on_token=lambda cid, token, lp, pos, last: positions.append(pos))
+            greedy = C.SamplingParams(top_k=1)      # the draws' words go to contexts in retire order
+            a, b = ctl.submit(list(range(1, 44)), 4, greedy), ctl.submit(list(range(20, 37)), 3, greedy)
+            ctl.run()
+            return ctl, sent, positions, ctl.generated(a) + ctl.generated(b)
+
+        one, sent1, pos1, got1 = run(1)
+        eight, sent8, pos8, got8 = run(8)
+        self.assertEqual(got8, got1)
+        self.assertEqual(sorted(pos8), sorted(pos1))
+        chunks = sorted((s.position, s.tokens) for s in sent8 if s.tokens > 1)
+        self.assertEqual(chunks, sorted([(p, 8) for p in range(0, 40, 8)] + [(0, 8), (8, 8)]))
+        # Five chunks and three single prompt tokens for the first context, two
+        # and one for the second; neither prompt ends on a chunk, so no chunk
+        # is drawn from.
+        self.assertFalse(any(s.flags & C.FLAG_SAMPLE for s in sent8 if s.tokens > 1))
+        self.assertLess(len(sent8), len(sent1) - 40)
+        self.assertLess(eight.steps, one.steps)
+
+    def test_a_chunk_that_ends_the_prompt_is_drawn_from(self):
+        rng = np.random.default_rng(20)
+        emb, logits_of, head = fake_model(rng)
+        ring = C.Ring(3, lambda item: item.hidden, [head(0), head(1)])
+        sent, inject = [], ring.inject
+        ring.inject = lambda packet: (sent.append(C.unpack_item(packet, emb.hidden)[0]), inject(packet))[1]
+        ctl = C.Controller(emb, ring, slots=2, seed=21, chunk=4)
+        cid = ctl.submit([9, 8, 7, 6, 5, 4, 3, 2], 2)
+        ctl.run()
+        self.assertEqual([(s.position, s.tokens, s.flags & C.FLAG_SAMPLE) for s in sent],
+                         [(0, 4, 0), (4, 4, C.FLAG_SAMPLE), (8, 1, C.FLAG_SAMPLE)])
+        # The head dies read the chunk's last token: the draw is from token 2's logits.
+        draws = np.random.default_rng(21)
+        logits = logits_of(emb.lookup(2))
+        rows, merged, _ = C.merge_lists([C.head_list(0, logits[:32], 8, 0), C.head_list(1, logits[32:], 8, 32)])
+        self.assertEqual(ctl.generated(cid)[0], C.sample(rows, merged, C.SamplingParams(), int(draws.integers(0, 1 << 32)))[0])
 
     def test_a_short_table_waits_rather_than_evict_mid_turn(self):
         # One slot, two contexts: the second waits for the first's turn to

@@ -1,13 +1,17 @@
 // The controller's datapath: a request from the soft side becomes a packet on
 // the ring, and the packet that comes back becomes a token.
 //
-//   request (slot, position, flags, token, sampling parameters, random word)
-//     -> the token's row of the embedding table, as the packet's payload
+//   request (slot, position, flags, count, sampling parameters, random word)
+//   and its count tokens, on their own stream
+//     -> the tokens' rows of the embedding table, as the packet's payload
 //     -> fabric_ring_tx
 //   fabric_ring_rx
-//     -> the hidden vector skipped, the head dies' lists parsed out
+//     -> the hidden vectors skipped, the head dies' lists parsed out
 //     -> fabric_sampler
 //     -> the token, with the slot it belongs to
+//
+// A request of one token is a decode step or a prompt's odd token; of more,
+// a chunk of a prompt, one packet whose rows follow one another.
 //
 // Which context goes next, and the table of slots, are the soft side's and
 // are not here; this is what has to be gateware because it is a stream.
@@ -30,7 +34,11 @@ module fabric_controller_top #(
     input  wire [15:0] req_slot,
     input  wire [31:0] req_position,
     input  wire [7:0]  req_flags,
-    input  wire [31:0] req_token,
+    input  wire [7:0]  req_count,         // tokens in the packet, one or more
+    // its tokens, one a row, taken as the rows are read
+    input  wire        in_valid,
+    output wire        in_ready,
+    input  wire [31:0] in_token,
     input  wire [15:0] req_inv_t,
     input  wire [7:0]  req_top_k,
     input  wire [15:0] req_top_p,
@@ -62,7 +70,8 @@ module fabric_controller_top #(
     // since the table answers a cycle after its address; a real part is read
     // in bursts and this is where that would go.
     // ---------------------------------------------------------------------
-    reg          sending, have;
+    reg          sending, have, need;
+    reg [7:0]    rows_left;
     reg [HWW-1:0] idx;
     reg [31:0]   word;
     reg [31:0]   base;
@@ -76,58 +85,66 @@ module fabric_controller_top #(
     wire hdr_go = req_valid && req_ready;
 
     assign req_ready = !sending && hdr_ready;
-    assign emb_en    = sending && !have;
+    assign in_ready  = sending && need;
+    assign emb_en    = sending && !need && !have;
     assign emb_addr  = base + {{(32-HWW){1'b0}}, idx};
 
     fabric_ring_tx u_tx (
         .clk(clk), .rst_n(rst_n),
         .hdr_valid(hdr_go), .hdr_ready(hdr_ready), .hdr_kind(KIND[7:0]), .hdr_flags(req_flags),
-        .hdr_context(req_slot), .hdr_position(req_position), .hdr_length(16'(D * 2)),
+        .hdr_context(req_slot), .hdr_position(req_position),
+        .hdr_tokens(req_count), .hdr_length(24'(req_count) * 24'(D * 2)),
         .p_valid(have), .p_ready(p_ready), .p_data(word),
         .l_valid(l_valid), .l_data(l_data), .l_sop(l_sop), .l_ready(l_ready));
 
     reg emb_q;                                              // a read was issued last cycle
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            sending <= 1'b0; have <= 1'b0; idx <= 0; emb_q <= 1'b0;
+            sending <= 1'b0; have <= 1'b0; need <= 1'b0; idx <= 0; emb_q <= 1'b0;
         end else begin
             emb_q <= emb_en;
             if (hdr_go) begin
-                sending <= 1'b1; have <= 1'b0; idx <= 0;
-                base <= req_token * HW;
+                sending <= 1'b1; have <= 1'b0; need <= 1'b1; idx <= 0; rows_left <= req_count;
                 slot_q <= req_slot; flags_q <= req_flags;
                 inv_t_q <= req_inv_t; top_k_q <= req_top_k; top_p_q <= req_top_p; rnd_q <= req_rnd;
             end else begin
                 // The table answers the cycle after its address, so the word
                 // is taken then, not when the read was issued.
+                if (in_valid && in_ready) begin base <= in_token * HW; need <= 1'b0; end
                 if (emb_q) begin word <= emb_data; have <= 1'b1; end
                 if (have && p_ready) begin
                     have <= 1'b0;
                     idx <= idx + 1'b1;
-                    if (idx == HW - 1) sending <= 1'b0;
+                    if (idx == HW - 1) begin               // the row is out: the next token's, or done
+                        idx <= 0;
+                        rows_left <= rows_left - 1'b1;
+                        if (rows_left == 1) sending <= 1'b0;
+                        else need <= 1'b1;
+                    end
                 end
             end
         end
     end
 
     // ---------------------------------------------------------------------
-    // Back: the hidden vector skipped, the lists parsed, the token drawn.
+    // Back: the hidden vectors skipped, the lists parsed, the token drawn --
+    // from the last token's lists, the only ones a chunk carries.
     // A list is a header word pair (die, k, then the log-sum-exp) and k pairs
     // of (row, logit), which is what controller.pack_head_list writes.
     // ---------------------------------------------------------------------
     wire        rh_valid, rp_valid, rp_last, r_done, r_ok;
-    wire [7:0]  rh_flags;
-    wire [15:0] rh_context, rh_length;
+    wire [7:0]  rh_flags, rh_tokens;
+    wire [15:0] rh_context;
     wire [31:0] rp_data;
     fabric_ring_rx u_rx (
         .clk(clk), .rst_n(rst_n), .l_valid(r_valid), .l_data(r_data), .l_sop(r_sop), .l_ready(r_ready),
         .rx_ready(1'b1), .hdr_valid(rh_valid), .hdr_kind(), .hdr_flags(rh_flags),
-        .hdr_context(rh_context), .hdr_position(), .hdr_length(rh_length),
+        .hdr_context(rh_context), .hdr_position(), .hdr_tokens(rh_tokens), .hdr_length(),
         .p_valid(rp_valid), .p_data(rp_data), .p_last(rp_last), .done(r_done), .ok(r_ok));
 
     localparam [2:0] P_SKIP = 0, P_LH0 = 1, P_LH1 = 2, P_ROW = 3, P_LOG = 4;
     reg [2:0]  pstate;
-    reg [15:0] pw;
+    reg [23:0] pw, skip;                     // payload words so far; the hidden vectors' words
     reg [7:0]  lk, lseen;
     reg        ldie;
     reg [31:0] erow;
@@ -160,12 +177,13 @@ module fabric_controller_top #(
             end
             if (rh_valid) begin
                 reply_slot <= rh_context;
+                skip <= 24'(rh_tokens) * 24'(HW);
                 reply_sample <= rh_flags[0];                 // FLAG_SAMPLE
             end
             if (rp_valid) begin
                 pw <= pw + 1'b1;
                 case (pstate)
-                    P_SKIP: if (pw == HW - 1) pstate <= P_LH0;
+                    P_SKIP: if (pw == skip - 1) pstate <= P_LH0;
                     P_LH0: begin
                         ldie <= rp_data[0];
                         lk <= rp_data[15:8];
