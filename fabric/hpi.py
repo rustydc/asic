@@ -27,6 +27,7 @@ row bit RA[14] rides in bit 1 of the A3 byte.
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -177,6 +178,132 @@ def efficiency(beats: int, f_mhz: float = 250.0) -> float:
     return data / total
 
 
+class PathModel:
+    """Time on the die's memory path, request by request: the port, the
+    clock crossing, the stripe unit, the channels and the devices, at the
+    part's timing (``DEVICE`` and the latency codes).  Core cycles.
+
+    ``asbuilt`` is ``rtl/fabric_hpi.sv`` as it is: the stripe takes one
+    request at a time and holds it until every chunk is done; a write chunk
+    is fed to its channel whole before the next is issued and goes to the
+    device once it is in; a read chunk is filled from the device into the
+    channel's page buffer and only then drained to the port, in order.  The
+    model follows those state machines clock for clock, and the two
+    crossing constants and the push-out were fitted to ``tb_mem_bridge``
+    measured request by request (``test_hpi``): within three per cent from
+    one beat to 4095, over one device and over sixteen.
+
+    ``pipelined`` is the controller with its two known faults fixed: read
+    data goes to the port as it arrives rather than after the chunk, and
+    the stripe takes the next request while the last one's chunks run, so
+    requests to different devices overlap.  That controller is not built;
+    this is what the part allows it.
+
+    ``pushout`` is the refresh push-out in clocks, per read burst: the
+    testbench's device model draws it uniformly from 0 to the latency, so
+    its mean is half; the real part pushes out only a burst that meets a
+    refresh, so 0 is typical and the latency the worst case."""
+
+    def __init__(self, ndev: int = 16, mode: str = "asbuilt", core_mhz: float = 800.0, f_mhz: float = 250.0,
+                 pushout: float | None = None, device: Device = DEVICE, xb: int = 4,
+                 cross_write: float = 6.0, cross_read: float = 7.0) -> None:
+        assert mode in ("asbuilt", "pipelined"), mode
+        _, self.lc, _, self.wlc = latency_codes(f_mhz)
+        self.ndev, self.mode, self.core_mhz, self.f_mhz, self.xb = ndev, mode, core_mhz, f_mhz, xb
+        self.pushout = self.lc / 2 if pushout is None else pushout
+        self.cph = -(-int(device.t_cph_ns * f_mhz) // 1000)
+        self.cross_write, self.cross_read = cross_write, cross_read
+
+    def _core(self, clocks: float) -> int:
+        return int(math.ceil(clocks * self.core_mhz / self.f_mhz))
+
+    def _burst(self, write: bool, beats: int) -> float:
+        """A chunk on its device, CE# low to CE# high: three command clocks,
+        the latency, two words a clock."""
+        return 3 + (self.wlc if write else self.lc + self.pushout) + 4 * beats
+
+    def request(self, write: bool, beats: int, addr: int = 0) -> int:
+        """One request on an idle path, from the port taking it to its last
+        read beat back or its last write done."""
+        return self._core(self._request(write, beats, addr)[1])
+
+    def taken(self, beats: int, addr: int = 0) -> int:
+        """A write's last beat taken by the path, from the port taking the
+        request: when the unit writing it is done, since writes are posted."""
+        if beats <= 0:
+            return 0
+        t, free = 0.0, {}
+        for dev, _, s in chunks(addr, beats, self.ndev):
+            t = max(t, free.get(dev, 0.0)) + 1 + math.ceil(s / self.xb)
+            free[dev] = t + self._burst(True, s) + 1 + self.cph + 1
+        return self._core(t + self.cross_write)
+
+    def first_beat(self, beats: int, addr: int = 0) -> int:
+        """A read's first beat back, from the port taking it."""
+        return self._core(self._request(False, beats, addr)[0])
+
+    def _request(self, write: bool, beats: int, addr: int) -> tuple[float, float]:
+        ch = chunks(addr, beats, self.ndev)
+        free: dict[int, float] = {}
+        t, first, end = 0.0, None, 0.0
+        for dev, _, s in ch:
+            if write:
+                t = max(t, free.get(dev, 0.0)) + 1
+                t += math.ceil(s / self.xb)                      # the chunk into its channel
+                done = t + self._burst(True, s) + 1 + self.cph + 1
+                free[dev] = done
+                end = max(end, done)
+            else:
+                t = max(t, free.get(dev, 0.0)) + 2
+                data0 = t + self._burst(False, 0)                # its first words on the wires
+                filled = t + self._burst(False, s)
+                if self.mode == "asbuilt":
+                    start = max(end, filled + self.cph)          # drained only once filled, in order
+                else:
+                    start = max(end, data0 + 1)                  # streamed as it arrives
+                if first is None:
+                    first = start + 1
+                end = max(start + math.ceil(s / self.xb) + 1, (filled + 1) if self.mode == "pipelined" else 0)
+                free[dev] = (filled + self.cph) if self.mode == "pipelined" else end + 1
+        cross = self.cross_write if write else self.cross_read
+        return (first or 0.0) + cross, end + cross
+
+    def cost(self, write: bool, beats: int, addr: int = 0) -> int:
+        """What a request costs the unit that makes it, in a run of them.  As
+        built that is the whole request, since the stripe holds it to the
+        end.  Pipelined, a request overlaps the ones around it, so it costs
+        what it occupies: its busiest device's bursts or its beats on the
+        port, whichever is longer, and a read its first beat's latency as
+        well, which its consumer waits for."""
+        if self.mode == "asbuilt":
+            return self.request(write, beats, addr)
+        load: dict[int, float] = {}
+        for dev, _, s in chunks(addr, beats, self.ndev):
+            load[dev] = load.get(dev, 0.0) + self._burst(write, s) + self.cph
+        busy = max(max(load.values()), math.ceil(beats / self.xb))
+        lead = 0.0 if write else 3 + self.lc + self.pushout + self.cross_read
+        return self._core(busy + lead)
+
+    def sequence(self, requests) -> int:
+        """Requests from one unit, each issued as soon as the path takes it:
+        in turn as built, overlapping across devices when pipelined."""
+        if self.mode == "asbuilt":
+            return sum(self.request(w, b, a) for w, b, a in requests)
+        free = [0.0] * self.ndev
+        port, end = 0.0, 0.0
+        for write, beats, addr in requests:
+            for dev, _, s in chunks(addr, beats, self.ndev):
+                start = max(port, free[dev])
+                port = start + math.ceil(s / self.xb)            # the port moves a chunk's beats, in order
+                if write:
+                    done = port + self._burst(True, s) + 1 + self.cph
+                else:
+                    done = max(port, start + self._burst(False, s) + 1)
+                free[dev] = done + (0 if write else self.cph)
+                end = max(end, done)
+        return self._core(end + self.cross_read)
+
+
 class StripedImage:
     """The bytes of ``ndev`` devices addressed through the stripe map."""
 
@@ -233,3 +360,36 @@ def emit_hpi_vectors(directory: Path, rng: np.random.Generator, ndev: int = 4, d
         NDEV=ndev, DEV_WORDS=device_bytes // 2, N=transactions, NW=max(len(wbeats), 1), NR=max(len(rbeats), 1),
         MR0=mrs[0], MR4=mrs[4], MR8=mrs[8]), indent=2), encoding="utf-8")
     return json.loads((directory / "params.json").read_text(encoding="utf-8"))
+
+
+def emit_timing_vectors(directory: Path, ndev: int, sizes=(1, 7, 16, 64, 65, 256, 1025, 2048), seed: int = 1) -> tuple[dict, list]:
+    """Requests for ``tb_mem_bridge`` in its steady mode, one at a time, to
+    time each against ``PathModel``: every size written and read back, at a
+    stripe boundary and 768 bytes into a stripe.  Returns the testbench
+    parameters and the requests as ``(write, beats, byte address)``."""
+    directory.mkdir(parents=True, exist_ok=True)
+    rng = np.random.default_rng(seed)
+    device_kb = max(256, 4096 // ndev)
+    image = StripedImage(ndev, device_kb << 10)
+    spec, reqs, wb, rb = [], [], [], []
+    for i, beats in enumerate(sizes):
+        for k, off in enumerate((0, 768)):
+            addr = (2 * i + k) * 65536 + off
+            spec += [(True, beats, addr), (False, beats, addr)]
+    for write, beats, addr in spec:
+        if write:
+            payload = bytes(rng.integers(0, 256, beats * BEAT_BYTES, dtype=np.uint8))
+            image.write(addr, payload)
+            wb += [int.from_bytes(payload[i:i + BEAT_BYTES], "little") for i in range(0, len(payload), BEAT_BYTES)]
+        else:
+            payload = image.read(addr, beats * BEAT_BYTES)
+            rb += [int.from_bytes(payload[i:i + BEAT_BYTES], "little") for i in range(0, len(payload), BEAT_BYTES)]
+        reqs.append((int(write) << 44) | (beats << 32) | addr)
+    write_hex(directory / "reqs.hex", reqs, 48)
+    write_hex(directory / "wdata.hex", wb or [0], 128)
+    write_hex(directory / "expected_rdata.hex", rb or [0], 128)
+    image.to_hex(directory / "expected_devs.hex")
+    mrs = mode_registers()
+    params = dict(NDEV=ndev, DEV_WORDS=(device_kb << 10) // 2, N=len(reqs), NW=max(1, len(wb)), NR=max(1, len(rb)),
+                  MR0=mrs[0], MR4=mrs[4], MR8=mrs[8], CXB=2, MXB=4, STEADY=1)
+    return params, spec

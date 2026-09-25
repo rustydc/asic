@@ -165,6 +165,46 @@ class CdcRtlTest(unittest.TestCase):
 
 
 @unittest.skipUnless(shutil.which("iverilog") and shutil.which("vvp"), "iverilog not installed")
+@unittest.skipUnless(shutil.which("iverilog") and shutil.which("vvp"), "iverilog not installed")
+class PathTimingTest(unittest.TestCase):
+    """``PathModel`` against the RTL: each request through the bridge, the
+    stripe unit, the channels and the device models, taken on the core clock
+    to complete, one at a time."""
+
+    CORE_NS = 1.25                             # the engine testbench's core clock, 800 MHz
+
+    def measure(self, ndev: int) -> list[tuple[tuple, int]]:
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            params, spec = H.emit_timing_vectors(work, ndev)
+            args = [f"-Ptb_mem_bridge.{name}={value}" for name, value in params.items()]
+            args.append(f"-Ptb_mem_bridge.CORE_NS={self.CORE_NS}")
+            subprocess.run(["iverilog", "-g2012", "-I", str(RTL), "-s", "tb_mem_bridge", "-o", "sim.vvp", *args,
+                            *(str(RTL / n) for n in ("fabric_cdc.sv", "fabric_phy.sv", "fabric_hpi.sv", "tb_mem_bridge.sv"))],
+                           cwd=work, check=True, capture_output=True, text=True)
+            out = subprocess.run(["vvp", "sim.vvp"], cwd=work, check=True, capture_output=True, text=True).stdout
+            self.assertIn("PASS", out, out)
+            rows = [[int(v) for v in line.split()] for line in (work / "req_times.txt").read_text().splitlines()]
+        return [(spec[n], done - take) for n, _, _, take, done in rows]
+
+    def check(self, ndev: int) -> None:
+        model = H.PathModel(ndev, core_mhz=1000 / self.CORE_NS)
+        for (write, beats, addr), took in self.measure(ndev):
+            want = model.request(write, beats, addr)
+            # The device model draws a read's refresh push-out at random, 0
+            # to the latency, and the model takes its mean, so a read may be
+            # off by half the latency besides.
+            spread = 0 if write else model.lc / 2 * model.core_mhz / model.f_mhz
+            self.assertLessEqual(abs(want - took), 0.03 * took + spread,
+                                 f"{'write' if write else 'read'} of {beats} beats at {addr}: the RTL took {took}, the model says {want}")
+
+    def test_sixteen_devices(self) -> None:
+        self.check(16)
+
+    def test_four_devices(self) -> None:
+        self.check(4)
+
+
 class PhyRtlTest(unittest.TestCase):
     """The DLL on its own across tap lengths, then the controller through its delay lines."""
 

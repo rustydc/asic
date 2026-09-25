@@ -1044,6 +1044,74 @@ took that to 3,360. More devices scale the port: at 24 the port bound is
 5,100 tokens/s and at 32 it is 6,800, with the tiles at 16,000 the next
 ceiling after the port.
 
+### At the part's timing
+
+Everything above takes the memory as a port that moves a beat pair a core
+cycle after a short latency, and the path behind it as sixteen devices'
+worth of bandwidth. That is not what the devices are. `hpi.PathModel`
+times each request on the real path: the port, the clock crossing, the
+stripe unit, the channels and sixteen APS512XXN at their datasheet timing
+-- three command clocks, read latency 10 plus any refresh push-out, write
+latency 9, two words a clock, tCPH of 7 -- and the controller as it is
+built. It follows `fabric_hpi.sv`'s state machines, and its two crossing
+constants were fitted to `tb_mem_bridge` measured request by request:
+it is within three per cent of the RTL from sixteen beats to 4,095, over
+four devices and over sixteen, plus the random push-out the device model
+draws for a read (`PathTimingTest`). With it, `Timing(devices=...)`
+charges every memory step its requests on the path: the mover's reads
+whole, its writes posted (the step ends when the bridge has the data, and
+the next request waits for the path), the record reader's and the scan's
+pages as they arrive. The engine run over the device models lands within
+three per cent of that schedule, 3,598 cycles against 3,643 for the
+recurrent layer and 4,424 against 4,515 for the global one, where the
+ideal port said 1,382 and 1,766.
+
+The path as built is far from the devices' own rate, for two reasons the
+measurement makes plain. The stripe unit takes one request at a time and
+holds it to the end, and a read chunk is filled into its channel's page
+buffer before any of it is drained; so a 16 KB state slot moves at 7 GB/s,
+not 15. And a stripe is 1 KB, so anything of a kilobyte or less goes to
+one device at 1 GB/s: the record reader's two-kilobyte window pages and the
+scan's pages of 25 index records each reach two devices of sixteen, one
+request at a time, and at the end of a 128K context the scan's 655 KB of
+index is most of the global layer's time.
+
+At 600 MHz, per die, streamed:
+
+| Memory | Recurrent | Global, 4K | Global, 128K | Tokens/s, 4K | Tokens/s, 128K |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| the ideal port | 41,605 | 75,823 | 115,503 | 2,990 | 2,497 |
+| 16 PSRAMs, the path as built | 93,221 | 244,500 | 502,511 | 1,145 | 767 |
+| pipelined: reads streamed, requests overlapped | 55,406 | 212,137 | 438,065 | 1,586 | 993 |
+| and the scan and the reader asking ahead | 55,406 | 78,587 | 118,057 | 2,451 | 2,111 |
+| the same, every read burst pushed out | 57,638 | 78,803 | 118,225 | 2,384 | 2,061 |
+
+So the 2.5K of the ideal port is 770 tokens/s on the parts as the
+controller is built, and 2.1K with three changes to it: drain a read
+chunk as it arrives, take the next request while the last one's chunks
+run, and let the scan and the record reader keep requests in flight so
+their pages spread over the devices. The last is what the global layer
+needs; the first two are what the recurrent layer's state needs, and even
+then its 1 MB a token of state at the devices' 14.9 GB/s is 70 µs of the
+92 µs it takes. The push-out costs two per cent at worst.
+
+The device count is a cost question -- a part is about $5 in hundreds,
+and sixteen a die is 128 of them on the board. At the pipelined
+controller, per die:
+
+| PSRAMs a die | Capacity | Contexts at 128K | Tokens/s, 4K | Tokens/s, 128K |
+| ---: | ---: | ---: | ---: | ---: |
+| 4 | 256 MB | 23 | 896 | 777 |
+| 8 | 512 MB | 46 | 1,558 | 1,374 |
+| 12 | 768 MB | 70 | 1,613 | 1,459 |
+| 16 | 1 GB | 93 | 2,451 | 2,111 |
+| 24 | 1.5 GB | 140 | 2,561 | 2,192 |
+
+Twelve buys little over eight and twenty-four little over sixteen, because
+a state slot is sixteen stripes: at twelve devices four of them take two,
+and at twenty-four eight take none. The device count wants to divide
+sixteen, or the stripe to follow it.
+
 ## The layer engine
 
 `rtl/fabric_engine.sv` is the sequencer wired into the real units:

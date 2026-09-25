@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import collections
 import dataclasses
+import functools
 import json
 import math
 from pathlib import Path
@@ -183,11 +184,22 @@ class Timing:
     # The memory behind the port.  ``devices`` of 0 is the testbench's own
     # model, a beat a cycle after a short latency, which is what the engine
     # tests run against and what the constants above are measured on.  With
-    # devices it is the HPI path: the stripe map sends each ``stripe_beats``
-    # of a transfer to the next device, so a transfer short of a stripe gets
-    # one device however many there are, and each device's chunk is a burst
-    # of its own -- a command, the read latency and the gap before the next.
+    # devices it is the HPI path to that many APS512XXN parts at their
+    # datasheet timing (``hpi.PathModel``): the stripe map sends each 1 KB of
+    # a request to the next device, so a request of a stripe or less gets one
+    # device however many there are, and each device's chunk is a burst of
+    # its own -- the command, the latency, two words a clock and tCPH.
+    # ``memory_mode`` is the controller as built or with its faults fixed;
+    # ``pushout`` the refresh push-out a read burst takes (None: the
+    # testbench device model's mean).
     devices: int = 0
+    memory_mode: str = "asbuilt"
+    pushout: float | None = None
+    # The scan and the record reader keep one request in flight and wait for
+    # it, so a page of records reaches one or two devices of the sixteen.
+    # ``deep_requests`` is those two units asking ahead, which only the
+    # pipelined path can take: their requests then overlap across devices.
+    deep_requests: bool = False
     stripe_beats: int = hpi.STRIPE_BYTES // BEAT
     burst_clocks: int = 20           # a burst's command, latency and tCPH, at 250 MHz
     beat_clocks: int = 4             # x16 DDR: four clocks to a sixteen-byte beat
@@ -242,6 +254,12 @@ class Timing:
         return (self.attn_start_latency + 2 * group * beats
                 + rows * (2 * beats + self.attn_row_stall) + group * beats + self.attn_out_latency)
 
+    @property
+    def path(self) -> "hpi.PathModel | None":
+        if not self.devices:
+            return None
+        return _path(self.devices, self.memory_mode, self.core_mhz, self.controller_mhz, self.pushout)
+
     def transfer(self, beats: int) -> int:
         """Core cycles the memory needs for one transfer of ``beats``.
 
@@ -263,9 +281,27 @@ class Timing:
 
     def move(self, beats: int, write: bool) -> int:
         """The beat mover: memory to the vector buffer, or back, two beats a
-        transfer -- the port's wide requests and the buffer's wide port."""
+        transfer -- the port's wide requests and the buffer's wide port.
+        Over the devices it is one request on the path, and a write is
+        charged its completion: the mover's writes are posted, but the next
+        memory step waits for the path, and the steps take the memory unit
+        in turn."""
+        if self.path is not None:
+            if write and self.path.mode == "asbuilt":
+                # Posted: the bridge's queues take 64 beats at once, the
+                # rest as the path feeds them to the devices.
+                taken = self.path.taken(beats - 64) if beats > 64 else 0
+                return max(taken, -(-beats // 2)) + self.mem_write_latency
+            return self.path.cost(write, beats) + (self.mem_write_latency if write else self.mem_read_latency)
         transfers = -(-beats // 2)
         return (self.port_write_beat * transfers + self.mem_write_latency) if write else (transfers + self.mem_read_latency)
+
+    def port(self, beats: int, write: bool) -> tuple[int, bool]:
+        """A mover request's hold on the path as built, and whether it is a
+        posted write: see ``Step.port``."""
+        if self.path is None or self.path.mode != "asbuilt":
+            return 0, False
+        return self.path.request(write, beats), write
 
     def read_records(self, requests: list[int], record_beats: int, head_dim: int, maxr: int) -> int:
         """The record reader over ``requests`` (the records in each), cycle for
@@ -288,6 +324,12 @@ class Timing:
         where the engine takes it a page of eight at a time."""
         out = 2 * (head_dim // self.head_lanes(head_dim)) + self.reader_gap
         cap = 2 * maxr
+        path = self.path
+        if path is not None and self.deep_requests and path.mode == "pipelined":
+            # Every request asked for ahead: the records arrive at the rate
+            # the devices give them, and go out at the reader's.
+            got = path.sequence([(False, n * record_beats, i * n * record_beats * BEAT) for i, n in enumerate(requests)])
+            return self.reader_latency + path.first_beat(record_beats) + max(got, sum(requests) * out)
         taken, prev, done, arrived = 0, None, [], 0
         for count in requests:
             if prev is not None:
@@ -296,39 +338,79 @@ class Timing:
                 need = arrived + count - cap                  # records that must be out first
                 if need > 0:
                     taken = max(taken, done[need - 1] + 1)
+            lead, spacing = self.reader_arrive, record_beats
+            if path is not None:
+                # Over the devices the request's records come back as the
+                # path has them: its first beat, then the rest at the rate its
+                # devices give -- after the whole of a chunk, as built, since
+                # a chunk is drained only once it is filled.
+                first = path.first_beat(count * record_beats)
+                lead = first - record_beats
+                spacing = max(record_beats, (path.request(False, count * record_beats) - first) / count)
             for k in range(count):
-                arrive = taken + self.reader_arrive + (k + 1) * record_beats
+                arrive = taken + lead + (k + 1) * spacing
                 done.append(max(done[-1] if done else 0, arrive) + out)
             arrived += count
-            prev = taken + self.reader_arrive + count * record_beats
-        return self.reader_latency + (done[-1] if done else 0)
+            prev = taken + lead + count * spacing
+        return self.reader_latency + int(math.ceil(done[-1] if done else 0))
 
-    def scan(self, records: int, record_beats: int, selected: int) -> int:
+    def scan(self, records: int, record_beats: int, selected: int, per_request: int = 0) -> int:
         """The index scan: the query's codes, then every eligible record read in
-        one burst and scored, then the chosen ids out a cycle each."""
+        one burst and scored, then the chosen ids out a cycle each.  Over the
+        devices the records come a page (``per_request``) a request, each
+        request's first beat the path's latency after it and then a beat a
+        cycle into the scorer."""
         if not records:
             return self.scan_latency
+        if self.path is not None and per_request and self.deep_requests and self.path.mode == "pipelined":
+            got = self.path.sequence([(False, records * record_beats, 0)])
+            return self.scan_latency + self.path.first_beat(record_beats) + max(got, record_beats * records) + selected - 1
+        if self.path is not None and per_request:
+            pages = [min(per_request, records - i) for i in range(0, records, per_request)]
+            each = sum(max(self.path.request(False, n * record_beats), self.path.first_beat(n * record_beats) + n * record_beats)
+                       for n in pages)
+            return self.scan_latency + each + selected - 1
         return self.scan_latency + self.scan_request + record_beats * records + selected - 1
 
     def write_record(self, record_beats: int) -> int:
         """A record the append writes.  It has its own path to the port, not
         the mover's, and still takes three cycles a beat: the same address,
-        data, present that the mover used to."""
+        data, present that the mover used to.  Over the devices, its request
+        on the path."""
+        if self.path is not None:
+            return max(self.path.cost(True, record_beats), record_beats * self.append_beat)
         return self.port_request + record_beats * self.append_beat
 
     def fill(self, beats: int) -> int:
         """A fresh read on a FIRST token: the buffer filled, two beats a cycle."""
         return -(-beats // 2) + self.fill_latency
 
-    def append(self, heads: int, record_beats: int, block_end: bool, first: bool = False) -> int:
-        """The token's window records, and at a block's end its block means and index record."""
+    def append(self, heads: int, record_beats: int, block_end: bool, first: bool = False, sums_beats: int = 0,
+               index_beats: int = 0) -> int:
+        """The token's window records, and at a block's end its block means and
+        index record.  Over the devices the block sums' read and write and the
+        index record are requests on the path too."""
         one = heads * self.write_record(record_beats)
+        extra = 0
+        if self.path is not None and sums_beats:
+            ideal = 2 * -(-sums_beats // 2)
+            extra = self.path.cost(False, sums_beats) + self.path.cost(True, sums_beats) - ideal
+            if block_end and index_beats:
+                extra += self.path.cost(True, index_beats)
         return (self.append_latency - (self.append_first_saving if first else 0) + one
-                + (one + self.append_index_latency if block_end else 0))
+                + (one + self.append_index_latency if block_end else 0) + extra)
 
     def memory(self, nbytes: int, burst_bytes: int) -> int:
         """Cycles the port is busy moving nbytes in bursts of burst_bytes, at the HPI burst efficiency."""
         return int(math.ceil(nbytes / (self.port_bytes_per_cycle * hpi.efficiency(max(1, burst_bytes // BEAT)))))
+
+
+POSTED_SLACK = 40        # core cycles of a posted write the bridge's queues hold while the path is busy (64 beats)
+
+
+@functools.lru_cache(maxsize=None)
+def _path(devices: int, mode: str, core_mhz: float, f_mhz: float, pushout: float | None) -> "hpi.PathModel":
+    return hpi.PathModel(devices, mode, core_mhz, f_mhz, pushout)
 
 
 # --------------------------------------------------------------------------
@@ -348,6 +430,14 @@ class Step:
     token: int | None = None         # set on a stream's steps: their private buffers carry the token suffix
     deps: list[int] = dataclasses.field(default_factory=list)
     ops: dict | None = None          # the command's operands for the layer engine (see ``operands``)
+    # The memory path as built: ``port`` is the cycles the step's request
+    # holds it, and a ``posted`` write's step ends when its data is taken,
+    # before the path has written it.  A later step waits for the path only
+    # for its own request (``schedule``).  Both are zero on the testbench's
+    # memory and on the pipelined path, whose steps are charged what they
+    # occupy.
+    port: int = 0
+    posted: bool = False
 
     def __post_init__(self) -> None:
         self.cycles = max(1, int(self.cycles))       # a command occupies its unit for at least a cycle
@@ -539,8 +629,8 @@ def recurrent_program(cfg, c: L.RecurrentConsts | None, spec: TileSpec, mm: Memo
     T = chunk
     steps: list[Step] = []
 
-    def add(name, unit, src, dst, cycles, func=None, engine=0, nbytes=0, ops=None):
-        steps.append(Step(name, unit, engine, tuple(src), tuple(dst), int(cycles), func, nbytes, ops=ops))
+    def add(name, unit, src, dst, cycles, func=None, engine=0, nbytes=0, ops=None, port=(0, False)):
+        steps.append(Step(name, unit, engine, tuple(src), tuple(dst), int(cycles), func, nbytes, ops=ops, port=port[0], posted=port[1]))
 
     def fabric(q):
         return lambda x: L._fabric(q, x, spec)
@@ -560,7 +650,8 @@ def recurrent_program(cfg, c: L.RecurrentConsts | None, spec: TileSpec, mm: Memo
         e["hist"] = np.zeros_like(e["hist_mem"]) if first else e["hist_mem"]
     add("dma.hist_rd", "mem", (), ("hist",), t.fill(hist_beats) if first else t.move(hist_beats, write=False), hist_rd,
         nbytes=0 if first else hist_bytes,
-        ops=operands(src=("m_hist", 0), dst=("hist", 0), arg=MEM_RD | MEM_FRESH_ZERO, len=hist_beats))
+        ops=operands(src=("m_hist", 0), dst=("hist", 0), arg=MEM_RD | MEM_FRESH_ZERO, len=hist_beats),
+        port=(0, False) if first else t.port(hist_beats, False))
     # The heads over the state engines, each engine alternating two state
     # slots; a chunk's tokens run on the slot in turn.  The first reads go
     # here, under the norm, the input pass and the conv, which they do not
@@ -579,7 +670,8 @@ def recurrent_program(cfg, c: L.RecurrentConsts | None, spec: TileSpec, mm: Memo
                 e[slot] = rows
         add(f"dma.s_rd[{h}]", "mem", (), (slot,), t.fill(slot_beats) if first else t.move(slot_beats, write=False), s_rd,
             nbytes=0 if first else head_bytes,
-            ops=operands(src=(f"m_s[{h}]", 0), dst=(slot, 0), arg=MEM_RD | MEM_FRESH_SLOT, len=slot_beats))
+            ops=operands(src=(f"m_s[{h}]", 0), dst=(slot, 0), arg=MEM_RD | MEM_FRESH_SLOT, len=slot_beats),
+            port=(0, False) if first else t.port(slot_beats, False))
     for h in range(min(read_ahead, nv)):
         s_read(h)
     for i in range(T):
@@ -607,7 +699,7 @@ def recurrent_program(cfg, c: L.RecurrentConsts | None, spec: TileSpec, mm: Memo
             -(-conv_dim // t.l_conv) + t.conv_latency, conv,
             ops=operands(src=("P1", i * p1), dst=("conv", i * conv_dim), a2=(hist_name(i), 0), a3=(hist_name(i + 1), 0), len=conv_dim // t.l_conv))
     add("dma.hist_wr", "mem", ("hist_next",), (), t.move(hist_beats, write=True), lambda e: e.__setitem__("hist_mem", e["hist_next"]), nbytes=hist_bytes,
-        ops=operands(src=("hist_next", 0), dst=("m_hist", 0), arg=MEM_WR, len=hist_beats))
+        ops=operands(src=("hist_next", 0), dst=("m_hist", 0), arg=MEM_WR, len=hist_beats), port=t.port(hist_beats, True))
     for i in range(T):
         def gates(e, i=i):
             decay, beta = L.head_gates_int(get(e, "a_acc", i)[:nv], get(e, "b_acc", i)[:nv], c.gate_mult_a, c.gate_sh_a,
@@ -652,7 +744,7 @@ def recurrent_program(cfg, c: L.RecurrentConsts | None, spec: TileSpec, mm: Memo
             else:
                 e["s_mem"][h] = e[slot]
         add(f"dma.s_wr[{h}]", "mem", (slot,), (), t.move(slot_beats, write=True), s_wr, nbytes=head_bytes,
-            ops=operands(src=(slot, 0), dst=(f"m_s[{h}]", 0), arg=MEM_WR, len=slot_beats))
+            ops=operands(src=(slot, 0), dst=(f"m_s[{h}]", 0), arg=MEM_WR, len=slot_beats), port=t.port(slot_beats, True))
         if read_ahead and h + read_ahead < nv:
             s_read(h + read_ahead)
         for i in range(T):
@@ -769,8 +861,8 @@ def global_program(cfg, c: L.GlobalConsts | None, spec: TileSpec, mm: MemoryMap,
     T = chunk
     steps: list[Step] = []
 
-    def add(name, unit, src, dst, cycles, func=None, engine=0, nbytes=0, ops=None):
-        steps.append(Step(name, unit, engine, tuple(src), tuple(dst), int(cycles), func, nbytes, ops=ops))
+    def add(name, unit, src, dst, cycles, func=None, engine=0, nbytes=0, ops=None, port=(0, False)):
+        steps.append(Step(name, unit, engine, tuple(src), tuple(dst), int(cycles), func, nbytes, ops=ops, port=port[0], posted=port[1]))
 
     def tok(name: str, i: int) -> str:
         return name if chunk == 1 else f"{name}<{i}>"
@@ -818,14 +910,15 @@ def global_program(cfg, c: L.GlobalConsts | None, spec: TileSpec, mm: MemoryMap,
     for i in range(T):
         p = pos + i
         append_bytes = nkv * mm.kv_record_bytes + (nkv * mm.kv_record_bytes + mm.index_record_bytes) // mm.block + 2 * mm.sums_bytes
-        add(tok("mem.append", i), "mem", ("k", "P1"), (), t.append(nkv, rec_beats, (p + 1) % mm.block == 0, first and p == 0), nbytes=append_bytes,
+        add(tok("mem.append", i), "mem", ("k", "P1"), (), t.append(nkv, rec_beats, (p + 1) % mm.block == 0, first and p == 0,
+                                                         -(-mm.sums_bytes // BEAT), -(-mm.index_record_bytes // BEAT)), nbytes=append_bytes,
             ops=operands(src=("k", i * nkv * hd), dst=("P1", i * p1 + off_ik), a2=("P1", i * p1 + off_v), a3=ctx,
                          arg=[(0, MEM_APPEND), (4, p)]))
         # The scan reads the index a page of records per request; the rows are the
         # window (head-major, page bursts) and one mean record per selected block.
         eligible = eligible_blocks(p, mm.local_window, mm.block)
         scan_bytes = eligible * mm.index_record_bytes
-        add(tok("mem.scan", i), "mem", ("iq",), (_contrib("sel", chunk),), t.scan(eligible, mm.index_record_bytes // BEAT, min(cfg.top_blocks, eligible)),
+        add(tok("mem.scan", i), "mem", ("iq",), (_contrib("sel", chunk),), t.scan(eligible, mm.index_record_bytes // BEAT, min(cfg.top_blocks, eligible), mm.index_burst_records),
             lambda e, i=i: put(e, "selected", i, None), nbytes=scan_bytes,
             ops=operands(src=("iq", i * idim), dst=("sel", i * sel_bytes), a3=ctx, arg=[(0, MEM_SCAN), (4, p)]))
         n_window, n_blocks = min(p + 1, mm.local_window), min(cfg.top_blocks, eligible)
@@ -917,7 +1010,7 @@ def retarget(steps: list[Step], token: int) -> list[Step]:
     for s in steps:
         ops = None if s.ops is None else {k: _rename_value(v, token) for k, v in s.ops.items()}
         out.append(Step(s.name, s.unit, s.engine, tuple(_renamed(n, token) for n in s.src),
-                        tuple(_renamed(n, token) for n in s.dst), s.cycles, s.func, s.nbytes, token, ops=ops))
+                        tuple(_renamed(n, token) for n in s.dst), s.cycles, s.func, s.nbytes, token, ops=ops, port=s.port, posted=s.posted))
     return out
 
 
@@ -1095,6 +1188,7 @@ def schedule(steps: list[Step], releases: int = RELEASES) -> Schedule:
     running: dict[int, int] = {}                             # engine port -> the step on it
     pending: dict[int, int] = {}                             # engine port -> a step whose release is held
     cycle, i = 0, 0
+    path_free = 0                                            # the memory path as built: the cycle it is idle
     while i < n or running or pending:
         # A unit that ended at cycle - 1 reports done now; the drains this
         # cycle are the lowest ports of what is held and what just arrived.
@@ -1118,6 +1212,21 @@ def schedule(steps: list[Step], releases: int = RELEASES) -> Schedule:
             # command issued to the cycle its completion arrived.  The unit
             # therefore stops working one before that, and reports done at it.
             issue[i], end[i] = cycle, cycle + steps[i].cycles - 1
+            st = steps[i]
+            if st.port:
+                # The memory path as built takes one request at a time: a
+                # read waits for the one before it, and a posted write's data
+                # is taken once the path is free (bar what its queues hold).
+                start = max(cycle, path_free)
+                if st.posted:
+                    # A write the bridge's queues hold is taken at once; a
+                    # longer one is taken as the path frees.
+                    if st.port > 0 and st.cycles > POSTED_SLACK:
+                        end[i] = max(end[i], start + st.cycles - 1 - POSTED_SLACK)
+                    path_free = start + st.port
+                else:
+                    end[i] = start + st.cycles - 1
+                    path_free = end[i] + 1
             running[port_of[i]] = i
             i += 1
         # The next cycle anything can happen: a drain, a completion, or --

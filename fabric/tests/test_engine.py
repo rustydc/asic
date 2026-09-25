@@ -16,6 +16,9 @@ from fabric.memory import GlobalContextMemory, MemoryMap
 from fabric.tile import TileSpec
 
 RTL = Path(__file__).parents[1] / "rtl"
+# The engine testbench's clocks are 1.25 ns for the core and 4 ns for the
+# memory controller: the timing for a run over its four PSRAM models.
+PSRAM_TB = S.Timing(core_mhz=800, devices=4)
 SOURCES = [RTL / name for name in ("fabric_sram.sv", "fabric_vector.sv", "fabric_norm.sv", "fabric_recurrent.sv", "fabric_ffn.sv", "fabric_attention.sv",
                                    "fabric_memory.sv", "fabric_tile.sv", "fabric_sequencer.sv", "fabric_engine.sv",
                                    "fabric_phy.sv", "fabric_cdc.sv", "fabric_hpi.sv", "fabric_controller.sv", "fabric_ring.sv",
@@ -52,10 +55,15 @@ def run_engine(case: unittest.TestCase, cfg, c, spec, mm, steps: list[S.Step], i
     # assertion that keeps them from drifting -- for a long time nothing
     # compared them and the model had settled at about half the real count.
     # Its port is the testbench's memory, a beat a cycle after a short
-    # latency; with the HPI devices behind the port the memory steps are the
-    # PSRAM's and the model has no calibration for them.
+    # latency.  With the HPI devices behind the port the memory steps are the
+    # PSRAMs' (``Timing(devices=...)``, ``hpi.PathModel``): the path is
+    # calibrated request by request, but the devices' refresh push-out is
+    # random and the clock crossing adds a cycle here and there, so the two
+    # agree to three per cent rather than exactly.
     if not ndev:
         case.assertEqual(took, S.schedule(steps).cycles, passed)
+    else:
+        case.assertLessEqual(abs(took - S.schedule(steps).cycles), 0.03 * took, passed)
     return took
 
 
@@ -181,9 +189,10 @@ class EngineRtlTest(unittest.TestCase):
         self.assertGreater(cycles, S.schedule(self.prog).cycles // 2)
 
     def test_one_token_over_the_hpi_devices(self) -> None:
-        # The same token with the bridge, the stripe unit and four PSRAM models behind the memory port.
-        cycles = self.run_engine(self.prog, self.context_after(2), ndev=4)
-        self.assertGreater(cycles, S.schedule(self.prog).cycles // 2)
+        # The same token with the bridge, the stripe unit and four PSRAM models
+        # behind the memory port, against the schedule on the path's timing.
+        prog = S.recurrent_program(self.cfg, self.c, self.spec, self.mm, PSRAM_TB)
+        self.run_engine(prog, self.context_after(2), ndev=4)
 
     def test_the_same_program_serves_any_slot(self) -> None:
         # The program carries its memory operands as offsets in the token's
@@ -366,7 +375,7 @@ class GlobalEngineRtlTest(unittest.TestCase):
     def test_one_token_over_the_hpi_devices(self) -> None:
         pos = 31
         inputs, images = self.context_at(pos)
-        prog = S.global_program(self.cfg, self.c, self.spec, self.mm, pos)
+        prog = S.global_program(self.cfg, self.c, self.spec, self.mm, pos, PSRAM_TB)
         run_engine(self, self.cfg, self.c, self.spec, self.mm, prog, inputs, {"m_ctx": images}, ndev=4)
 
     def test_a_stream_of_two_contexts(self) -> None:
