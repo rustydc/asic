@@ -44,7 +44,7 @@ module tb_hpi #(
     fabric_hpi_stripe #(.NDEV(NDEV), .DW(DW)) stripe (
         .clk(clk), .rst_n(rst_n), .req_valid(req_valid), .req_ready(req_ready), .req_write(req_write), .req_addr(req_addr),
         .req_beats(req_beats), .wdata_valid(wdata_valid), .wdata_ready(wdata_ready), .wdata(wdata), .rdata_valid(rdata_valid),
-        .rdata(rdata), .x_valid(x_valid), .x_ready(x_ready), .x_write(x_write), .x_addr(x_addr), .x_beats(x_beats),
+        .rdata_ready(1'b1), .rdata(rdata), .x_valid(x_valid), .x_ready(x_ready), .x_write(x_write), .x_addr(x_addr), .x_beats(x_beats),
         .x_wdata_valid(x_wdata_valid), .x_wdata_ready(x_wdata_ready), .x_wdata(x_wdata), .x_rdata_valid(x_rdata_valid),
         .x_rdata_ready(x_rdata_ready), .x_rdata(x_rdata), .x_done(x_done));
 

@@ -142,6 +142,27 @@ class CdcRtlTest(unittest.TestCase):
             self.assertIn("PASS", out, out)
             self.assertNotIn("ERROR", out, out)
 
+    def test_memory_path_four_beats_a_transfer(self) -> None:
+        # The engine's path: the controller side moves four beats a transfer,
+        # the core side two for a wide request (every other one here) and one
+        # for a narrow; and a narrow core side, which drains a read slower than
+        # the controller fills it, so the read FIFO's push-back is exercised.
+        for ndev, core_ns, cxb in ((4, 1.67, 2), (16, 1.25, 2), (4, 1.3, 1)):
+            with tempfile.TemporaryDirectory() as directory:
+                work = Path(directory)
+                params = H.emit_hpi_vectors(work, np.random.default_rng(50 + ndev), ndev=ndev, device_kb=16,
+                                            transactions=16, max_beats=300)
+                args = [f"-Ptb_mem_bridge.{name}={value}" for name, value in params.items()]
+                args += [f"-Ptb_mem_bridge.CORE_NS={core_ns}", f"-Ptb_mem_bridge.CXB={cxb}", "-Ptb_mem_bridge.MXB=4"]
+                subprocess.run(["iverilog", "-g2012", "-I", str(RTL), "-s", "tb_mem_bridge", "-o", "sim.vvp", *args,
+                                str(RTL / "fabric_phy.sv"), str(RTL / "fabric_cdc.sv"), str(RTL / "fabric_hpi.sv"),
+                                str(RTL / "tb_mem_bridge.sv")],
+                               cwd=work, check=True, capture_output=True, text=True)
+                result = subprocess.run(["vvp", "sim.vvp"], cwd=work, check=True, capture_output=True, text=True)
+            out = result.stdout + result.stderr
+            self.assertIn("PASS", out, out)
+            self.assertNotIn("ERROR", out, out)
+
 
 @unittest.skipUnless(shutil.which("iverilog") and shutil.which("vvp"), "iverilog not installed")
 class PhyRtlTest(unittest.TestCase):

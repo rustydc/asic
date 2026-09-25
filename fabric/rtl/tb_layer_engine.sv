@@ -94,52 +94,46 @@ module tb_layer_engine #(
         .m_req_beats(req_beats), .m_wdata_valid(wdata_valid), .m_wdata_ready(wdata_ready), .m_wdata(wdata), .m_rdata_valid(rdata_valid),
         .m_rdata(rdata));
     wire mem_ready;                                       // the memory can take requests
+    wire mem_quiet;                                       // no request or write beat still on its way to the devices
     reg  dump = 0;                                        // the memory images to their files
     reg [15:0] dimg [0:NDEV*DEV_WORDS-1];                 // every device's words in turn
     generate
         if (USE_HPI) begin : g_hpi
             reg mclk = 0;
             always #2.0 mclk = ~mclk;                     // the controller clock, 250 MHz
-            wire          m_req_valid, m_req_ready, m_req_write, m_wdata_valid, m_wdata_ready, m_rdata_valid, rd_overflow;
+            // The engine's moves are two beats a transfer, the controller's four:
+            // sixteen devices each fill a beat every four clocks.
+            wire          m_req_valid, m_req_ready, m_req_write, m_wdata_valid, m_wdata_ready, m_rdata_valid, m_rdata_ready, rd_overflow;
             wire [31:0]   m_req_addr;
             wire [11:0]   m_req_beats;
-            wire [127:0]  m_wdata, m_rdata;
-            // The bridge moves a beat a transfer; the engine's moves are two.
-            wire          n_req_valid, n_req_ready, n_req_write, n_wdata_valid, n_wdata_ready, n_rdata_valid;
-            wire [31:0]   n_req_addr;
-            wire [11:0]   n_req_beats;
-            wire [127:0]  n_wdata, n_rdata;
-            fabric_mem_narrow #(.DW(128)) narrow (
-                .clk(clk), .rst_n(rst_n), .w_req_valid(req_valid), .w_req_ready(req_ready), .w_req_write(req_write), .w_req_wide(req_wide),
-                .w_req_addr(req_addr), .w_req_beats(req_beats), .w_wdata_valid(wdata_valid), .w_wdata_ready(wdata_ready), .w_wdata(wdata),
-                .w_rdata_valid(rdata_valid), .w_rdata(rdata),
-                .n_req_valid(n_req_valid), .n_req_ready(n_req_ready), .n_req_write(n_req_write), .n_req_addr(n_req_addr),
-                .n_req_beats(n_req_beats), .n_wdata_valid(n_wdata_valid), .n_wdata_ready(n_wdata_ready), .n_wdata(n_wdata),
-                .n_rdata_valid(n_rdata_valid), .n_rdata(n_rdata));
-            fabric_mem_bridge #(.DW(128)) bridge (
-                .c_clk(clk), .c_rst_n(rst_n), .c_req_valid(n_req_valid), .c_req_ready(n_req_ready), .c_req_write(n_req_write),
-                .c_req_addr(n_req_addr), .c_req_beats(n_req_beats), .c_wdata_valid(n_wdata_valid), .c_wdata_ready(n_wdata_ready),
-                .c_wdata(n_wdata), .c_rdata_valid(n_rdata_valid), .c_rdata(n_rdata),
+            wire [511:0]  m_wdata, m_rdata;
+            fabric_mem_bridge #(.DW(128), .CXB(2), .MXB(4)) bridge (
+                .c_clk(clk), .c_rst_n(rst_n), .c_req_valid(req_valid), .c_req_ready(req_ready), .c_req_write(req_write), .c_req_wide(req_wide),
+                .c_req_addr(req_addr), .c_req_beats(req_beats), .c_wdata_valid(wdata_valid), .c_wdata_ready(wdata_ready),
+                .c_wdata(wdata), .c_rdata_valid(rdata_valid), .c_rdata(rdata),
                 .m_clk(mclk), .m_rst_n(rst_n), .m_req_valid(m_req_valid), .m_req_ready(m_req_ready), .m_req_write(m_req_write),
                 .m_req_addr(m_req_addr), .m_req_beats(m_req_beats), .m_wdata_valid(m_wdata_valid), .m_wdata_ready(m_wdata_ready),
-                .m_wdata(m_wdata), .m_rdata_valid(m_rdata_valid), .m_rdata(m_rdata), .rd_overflow(rd_overflow));
+                .m_wdata(m_wdata), .m_rdata_valid(m_rdata_valid), .m_rdata_ready(m_rdata_ready), .m_rdata(m_rdata), .rd_overflow(rd_overflow));
             wire [NDEV-1:0]     x_valid, x_ready, x_wdata_valid, x_wdata_ready, x_rdata_valid, x_rdata_ready, x_done;
             wire                x_write;
             wire [24:0]         x_addr;
             wire [7:0]          x_beats;
-            wire [127:0]        x_wdata;
-            wire [NDEV*128-1:0] x_rdata;
-            fabric_hpi_stripe #(.NDEV(NDEV), .DW(128)) stripe (
+            wire [511:0]        x_wdata;
+            wire [NDEV*512-1:0] x_rdata;
+            fabric_hpi_stripe #(.NDEV(NDEV), .DW(128), .XB(4)) stripe (
                 .clk(mclk), .rst_n(rst_n), .req_valid(m_req_valid), .req_ready(m_req_ready), .req_write(m_req_write), .req_addr(m_req_addr),
                 .req_beats(m_req_beats), .wdata_valid(m_wdata_valid), .wdata_ready(m_wdata_ready), .wdata(m_wdata), .rdata_valid(m_rdata_valid),
-                .rdata(m_rdata), .x_valid(x_valid), .x_ready(x_ready), .x_write(x_write), .x_addr(x_addr), .x_beats(x_beats),
-                .x_wdata_valid(x_wdata_valid), .x_wdata_ready(x_wdata_ready), .x_wdata(x_wdata), .x_rdata_valid(x_rdata_valid),
-                .x_rdata_ready(x_rdata_ready), .x_rdata(x_rdata), .x_done(x_done));
+                .rdata_ready(m_rdata_ready), .rdata(m_rdata), .x_valid(x_valid), .x_ready(x_ready), .x_write(x_write), .x_addr(x_addr),
+                .x_beats(x_beats), .x_wdata_valid(x_wdata_valid), .x_wdata_ready(x_wdata_ready), .x_wdata(x_wdata),
+                .x_rdata_valid(x_rdata_valid), .x_rdata_ready(x_rdata_ready), .x_rdata(x_rdata), .x_done(x_done));
             wire [NDEV-1:0]    clk_en, init_done, device_ok, ce_n, dq_oe, dqs_oe, phy_quiet;
             wire [NDEV*16-1:0] dq_c, dq_d;
             wire [NDEV*2-1:0]  dm_c, dqs_dev, dqs_d;
             wire [NDEV-1:0]    clk_dev;
             assign mem_ready = &init_done && &device_ok;
+            // Writes are posted: the engine is done when the port has taken the
+            // last beat, and the devices have it a microsecond later.
+            assign mem_quiet = !stripe.busy && !m_req_valid && !m_wdata_valid;
             genvar g;
             for (g = 0; g < NDEV; g = g + 1) begin : g_dev
                 wire [1:0] dqs_bus = dqs_oe[g] ? dqs_dev[g*2 +: 2] : 2'b00;
@@ -148,12 +142,12 @@ module tb_layer_engine #(
                 assign #1.0 dqs_d[g*2 +: 2] = dqs_bus;
                 wire [15:0] dq_bus_c = dq_oe[g] ? dq_c[g*16 +: 16] : 16'hzzzz;
                 wire [15:0] dq_bus_d = dqs_oe[g] ? dq_d[g*16 +: 16] : 16'hzzzz;
-                fabric_hpi_channel #(.MR0(MR0), .MR4(MR4), .MR8(MR8), .TPU_CYCLES(60), .TRST_CYCLES(20)) ch (
+                fabric_hpi_channel #(.MR0(MR0), .MR4(MR4), .MR8(MR8), .TPU_CYCLES(60), .TRST_CYCLES(20), .XB(4)) ch (
                     .clk(mclk), .rst_n(rst_n), .phy_ready(1'b1), .phy_quiet(phy_quiet[g]),
                     .clk_en(clk_en[g]), .init_done(init_done[g]), .device_ok(device_ok[g]),
                     .xact_valid(x_valid[g]), .xact_ready(x_ready[g]), .xact_write(x_write), .xact_addr(x_addr), .xact_beats(x_beats),
                     .wdata_valid(x_wdata_valid[g]), .wdata_ready(x_wdata_ready[g]), .wdata(x_wdata),
-                    .rdata_valid(x_rdata_valid[g]), .rdata_ready(x_rdata_ready[g]), .rdata(x_rdata[g*128 +: 128]), .xact_done(x_done[g]),
+                    .rdata_valid(x_rdata_valid[g]), .rdata_ready(x_rdata_ready[g]), .rdata(x_rdata[g*512 +: 512]), .xact_done(x_done[g]),
                     .ce_n(ce_n[g]), .dq_o(dq_c[g*16 +: 16]), .dq_oe(dq_oe[g]), .dq_i(dq_bus_d), .dm_o(dm_c[g*2 +: 2]), .dm_oe(),
                     .dqs_d(dqs_d[g*2 +: 2]));
                 fabric_hpi_device #(.WORDS(DEV_WORDS), .T_DQSCK_NS(2.5 + 0.5 * (g % 4)), .PUSHOUT_SEED(7 + g)) dev (
@@ -173,6 +167,7 @@ module tb_layer_engine #(
                 .req_addr(req_addr),
                 .req_beats(req_beats), .wdata_valid(wdata_valid), .wdata_ready(wdata_ready), .wdata(wdata), .rdata_valid(rdata_valid), .rdata(rdata));
             assign mem_ready = 1'b1;
+            assign mem_quiet = 1'b1;
             always @(posedge dump) $writememh("mem_out.hex", u_mem.mem);
         end
     endgenerate
@@ -301,6 +296,8 @@ module tb_layer_engine #(
         $fclose(trace);
         dump_ports;
         $fclose(span);
+        guard = 0;                                // the last posted writes into the devices
+        while (guard < 200) begin @(posedge clk); guard = mem_quiet ? guard + 1 : 0; end
         dut.u_vb.dumping = 1'b1; #0.1;            // the banks back into one image
         $writememh("vb_out.hex", dut.u_vb.mem);
         dump = 1; #10;
