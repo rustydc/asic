@@ -15,6 +15,7 @@ module tb_layer_engine #(
     parameter int FIRST = 0,                              // FIRST, a bit per token in flight: its slot starts from zero
     parameter int SLOT0 = 0, SLOT1 = 0, SLOT2 = 0, SLOT3 = 0,  // each token in flight's slot, in 2 KB pages
     parameter int POS0 = 0, POS1 = 0, POS2 = 0, POS3 = 0,      // and its position
+    parameter int LAYER = 0, LAYERS = 1,                     // the layer run, of the layers the weights are banked for
     parameter int D    = 96,
     parameter int NK   = 2,
     parameter int NV   = 4,
@@ -83,7 +84,8 @@ module tb_layer_engine #(
     parameter int RING_LANES      = 1,
     parameter int RING_CHUNK      = 1,
     parameter int RING_SLOT_PAGES = 1,
-    parameter int RING_PAGE_BASE  = 0
+    parameter int RING_PAGE_BASE  = 0,
+    parameter int RING_LAYERS     = 1                        // a token's layers, run in turn (die_layers.hex)
 );
     reg clk = 0, rst_n = 0;
     always #0.625 clk = ~clk;
@@ -98,16 +100,18 @@ module tb_layer_engine #(
     wire [3:0]   l_first;
     wire [4*21-1:0] l_slot;
     wire [4*32-1:0] l_pos;
+    wire [1:0]      l_layer;
     wire [AW-1:0] l_wr_addr, l_rd_addr;
     wire [127:0] l_wr_data, l_rd_data;
     wire [31:0]  d_data;
     reg          u_valid = 0, u_sop = 0;
     reg  [31:0]  u_data = 0;
     fabric_die_link #(.D(D), .CHUNK(RING_CHUNK), .LANES(RING_LANES), .SLOT_PAGES(RING_SLOT_PAGES), .PAGE_BASE(RING_PAGE_BASE),
-                      .AW(AW), .TABLE_FILE(RING ? "die_table.hex" : "")) u_link (
+                      .AW(AW), .LAYERS(RING_LAYERS), .TABLE_FILE(RING ? "die_table.hex" : ""),
+                      .LAYER_FILE(RING_LAYERS > 1 ? "die_layers.hex" : "")) u_link (
         .clk(clk), .rst_n(rst_n), .u_valid(u_valid), .u_data(u_data), .u_sop(u_sop), .u_ready(u_ready),
         .d_valid(d_valid), .d_data(d_data), .d_sop(d_sop), .d_ready(1'b1),
-        .e_start(l_start), .e_pc(l_pc), .e_steps(l_steps), .e_first(l_first), .e_slot_page(l_slot), .e_position(l_pos), .e_done(done),
+        .e_start(l_start), .e_pc(l_pc), .e_steps(l_steps), .e_first(l_first), .e_slot_page(l_slot), .e_position(l_pos), .e_layer(l_layer), .e_done(done),
         .v_sel(l_sel), .v_wr_en(l_wr_en), .v_wr_addr(l_wr_addr), .v_wr_data(l_wr_data),
         .v_rd_en(l_rd_en), .v_rd_addr(l_rd_addr), .v_rd_data(l_rd_data), .crc_errors(l_crc), .malformed(l_bad));
     wire         req_valid, req_ready, req_write, req_wide, wdata_valid, wdata_ready, rdata_valid;
@@ -117,12 +121,12 @@ module tb_layer_engine #(
     fabric_layer_engine #(.D(D), .NK(NK), .NV(NV), .HK(HK), .HV(HV), .KK(KK), .CONV(CONV), .NH(NH), .NKV(NKV), .HD(HD), .RD(RD), .IDIM(IDIM),
                           .W(W), .BS(BS), .TOP(TOP), .KV_BITS(KV_BITS), .REC_BYTES(REC_BYTES), .RPB(RPB), .MAXR(MAXR),
                           .WINDOW_OFF(WINDOW_OFF), .BLOCK_OFF(BLOCK_OFF), .INDEX_OFF(INDEX_OFF), .SUMS_OFF(SUMS_OFF), .ATT_L(ATT_L), .SW_L(SW_L),
-                          .ROWS(ROWS), .COLS(COLS), .P(P), .NT(NT), .TMAX(TMAX), .MODEL_TILES(MODEL_TILES), .WB(WB), .ACC(ACC), .SB(SB), .SHB(SHB), .SW(SW), .YSH(YSH), .VB_BYTES(VB_BYTES), .AW(AW),
+                          .ROWS(ROWS), .COLS(COLS), .P(P), .NT(NT), .TMAX(TMAX), .MODEL_TILES(MODEL_TILES), .LAYERS(LAYERS), .WB(WB), .ACC(ACC), .SB(SB), .SHB(SHB), .SW(SW), .YSH(YSH), .VB_BYTES(VB_BYTES), .AW(AW),
                           .VB_BANKS(VB_BANKS), .VB_BANK_SHIFT(VB_BANK_SHIFT), .VB_NPR(VB_NPR), .VB_NPW(VB_NPW), .VB_RMAP0(VB_RMAP0), .VB_RMAP1(VB_RMAP1),
         .VB_WMAP0(VB_WMAP0), .VB_WMAP1(VB_WMAP1), .VB_RCAP2(VB_RCAP2), .VB_RCAP3(VB_RCAP3), .VB_WCAP2(VB_WCAP2)) dut (
         .clk(clk), .rst_n(rst_n), .start(RING ? l_start : start), .first(RING ? l_first : FIRST[3:0]),
         .slot_page(RING ? l_slot : {SLOT3[20:0], SLOT2[20:0], SLOT1[20:0], SLOT0[20:0]}),
-        .position(RING ? l_pos : {32'(POS3), 32'(POS2), 32'(POS1), 32'(POS0)}),
+        .position(RING ? l_pos : {32'(POS3), 32'(POS2), 32'(POS1), 32'(POS0)}), .layer(RING ? l_layer : 2'(LAYER)),
         .pc_start(RING ? l_pc : 16'd0), .n_steps(RING ? l_steps : N[15:0]), .running(running), .done(done),
         .m_req_valid(req_valid), .m_req_ready(req_ready), .m_req_write(req_write), .m_req_wide(req_wide), .m_req_addr(req_addr),
         .m_req_beats(req_beats), .m_wdata_valid(wdata_valid), .m_wdata_ready(wdata_ready), .m_wdata(wdata), .m_rdata_valid(rdata_valid),

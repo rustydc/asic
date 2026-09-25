@@ -29,6 +29,13 @@ class DieLinkModelTest(unittest.TestCase):
                          [(False, [0, 1]), (False, [2]), (True, [7, 8]), (False, [9])])
         self.assertEqual([b.entry for b in got], [1, 0, 5, 0])
 
+    def test_a_slot_takes_one_lane(self):
+        # A prompt's packets come back to back from one slot; each is a batch
+        # of its own, since two tokens of one context cannot run at once.
+        link = die.DieLink(8, chunk=4, lanes=4)
+        got = link.batches([[packet(3, 0, 1), packet(3, 1, 1), packet(5, 0, 1), packet(3, 2, 1)]])
+        self.assertEqual([[(it.context, it.position) for it in b.items] for b in got], [[(3, 0)], [(3, 1), (5, 0)], [(3, 2)]])
+
     def test_what_is_dropped(self):
         link = die.DieLink(8, chunk=4, lanes=4)
         bad = bytearray(packet(1, 0, 1))

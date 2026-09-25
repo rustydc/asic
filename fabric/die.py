@@ -5,7 +5,8 @@ chunk of a prompt (``controller.py``), and are gathered into batches of up
 to ``lanes``: the engine runs a program over a batch, its packets' tokens
 interleaved.  A batch is one shape, a token a lane or a chunk a lane, since
 a program is compiled for one; it closes when it is full, when a packet of
-the other shape arrives, or when the link goes quiet.  A packet whose CRC
+the other shape or of a slot already in it arrives, or when the link goes
+quiet.  A packet whose CRC
 fails takes no lane, and one the die has no program for -- not a work item,
 a token count other than one or the chunk, a length other than the vectors
 -- is dropped; both are counted.  Each lane's packet leaves with the
@@ -71,8 +72,11 @@ class DieLink:
                     self.malformed += 1
                     continue
                 chunked = tokens != 1
-                # The header decides: a packet that cannot join closes the batch, whatever its CRC.
-                if cur is not None and cur.items and (len(cur.items) == self.lanes or cur.chunked != chunked):
+                # The header decides: a packet that cannot join closes the batch, whatever its CRC.  A
+                # slot already in the batch cannot join it: two tokens of one context cannot run at once.
+                context = C._unheader(packet)[2]
+                if cur is not None and cur.items and (len(cur.items) == self.lanes or cur.chunked != chunked
+                                                      or any(it.context == context for it in cur.items)):
                     out.append(cur)
                     cur = None
                 try:
@@ -145,6 +149,10 @@ def emit_die_link_vectors(directory, rng: np.random.Generator, d: int = 16, chun
         f = int(rng.integers(0, 8)) if flags is None else flags
         return C.pack_item(C.WorkItem(int(rng.integers(0, 200)), int(rng.integers(0, 1 << 20)), hidden, f))
 
+    def same(context: int, position: int) -> bytes:
+        hidden = rng.integers(-32768, 32767, size=d).astype(np.int16)
+        return C.pack_item(C.WorkItem(context, position, hidden, 0))
+
     def bad_crc(packet: bytes) -> bytes:
         raw = bytearray(packet)
         raw[C.HEADER_BYTES + 3] ^= 0x40
@@ -163,6 +171,7 @@ def emit_die_link_vectors(directory, rng: np.random.Generator, d: int = 16, chun
         [not_item(item(1)), item(2 if chunk != 2 else 4), item(chunk, C.FLAG_FIRST)],   # dropped, dropped, a chunk
         [item(chunk) for _ in range(5)],                           # chunks: four and one
         [bad_crc(item(chunk)), item(1)],                           # a failed chunk opens no batch
+        [same(9, 0), same(9, 1), same(4, 7), same(9, 2)],          # one slot's prompt: a lane a batch
     ]
     batches = link.batches(groups)
 

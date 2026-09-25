@@ -32,7 +32,7 @@ module tb_die_link #(
     reg [31:0]  gout [0:GROUPS-1];
     reg [31:0]  om [0:OWORDS-1];
     reg [127:0] sm [0:BATCHES-1];
-    reg [255:0] tm [0:7];
+    reg [255:0] tm [0:15];
 
     reg         u_valid = 0, u_sop = 0, d_ready = 1;
     reg [31:0]  u_data = 0;
@@ -43,6 +43,7 @@ module tb_die_link #(
     wire [3:0]  e_first;
     wire [4*21-1:0] e_slot_page;
     wire [4*32-1:0] e_position;
+    wire [1:0]      e_layer;
     reg         e_done = 0;
     wire        v_sel, v_wr_en, v_rd_en;
     wire [AW-1:0] v_wr_addr, v_rd_addr;
@@ -55,7 +56,7 @@ module tb_die_link #(
         .clk(clk), .rst_n(rst_n),
         .u_valid(u_valid), .u_data(u_data), .u_sop(u_sop), .u_ready(u_ready),
         .d_valid(d_valid), .d_data(d_data), .d_sop(d_sop), .d_ready(d_ready),
-        .e_start(e_start), .e_pc(e_pc), .e_steps(e_steps), .e_first(e_first), .e_slot_page(e_slot_page), .e_position(e_position), .e_done(e_done),
+        .e_start(e_start), .e_pc(e_pc), .e_steps(e_steps), .e_first(e_first), .e_slot_page(e_slot_page), .e_position(e_position), .e_layer(e_layer), .e_done(e_done),
         .v_sel(v_sel), .v_wr_en(v_wr_en), .v_wr_addr(v_wr_addr), .v_wr_data(v_wr_data),
         .v_rd_en(v_rd_en), .v_rd_addr(v_rd_addr), .v_rd_data(v_rd_data),
         .crc_errors(crc_errors), .malformed(malformed));

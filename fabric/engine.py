@@ -314,7 +314,12 @@ class Layout:
     at run time (``slot_pages``), so one program image serves a context in
     any slot."""
 
-    def __init__(self, steps: list[S.Step], sizes: dict[str, int], chunk: int = 1, base_page: int = 0) -> None:
+    def __init__(self, steps: list[S.Step], sizes: dict[str, int], chunk: int = 1, base_page: int = 0,
+                 programs: list[list[S.Step]] | None = None) -> None:
+        """``programs``, if given, are every program the engine will run from
+        this one buffer placement -- a die's recurrent and global layers --
+        and the buffers are placed and banked over all of them, so a name is
+        at one address in each; the memory names are ``steps``'s own."""
         self.sizes, self.chunk = sizes, chunk
         self.vb: dict[str, int] = {}
         self.mem: dict[str, int] = {}
@@ -338,7 +343,16 @@ class Layout:
                 self.mem[name] = mem_next
                 mem_next += -(-beats // PAGE_BEATS) * PAGE_BEATS
         self.mem_beats = mem_next
-        self._place(steps, names)
+        if programs:                                     # the names in the programs' order, so every layout of the set agrees
+            names = []
+        programs = programs or [steps]
+        for prog in programs:
+            for step in prog:
+                for value in (step.ops or {}).values():
+                    for name in _refs(value):
+                        if not name.startswith(S.MEM_PREFIX) and name not in names:
+                            names.append(name)
+        self._place(programs, names)
 
     def slot_pages(self) -> dict[int, int]:
         """Each token in flight's slot, as a page: what the engine is started with."""
@@ -350,17 +364,25 @@ class Layout:
             return self.mem[name] - self.region[_suffix(name)]
         return self.vb[name]
 
-    def _place(self, steps: list[S.Step], names: list[str]) -> None:
+    def _place(self, programs: list[list[S.Step]], names: list[str]) -> None:
         """The vector buffer in banks: each buffer takes one, and a buffer's
         bank is the high bits of its address, so an adapter's byte address
         carries it and no port needs a bank field of its own.  The banks are
         the same size, since the stride has to be a shift, and the colouring
         balances them so that size is the largest bank and not the sum."""
-        self.bank = colour_banks(bank_conflicts(steps, self.chunk), lambda n: -(-self.size(n) // BEAT) * BEAT)
+        graph: dict[str, set[str]] = {}
+        for prog in programs:                            # the programs never run together: their conflicts, each
+            for name, edges in bank_conflicts(prog, self.chunk).items():
+                graph.setdefault(name, set()).update(edges)
+        self.bank = colour_banks(graph, lambda n: -(-self.size(n) // BEAT) * BEAT)
         for name in names:                               # a buffer no step's operands reach still needs a bank
             self.bank.setdefault(name, 0)
         self.banks = max(self.bank.values()) + 1 if self.bank else 1
-        self.bank_reads, self.bank_writes = bank_ports(steps, self.bank, self.chunk)
+        self.bank_reads, self.bank_writes = [0] * self.banks, [0] * self.banks
+        for prog in programs:
+            reads, writes = bank_ports(prog, self.bank, self.chunk)
+            self.bank_reads = [max(a, b) for a, b in zip(self.bank_reads, reads)]
+            self.bank_writes = [max(a, b) for a, b in zip(self.bank_writes, writes)]
         fill = [0] * self.banks
         for name in names:
             b = self.bank[name]
@@ -500,34 +522,43 @@ def _write_rom(path: Path, words: np.ndarray, spec: TileSpec) -> None:
                   spec.cols * spec.weight_bits)
 
 
-def _tiles(directory: Path, c, cfg, spec: TileSpec) -> int:
-    """The tile ROM images, the flat requantizer tables and the pass table; returns the tile count."""
-    mult, shift, table = [], [], []
+def _tiles(directory: Path, c, cfg, spec: TileSpec, layers: list | None = None) -> int:
+    """The tile ROM images, the flat requantizer tables and the pass table;
+    returns the tile count.  With ``layers`` (a die's layers' constants, in
+    order) the array holds every layer's tiles, one after another, and layer
+    L's passes are 4 L to 4 L + 3, which the engine's layer register picks."""
+    mult, shift, table, ranges = [], [], [], []
     t = 0
-    for p, matrices in enumerate(_passes(c)):
-        for q, base, raw in matrices:
-            cm = compile_matrix(q, spec)
-            first = t
-            for tile in cm.tiles:
-                _write_rom(directory / f"tile_{t}.hex", tile.rom_words(spec), spec)
-                mult += list(tile.mult)
-                shift += list(tile.shift)
-                chain = 0xFFF if tile.row_block == 0 else t - cm.col_blocks
-                assert chain == 0xFFF or cm.tiles[chain - first].col_block == tile.col_block
-                last = tile.row_block == cm.row_blocks - 1
-                nbytes = tile.valid_cols * (4 if raw else 1)
-                dst_off = base + tile.col_block * spec.cols * (4 if raw else 1)
-                assert nbytes < 256 and dst_off < (1 << 24) and cm.row_blocks < 16
-                table.append(p | (tile.row_block << 4) | (chain << 8) | (int(last) << 20) | (int(raw) << 21) | (nbytes << 22) | (dst_off << 30))
-                t += 1
-    # The timing model works the same array out from the config alone, and a
-    # pass's cost is partly the array's size, so the two must agree.
-    assert t == sum(-(-i // spec.rows) * -(-o // spec.cols)
-                    for p in S.pass_matrices(cfg, isinstance(c, L.RecurrentConsts)) for i, o, _ in p), t
-    assert t < 0xFFF
+    for layer, lc in enumerate(layers or [c]):
+        first = t
+        for p, matrices in enumerate(_passes(lc)):
+            ranges.append(t)
+            for q, base, raw in matrices:
+                cm = compile_matrix(q, spec)
+                start = t
+                for tile in cm.tiles:
+                    _write_rom(directory / f"tile_{t}.hex", tile.rom_words(spec), spec)
+                    mult += list(tile.mult)
+                    shift += list(tile.shift)
+                    chain = 0xFFF if tile.row_block == 0 else t - cm.col_blocks
+                    assert chain == 0xFFF or cm.tiles[chain - start].col_block == tile.col_block
+                    last = tile.row_block == cm.row_blocks - 1
+                    nbytes = tile.valid_cols * (4 if raw else 1)
+                    dst_off = base + tile.col_block * spec.cols * (4 if raw else 1)
+                    assert nbytes < 256 and dst_off < (1 << 24) and cm.row_blocks < 16
+                    table.append((4 * layer + p) | (tile.row_block << 4) | (chain << 8) | (int(last) << 20) | (int(raw) << 21)
+                                 | (nbytes << 22) | (dst_off << 30))
+                    t += 1
+            ranges[-1] |= (t - 1) << 12                 # the pass's first tile and its last
+        # The timing model works the same array out from the config alone, and a
+        # pass's cost is partly its tiles, so the two must agree.
+        assert t - first == sum(-(-i // spec.rows) * -(-o // spec.cols)
+                                for p in S.pass_matrices(cfg, isinstance(lc, L.RecurrentConsts)) for i, o, _ in p), t
+    assert t < 0xFFF and len(ranges) <= 16
     write_hex(directory / "tiles_mult.hex", mult, spec.scale_bits)
     write_hex(directory / "tiles_shift.hex", shift, spec.shift_bits)
     write_hex(directory / "passes.hex", table, TAB_BITS)
+    write_hex(directory / "pass_ranges.hex", ranges + [0] * (16 - len(ranges)), 24)
     return t
 
 
@@ -570,6 +601,30 @@ def _consts(directory: Path, c, cfg, sw: int) -> None:
                   [c.mult_s | (c.sh_s << 16) | (c.mult_gate << 22) | (c.sh_gate << 38) | (c.mult_o << 44) | (c.sh_o << 60)], 66)
     write_hex(directory / "swiglu_consts.hex", [f.mult_g | (f.sh_g << 16) | (f.mult_o << 22) | (f.sh_o << 38)] + [0] * 15, 44)
     write_hex(directory / "residual_consts.hex", [c.res_mult | (c.res_shift << 16), f.res_mult | (f.res_shift << 16)] + [0] * 14, 22)
+
+
+def _geometry(cfg, spec: TileSpec, mm: MemoryMap, layout: "Layout", programs: list[list[S.Step]], chunk: int, nt: int,
+              model_tiles: bool = False) -> dict:
+    """The engine's elaboration: its units' geometry, the global layer's
+    memory map, the tile array and the vector buffer's banks and ports."""
+    d, nk, nv = cfg.hidden_size, cfg.linear_num_key_heads, cfg.linear_num_value_heads
+    hk, hv = cfg.linear_key_head_dim, cfg.linear_value_head_dim
+    regions = mm.regions()
+    return {"D": d, "NK": nk, "NV": nv, "HK": hk, "HV": hv, "KK": cfg.linear_conv_kernel,
+            "CONV": 2 * nk * hk + nv * hv, "NH": cfg.num_attention_heads, "NKV": cfg.num_key_value_heads, "HD": cfg.head_dim,
+            "RD": cfg.rotary_dim, "IDIM": cfg.index_dim, "W": mm.local_window, "BS": mm.block, "TOP": cfg.top_blocks,
+            "KV_BITS": mm.kv_bits, "REC_BYTES": mm.kv_record_bytes, "RPB": mm.index_burst_records, "MAXR": mm.window_burst_records,
+            "WINDOW_OFF": regions["window0"][0], "BLOCK_OFF": regions["blocks0"][0], "INDEX_OFF": regions["index0"][0],
+            "SUMS_OFF": regions["sums0"][0], "ATT_L": S.Timing().head_lanes(cfg.head_dim), "SW_L": S.Timing().l_vec,
+            "ROWS": spec.rows, "COLS": spec.cols, "P": spec.rows_per_cycle, "NT": nt, "TMAX": chunk,
+            "MODEL_TILES": int(model_tiles), "AW": max(16, (max(layout.vb_bytes, 1) - 1).bit_length() + 1),
+            "WB": spec.weight_bits, "ACC": spec.acc_bits, "SB": spec.scale_bits, "SHB": spec.shift_bits, "SW": L.sw_for(16, d),
+            "YSH": L.ysh_for(hk), "VB_BYTES": layout.vb_bytes,
+            "VB_BANKS": layout.banks, "VB_BANK_SHIFT": layout.bank_shift,
+            "VB_RCAP2": layout.cap_mask(layout.bank_reads, 2),
+            "VB_RCAP3": layout.cap_mask(layout.bank_reads, 3),
+            "VB_WCAP2": layout.cap_mask(layout.bank_writes, 2),
+            **port_params(programs, chunk)}
 
 
 def port_params(programs: list[S.Step] | list[list[S.Step]], chunk: int = 1) -> dict:
@@ -659,22 +714,9 @@ class EngineRun:
         nt = _tiles(directory, c, cfg, spec)
         sw = L.sw_for(16, d)
         _consts(directory, c, cfg, sw)
-        regions = mm.regions()
-        self.params = {"N": len(steps), "D": d, "NK": nk, "NV": self.nv, "HK": self.hk, "HV": self.hv, "KK": cfg.linear_conv_kernel,
-                       "CONV": conv_dim, "FFN": ffn, "NH": cfg.num_attention_heads, "NKV": cfg.num_key_value_heads, "HD": cfg.head_dim,
-                       "RD": cfg.rotary_dim, "IDIM": cfg.index_dim, "W": mm.local_window, "BS": mm.block, "TOP": cfg.top_blocks,
-                       "KV_BITS": mm.kv_bits, "REC_BYTES": mm.kv_record_bytes, "RPB": mm.index_burst_records, "MAXR": mm.window_burst_records,
-                       "WINDOW_OFF": regions["window0"][0], "BLOCK_OFF": regions["blocks0"][0], "INDEX_OFF": regions["index0"][0],
-                       "SUMS_OFF": regions["sums0"][0], "ATT_L": S.Timing().head_lanes(cfg.head_dim), "SW_L": S.Timing().l_vec,
-                       "ROWS": spec.rows, "COLS": spec.cols, "P": spec.rows_per_cycle, "NT": nt, "TMAX": self.chunk,
-                       "MODEL_TILES": int(model_tiles), "AW": max(16, (max(self.layout.vb_bytes, 1) - 1).bit_length() + 1),
-                       "WB": spec.weight_bits, "ACC": spec.acc_bits, "SB": spec.scale_bits, "SHB": spec.shift_bits, "SW": sw,
-                       "YSH": L.ysh_for(self.hk), "VB_BYTES": self.layout.vb_bytes, "MEM_BEATS": self.layout.mem_beats,
-                       "VB_BANKS": self.layout.banks, "VB_BANK_SHIFT": self.layout.bank_shift,
-                       "VB_RCAP2": self.layout.cap_mask(self.layout.bank_reads, 2),
-                       "VB_RCAP3": self.layout.cap_mask(self.layout.bank_reads, 3),
-                       "VB_WCAP2": self.layout.cap_mask(self.layout.bank_writes, 2),
-                       **port_params(steps, self.chunk),
+        self.params = {"N": len(steps), "FFN": ffn,
+                       **_geometry(cfg, spec, mm, self.layout, [steps], self.chunk, nt, model_tiles),
+                       "MEM_BEATS": self.layout.mem_beats,
                        "SCHEDULE_CYCLES": S.schedule(steps).cycles, **hpi_params,
                        # The tokens in flight: each one's slot, and FIRST for all of them or none.
                        **{f"SLOT{k}": page for k, page in self.layout.slot_pages().items()},
@@ -790,4 +832,177 @@ class EngineRun:
                 problems.append(f"bank {b}: {reads} reads at once, the colouring gave it {gave_r}")
             if writes > gave_w:
                 problems.append(f"bank {b}: {writes} writes at once, the colouring gave it {gave_w}")
+        return problems
+
+
+class DieRun:
+    """A layer die on the engine: its three recurrent layers and its global
+    layer, one token after another of one context through the ring.
+
+    The engine holds all four layers' weights and constants, banked by
+    layer; it runs two programs, the recurrent one three times and the
+    global one once, each writing its output over its input
+    (``sequencer.in_place``), so a layer's output is the next layer's input
+    where it lies.  The vector buffer is placed over both programs at once,
+    so a buffer is at one address in each and one elaboration serves both.
+    A slot is the four layers' state one after another -- three recurrent
+    regions and the global context -- and the die link starts each layer
+    with its part of the slot, its program and its layer.
+
+    ``consts`` are the four layers' compiled constants, in order, all at one
+    residual scale (the packet's).  ``tokens`` are ``(position, x, first)``
+    for one context in slot ``slot``: they go in as packets back to back,
+    and each runs the four layers before the next, since a slot takes one
+    lane of a batch.  The expected results are the chained integer model's:
+    the packets out and every layer's state after the last token."""
+
+    def __init__(self, directory: Path, cfg, consts: list, spec: TileSpec, mm_r: MemoryMap, mm_g: MemoryMap,
+                 tokens: list[tuple[int, np.ndarray, bool]], slot: int = 3, page_base: int = 5, seed: int = 11) -> None:
+        from fabric import controller as C
+        from fabric.memory import GlobalContextMemory
+        directory.mkdir(parents=True, exist_ok=True)
+        assert len(consts) == 4 and all(isinstance(c, L.RecurrentConsts) for c in consts[:3])
+        assert isinstance(consts[3], L.GlobalConsts) and len({c.s_h for c in consts}) == 1, "one residual scale"
+        self.cfg, self.consts, self.mm_r, self.mm_g = cfg, consts, mm_r, mm_g
+        nv, hk, hv = cfg.linear_num_value_heads, cfg.linear_key_head_dim, cfg.linear_value_head_dim
+        lay_r, lay_g = S.recurrent_layout(cfg, spec, mm_r), S.global_layout(cfg, spec, mm_g)
+        for c in consts[:3]:
+            _LAYOUTS[id(c)] = lay_r
+        _LAYOUTS[id(consts[3])] = lay_g
+        # The two programs, in place, and one buffer placement over both.
+        self.rec = S.in_place(S.recurrent_program(cfg, consts[0], spec, mm_r))
+        self.glob = S.in_place(S.global_program(cfg, consts[3], spec, mm_g, tokens[0][0]))
+        sizes = dict(lay_r["sizes"])
+        for name, n in lay_g["sizes"].items():
+            sizes[name] = max(n, sizes.get(name, 0))
+        self.lr = Layout(self.rec, sizes, programs=[self.rec, self.glob])
+        self.lg = Layout(self.glob, sizes, programs=[self.rec, self.glob])
+        assert self.lr.vb == self.lg.vb and self.lr.banks == self.lg.banks
+        # A slot: three recurrent regions, then the global one.
+        pages_r, pages_g = self.lr.mem_beats // PAGE_BEATS, self.lg.mem_beats // PAGE_BEATS
+        self.layer_page = [0, pages_r, 2 * pages_r, 3 * pages_r]
+        self.slot_pages = 3 * pages_r + pages_g
+        self.slot, self.page_base = slot, page_base
+        start = (page_base + slot * self.slot_pages) * PAGE_BEATS * BEAT
+        mem = bytearray(start + self.slot_pages * PAGE_BEATS * BEAT)
+        rng = np.random.default_rng(seed)
+        self.start = start
+
+        def region(layer: int) -> int:
+            return start + self.layer_page[layer] * PAGE_BEATS * BEAT
+
+        # The slot another context left: the recurrent state and history are
+        # garbage, which FIRST must not read; the global region is garbage
+        # where FIRST must not read it (the block sums, the window beyond the
+        # tokens) and zero where the model starts from zero.
+        first_pos = tokens[0][0]
+        assert tokens[0][2] and first_pos == 0, "the slot starts fresh"
+        for layer in range(3):
+            n = pages_r * PAGE_BEATS * BEAT
+            mem[region(layer):region(layer) + n] = rng.integers(0, 256, n, dtype=np.uint8).tobytes()
+        store = GlobalContextMemory(mm_g, cfg.top_blocks)
+        regions = mm_g.regions()
+        g0 = region(3) + self.lg.operand("m_ctx") * BEAT
+        before = bytearray(store.image.data)
+        off, size = regions["sums0"]
+        before[off:off + size] = rng.integers(0, 256, size, dtype=np.uint8).tobytes()
+        woff, _ = regions["window0"]
+        rec = mm_g.kv_record_bytes
+        junk = {}
+        for n in range(cfg.num_key_value_heads):
+            for p in range(len(tokens), mm_g.local_window):
+                a = woff + (n * mm_g.local_window + p) * rec
+                junk[a] = rng.integers(0, 256, rec, dtype=np.uint8).tobytes()
+                before[a:a + rec] = junk[a]
+        mem[g0:g0 + len(before)] = before
+
+        # The chain on the integer model: a token through the four layers.
+        s = [np.zeros((nv, hk, hv), dtype=np.int64) for _ in range(3)]
+        sc = [np.tile([L.ONE_U, 0, 0, 0], (nv, 1)).astype(np.int64) for _ in range(3)]
+        conv_dim = 2 * cfg.linear_num_key_heads * hk + nv * hv
+        hist = [np.zeros((conv_dim, cfg.linear_conv_kernel - 1), dtype=np.int64) for _ in range(3)]
+        zero = np.zeros((cfg.num_key_value_heads, 1, cfg.head_dim), dtype=np.int64)
+        self.outputs, packets_in, packets_out = [], [], []
+        for pos, x, first in tokens:
+            h = np.asarray(x, dtype=np.int64)
+            for layer in range(3):
+                prog = S.recurrent_program(cfg, consts[layer], spec, mm_r, first=first)
+                env = S.run_program(prog, {"x": h, "s_mem": s[layer].copy(), "scale_mem": sc[layer].copy(), "hist_mem": hist[layer].copy()})
+                h, s[layer], sc[layer], hist[layer] = env["x2"], env["s_mem"], env["scale_mem"], env["hist_mem"]
+            own = L.global_layer_int(consts[3], cfg, spec, h, pos, zero, zero)
+            store.append(pos, own["k"], own["v"], own["index_k"])
+            got = store.retrieve(pos, own["index_q_unit"])
+            env = S.run_program(S.global_program(cfg, consts[3], spec, mm_g, pos, first=first),
+                                {"x": h, "k_rows": got["k_rows"], "v_rows": got["v_rows"]})
+            h = np.asarray(env["x2"], dtype=np.int64)
+            self.outputs.append(h)
+            flags = C.FLAG_FIRST if first else 0
+            packets_in.append(C.pack_item(C.WorkItem(slot, pos, np.asarray(x).astype(np.int16), flags)))
+            packets_out.append(C.pack_item(C.WorkItem(slot, pos, h.astype(np.int16), flags)))
+        after = bytearray(store.image.data)
+        for a, data in junk.items():
+            after[a:a + rec] = data
+        self.expected = {"s": s, "scale": sc, "hist": hist, "ctx": bytes(after)}
+        self.region = region
+
+        # The images and the tables.
+        _write_bytes(directory / "vb_init.hex", bytes(self.lr.vb_bytes))
+        _write_beats(directory / "mem_init.hex", bytes(mem))
+        L.write_luts(directory)
+        words_r, words_g = S.encode(self.rec, self.lr), S.encode(self.glob, self.lg)
+        write_hex(directory / "program.hex", words_r + words_g, 256)
+        nt = _tiles(directory, consts[0], cfg, spec, layers=consts)
+        sw = L.sw_for(16, cfg.hidden_size)
+        tables: dict[str, list[str]] = {}
+        for layer, c in enumerate(consts):                 # each unit's constants, a layer's bank after another's
+            sub = directory / f"layer{layer}"
+            sub.mkdir(exist_ok=True)
+            _consts(sub, c, cfg, sw)
+            for f in sub.iterdir():
+                tables.setdefault(f.name, []).append(f.read_text())
+        for name, parts in tables.items():
+            (directory / name).write_text("".join(parts))
+        words = lambda packet: [int.from_bytes(packet[i:i + 4], "little") for i in range(0, len(packet), 4)]
+        ins = [w for p in packets_in for w in words(p)]
+        outs = [w for p in packets_out for w in words(p)]
+        write_hex(directory / "ring_in.hex", ins, 32)
+        write_hex(directory / "ring_len.hex", [len(p) // 4 for p in packets_in], 16)
+        write_hex(directory / "ring_out.hex", outs, 32)
+        lanes = self.lr.vb["x"] << 32 | self.lr.vb["x"] << 128   # lane 0's input and output: the same buffer, in place
+        table = [0] * 16
+        table[0] = lanes | (len(self.rec) << 16)                   # kind 0, a token a lane, one lane: pc 0
+        table[8] = lanes | (len(self.rec) + (len(self.glob) << 16))  # kind 1, after it
+        write_hex(directory / "die_table.hex", table, 256)
+        write_hex(directory / "die_layers.hex", [int(layer == 3) | (self.layer_page[layer] << 1) for layer in range(4)], 32)
+        self.params = {"N": len(tokens) * (3 * len(self.rec) + len(self.glob)), "FFN": cfg.layer_intermediate_size(0),
+                       **_geometry(cfg, spec, mm_g, self.lr, [self.rec, self.glob], 1, nt),
+                       "MEM_BEATS": len(mem) // BEAT, "SCHEDULE_CYCLES": 0, "USE_HPI": 0, "LAYERS": 4,
+                       "RING": 1, "RING_PACKETS": len(tokens), "RING_IN": len(ins), "RING_OUT": len(outs), "RING_LANES": 1,
+                       "RING_CHUNK": 1, "RING_SLOT_PAGES": self.slot_pages, "RING_PAGE_BASE": page_base, "RING_LAYERS": 4}
+        (directory / "params.json").write_text(json.dumps(self.params))
+
+    def check(self, directory: Path) -> list[str]:
+        """Every layer's state after the last token against the chained model's."""
+        mem = read_hex_bytes(directory / "mem_out.hex", BEAT)
+        problems = []
+        nv, hk, hv = self.cfg.linear_num_value_heads, self.cfg.linear_key_head_dim, self.cfg.linear_value_head_dim
+        for layer in range(3):
+            base = self.region(layer)
+            take = lambda name: mem[base + self.lr.operand(name) * BEAT:base + self.lr.operand(name) * BEAT + self.lr.size(name)]
+            hist = np.frombuffer(take("m_hist"), dtype=np.int8).astype(np.int64)
+            hist = hist.reshape(-1, S.HIST_REC)[:, :self.cfg.linear_conv_kernel - 1]
+            if not np.array_equal(hist, self.expected["hist"][layer]):
+                problems.append(f"layer {layer}: the conv history differs")
+            for h in range(nv):
+                rows, scale = _unpack_slot(take(f"m_s[{h}]"), hk, hv)
+                if not np.array_equal(rows, self.expected["s"][layer][h]):
+                    problems.append(f"layer {layer} head {h}: {int((rows != self.expected['s'][layer][h]).sum())} state elements differ")
+                if tuple(scale) != tuple(int(v) for v in self.expected["scale"][layer][h]):
+                    problems.append(f"layer {layer} head {h}: scale {scale}")
+        g0 = self.region(3) + self.lg.operand("m_ctx") * BEAT
+        want = self.expected["ctx"]
+        got = mem[g0:g0 + len(want)]
+        if got != want:
+            first = next(i for i in range(len(want)) if got[i] != want[i])
+            problems.append(f"layer 3: the context differs first at byte {first}")
         return problems

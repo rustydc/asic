@@ -492,21 +492,23 @@ def pass_matrices(cfg, recurrent: bool) -> list[list[tuple[int, int, bool]]]:
 def pass_walk(cfg, spec: TileSpec, recurrent: bool) -> list[int]:
     """What the write phase of each pass costs, per token of a chunk.
 
-    The pass adapter's write phase steps over *every* tile of the array, one
-    cycle for a tile that is not in this pass and one beat of its output per
-    token for one that is, so the array's size is part of every pass's cost.
-    Returned per pass as ``fixed + per_token``, packed as a pair."""
-    passes = pass_matrices(cfg, recurrent)
-    total = sum(-(-i // spec.rows) * -(-o // spec.cols) for p in passes for i, o, _ in p)
+    The pass adapter's write phase steps over the pass's own tiles, which
+    are consecutive in the array: one cycle for a tile that is not its
+    column's last row block, and one beat of its output per token for one
+    that is.  It used to step over every tile of the array, which made the
+    array's size part of every pass's cost, and a die's four layers four
+    times that.  Returned per pass as ``fixed + per_token``, packed as a
+    pair."""
     out = []
-    for matrices in passes:
-        beats, hits = 0, 0
+    for matrices in pass_matrices(cfg, recurrent):
+        beats, hits, tiles = 0, 0, 0
         for i, o, raw in matrices:
+            tiles += -(-i // spec.rows) * -(-o // spec.cols)
             for cb in range(-(-o // spec.cols)):
                 valid = min(spec.cols, o - cb * spec.cols)
                 beats += -(-(valid * (4 if raw else 1)) // BEAT)
                 hits += 1
-        out.append((total - hits, beats))
+        out.append((tiles - hits, beats))
     return out
 
 
@@ -1042,6 +1044,35 @@ class _View(dict):
     def update(self, pairs) -> None:                    # type: ignore[override]
         for name, value in dict(pairs).items():
             self[name] = value
+
+
+def in_place(steps: list[Step]) -> list[Step]:
+    """A layer's program writing its output over its input: ``x2`` becomes
+    ``x``.  The residual's input is dead by the time the output is written --
+    both residual adds and the norm have read it -- so the buffer can take it,
+    and the dependencies say so: the write waits for the readers.  A die runs
+    its layers one after another on the same ``x``, so one layer's output is
+    the next one's input with nothing moved.  The integer model's functions
+    still name ``x2``; the chain renames between layers (``engine.DieRun``)."""
+    def name(n: str) -> str:
+        plus = n.startswith("+")
+        base = n[1:] if plus else n
+        head, _, tail = base.partition("@")
+        if head == "x2":
+            base = "x" + ("@" + tail if tail else "")
+        return ("+" if plus else "") + base
+
+    def value(v):
+        if isinstance(v, tuple):
+            return (name(v[0]),) + v[1:]
+        if isinstance(v, list):
+            return [(sh, value(x)) for sh, x in v]
+        return v
+    out = [dataclasses.replace(s, src=tuple(name(n) for n in s.src), dst=tuple(name(n) for n in s.dst),
+                               ops=None if s.ops is None else {k: value(v) for k, v in s.ops.items()}, deps=[])
+           for s in steps]
+    link(out)
+    return out
 
 
 def interleave(programs: list[list[Step]]) -> list[Step]:

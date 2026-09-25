@@ -1080,20 +1080,23 @@ At 600 MHz, per die, streamed:
 
 | Memory | Recurrent | Global, 4K | Global, 128K | Tokens/s, 4K | Tokens/s, 128K |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| the ideal port | 41,605 | 75,823 | 115,503 | 2,990 | 2,497 |
-| 16 PSRAMs, the path as built | 93,221 | 244,500 | 502,511 | 1,145 | 767 |
-| pipelined: reads streamed, requests overlapped | 55,406 | 212,137 | 438,065 | 1,586 | 993 |
-| and the scan and the reader asking ahead | 55,406 | 78,587 | 118,057 | 2,451 | 2,111 |
-| the same, every read burst pushed out | 57,638 | 78,803 | 118,225 | 2,384 | 2,061 |
+| the ideal port | 40,365 | 75,823 | 115,503 | 3,047 | 2,536 |
+| 16 PSRAMs, the path as built | 95,416 | 244,500 | 502,511 | 1,130 | 761 |
+| pipelined: reads streamed, requests overlapped | 54,766 | 212,137 | 438,065 | 1,594 | 996 |
+| and the scan and the reader asking ahead | 54,766 | 78,587 | 118,057 | 2,470 | 2,125 |
+| the same, every read burst pushed out | 56,998 | 78,803 | 118,225 | 2,402 | 2,075 |
 
-So the 2.5K of the ideal port is 770 tokens/s on the parts as the
+(With a pass walking only its own tiles, below; the first figures here
+were 41,605 cycles and 2,497 tokens/s for the ideal port.)
+
+So the 2.5K of the ideal port is 760 tokens/s on the parts as the
 controller is built, and 2.1K with three changes to it: drain a read
 chunk as it arrives, take the next request while the last one's chunks
 run, and let the scan and the record reader keep requests in flight so
 their pages spread over the devices. The last is what the global layer
 needs; the first two are what the recurrent layer's state needs, and even
 then its 1 MB a token of state at the devices' 14.9 GB/s is 70 µs of the
-92 µs it takes. The push-out costs two per cent at worst.
+91 µs it takes. The push-out costs two per cent at worst.
 
 The device count is a cost question -- a part is about $5 in hundreds,
 and sixteen a die is 128 of them on the board. At the pipelined
@@ -1101,11 +1104,11 @@ controller, per die:
 
 | PSRAMs a die | Capacity | Contexts at 128K | Tokens/s, 4K | Tokens/s, 128K |
 | ---: | ---: | ---: | ---: | ---: |
-| 4 | 256 MB | 23 | 896 | 777 |
-| 8 | 512 MB | 46 | 1,558 | 1,374 |
-| 12 | 768 MB | 70 | 1,613 | 1,459 |
-| 16 | 1 GB | 93 | 2,451 | 2,111 |
-| 24 | 1.5 GB | 140 | 2,561 | 2,192 |
+| 4 | 256 MB | 23 | 881 | 765 |
+| 8 | 512 MB | 46 | 1,572 | 1,386 |
+| 12 | 768 MB | 70 | 1,638 | 1,479 |
+| 16 | 1 GB | 93 | 2,470 | 2,125 |
+| 24 | 1.5 GB | 140 | 2,584 | 2,208 |
 
 Twelve buys little over eight and twenty-four little over sixteen, because
 a state slot is sixteen stripes: at twelve devices four of them take two,
@@ -1506,19 +1509,70 @@ the tokens come in as packets, the link starts the engine, and what leaves
 is the model's packets bit for bit -- two recurrent contexts as two lanes
 in slots away from the base, and a global chunk of three as one packet.
 
-Two things the table assumes and the compiler does not yet provide. A
-lane is written before the batch's size is known, so every program of a
-shape must put lane k's input and output at the same buffer addresses;
-`engine.Layout` lays out one program, and a die's program set wants one
-layout over all of them (it wants that anyway: the buffer's banks are one
-set of parameters). And a die runs four layers, where the engine runs one
-program of one layer: nothing yet makes one layer's output the next one's
-input, points a layer's passes at its own weights and constants, or gives
-it its part of the slot.
+### A die's four layers
+
+A layer die runs three recurrent layers and a global one for every token,
+and now the engine does: the die link runs a batch's four layers in turn,
+starting the engine for each with its program, its layer and its part of
+the slot, and sends the packets on after the fourth. What that took:
+
+* **The weights and constants banked by layer.** The tile array holds all
+  four layers' tiles, one layer after another, and layer L's passes are
+  4 L to 4 L + 3 in the pass table; every unit's constants -- the norms'
+  sets, the conv taps, the gates, SwiGLU, the residual adds, the rotary's
+  gains and frequencies, the attention's scales -- are four banks deep.
+  The engine is started with its layer, and a command's pass or constant
+  set is looked up in that layer's bank, so the three recurrent layers run
+  one program.
+* **A pass walks its own tiles.** The pass adapter's write phase used to
+  step over every tile of the array, a cycle each for the ones not in the
+  pass, which made the array's size part of every pass's cost -- and a
+  die's array four layers of it. Each pass's tiles are consecutive, so the
+  adapter takes the pass's first and last tile from a table and walks only
+  those. At the 9B geometry that takes the recurrent layer from 59,144
+  cycles to 56,642 one token at a time; on a die it is what keeps four
+  layers of tiles from making every pass four times as long.
+* **In place.** A layer's program writes its output over its input
+  (`sequencer.in_place`): by the time the last residual add writes it,
+  both residual adds and the norm have read the input, and the
+  dependencies make the write wait for them. So one layer's output is the
+  next layer's input where it lies, and nothing is moved between layers.
+* **One buffer placement for both programs.** `engine.Layout` places and
+  banks the vector buffer over a set of programs -- the union of their
+  bank conflicts, the most any of them asks of a bank -- so a buffer is at
+  the same address in the recurrent program and the global one, and one
+  elaboration of the engine serves both. The same placement is what the
+  die link's lane addresses need.
+* **A slot of four parts.** A slot is the three recurrent layers' state
+  and the global layer's context one after another; the die link's layer
+  table gives each layer its kind (which program) and the page its part
+  starts at, which it adds to the slot's page as it starts the layer.
+* **A slot takes one lane.** A prompt's packets come from one slot back to
+  back, and two tokens of one context cannot run at once on its state, so
+  a packet whose slot is already in the batch closes it; the link and its
+  model both do this, which they did not before.
+
+`engine.DieRun` builds it all for the tiny geometry: four layers compiled
+at one residual scale (it is the packet's), the two programs, the banked
+tables, the slot with the recurrent state garbage and the global context
+another context's, and the chain on the integer model -- the three
+recurrent layers and the global one with its context memory, token after
+token. `DieRtlTest` sends two tokens of one context through the ring, the
+first FIRST at position 0: the link runs them one after the other, four
+layers each, and the packets that leave and every layer's state and the
+context afterwards are the chained model's bit for bit.
+
+What the program set still needs is a budget. A die holds every program
+it runs in one program memory of 1,024 steps; at the 9B geometry the
+recurrent program is 173 steps and the global 41, which fits with room,
+but a batch of four is 692 recurrent steps and a chunk of eight 894, and
+every shape the table can name is over ten thousand. Which shapes a die
+keeps is the decision left: single tokens at one, two and four lanes and
+chunks a lane at a time is about 2,700 steps.
 
 What is not covered yet: the ring's physical layer below the words (the
 source-synchronous clocking, the retry on a CRC failure), the management
-SPI that loads the dies' constants, the program set and the four layers above, the head dies' side of
+SPI that loads the dies' constants, the program store's budget above, the head dies' side of
 the ring, the queue engine in the gateware, and the Linux driver.
 
 ## RTL

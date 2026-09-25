@@ -46,7 +46,9 @@ module fabric_die_link #(
     parameter int GATHER_WAIT = 16,             // quiet cycles before a part-full batch runs
     parameter int AW          = 24,             // vector-buffer address bits
     parameter int KIND        = 8'h57,
-    parameter     TABLE_FILE  = "die_table.hex"
+    parameter int LAYERS      = 1,              // layers a token takes on this die, run in turn: four on a layer die
+    parameter     TABLE_FILE  = "die_table.hex",
+    parameter     LAYER_FILE  = ""              // each layer's kind and its part of a slot (below); none: one layer at the slot's start
 ) (
     input  wire              clk,
     input  wire              rst_n,
@@ -67,6 +69,7 @@ module fabric_die_link #(
     output reg  [3:0]        e_first,
     output reg  [4*21-1:0]   e_slot_page,
     output reg  [4*32-1:0]   e_position,
+    output reg  [1:0]        e_layer,
     input  wire              e_done,
     // the vector buffer, while the engine is idle
     output wire              v_sel,
@@ -84,13 +87,26 @@ module fabric_die_link #(
     localparam int TB = D / 8;                  // vector-buffer beats a token
 
     // ---------------------------------------------------------------------
-    // The program table: an entry a batch shape, {chunk, lanes - 1}.
+    // The program table: an entry a layer kind and batch shape,
+    // {kind, chunk, lanes - 1}.  A kind is a program: a die's three recurrent
+    // layers run one program and its global layer the other, each layer on
+    // its own bank of weights and constants (the engine's layer) and its own
+    // part of the slot (the layer table).
     //   [15:0] first step   [31:16] steps
     //   [32 + 24k +: 24] lane k's input   [128 + 24k +: 24] lane k's output
     // ---------------------------------------------------------------------
-    reg [255:0] table_mem [0:7];
+    reg [255:0] table_mem [0:15];
     initial if (TABLE_FILE != "") $readmemh(TABLE_FILE, table_mem);
     reg [255:0] entry;
+    // The layer table: [0] the layer's kind, [21:1] the page its part of a
+    // slot starts at, from the slot's first.
+    reg [31:0]  layer_mem [0:3];
+    integer     li;
+    initial begin
+        for (li = 0; li < 4; li = li + 1) layer_mem[li] = 0;
+        if (LAYER_FILE != "") $readmemh(LAYER_FILE, layer_mem);
+    end
+    reg [1:0]   lay;                            // the layer running
 
     // ---------------------------------------------------------------------
     // The lanes.
@@ -134,8 +150,12 @@ module fabric_die_link #(
                            && (rh_length == 24'(rh_tokens) * 24'(2 * D));
     wire        rh_cls   = (rh_tokens != 8'd1);
     // It joins the batch being gathered: the engine is idle, there is room,
-    // and it is the batch's shape (or the batch is empty).
-    wire        joins    = (xstate == X_IDLE) && (lanes < LANES) && (lanes == 0 || rh_cls == cls);
+    // it is the batch's shape (or the batch is empty), and its slot is not in
+    // the batch already -- a prompt's packets come back to back, and two
+    // tokens of one context cannot run at once on its state.
+    wire        dup      = (lanes > 0 && l_context[0] == rh_context) || (lanes > 1 && l_context[1] == rh_context)
+                        || (lanes > 2 && l_context[2] == rh_context);
+    wire        joins    = (xstate == X_IDLE) && (lanes < LANES) && (lanes == 0 || (rh_cls == cls && !dup));
 
     // The payload is read off the link only into a lane or to be dropped; a
     // header is always taken, and its payload held there until it can be.
@@ -181,7 +201,7 @@ module fabric_die_link #(
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             rstate <= R_HDR; xstate <= X_IDLE; lanes <= 0; cls <= 1'b0; wsub <= 0; quiet <= 0;
-            v_wr_en <= 1'b0; e_start <= 1'b0; e_pc <= 0; e_steps <= 0; e_first <= 0; e_slot_page <= 0; e_position <= 0;
+            v_wr_en <= 1'b0; e_start <= 1'b0; e_pc <= 0; e_steps <= 0; e_first <= 0; e_slot_page <= 0; e_position <= 0; e_layer <= 0; lay <= 0;
             t_hdr <= 1'b0; tlane <= 0; tleft <= 0; tfetch <= 0; rbusy <= 1'b0; have <= 1'b0; tsub <= 0;
             crc_errors <= 0; malformed <= 0;
         end else begin
@@ -240,21 +260,30 @@ module fabric_die_link #(
                         rstate <= R_PAY;
                     end else if (lanes != 0 && ((rstate == R_HOLD) ||
                                                 (rstate == R_HDR && !rh_valid && (lanes == LANES || quiet >= GATHER_WAIT)))) begin
-                        entry <= table_mem[{cls, 2'(lanes - 1)}];
+                        lay <= 0;
+                        entry <= table_mem[{layer_mem[0][0], cls, 2'(lanes - 1)}];
                         xstate <= X_LOOK;
                     end
                 end
                 X_LOOK: begin
-                    e_pc <= entry[15:0]; e_steps <= entry[31:16];
+                    e_pc <= entry[15:0]; e_steps <= entry[31:16]; e_layer <= lay;
                     for (k = 0; k < 4; k = k + 1) begin
                         e_first[k] <= (k < lanes) && l_flags[k][1];                // FLAG_FIRST
                         e_position[32*k +: 32] <= (k < lanes) ? l_position[k] : 32'd0;
-                        e_slot_page[21*k +: 21] <= 21'(PAGE_BASE) + ((k < lanes) ? 21'(l_context[k]) * 21'(SLOT_PAGES) : 21'd0);
+                        e_slot_page[21*k +: 21] <= 21'(PAGE_BASE) + layer_mem[lay][21:1]
+                                                   + ((k < lanes) ? 21'(l_context[k]) * 21'(SLOT_PAGES) : 21'd0);
                     end
                     xstate <= X_START;
                 end
                 X_START: begin e_start <= 1'b1; xstate <= X_RUN; end
-                X_RUN: if (e_done) begin tlane <= 0; t_hdr <= 1'b1; xstate <= X_THDR; end
+                X_RUN: if (e_done) begin
+                    if (lay == 2'(LAYERS - 1)) begin tlane <= 0; t_hdr <= 1'b1; xstate <= X_THDR; end
+                    else begin                          // the next layer, on the same lanes: its output is in place of its input
+                        lay <= lay + 1'b1;
+                        entry <= table_mem[{layer_mem[lay + 1'b1][0], cls, 2'(lanes - 1)}];
+                        xstate <= X_LOOK;
+                    end
+                end
                 X_THDR: if (t_hdr_ready) begin
                     // The tx takes the header this cycle; the lane's words follow.
                     t_hdr <= 1'b0;
@@ -293,7 +322,7 @@ module fabric_die_link #(
     function automatic [AW-1:0] entry_in(input [2:0] k, input c);
         reg [255:0] e;
         begin
-            e = table_mem[{c, 2'(LANES - 1)}];
+            e = table_mem[{1'b0, c, 2'(LANES - 1)}];
             entry_in = e[32 + 24*k +: AW];
         end
     endfunction

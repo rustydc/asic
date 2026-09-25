@@ -236,7 +236,10 @@ class EngineRtlTest(unittest.TestCase):
         self.assertEqual(len([s for s in chunk if s.unit == "mem"]), len([s for s in self.prog if s.unit == "mem"]))
         cycles = self.run_engine(chunk, inputs)
         single = self.run_engine(self.prog, self.context_after(1))
-        self.assertLess(cycles, 2.5 * single)                    # three tokens for well under three tokens' time
+        # Three tokens for well under three tokens' time.  (The share a chunk
+        # saves at this small geometry fell when a pass stopped walking the
+        # other passes' tiles, which had been a large part of one token's.)
+        self.assertLess(cycles, 0.9 * 3 * single)
 
     def test_a_stream_of_two_contexts(self) -> None:
         two = S.stream(self.prog, 2)
@@ -405,6 +408,73 @@ class GlobalEngineRtlTest(unittest.TestCase):
             memory[f"m_ctx@{token}"] = images
             programs.append(S.retarget(S.global_program(self.cfg, self.c, self.spec, self.mm, pos), token))
         run_engine(self, self.cfg, self.c, self.spec, self.mm, S.interleave(programs), inputs, memory)
+
+
+@unittest.skipUnless(shutil.which("iverilog") and shutil.which("vvp"), "iverilog not installed")
+class DieRtlTest(unittest.TestCase):
+    """A layer die on the engine: three recurrent layers and the global one,
+    their weights and constants banked by layer, two programs over one buffer
+    placement, the die link running a token's four layers in turn -- against
+    the four integer layers chained."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        try:
+            import torch
+            from fixed_llm_poc import ASICDecoderLayer, tiny_config
+        except ImportError:  # pragma: no cover
+            raise unittest.SkipTest("PyTorch not installed")
+        cls.cfg = cfg = tiny_config()
+        torch.manual_seed(0)
+        ws = [{k: v.detach().double().numpy() for k, v in ASICDecoderLayer(cfg, i).state_dict().items()} for i in range(4)]
+        assert [cfg.is_global_layer(i) for i in range(4)] == [False, False, False, True]
+        cls.spec = TileSpec(rows=cfg.hidden_size, cols=16)
+        cls.mm_r = MemoryMap.from_config(cfg)
+        cls.mm_g = MemoryMap.from_config(cfg, context_tokens=256, recurrent_layers=0)
+        rng = np.random.default_rng(5)
+        nv, hk, hv = cfg.linear_num_value_heads, cfg.linear_key_head_dim, cfg.linear_value_head_dim
+        nkv, hd = cfg.num_key_value_heads, cfg.head_dim
+        conv_dim = 2 * cfg.linear_num_key_heads * hk + nv * hv
+        cls.xs = [rng.standard_normal(cfg.hidden_size) * 2.0 for _ in range(6)]
+        # The float chain, each layer calibrated on what reaches it.
+        s = [np.zeros((nv, hk, hv)) for _ in range(3)]
+        hist = [np.zeros((conv_dim, cfg.linear_conv_kernel - 1)) for _ in range(3)]
+        runs, kf, vf = [[] for _ in range(4)], [], []
+        for pos, x in enumerate(cls.xs):
+            h = x
+            for i in range(3):
+                r = L.recurrent_layer_float(ws[i], cfg, h, s[i], hist[i])
+                s[i], hist[i], h = r["s_next"], r["hist_next"], r["x2"]
+                runs[i].append(r)
+            own = L.global_layer_float(ws[3], cfg, h, pos, np.zeros((nkv, 1, hd)), np.zeros((nkv, 1, hd)))
+            kf.append(own["k"])
+            vf.append(own["v"])
+            r = L.global_layer_float(ws[3], cfg, h, pos, np.stack(kf, axis=1), np.stack(vf, axis=1))
+            runs[3].append(r)
+        cals = [L.calibrate(runs[i], L.RECURRENT_CAL_KEYS) for i in range(3)] + [L.calibrate(runs[3], L.GLOBAL_CAL_KEYS)]
+        # One residual scale for the four layers: it is the packet's.
+        top = max(max(c["x2"] for c in cals), max(float(np.abs(x).max()) for x in cls.xs))
+        for c in cals:
+            c["x2"] = top
+        cls.consts = [L.compile_recurrent_layer(ws[i], cfg, cls.spec, cals[i]) for i in range(3)] + \
+                     [L.compile_global_layer(ws[3], cfg, cls.spec, cals[3])]
+
+    def test_two_tokens_through_the_four_layers(self) -> None:
+        # The first token FIRST at position 0 over a slot another context
+        # left, the second after it: two packets back to back from one slot,
+        # which the link runs one after the other, four layers each.
+        s_h = self.consts[0].s_h
+        tokens = [(p, np.rint(self.xs[p] / s_h).astype(np.int64), p == 0) for p in range(2)]
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            run = E.DieRun(work, self.cfg, self.consts, self.spec, self.mm_r, self.mm_g, tokens)
+            self.assertNotEqual(run.outputs[0].tolist(), tokens[0][1].tolist())
+            args = [f"-Ptb_layer_engine.{name}={value}" for name, value in run.params.items()]
+            subprocess.run(["iverilog", "-g2012", "-I", str(RTL), "-s", "tb_layer_engine", "-o", "sim.vvp", *args, *map(str, SOURCES)],
+                           cwd=work, check=True, capture_output=True, text=True)
+            out = subprocess.run(["vvp", "sim.vvp"], cwd=work, check=True, capture_output=True, text=True).stdout
+            self.assertIn("PASS", out, out)
+            self.assertEqual(run.check(work), [])
 
 
 @unittest.skipUnless(os.environ.get("FABRIC_FULL_SIZE") and shutil.which("iverilog"), "set FABRIC_FULL_SIZE=1 for the full-size run")
