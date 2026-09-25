@@ -21,7 +21,9 @@
 //   * each lane's slot as a page of the die's memory: the packet's context
 //     field is the controller's slot number, and a slot is SLOT_PAGES pages
 //     from PAGE_BASE on;
-//   * FIRST per lane, from the packet's flag.
+//   * FIRST per lane, from the packet's flag;
+//   * each lane's position, from the packet: the global layer's commands
+//     carry a token's place in its chunk and the engine adds it.
 //
 // The vector buffer is the engine's: this unit uses the memory unit's ports
 // while the engine is idle (`v_sel`), so a packet's payload waits on the
@@ -64,6 +66,7 @@ module fabric_die_link #(
     output reg  [15:0]       e_steps,
     output reg  [3:0]        e_first,
     output reg  [4*21-1:0]   e_slot_page,
+    output reg  [4*32-1:0]   e_position,
     input  wire              e_done,
     // the vector buffer, while the engine is idle
     output wire              v_sel,
@@ -178,7 +181,7 @@ module fabric_die_link #(
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             rstate <= R_HDR; xstate <= X_IDLE; lanes <= 0; cls <= 1'b0; wsub <= 0; quiet <= 0;
-            v_wr_en <= 1'b0; e_start <= 1'b0; e_pc <= 0; e_steps <= 0; e_first <= 0; e_slot_page <= 0;
+            v_wr_en <= 1'b0; e_start <= 1'b0; e_pc <= 0; e_steps <= 0; e_first <= 0; e_slot_page <= 0; e_position <= 0;
             t_hdr <= 1'b0; tlane <= 0; tleft <= 0; tfetch <= 0; rbusy <= 1'b0; have <= 1'b0; tsub <= 0;
             crc_errors <= 0; malformed <= 0;
         end else begin
@@ -245,6 +248,7 @@ module fabric_die_link #(
                     e_pc <= entry[15:0]; e_steps <= entry[31:16];
                     for (k = 0; k < 4; k = k + 1) begin
                         e_first[k] <= (k < lanes) && l_flags[k][1];                // FLAG_FIRST
+                        e_position[32*k +: 32] <= (k < lanes) ? l_position[k] : 32'd0;
                         e_slot_page[21*k +: 21] <= 21'(PAGE_BASE) + ((k < lanes) ? 21'(l_context[k]) * 21'(SLOT_PAGES) : 21'd0);
                     end
                     xstate <= X_START;

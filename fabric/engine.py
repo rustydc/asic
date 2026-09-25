@@ -599,11 +599,17 @@ class EngineRun:
     lane each, and the engine is started by ``fabric_die_link`` rather than
     the testbench: the buffer starts with no input in it, and what leaves
     on the link is checked against the model's packets (``ring_out.hex``).
-    ``position`` is the packets' position field."""
+
+    Each token in flight's position is the engine's to know at run time,
+    as its slot is: a global program's memory, rotary-table and attention
+    commands carry the token's place in its chunk, and the engine adds the
+    position it was started with.  The positions are the programs' own
+    (their memory steps say which), and go in as ``POS<k>``, or on the
+    packets through the ring."""
 
     def __init__(self, directory: Path, cfg, c, spec: TileSpec, mm: MemoryMap, steps: list[S.Step], inputs: dict,
                  memory: dict[str, tuple[bytes, bytes]] | None = None, ndev: int = 0, model_tiles: bool = False,
-                 first: bool = False, base_page: int = 0, ring: bool = False, position: int = 0) -> None:
+                 first: bool = False, base_page: int = 0, ring: bool = False) -> None:
         directory.mkdir(parents=True, exist_ok=True)
         self.cfg, self.steps, self.mm, self.ndev = cfg, steps, mm, ndev
         self.recurrent = isinstance(c, L.RecurrentConsts)
@@ -616,6 +622,7 @@ class EngineRun:
         _LAYOUTS[id(c)] = lay
         self.layout = Layout(steps, lay["sizes"], self.chunk, base_page)
         self.suffixes = sorted({"" if "@" not in key else "@" + key.split("@")[1] for key in inputs})
+        self.positions = {s.token or 0: s.ops["position"] for s in steps if s.ops and "position" in s.ops}
         # Images: the vector buffer holds each token's x, the memory its context.
         vb = bytearray(self.layout.vb_bytes)
         mem = bytearray(self.layout.mem_beats * BEAT)
@@ -671,12 +678,13 @@ class EngineRun:
                        "SCHEDULE_CYCLES": S.schedule(steps).cycles, **hpi_params,
                        # The tokens in flight: each one's slot, and FIRST for all of them or none.
                        **{f"SLOT{k}": page for k, page in self.layout.slot_pages().items()},
-                       "FIRST": ((1 << len(self.layout.region)) - 1) if first else 0}
+                       "FIRST": ((1 << len(self.layout.region)) - 1) if first else 0,
+                       **{f"POS{k}": pos for k, pos in self.positions.items()}}
         if ring:
-            self.params.update(self._ring(directory, inputs, first, base_page, position))
+            self.params.update(self._ring(directory, inputs, first, base_page))
         (directory / "params.json").write_text(json.dumps(self.params))
 
-    def _ring(self, directory: Path, inputs: dict, first: bool, base_page: int, position: int) -> dict:
+    def _ring(self, directory: Path, inputs: dict, first: bool, base_page: int) -> dict:
         """The packets in, a lane per token in flight, and the ones the model
         says leave; the die's program table; the link's parameters.  A lane's
         slot number is where its context's region is in the memory image: the
@@ -695,6 +703,7 @@ class EngineRun:
         ins, lengths, outs = [], [], []
         for k, sfx in enumerate(lanes):
             x = np.asarray(inputs["x" + sfx], dtype=np.int64).astype(np.int16)
+            position = self.positions.get(k, 0)
             packet = C.pack_item(C.WorkItem(slot[sfx], position, x, flags))
             ins += words(packet)
             lengths.append(len(packet) // 4)

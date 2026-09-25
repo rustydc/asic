@@ -26,15 +26,14 @@ SOURCES = [RTL / name for name in ("fabric_sram.sv", "fabric_vector.sv", "fabric
 
 
 def run_engine(case: unittest.TestCase, cfg, c, spec, mm, steps: list[S.Step], inputs: dict, memory=None, ndev: int = 0,
-               model_tiles: bool = False, log=None, first: bool = False, base_page: int = 0, ring: bool = False,
-               position: int = 0) -> int:
+               model_tiles: bool = False, log=None, first: bool = False, base_page: int = 0, ring: bool = False) -> int:
     """Emit, simulate and check one program; returns the engine's cycle count.  With ``ndev`` the memory is the HPI path,
     with ``model_tiles`` the tiles' behavioural columns (full-size runs), with ``first`` the token is FIRST, with ``ring``
     the tokens come and go as packets through the die's ring link."""
     with tempfile.TemporaryDirectory() as directory:
         work = Path(directory)
         t0 = time.time()
-        run = E.EngineRun(work, cfg, c, spec, mm, steps, inputs, memory, ndev, model_tiles, first, base_page, ring, position)
+        run = E.EngineRun(work, cfg, c, spec, mm, steps, inputs, memory, ndev, model_tiles, first, base_page, ring)
         args = [f"-Ptb_layer_engine.{name}={value}" for name, value in run.params.items()]
         t1 = time.time()
         subprocess.run(["iverilog", "-g2012", "-I", str(RTL), "-s", "tb_layer_engine", "-o", "sim.vvp", *args, *map(str, SOURCES)],
@@ -255,7 +254,7 @@ class EngineRtlTest(unittest.TestCase):
         inputs = {}
         for token, tokens in ((0, 3), (1, 1)):
             inputs.update({f"{k}@{token}": v for k, v in self.context_after(tokens).items()})
-        run_engine(self, self.cfg, self.c, self.spec, self.mm, two, inputs, base_page=37, ring=True, position=3)
+        run_engine(self, self.cfg, self.c, self.spec, self.mm, two, inputs, base_page=37, ring=True)
 
 
 @unittest.skipUnless(shutil.which("iverilog") and shutil.which("vvp"), "iverilog not installed")
@@ -335,12 +334,32 @@ class GlobalEngineRtlTest(unittest.TestCase):
         prog = S.global_program(self.cfg, self.c, self.spec, self.mm, 30, chunk=3)
         run_engine(self, self.cfg, self.c, self.spec, self.mm, prog, inputs, {"m_ctx": images})
 
+    def test_one_program_serves_every_position(self) -> None:
+        # The position is the engine's to know, as the slot is: the program's
+        # memory, rotary-table and attention commands carry a token's place
+        # in its chunk and the engine adds the position it is started with.
+        # So the image is the same byte for byte at every position, and the
+        # token is exact at one no other test runs.
+        images = []
+        for pos in (3, 31, 38):
+            with tempfile.TemporaryDirectory() as directory:
+                inputs, memory = self.context_at(pos)
+                prog = S.global_program(self.cfg, self.c, self.spec, self.mm, pos)
+                run = E.EngineRun(Path(directory), self.cfg, self.c, self.spec, self.mm, prog, inputs, {"m_ctx": memory})
+                self.assertEqual(run.params["POS0"], pos)
+                images.append((Path(directory) / "program.hex").read_text())
+        self.assertEqual(images[0], images[1])
+        self.assertEqual(images[0], images[2])
+        inputs, images38 = self.context_at(38)
+        prog = S.global_program(self.cfg, self.c, self.spec, self.mm, 38)
+        run_engine(self, self.cfg, self.c, self.spec, self.mm, prog, inputs, {"m_ctx": images38})
+
     def test_a_chunk_through_the_ring(self) -> None:
         # A prompt's chunk as one packet of three tokens: its three vectors
         # into the buffer, the chunk's program, and three out.
         inputs, images = self.chunk_at(30, 3)
         prog = S.global_program(self.cfg, self.c, self.spec, self.mm, 30, chunk=3)
-        run_engine(self, self.cfg, self.c, self.spec, self.mm, prog, inputs, {"m_ctx": images}, ring=True, position=30)
+        run_engine(self, self.cfg, self.c, self.spec, self.mm, prog, inputs, {"m_ctx": images}, ring=True)
 
     def test_a_first_token_over_a_used_slot(self) -> None:
         # FIRST at position 0 in a context image another context left behind:

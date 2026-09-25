@@ -1444,6 +1444,29 @@ slot, and a stream's tokens -- up to four in flight -- each in its own.
 A test emits the same program with the context at page 0 and at page 37,
 checks the two images are the same byte for byte, and runs the second.
 
+### The position at run time
+
+Nor does a program know its position. The global layer's used to carry
+it in three places: the rotary table's command, the memory unit's append,
+scan and rows commands, and the attention command's row count, which is
+the window and the blocks the position gives. Now each of them carries
+only the token's place in its chunk, and the token in flight it is for,
+and the engine is started with each token in flight's position as it is
+with its slot. The memory unit and the rotary table add the position when
+they take the command; the attention core works the row count out itself,
+`min(pos + 1, W)` window rows and `min(TOP, eligible)` blocks, over the
+two cycles after it takes the command, which is long before the queries
+and the gates are in and the count is first wanted. The memory unit
+already derived the window's runs and the record counts from the position
+it was given, so nothing else moved.
+
+So one global program serves every position, which a die needs: without
+it there would be a program for each of 128K positions. A test emits the
+program at positions 3, 31 and 38, checks the three images are the same
+byte for byte, and runs the token at 38, which no other test does; the
+stream of two contexts at positions 31 and 20 runs from one image too, and
+through the ring the position comes off the packet.
+
 ### The ring link on the die
 
 `rtl/fabric_die_link.sv` is a layer die's front end, between the ring and
@@ -1488,15 +1511,14 @@ lane is written before the batch's size is known, so every program of a
 shape must put lane k's input and output at the same buffer addresses;
 `engine.Layout` lays out one program, and a die's program set wants one
 layout over all of them (it wants that anyway: the buffer's banks are one
-set of parameters). And the global layer's program is compiled for a
-position -- the rotary table, the append and the scan take it as an
-operand, and the attention takes the row count it implies -- so the
-position in the packet has to reach those operands at run time the way the
-slot now does before one global program serves every position.
+set of parameters). And a die runs four layers, where the engine runs one
+program of one layer: nothing yet makes one layer's output the next one's
+input, points a layer's passes at its own weights and constants, or gives
+it its part of the slot.
 
 What is not covered yet: the ring's physical layer below the words (the
 source-synchronous clocking, the retry on a CRC failure), the management
-SPI that loads the dies' constants, the two above, the head dies' side of
+SPI that loads the dies' constants, the program set and the four layers above, the head dies' side of
 the ring, the queue engine in the gateware, and the Linux driver.
 
 ## RTL

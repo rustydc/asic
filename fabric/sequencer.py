@@ -105,8 +105,15 @@ WR_PORTS = {"tiles": 1, "norm": 1, "conv": 2, "gates": 1, "delta": 1,
             "swiglu": 1, "residual": 1, "rotary": 1, "attn": 1, "mem": 1}
 MEM_APPEND, MEM_SCAN, MEM_ROWS = 2, 3, 4   # the global layer's: append the token, scan the index, stream a head's rows
 MEM_PAGE_SHIFT = 7           # a memory page (the map's alignment) in beats: the context base travels as a page number
-MAX_TOKENS = 4               # tokens in flight the engine holds a slot for
-SLOT_TOKEN_SHIFT = 28        # a memory command's token in flight, in a3's top bits
+MAX_TOKENS = 4               # tokens in flight the engine holds a slot and a position for
+SLOT_TOKEN_SHIFT = 28        # a memory or rotary-table command's token in flight, in a3's top bits
+# An attention command's row count at run time: the window and the chosen
+# blocks the token's position gives, min(pos + 1, W) + min(TOP, eligible
+# blocks), with the token in flight at arg[29:28] and its place in a chunk
+# in arg[15:0].  The engine is started with each token's position; nothing
+# in the program depends on it, so one image serves every position.
+ATTN_ROWS_AT = 1 << 31
+POS_TOKEN_SHIFT = 28
 ROT_TABLE, ROT_HEAD = 0, 1   # the rotary unit's operations (arg[3:0]); arg[7:4] the head kind, 0 q and 1 k
 NORM_INT16 = 1 << 8          # the norm's input elements are int16 (else int8)
 NORM_GATED = 1 << 9          # the norm's gain is silu of the requantized int8 vector at arg[31:16]
@@ -887,7 +894,7 @@ def global_program(cfg, c: L.GlobalConsts | None, spec: TileSpec, mm: MemoryMap,
     for i in range(T):
         add(tok("rotary.table", i), "rotary", (), (_contrib("rot", chunk),), rd // 2 + t.rotary_table_latency,
             lambda e, i=i: put(e, "rot", i, L.rotary_table_int(pos + i, c.inv_freq)),
-            ops=operands(dst=("rot", i * 2 * rd), arg=ROT_TABLE, a3=pos + i, len=rd // 2))
+            ops=operands(dst=("rot", i * 2 * rd), arg=ROT_TABLE, a3=i, len=rd // 2))
         add(tok("norm.index_q", i), "norm", ("P1",), (_contrib("iq", chunk),), t.norm(idim),
             lambda e, i=i: put(e, "index_q_unit", i, L._norm(get(e, "index_q", i), c.unit_norm)),
             ops=operands(src=("P1", i * p1 + off_iq), dst=("iq", i * idim), arg=NORM_UNIT, len=idim // t.lanes))
@@ -913,14 +920,14 @@ def global_program(cfg, c: L.GlobalConsts | None, spec: TileSpec, mm: MemoryMap,
         add(tok("mem.append", i), "mem", ("k", "P1"), (), t.append(nkv, rec_beats, (p + 1) % mm.block == 0, first and p == 0,
                                                          -(-mm.sums_bytes // BEAT), -(-mm.index_record_bytes // BEAT)), nbytes=append_bytes,
             ops=operands(src=("k", i * nkv * hd), dst=("P1", i * p1 + off_ik), a2=("P1", i * p1 + off_v), a3=ctx,
-                         arg=[(0, MEM_APPEND), (4, p)]))
+                         arg=[(0, MEM_APPEND), (4, i)], position=pos))
         # The scan reads the index a page of records per request; the rows are the
         # window (head-major, page bursts) and one mean record per selected block.
         eligible = eligible_blocks(p, mm.local_window, mm.block)
         scan_bytes = eligible * mm.index_record_bytes
         add(tok("mem.scan", i), "mem", ("iq",), (_contrib("sel", chunk),), t.scan(eligible, mm.index_record_bytes // BEAT, min(cfg.top_blocks, eligible), mm.index_burst_records),
             lambda e, i=i: put(e, "selected", i, None), nbytes=scan_bytes,
-            ops=operands(src=("iq", i * idim), dst=("sel", i * sel_bytes), a3=ctx, arg=[(0, MEM_SCAN), (4, p)]))
+            ops=operands(src=("iq", i * idim), dst=("sel", i * sel_bytes), a3=ctx, arg=[(0, MEM_SCAN), (4, i)], position=pos))
         n_window, n_blocks = min(p + 1, mm.local_window), min(cfg.top_blocks, eligible)
         rows = n_window + n_blocks
         for n in range(nkv):
@@ -934,7 +941,8 @@ def global_program(cfg, c: L.GlobalConsts | None, spec: TileSpec, mm: MemoryMap,
                 t.read_records(window_requests(p, mm.local_window, mm.window_burst_records) + [1] * n_blocks, rec_beats, hd,
                                mm.window_burst_records),
                 mem_rows, nbytes=window_bytes + block_bytes,
-                ops=operands(src=("sel", i * sel_bytes), dst=(f"rows[{n}]", i * rows_bytes), a2=n, a3=ctx, arg=[(0, MEM_ROWS), (4, p)], len=rows))
+                ops=operands(src=("sel", i * sel_bytes), dst=(f"rows[{n}]", i * rows_bytes), a2=n, a3=ctx, arg=[(0, MEM_ROWS), (4, i)],
+                             position=pos))
 
             def attn(e, n=n, heads=heads, i=i):
                 q = np.stack([get(e, f"q[{h}]", i) for h in heads])
@@ -944,7 +952,8 @@ def global_program(cfg, c: L.GlobalConsts | None, spec: TileSpec, mm: MemoryMap,
             add(tok(f"attn[{n}]", i), "attn", (f"qg[{n}]", "P1", f"rows[{n}]"), ("+att",),
                 t.attention(rows, group, hd), attn, engine=n % UNITS["attn"][1],
                 ops=operands(src=(f"qg[{n}]", i * group * hd), dst=("att", i * nh * hd + n * group * hd),
-                             a2=("P1", i * p1 + n * group * 2 * hd + hd), a3=(f"rows[{n}]", i * rows_bytes), len=rows))
+                             a2=("P1", i * p1 + n * group * 2 * hd + hd), a3=(f"rows[{n}]", i * rows_bytes),
+                             arg=ATTN_ROWS_AT | i))
 
     def o_proj(e):
         for i in range(T):
@@ -1287,15 +1296,23 @@ def encode(steps: list[Step], layout=None) -> list[int]:
         assert step.cycles < (1 << 32) and step.engine < 16
         ops = step.ops if layout is not None and step.ops is not None else {}
         length = resolve_value(ops["len"], layout) if "len" in ops else min(step.cycles, 0xFFFF)
+        if layout is not None and "len" not in ops and step.unit in ("mem", "attn"):
+            length = 0                   # the unit takes its count from the position, not the program
         fields = {k: resolve_value(ops.get(k), layout) for k in ("arg", "src", "dst", "a2", "a3")}
         if layout is None:
             fields["arg"] = step.cycles
-        elif step.unit == "mem":
+        elif step.unit == "mem" or (step.unit == "rotary" and fields["arg"] & 0xF == ROT_TABLE):
             # Which token in flight the command is for: the engine adds that
-            # token's slot page to its memory addresses.
+            # token's slot page to the memory unit's addresses, and its
+            # position to the offset the memory unit and the rotary table
+            # are given (the token's place in a chunk).
             token = step.token or 0
             assert token < MAX_TOKENS and fields["a3"] < (1 << SLOT_TOKEN_SHIFT), step.name
             fields["a3"] |= token << SLOT_TOKEN_SHIFT
+        elif step.unit == "attn" and fields["arg"] & ATTN_ROWS_AT:
+            token = step.token or 0
+            assert token < MAX_TOKENS and (fields["arg"] & ~ATTN_ROWS_AT) < (1 << POS_TOKEN_SHIFT), step.name
+            fields["arg"] |= token << POS_TOKEN_SHIFT
         assert length < (1 << 16) and fields["arg"] < (1 << 32), step.name
         assert all(fields[k] < (1 << ADDR_BITS) for k in ("src", "dst", "a2", "a3")), step.name
         w = UNITS[step.unit][0] | (step.engine << 4) | (int(i == len(steps) - 1) << 8) | (length << 16)

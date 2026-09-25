@@ -1199,6 +1199,7 @@ module fabric_rotary_adapter #(
 ) (
     input  wire          clk,
     input  wire          rst_n,
+    input  wire [4*32-1:0] position,         // each token in flight's position; a table command names its token in a3[29:28]
     input  wire          cmd_valid,
     input  wire [29:0]   cmd_src,
     input  wire [29:0]   cmd_dst,
@@ -1280,7 +1281,7 @@ module fabric_rotary_adapter #(
             if (ldv) tab_r[j_d*128 +: 128] <= rd_data;
             case (state)
                 S_IDLE: if (cmd_valid) begin
-                    src <= cmd_src[AW-1:0]; dst <= cmd_dst[AW-1:0]; kind <= cmd_arg[7:4]; tab_addr <= cmd_a2[AW-1:0]; pos <= {2'd0, cmd_a3};
+                    src <= cmd_src[AW-1:0]; dst <= cmd_dst[AW-1:0]; kind <= cmd_arg[7:4]; tab_addr <= cmd_a2[AW-1:0]; pos <= position[32*cmd_a3[29:28] +: 32] + {4'd0, cmd_a3[27:0]};
                     consts_r <= consts[cmd_arg[4]]; tag <= cmd_tag; i <= 0; o <= 0; j <= 0;
                     if (cmd_arg[3:0] == 0) begin tstart <= 1'b1; state <= S_TABLE; end
                     else state <= S_LOADT;
@@ -1332,10 +1333,14 @@ module fabric_attn_adapter #(
     parameter int L  = 8,
     parameter int LW = 28,
     parameter int AW = 16,
+    parameter int W  = 16,                      // the window, the block and the blocks chosen: the rows a position gives
+    parameter int BS = 4,
+    parameter int TOP = 2,
     parameter     LUT_DIR = "./"
 ) (
     input  wire          clk,
     input  wire          rst_n,
+    input  wire [4*32-1:0] position,         // each token in flight's position
     input  wire          cmd_valid,
     input  wire [15:0]   cmd_len,
     input  wire [29:0]   cmd_src,
@@ -1362,6 +1367,17 @@ module fabric_attn_adapter #(
     reg [AW-1:0] src, dst, gate, rows;
     reg [15:0]   n, r, o;
     reg [7:0]    tag, g, b;
+    // The row count.  With arg[31] it is the position's, which the program
+    // cannot know: min(pos + 1, W) window rows and min(TOP, eligible)
+    // blocks, where a block is eligible once its last position is W before
+    // this one.  Worked out over the first two cycles; nothing asks for it
+    // before the queries and the gates are in, 2 G HD / L beats later.
+    localparam int LOG_BS = (BS > 1) ? $clog2(BS) : 0;
+    reg                at_pos;
+    reg [31:0]         rp;
+    reg signed [32:0]  span;
+    reg [15:0]         wn;
+    wire [31:0]        elig = span[32] ? 32'd0 : 32'(span >>> LOG_BS);
     reg [1:0]    phase;
     reg          start, finish;
     reg [65:0]   k;
@@ -1406,9 +1422,17 @@ module fabric_attn_adapter #(
                 S_IDLE: if (cmd_valid) begin
                     src <= cmd_src[AW-1:0]; dst <= cmd_dst[AW-1:0]; gate <= cmd_a2[AW-1:0]; rows <= cmd_a3[AW-1:0]; n <= cmd_len; tag <= cmd_tag;
                     k <= consts[0]; phase <= 0; g <= 0; b <= 0; r <= 0; o <= 0; start <= 1'b1; state <= S_START;
+                    at_pos <= cmd_arg[31];
+                    rp <= position[32*cmd_arg[29:28] +: 32] + {16'd0, cmd_arg[15:0]};
                 end
-                S_START: state <= S_RUN;
+                S_START: begin
+                    span <= $signed({1'b0, rp}) - W + 1;
+                    wn <= (rp + 1 > W) ? 16'(W) : 16'(rp + 1);
+                    state <= S_RUN;
+                end
                 S_RUN: if (issue) begin
+                    if (at_pos && phase == 2'd0 && g == 0 && b == 0)
+                        n <= wn + ((elig > TOP) ? 16'(TOP) : 16'(elig));
                     // The counters name the next beat to ask for.
                     if (b != BEATS - 1) b <= b + 1'b1;
                     else begin
@@ -1436,7 +1460,8 @@ module fabric_attn_adapter #(
 endmodule
 
 // ---------------------------------------------------------------------------
-// The memory unit.  arg[3:0] is the operation, arg[31:4] the position and
+// The memory unit.  arg[3:0] is the operation, arg[31:4] the token's place
+// in its chunk (the engine's position for the token is added) and
 // a3 the context's memory page (2 KB units) where the global layer needs
 // them:
 //   0  memory beats src (a beat address) to the buffer at dst, len beats
@@ -1480,6 +1505,7 @@ module fabric_mem_unit #(
     // program image serves a context in any slot.
     input  wire [4*21-1:0] slot_page,
     input  wire [3:0]    first,
+    input  wire [4*32-1:0] position,         // and its position: arg[31:4] is the token's place in its chunk
     input  wire          cmd_valid,
     input  wire [15:0]   cmd_len,
     input  wire [29:0]   cmd_src,
@@ -1782,7 +1808,7 @@ module fabric_mem_unit #(
             if (rr_rec_done) begin rw_rec <= rw_rec + 1'b1; rw_ob <= 0; end
             case (state)
                 S_IDLE: if (cmd_valid) begin
-                    op <= cmd_arg[3:0]; pos <= {4'd0, cmd_arg[31:4]}; ctx_base <= {cmd_a3[20:0] + cmd_page, 11'd0};
+                    op <= cmd_arg[3:0]; pos <= position[32*cmd_tok +: 32] + {4'd0, cmd_arg[31:4]}; ctx_base <= {cmd_a3[20:0] + cmd_page, 11'd0};
                     cmd_first <= first[cmd_tok];
                     n <= cmd_len; src <= cmd_src[AW-1:0]; dst <= cmd_dst[AW-1:0]; arg_lo <= cmd_a2[AW-1:0]; head <= cmd_a2[7:0]; tag <= cmd_tag;
                     case (cmd_arg[3:0])
@@ -1923,6 +1949,7 @@ module fabric_layer_engine #(
     input  wire         start,
     input  wire [3:0]   first,               // FIRST, per token in flight (latched at start)
     input  wire [4*21-1:0] slot_page,        // each token in flight's slot, in 2 KB pages (latched at start)
+    input  wire [4*32-1:0] position,         // each token in flight's position (latched at start)
     input  wire [15:0]  pc_start,            // the program's first step
     input  wire [15:0]  n_steps,
     output wire         running,
@@ -2012,9 +2039,10 @@ module fabric_layer_engine #(
     wire [127:0] mem_rd_hi, mem_wr_hi;               // the memory unit's second word: the buffer's wide port
     reg  [3:0]      first_r;
     reg  [4*21-1:0] slot_r;
+    reg  [4*32-1:0] pos_r;
     always @(posedge clk or negedge rst_n)
-        if (!rst_n) begin first_r <= 4'd0; slot_r <= 0; end
-        else if (start) begin first_r <= first; slot_r <= slot_page; end
+        if (!rst_n) begin first_r <= 4'd0; slot_r <= 0; pos_r <= 0; end
+        else if (start) begin first_r <= first; slot_r <= slot_page; pos_r <= position; end
     wire [15:0]  mem_wr_hi_be;
     fabric_vb #(.BYTES(VB_BYTES), .NR(NR), .NW(NW), .AW(AW), .NB(VB_BANKS), .BSH(VB_BANK_SHIFT),
                 .RCAP2(VB_RCAP2), .RCAP3(VB_RCAP3), .WCAP2(VB_WCAP2),
@@ -2069,7 +2097,7 @@ module fabric_layer_engine #(
         end
         for (e = 0; e < 2; e = e + 1) begin : g_rotary
             fabric_rotary_adapter #(.HD(HD), .R(RD), .NL(ATT_L), .SW(SW), .AW(AW), .LUT_DIR(LUT_DIR)) u (
-                .clk(clk), .rst_n(rst_n), .cmd_valid(cmd_valid[U_ROTARY] && cmd_engine == e), .cmd_src(cmd_src), .cmd_dst(cmd_dst),
+                .clk(clk), .rst_n(rst_n), .position(pos_r), .cmd_valid(cmd_valid[U_ROTARY] && cmd_engine == e), .cmd_src(cmd_src), .cmd_dst(cmd_dst),
                 .cmd_a2(cmd_a2), .cmd_a3(cmd_a3), .cmd_arg(cmd_arg), .cmd_tag(cmd_tag), .cmd_ready(ready_rotary[e]),
                 .done_valid(done_valid[U_ROTARY*NE + e]), .done_tag(done_tag[(U_ROTARY*NE + e)*8 +: 8]),
                 .rd_addr(rd_addr[(R_ROTARY + e)*AW +: AW]), .rd_data(rd_data[(R_ROTARY + e)*128 +: 128]),
@@ -2077,8 +2105,8 @@ module fabric_layer_engine #(
                 .wr_be(wr_be[(W_ROTARY + e)*16 +: 16]));
         end
         for (e = 0; e < NE; e = e + 1) begin : g_attn
-            fabric_attn_adapter #(.HD(HD), .G(GROUP), .L(ATT_L), .AW(AW), .LUT_DIR(LUT_DIR)) u (
-                .clk(clk), .rst_n(rst_n), .cmd_valid(cmd_valid[U_ATTN] && cmd_engine == e), .cmd_len(cmd_len), .cmd_src(cmd_src),
+            fabric_attn_adapter #(.HD(HD), .G(GROUP), .L(ATT_L), .AW(AW), .W(W), .BS(BS), .TOP(TOP), .LUT_DIR(LUT_DIR)) u (
+                .clk(clk), .rst_n(rst_n), .position(pos_r), .cmd_valid(cmd_valid[U_ATTN] && cmd_engine == e), .cmd_len(cmd_len), .cmd_src(cmd_src),
                 .cmd_dst(cmd_dst), .cmd_a2(cmd_a2), .cmd_a3(cmd_a3), .cmd_arg(cmd_arg), .cmd_tag(cmd_tag), .cmd_ready(ready_attn[e]),
                 .done_valid(done_valid[U_ATTN*NE + e]), .done_tag(done_tag[(U_ATTN*NE + e)*8 +: 8]),
                 .rd_addr(rd_addr[(R_ATTN + e)*AW +: AW]), .rd_data(rd_data[(R_ATTN + e)*128 +: 128]),
@@ -2141,7 +2169,7 @@ module fabric_layer_engine #(
     fabric_mem_unit #(.HD(HD), .NKV(NKV), .IDIM(IDIM), .BS(BS), .W(W), .TOP(TOP), .KV_BITS(KV_BITS), .L(ATT_L), .REC_BYTES(REC_BYTES),
                       .RPB(RPB), .MAXR(MAXR), .WINDOW_OFF(WINDOW_OFF), .BLOCK_OFF(BLOCK_OFF), .INDEX_OFF(INDEX_OFF), .SUMS_OFF(SUMS_OFF),
                       .AW(AW), .LUT_DIR(LUT_DIR)) u_mem (
-        .clk(clk), .rst_n(rst_n), .slot_page(slot_r), .first(first_r), .cmd_valid(cmd_valid[U_MEM] && cmd_engine == 0), .cmd_len(cmd_len), .cmd_src(cmd_src), .cmd_dst(cmd_dst),
+        .clk(clk), .rst_n(rst_n), .slot_page(slot_r), .first(first_r), .position(pos_r), .cmd_valid(cmd_valid[U_MEM] && cmd_engine == 0), .cmd_len(cmd_len), .cmd_src(cmd_src), .cmd_dst(cmd_dst),
         .cmd_a2(cmd_a2), .cmd_a3(cmd_a3), .cmd_arg(cmd_arg), .cmd_tag(cmd_tag), .cmd_ready(ready_mem), .done_valid(done_valid[U_MEM*NE]), .done_tag(done_tag[U_MEM*NE*8 +: 8]),
         .rd_addr(mu_rd_addr), .rd_en(mu_rd_en), .rd_data(rd_data[R_MEM*128 +: 128]), .rd_hi(mem_rd_hi),
         .wr_en(mu_wr_en), .wr_addr(mu_wr_addr), .wr_data(mu_wr_data), .wr_be(mu_wr_be),
