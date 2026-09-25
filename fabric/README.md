@@ -814,8 +814,8 @@ global-layer traffic is about 2.5 times what this memory side moves and
 the memory-bound sweeps in `sim/README.md` are pessimistic on the global
 side until the selected-position count follows this map.
 
-Not here: error detection on the stored state, and context allocation and
-eviction, which the FPGA owns. The sequencer that orders the units across
+Not here: error detection on the stored state, and which conversation is
+in which slot, which the host decides (the host's queues below). The sequencer that orders the units across
 a token and the memory controller and PHY for the chosen device are in
 their own sections below.
 
@@ -1277,13 +1277,13 @@ The appliance is a ring of dies behind one FPGA, and the FPGA is a part of
 the product rather than a stage of its development: it terminates PCIe,
 turns a token into the hidden vector that enters the ring, decides which
 context's token goes next, takes the two head dies' lists off the item
-that comes back and draws the next token from them, and keeps the table of
-which context holds which slot of the dies' memories. `controller.py` is
+that comes back and draws the next token from them, and keeps each slot's
+turn going. `controller.py` is
 its model, in the way `sequencer.py` is the token sequencer's, and
 `rtl/fabric_controller.sv` is the part of it that is arithmetic, checked
-against the model bit for bit. The rest -- the scheduler, the slot table,
-the host protocol -- is the FPGA's soft side, and the model is its
-specification.
+against the model bit for bit. The rest -- the scheduler, the slots'
+state, the host protocol -- is gateware still to write, and the model is
+its specification.
 
 Three contracts are fixed here that the dies must honour, because they are
 the ring's protocol and not the controller's alone.
@@ -1322,16 +1322,15 @@ token, against the simulator's 500-cycle allowance, and seventy cases at
 two geometries -- warm and cold, with ties, with partial lists, with top-p
 on half -- draw the row and the index the model draws.
 
-The embedding table is the DDR4 behind the FPGA: `vocab x hidden x 2`
-bytes, 2.03 GB for the 9B, one row a lookup. The slot table gives a
-context its own slot if it has one, a free one if any, else the least
-recently used slot whose holder is not in flight, and reports the
-eviction; an evicted context that has more to say starts over from its
-first token with FIRST set, which is the host's to avoid by sizing the
-resident set and the table's to report. The scheduler is round robin over
-the contexts with a token to send, one item into the ring whenever its
-first die is free, so every die works on a different context's token and
-one conversation sees the ring's latency.
+The embedding table is DRAM behind the FPGA -- DDR3 on the Artix-7 the
+controller is planned for; the rate is a row of 8 KB a token --
+`vocab x hidden x 2` bytes, 2.03 GB for the 9B, one row a lookup. The
+controller keeps, per slot, only what the ring needs: the tokens known and
+not yet sent (a turn's prompt, the last token drawn), the next position,
+and the turn's sampling parameters, stop tokens and count. The scheduler is
+round robin over the slots with a token to send, one packet into the ring
+whenever its first die is free, so every die works on a different slot's
+token and one conversation sees the ring's latency.
 
 A prompt's tokens are all known, so a context's prompt does not wait for
 each to come back: its packets go in back to back and fill the ring by
@@ -1393,24 +1392,29 @@ change if the part is tight. `fabric.fpga` runs that measurement.
 drives an NVMe drive: a submission ring of 64-byte commands and a
 completion ring of 16-byte entries in host memory, a doorbell each, and a
 phase bit on every completion so the host reads new entries without a count
-from the device. The commands are IDENTIFY, OPEN (a context, with its
-sampling parameters and up to four stop tokens), APPEND (a turn: tokens from
-a host buffer, then up to `max_new` sampled), CANCEL and CLOSE. Every
+from the device. The commands are IDENTIFY (the slots, the vocabulary, the
+positions a slot holds), APPEND (a turn in a slot: tokens from a host
+buffer, then up to `max_new` sampled, with the turn's sampling parameters
+and up to four stop tokens) and CANCEL. Every
 sampled token is a completion of its own, posted as soon as it is drawn,
 with its log-probability; the last of a turn is marked. The device never
 writes over a completion the host has not consumed -- tokens wait on the
 device instead -- so a slow reader costs latency, not data.
 
-A context is resident between turns: its state stays on the dies and the
-next APPEND carries only what is new. It keeps its slot until the slot is
-needed and it is between turns; a context is never evicted mid-turn, since
-it would have to start over and two contexts on one slot would evict each
-other for ever. One that lost its slot starts its next turn from its first
-token, marked FIRST -- even when it is given the same slot back -- which
-the controller does by itself, since it keeps every context's tokens.
-`host.Device` and `host.Driver` model the two sides over a byte array
-standing in for host memory, for the gateware and the Linux driver to be
-checked against.
+The device advertises N slots and the host addresses them itself. A slot
+keeps its context between turns, so the next APPEND to it carries only
+what is new, and the last token drawn goes in first. APPEND with FRESH
+starts the slot from zero -- its first packet is FIRST -- which is how a
+slot changes hands: the host gives a slot to another conversation by
+sending that conversation's whole history FRESH. So the device keeps no
+table of conversations and no history, and evicting one costs it nothing;
+it costs the host a prefill, which is why the choice is the host's, which
+knows which conversations are live and which will come back. The device
+refuses an APPEND to a slot mid-turn (BUSY) and one that would run past the
+slot's positions (TOO_LONG). `host.Slots` is a driver's policy, the least
+recently used idle slot given away; `host.Device` and `host.Driver` model
+the two sides over a byte array standing in for host memory, for the
+gateware and the Linux driver to be checked against.
 
 ### FIRST on the die
 

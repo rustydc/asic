@@ -14,19 +14,30 @@ NVMe drive, through a pair of rings in its own memory and two doorbells:
   which is what lets the device reuse the slots.  The device never writes an
   entry the host has not consumed: completions wait on the device instead.
 
+The device has N slots, which IDENTIFY reports: each is one resident
+context's state on the dies, up to ``max_tokens`` positions.  The host
+addresses them directly and decides what is in each -- which
+conversation, and when to give its slot to another.  A slot keeps its
+context between turns, so the next APPEND to it carries only what is new;
+APPEND with FRESH starts the slot from zero, which is how a slot changes
+hands, and the new conversation's whole history comes with it.  The device
+keeps no history and no table of conversations: evicting one is reusing
+its slot, which costs the device nothing and the host a prefill, and so is
+the host's to decide.
+
 Every entry is little-endian.  A command:
 
-    0   opcode   u8     IDENTIFY, OPEN, APPEND, CANCEL, CLOSE
-    1   flags    u8     (none yet)
+    0   opcode   u8     IDENTIFY, APPEND, CANCEL
+    1   flags    u8     APPEND: FRESH, start the slot from zero
     2   cmd_id   u16    the host's, echoed in every completion the command makes
-    4   ctx      u32    the context, for APPEND, CANCEL and CLOSE
+    4   slot     u32    APPEND, CANCEL
     8   addr     u64    host memory: the tokens for APPEND (u32 each), the page for IDENTIFY
     16  count    u32    tokens at addr
     20  max_new  u32    tokens to sample after them (APPEND; at least one)
-    24  inv_t    u32    OPEN: 1 / temperature in F16, as the sampler takes it
+    24  inv_t    u32    1 / temperature in F16, as the sampler takes it
     28  top_k    u16
     30  top_p    u16    in U16: 0xFFFF is 1.0
-    32  n_stops  u16    OPEN: tokens that end a turn when sampled, up to four
+    32  n_stops  u16    tokens that end the turn when sampled, up to four
     34  reserved u16
     36  stops    4 x u32
     52  reserved
@@ -35,20 +46,18 @@ A completion:
 
     0   token    u32    the sampled token (TOKEN set)
     4   logprob  i32    its log-probability, LOGPROB_FRAC fraction bits
-    8   ctx      u16    the context (OPEN's new one)
+    8   slot     u16
     10  cmd_id   u16
     12  sq_head  u16    the SQ entries the device has fetched: the host's room
     14  status   u8     OK, or why not
-    15  flags    u8     PHASE, TOKEN (a token is in the entry), LAST (the command is finished)
+    15  flags    u8     PHASE, TOKEN (a token is in the entry), LAST (the command is finished), CANCELLED
 
-IDENTIFY, OPEN, CANCEL and CLOSE each complete once, LAST set.  APPEND
-completes once per sampled token, the turn's last with LAST -- a token as
-soon as it is drawn, which is the stream a chat interface shows -- or once
-with an error.  A context is resident between turns: its state stays on
-the dies, so the next APPEND carries only what is new.  Resident contexts
-keep their slots until the slots are needed; one that lost its slot starts
-its next turn from its first token, which the controller does by itself
-(it keeps every context's tokens), so the host sees latency, not an error.
+IDENTIFY and CANCEL each complete once, LAST set.  APPEND completes once
+per sampled token, the turn's last with LAST -- a token as soon as it is
+drawn, which is the stream a chat interface shows -- or once with an
+error: BAD_SLOT, BUSY (the slot is mid-turn), BAD_ARGUMENT (no tokens and
+nothing to go on from, max_new of zero, a token outside the vocabulary),
+TOO_LONG (the turn would run past the slot's positions).
 
 The model below is the device's side (``Device``) and a driver's
 (``Driver``), over a byte array standing in for host memory; the gateware
@@ -66,9 +75,11 @@ from typing import Sequence
 from fabric import controller as C
 
 # Opcodes.
-IDENTIFY, OPEN, APPEND, CANCEL, CLOSE = 0x01, 0x02, 0x03, 0x04, 0x05
+IDENTIFY, APPEND, CANCEL = 0x01, 0x03, 0x04
+# Command flags.
+FRESH = 0x01
 # Status.
-OK, BAD_OPCODE, BAD_CONTEXT, BUSY, BAD_ARGUMENT, NO_CONTEXTS = 0, 1, 2, 3, 4, 5
+OK, BAD_OPCODE, BAD_SLOT, BUSY, BAD_ARGUMENT, TOO_LONG = 0, 1, 2, 3, 4, 5
 # Completion flags.
 PHASE, TOKEN, LAST, CANCELLED = 0x01, 0x02, 0x04, 0x08
 
@@ -77,10 +88,10 @@ LOGPROB_FRAC = 16
 MAX_STOPS = 4
 IDENTIFY_BYTES = 4096
 MAGIC = 0x43495341                  # "ASIC"
-VERSION = 1
+VERSION = 2                         # 2: slots addressed by the host
 
 # Registers, 32 bits each, in the device's BAR 0.
-REG_ID, REG_VERSION, REG_CONTEXTS, REG_VOCAB = 0x000, 0x004, 0x008, 0x00C
+REG_ID, REG_VERSION, REG_SLOTS, REG_VOCAB = 0x000, 0x004, 0x008, 0x00C
 REG_SQ_BASE_LO, REG_SQ_BASE_HI, REG_SQ_SIZE = 0x010, 0x014, 0x018
 REG_CQ_BASE_LO, REG_CQ_BASE_HI, REG_CQ_SIZE = 0x01C, 0x020, 0x024
 REG_ENABLE, REG_STATUS = 0x028, 0x02C
@@ -96,7 +107,7 @@ assert _SQ.size == SQ_ENTRY and _CQ.size == CQ_ENTRY
 class Command:
     opcode: int
     cmd_id: int = 0
-    ctx: int = 0
+    slot: int = 0
     addr: int = 0
     count: int = 0
     max_new: int = 0
@@ -110,18 +121,18 @@ class Command:
         if len(self.stops) > MAX_STOPS:
             raise ValueError(f"at most {MAX_STOPS} stop tokens")
         stops = list(self.stops) + [0] * (MAX_STOPS - len(self.stops))
-        return _SQ.pack(self.opcode, self.flags, self.cmd_id, self.ctx, self.addr, self.count, self.max_new,
+        return _SQ.pack(self.opcode, self.flags, self.cmd_id, self.slot, self.addr, self.count, self.max_new,
                         self.inv_t, self.top_k, self.top_p, len(self.stops), *stops)
 
     @classmethod
     def unpack(cls, raw: bytes) -> "Command":
-        (op, flags, cmd_id, ctx, addr, count, max_new, inv_t, top_k, top_p, n_stops, *stops) = _SQ.unpack(raw)
-        return cls(op, cmd_id, ctx, addr, count, max_new, inv_t, top_k, top_p, tuple(stops[:min(n_stops, MAX_STOPS)]), flags)
+        (op, flags, cmd_id, slot, addr, count, max_new, inv_t, top_k, top_p, n_stops, *stops) = _SQ.unpack(raw)
+        return cls(op, cmd_id, slot, addr, count, max_new, inv_t, top_k, top_p, tuple(stops[:min(n_stops, MAX_STOPS)]), flags)
 
 
 @dataclass
 class Completion:
-    ctx: int
+    slot: int
     cmd_id: int
     status: int = OK
     flags: int = 0
@@ -130,12 +141,12 @@ class Completion:
     sq_head: int = 0
 
     def pack(self) -> bytes:
-        return _CQ.pack(self.token, self.logprob, self.ctx, self.cmd_id, self.sq_head, self.status, self.flags)
+        return _CQ.pack(self.token, self.logprob, self.slot, self.cmd_id, self.sq_head, self.status, self.flags)
 
     @classmethod
     def unpack(cls, raw: bytes) -> "Completion":
-        token, logprob, ctx, cmd_id, sq_head, status, flags = _CQ.unpack(raw)
-        return cls(ctx, cmd_id, status, flags, token, logprob, sq_head)
+        token, logprob, slot, cmd_id, sq_head, status, flags = _CQ.unpack(raw)
+        return cls(slot, cmd_id, status, flags, token, logprob, sq_head)
 
 
 def logprob_fixed(lp: float) -> int:
@@ -163,17 +174,16 @@ class Device:
     """The controller's host side: its registers, the fetch of commands and
     the posting of completions, over the controller model."""
 
-    def __init__(self, ctl: C.Controller, memory: HostMemory, max_contexts: int = 1024) -> None:
-        self.ctl, self.mem, self.max_contexts = ctl, memory, max_contexts
-        self.regs = {REG_ID: MAGIC, REG_VERSION: VERSION, REG_CONTEXTS: max_contexts, REG_VOCAB: ctl.embedding.vocab,
+    def __init__(self, ctl: C.Controller, memory: HostMemory) -> None:
+        self.ctl, self.mem = ctl, memory
+        self.regs = {REG_ID: MAGIC, REG_VERSION: VERSION, REG_SLOTS: len(ctl.slots), REG_VOCAB: ctl.embedding.vocab,
                      REG_SQ_BASE_LO: 0, REG_SQ_BASE_HI: 0, REG_SQ_SIZE: 0, REG_CQ_BASE_LO: 0, REG_CQ_BASE_HI: 0,
                      REG_CQ_SIZE: 0, REG_ENABLE: 0, REG_STATUS: 0}
         self.sq_head = self.sq_tail = 0
         self.cq_tail = self.cq_head = 0
         self.phase = 1
         self.pending: deque[Completion] = deque()           # completions waiting for room in the CQ
-        self.turn_cmd: dict[int, int] = {}                   # context -> the APPEND its tokens complete
-        self.cancelled: set[int] = set()
+        self.turn_cmd: dict[int, int] = {}                   # slot -> the APPEND its tokens complete
         self.interrupts = 0
         ctl.on_token = self._token
 
@@ -218,52 +228,42 @@ class Device:
 
     def _execute(self, cmd: Command) -> None:
         ctl = self.ctl
-        done = lambda status=OK, ctx=cmd.ctx: self._post(Completion(ctx, cmd.cmd_id, status, LAST))
+        done = lambda status=OK, flags=0: self._post(Completion(cmd.slot, cmd.cmd_id, status, LAST | flags))
         if cmd.opcode == IDENTIFY:
-            page = struct.pack("<IIIIII", MAGIC, VERSION, self.max_contexts, ctl.embedding.vocab,
-                               ctl.table.slots, ctl.embedding.hidden)
+            page = struct.pack("<IIIIII", MAGIC, VERSION, len(ctl.slots), ctl.embedding.vocab, ctl.embedding.hidden,
+                               ctl.max_tokens)
             self.mem.write(cmd.addr, page + bytes(IDENTIFY_BYTES - len(page)))
             done()
-        elif cmd.opcode == OPEN:
-            open_now = sum(1 for c in ctl.contexts.values() if c.keep)
-            if open_now >= self.max_contexts:
-                done(NO_CONTEXTS, 0)
-                return
-            params = C.SamplingParams(cmd.inv_t, cmd.top_k, cmd.top_p)
-            done(OK, ctl.open(params, cmd.stops))
-        elif cmd.opcode in (APPEND, CANCEL, CLOSE):
-            ctx = ctl.contexts.get(cmd.ctx)
-            if ctx is None or not ctx.keep:
-                done(BAD_CONTEXT)
+        elif cmd.opcode in (APPEND, CANCEL):
+            if cmd.slot >= len(ctl.slots):
+                done(BAD_SLOT)
             elif cmd.opcode == APPEND:
-                if not ctx.done:
+                s = ctl.slots[cmd.slot]
+                raw = self.mem.read(cmd.addr, 4 * cmd.count)
+                tokens = list(struct.unpack(f"<{cmd.count}I", raw))
+                fresh = bool(cmd.flags & FRESH)
+                if s.busy:
                     done(BUSY)
-                elif cmd.max_new < 1:
+                elif cmd.max_new < 1 or any(t >= ctl.embedding.vocab for t in tokens) \
+                        or not (tokens or (s.pending and not fresh)):
                     done(BAD_ARGUMENT)
+                elif not ctl.fits(cmd.slot, len(tokens), cmd.max_new, fresh):
+                    done(TOO_LONG)
                 else:
-                    raw = self.mem.read(cmd.addr, 4 * cmd.count)
-                    tokens = list(struct.unpack(f"<{cmd.count}I", raw))
-                    if any(t >= ctl.embedding.vocab for t in tokens):
-                        done(BAD_ARGUMENT)
-                        return
-                    self.turn_cmd[cmd.ctx] = cmd.cmd_id
-                    self.cancelled.discard(cmd.ctx)
-                    ctl.append(cmd.ctx, tokens, cmd.max_new)
-            elif cmd.opcode == CANCEL:
-                if not ctx.done:
-                    self.cancelled.add(cmd.ctx)
-                    ctl.cancel(cmd.ctx)
-                done()
+                    self.turn_cmd[cmd.slot] = cmd.cmd_id
+                    ctl.append(cmd.slot, tokens, cmd.max_new, C.SamplingParams(cmd.inv_t, cmd.top_k, cmd.top_p),
+                               cmd.stops, fresh)
             else:
-                ctl.close(cmd.ctx)
+                if ctl.cancel(cmd.slot):                     # nothing left to draw: the turn ends here
+                    self._post(Completion(cmd.slot, self.turn_cmd.get(cmd.slot, 0), OK, LAST | CANCELLED))
                 done()
         else:
             done(BAD_OPCODE)
 
     # --- completions
-    def _token(self, cid: int, token: int, lp: float, position: int, last: bool) -> None:
-        flags = TOKEN | (LAST if last else 0) | (CANCELLED if last and cid in self.cancelled else 0)
-        self._post(Completion(cid, self.turn_cmd.get(cid, 0), OK, flags, token, logprob_fixed(lp)))
+    def _token(self, slot: int, token: int, lp: float, position: int, last: bool) -> None:
+        flags = TOKEN | (LAST if last else 0) | (CANCELLED if last and self.ctl.slots[slot].cancelled else 0)
+        self._post(Completion(slot, self.turn_cmd.get(slot, 0), OK, flags, token, logprob_fixed(lp)))
 
     def _post(self, cmp: Completion) -> None:
         self.pending.append(cmp)
@@ -346,18 +346,45 @@ class Driver:
         self.buf_next += IDENTIFY_BYTES
         return self.submit(Command(IDENTIFY, addr=self.identify_page))
 
-    def open(self, params: C.SamplingParams = C.SamplingParams(), stops: Sequence[int] = ()) -> int:
-        return self.submit(Command(OPEN, stops=tuple(stops), **sampling_fields(params)))
+    def append(self, slot: int, tokens: Sequence[int], max_new: int, params: C.SamplingParams = C.SamplingParams(),
+               stops: Sequence[int] = (), fresh: bool = False) -> int:
+        addr = self._buffer(struct.pack(f"<{len(tokens)}I", *tokens)) if tokens else 0
+        return self.submit(Command(APPEND, slot=slot, addr=addr, count=len(tokens), max_new=max_new, stops=tuple(stops),
+                                   flags=FRESH if fresh else 0, **sampling_fields(params)))
 
-    def append(self, ctx: int, tokens: Sequence[int], max_new: int) -> int:
-        addr = self._buffer(struct.pack(f"<{len(tokens)}I", *tokens))
-        return self.submit(Command(APPEND, ctx=ctx, addr=addr, count=len(tokens), max_new=max_new))
+    def cancel(self, slot: int) -> int:
+        return self.submit(Command(CANCEL, slot=slot))
 
-    def cancel(self, ctx: int) -> int:
-        return self.submit(Command(CANCEL, ctx=ctx))
 
-    def close(self, ctx: int) -> int:
-        return self.submit(Command(CLOSE, ctx=ctx))
+class Slots:
+    """What the driver keeps: which conversation is in which slot, least
+    recently used first.  A conversation placed fresh goes with its whole
+    history, which the host has.  The policy is the host's to change; this
+    one gives the least recently used idle slot away."""
+
+    def __init__(self, n: int) -> None:
+        self.n = n
+        self.holder: dict[int, object] = {}               # slot -> conversation
+        self.order: list[int] = []                        # slots, least recently used first
+
+    def place(self, conv, busy=lambda slot: False) -> tuple[int, bool] | None:
+        """A slot for ``conv`` and whether it must start fresh: its own, a
+        free one, or the least recently used idle one.  None if every slot
+        is mid-turn."""
+        for slot, who in self.holder.items():
+            if who == conv:
+                self.order.remove(slot)
+                self.order.append(slot)
+                return slot, False
+        free = [k for k in range(self.n) if k not in self.holder]
+        slot = free[0] if free else next((k for k in self.order if not busy(k)), None)
+        if slot is None:
+            return None
+        if slot in self.order:
+            self.order.remove(slot)
+        self.holder[slot] = conv
+        self.order.append(slot)
+        return slot, True
 
 
 def run(dev: Device, drv: Driver, until, max_steps: int = 200_000) -> list[Completion]:

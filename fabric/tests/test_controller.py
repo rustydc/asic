@@ -121,16 +121,23 @@ class SampleTest(unittest.TestCase):
         self.assertLessEqual(max(picked), keep - 1)
 
 
+def recorded(ring, emb):
+    """The ring, with every packet sent into it recorded."""
+    sent, inject = [], ring.inject
+    ring.inject = lambda packet: (sent.append(C.unpack_item(packet, emb.hidden)[0]), inject(packet))[1]
+    return sent
+
+
 class ControllerTest(unittest.TestCase):
-    def test_one_context_samples_exactly_what_the_model_says(self):
+    def test_one_slot_samples_exactly_what_the_model_says(self):
         rng = np.random.default_rng(8)
         emb, logits_of, head = fake_model(rng)
         ring = C.Ring(3, lambda item: item.hidden, [head(0), head(1)])
         ctl = C.Controller(emb, ring, slots=4, seed=9)
         prompt = [5, 17, 3]
-        cid = ctl.submit(prompt, max_new=6, params=C.SamplingParams.of(0.8, top_k=6))
+        ctl.append(2, prompt, max_new=6, params=C.SamplingParams.of(0.8, top_k=6))
         ctl.run()
-        got = ctl.generated(cid)
+        got = ctl.slots[2].generated
         self.assertEqual(len(got), 6)
         # The same draws, by hand: the item's token is the last prompt token, then each sampled one.
         draws = np.random.default_rng(9)
@@ -141,46 +148,91 @@ class ControllerTest(unittest.TestCase):
             rows, merged, total = C.merge_lists(lists)
             token, j = C.sample(rows, merged, C.SamplingParams.of(0.8, top_k=6), int(draws.integers(0, 1 << 32)))
             tokens.append(token)
-            self.assertAlmostEqual(ctl.contexts[cid].logprobs[i], C.logprob(int(merged[j]), total))
+            self.assertAlmostEqual(ctl.slots[2].logprobs[i], C.logprob(int(merged[j]), total))
         self.assertEqual(got, tokens[3:])
 
-    def test_contexts_share_the_ring_round_robin(self):
+    def test_slots_share_the_ring_round_robin(self):
         rng = np.random.default_rng(10)
         emb, _, head = fake_model(rng)
         ring = C.Ring(4, lambda item: item.hidden, [head(0), head(1)])
         ctl = C.Controller(emb, ring, slots=8, seed=11)
-        ids = [ctl.submit([1, 2], 5), ctl.submit([7], 5), ctl.submit([3, 4, 5], 5)]
+        for slot, prompt in ((0, [1, 2]), (5, [7]), (3, [3, 4, 5])):
+            ctl.append(slot, prompt, 5)
         ctl.run()
-        for cid in ids:
-            self.assertEqual(len(ctl.generated(cid)), 5)
-            self.assertTrue(all(0 <= t < 64 for t in ctl.generated(cid)))
-        self.assertEqual(ctl.table.evicted, [])
-        self.assertEqual(ctl.table.holder, {})                       # every slot given back
+        for slot in (0, 5, 3):
+            self.assertEqual(len(ctl.slots[slot].generated), 5)
+            self.assertTrue(all(0 <= t < 64 for t in ctl.slots[slot].generated))
         self.assertLess(ctl.steps, 3 * (2 + 1 + 3 + 5) * 6 + 50)     # the ring kept more than one item in flight
 
     def test_a_prompt_fills_the_ring_by_itself(self):
-        # A prompt's tokens are all known, so one context's go in back to back
+        # A prompt's tokens are all known, so one slot's go in back to back
         # rather than one per trip round the ring: in order, the last of them
         # drawn from, and a sampled token sent only once it has been drawn.
         rng = np.random.default_rng(16)
         emb, _, head = fake_model(rng)
         ring = C.Ring(8, lambda item: item.hidden, [head(0), head(1)])
-        sent, inject = [], ring.inject
-        ring.inject = lambda packet: (sent.append(C.unpack_item(packet, emb.hidden)[0]), inject(packet))[1]
+        sent = recorded(ring, emb)
         ctl = C.Controller(emb, ring, slots=4, seed=17)
         prompt = list(range(1, 41))
-        cid = ctl.submit(prompt, max_new=3)
+        ctl.append(0, prompt, max_new=3)
         ctl.run()
-        self.assertEqual(len(ctl.generated(cid)), 3)
+        self.assertEqual(len(ctl.slots[0].generated), 3)
+        # The turn's last token is drawn and not sent: it goes in first next turn.
         self.assertEqual([s.position for s in sent], list(range(len(prompt) + 2)))
         self.assertEqual([s.position for s in sent if s.flags & C.FLAG_SAMPLE], [39, 40, 41])
         self.assertEqual([s.flags & C.FLAG_FIRST for s in sent][:2], [C.FLAG_FIRST, 0])
         # Forty prompt tokens through a ten-stage ring: about forty steps and a
         # trip, not forty trips; then each sampled token a trip of its own.
         self.assertLess(ctl.steps, len(prompt) + 4 * 10 + 5)
-        # The sampled tokens went in only after they were drawn: the item for
-        # position 40 is the first sampled token.
-        self.assertEqual(emb.lookup(ctl.contexts[cid].tokens[40]).tolist(), sent[40].hidden.tolist())
+        self.assertEqual(emb.lookup(ctl.slots[0].generated[0]).tolist(), sent[40].hidden.tolist())
+        self.assertEqual(ctl.slots[0].pending, [ctl.slots[0].generated[-1]])
+
+    def test_a_turn_goes_on_from_where_the_slot_is(self):
+        # The next turn carries only the new tokens; the last token drawn goes
+        # in first, and nothing is FIRST.
+        rng = np.random.default_rng(22)
+        emb, _, head = fake_model(rng)
+        ring = C.Ring(2, lambda item: item.hidden, [head(0), head(1)])
+        sent = recorded(ring, emb)
+        ctl = C.Controller(emb, ring, slots=2, seed=23)
+        ctl.append(1, [4, 5, 6], 2)
+        ctl.run()
+        drawn = ctl.slots[1].generated[-1]
+        sent.clear()
+        ctl.append(1, [9, 10], 2)
+        ctl.run()
+        self.assertEqual([s.position for s in sent], [4, 5, 6, 7])
+        self.assertEqual(emb.lookup(drawn).tolist(), sent[0].hidden.tolist())
+        self.assertFalse(any(s.flags & C.FLAG_FIRST for s in sent))
+        self.assertEqual([s.position for s in sent if s.flags & C.FLAG_SAMPLE], [6, 7])
+
+    def test_fresh_starts_the_slot_over(self):
+        # The host gives a slot to another conversation by starting it fresh:
+        # position 0, FIRST, and what the slot held before is forgotten.
+        rng = np.random.default_rng(24)
+        emb, _, head = fake_model(rng)
+        ring = C.Ring(2, lambda item: item.hidden, [head(0), head(1)])
+        sent = recorded(ring, emb)
+        ctl = C.Controller(emb, ring, slots=1, seed=25)
+        ctl.append(0, [1, 2, 3], 3)
+        ctl.run()
+        sent.clear()
+        ctl.append(0, [7, 8], 1, fresh=True)
+        ctl.run()
+        self.assertEqual([(s.position, s.flags & C.FLAG_FIRST) for s in sent], [(0, C.FLAG_FIRST), (1, 0)])
+        self.assertEqual(emb.lookup(7).tolist(), sent[0].hidden.tolist())
+
+    def test_a_slot_mid_turn_is_refused_and_a_turn_must_fit(self):
+        rng = np.random.default_rng(26)
+        emb, _, head = fake_model(rng)
+        ctl = C.Controller(emb, C.Ring(2, lambda item: item.hidden, [head(0), head(1)]), slots=1, max_tokens=10)
+        ctl.append(0, [1, 2], 3)
+        with self.assertRaises(ValueError):
+            ctl.append(0, [3], 1)
+        ctl.run()
+        self.assertTrue(ctl.fits(0, 2, 3))                  # five used of ten: the drawn token, two, three
+        self.assertFalse(ctl.fits(0, 2, 4))
+        self.assertTrue(ctl.fits(0, 6, 4, fresh=True))
 
     def test_a_prompt_goes_in_chunks(self):
         # Eight tokens a packet while eight are known, then one: the dies see
@@ -197,15 +249,15 @@ class ControllerTest(unittest.TestCase):
                 sums[item.context] = sums[item.context] + item.hidden
                 return np.clip(sums[item.context] // 4, -32768, 32767)
             ring = C.Ring(1, layer, [head(0), head(1)])          # one layer die: the state is its
-            sent, inject = [], ring.inject
-            ring.inject = lambda packet: (sent.append(C.unpack_item(packet, emb.hidden)[0]), inject(packet))[1]
+            sent = recorded(ring, emb)
             positions = []
             ctl = C.Controller(emb, ring, slots=4, seed=19, chunk=chunk,
-                               on_token=lambda cid, token, lp, pos, last: positions.append(pos))
-            greedy = C.SamplingParams(top_k=1)      # the draws' words go to contexts in retire order
-            a, b = ctl.submit(list(range(1, 44)), 4, greedy), ctl.submit(list(range(20, 37)), 3, greedy)
+                               on_token=lambda slot, token, lp, pos, last: positions.append(pos))
+            greedy = C.SamplingParams(top_k=1)      # the draws' words go to slots in retire order
+            ctl.append(0, list(range(1, 44)), 4, greedy)
+            ctl.append(1, list(range(20, 37)), 3, greedy)
             ctl.run()
-            return ctl, sent, positions, ctl.generated(a) + ctl.generated(b)
+            return ctl, sent, positions, ctl.slots[0].generated + ctl.slots[1].generated
 
         one, sent1, pos1, got1 = run(1)
         eight, sent8, pos8, got8 = run(8)
@@ -213,7 +265,7 @@ class ControllerTest(unittest.TestCase):
         self.assertEqual(sorted(pos8), sorted(pos1))
         chunks = sorted((s.position, s.tokens) for s in sent8 if s.tokens > 1)
         self.assertEqual(chunks, sorted([(p, 8) for p in range(0, 40, 8)] + [(0, 8), (8, 8)]))
-        # Five chunks and three single prompt tokens for the first context, two
+        # Five chunks and three single prompt tokens for the first slot, two
         # and one for the second; neither prompt ends on a chunk, so no chunk
         # is drawn from.
         self.assertFalse(any(s.flags & C.FLAG_SAMPLE for s in sent8 if s.tokens > 1))
@@ -224,10 +276,9 @@ class ControllerTest(unittest.TestCase):
         rng = np.random.default_rng(20)
         emb, logits_of, head = fake_model(rng)
         ring = C.Ring(3, lambda item: item.hidden, [head(0), head(1)])
-        sent, inject = [], ring.inject
-        ring.inject = lambda packet: (sent.append(C.unpack_item(packet, emb.hidden)[0]), inject(packet))[1]
+        sent = recorded(ring, emb)
         ctl = C.Controller(emb, ring, slots=2, seed=21, chunk=4)
-        cid = ctl.submit([9, 8, 7, 6, 5, 4, 3, 2], 2)
+        ctl.append(0, [9, 8, 7, 6, 5, 4, 3, 2], 2)
         ctl.run()
         self.assertEqual([(s.position, s.tokens, s.flags & C.FLAG_SAMPLE) for s in sent],
                          [(0, 4, 0), (4, 4, C.FLAG_SAMPLE), (8, 1, C.FLAG_SAMPLE)])
@@ -235,44 +286,7 @@ class ControllerTest(unittest.TestCase):
         draws = np.random.default_rng(21)
         logits = logits_of(emb.lookup(2))
         rows, merged, _ = C.merge_lists([C.head_list(0, logits[:32], 8, 0), C.head_list(1, logits[32:], 8, 32)])
-        self.assertEqual(ctl.generated(cid)[0], C.sample(rows, merged, C.SamplingParams(), int(draws.integers(0, 1 << 32)))[0])
-
-    def test_a_short_table_waits_rather_than_evict_mid_turn(self):
-        # One slot, two contexts: the second waits for the first's turn to
-        # end.  Taking the slot mid-turn would send the first back to its
-        # first token, and the two would take it from each other for ever.
-        rng = np.random.default_rng(12)
-        emb, _, head = fake_model(rng)
-        ring = C.Ring(2, lambda item: item.hidden, [head(0), head(1)])
-        ctl = C.Controller(emb, ring, slots=1, seed=13)
-        a, b = ctl.submit([1, 2, 3], 3), ctl.submit([4, 5], 3)
-        ctl.run()
-        self.assertEqual(ctl.table.evicted, [])
-        self.assertEqual(len(ctl.generated(a)), 3)
-        self.assertEqual(len(ctl.generated(b)), 3)
-
-    def test_an_idle_resident_context_is_evicted_and_starts_over(self):
-        # Resident contexts keep their slot between turns until it is needed.
-        # One that lost it -- even if it gets the same slot back -- starts its
-        # next turn from its first token, marked FIRST.
-        rng = np.random.default_rng(14)
-        emb, _, head = fake_model(rng)
-        sent = []
-        ring = C.Ring(2, lambda item: item.hidden, [head(0), head(1)])
-        inject = ring.inject
-        ring.inject = lambda packet: (sent.append(C.unpack_item(packet, emb.hidden)[0]), inject(packet))[1]
-        ctl = C.Controller(emb, ring, slots=1, seed=15)
-        a = ctl.open()
-        ctl.append(a, [1, 2], 2)
-        ctl.run()
-        b = ctl.submit([7], 1)                       # takes the one slot from a, idle
-        ctl.run()
-        self.assertEqual(ctl.table.evicted, [(a, 0)])
-        sent.clear()
-        ctl.append(a, [3], 1)                        # a's second turn, back in slot 0
-        ctl.run()
-        self.assertEqual([(s.position, s.flags & C.FLAG_FIRST) for s in sent][:2], [(0, C.FLAG_FIRST), (1, 0)])
-        self.assertEqual(len(ctl.contexts[a].tokens), 2 + 2 + 1 + 1)
+        self.assertEqual(ctl.slots[0].generated[0], C.sample(rows, merged, C.SamplingParams(), int(draws.integers(0, 1 << 32)))[0])
 
 
 import shutil

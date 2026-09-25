@@ -1,14 +1,16 @@
 """The controller: what the FPGA at the head of the ring does.
 
-The appliance is a ring of dies behind one FPGA.  A work item -- one token
-of one context: its hidden vector, the context's slot and the position --
+The appliance is a ring of dies behind one FPGA.  A work item -- a token,
+or a chunk of a prompt's, of one context: its hidden vectors, the slot the
+context is in and the position --
 enters the ring at the first layer die and comes back from the last head
 die with two partial top-k lists appended, one from each half of the LM
 head.  Everything between a host's request and the next token it gets is
 the controller's: the embedding of the token into the hidden vector, the
-packet that carries it, which context goes next, the merge of the two lists
-and the draw from them, and the table that says which context holds which
-slot in the dies' memories.  This module is the model of that, the way
+packet that carries it, which slot goes next, and the merge of the two
+lists and the draw from them.  Which conversation is in which slot is the
+host's: it addresses the slots itself and gives one to another conversation
+by starting it fresh (``host.py``).  This module is the model of that, the way
 ``sequencer.py`` is the model of the token sequencer: the gateware will be
 checked against it bit for bit where it is arithmetic (the sampler, the
 CRC, the packet) and step for step where it is control (the scheduler).
@@ -23,9 +25,9 @@ the ring's protocol rather than the controller's alone:
   fixed-point value of ``LOGIT_FRAC`` fraction bits, and the log-sum-exp of
   the die's whole half in the same format, so the two halves can be merged
   into one distribution;
-* the FIRST flag: the first token of a context in a slot that another
-  context had, which tells a layer die to start that slot's state from
-  zero rather than from what the slot holds.
+* the FIRST flag: the first token of a slot started fresh, which tells a
+  layer die to start that slot's state from zero rather than from what the
+  slot holds.
 
 The sampler is integer arithmetic on the exponential table the attention
 core already uses (``layer.exp_neg_fixed``), so the same LUT serves both,
@@ -38,7 +40,7 @@ from __future__ import annotations
 import math
 import struct
 import zlib
-from collections import OrderedDict, deque
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Callable, Sequence
 
@@ -294,69 +296,30 @@ class EmbeddingTable:
 
 
 # --------------------------------------------------------------------------
-# Contexts and their slots
+# The slots
 # --------------------------------------------------------------------------
 
 @dataclass
-class Context:
-    id: int
-    tokens: list[int]                # the prompt, then what was generated
-    prompt_len: int
-    max_new: int
-    params: SamplingParams
-    slot: int | None = None
-    next_pos: int = 0                # the next position to inject
+class Slot:
+    """One resident context's place on the dies, as the controller keeps it.
+    The host decides what is in a slot -- which conversation, and when to
+    give its place to another -- and the controller keeps only what the
+    ring needs: the tokens known and not yet sent, the next position, and
+    the turn in progress.  No history: a conversation that comes back to a
+    slot it lost is the host's to send again, from its first token."""
+    index: int
+    pending: list[int] = field(default_factory=list)   # known and not yet sent: the turn's tokens, the last one drawn
+    position: int = 0                # the next position to send
+    fresh: bool = True               # the next packet starts the slot from zero (FIRST)
+    busy: bool = False               # a turn is in progress
     in_flight: int = 0               # its packets in the ring: a prompt's go in back to back
-    fresh: bool = True               # the slot has not seen this context yet
-    done: bool = False
+    prompt_end: int = 0              # the turn's last known position: its packet is drawn from
+    max_new: int = 0
+    params: SamplingParams = field(default_factory=SamplingParams)
+    stops: tuple[int, ...] = ()
+    generated: list[int] = field(default_factory=list)  # this turn's tokens
     logprobs: list[float] = field(default_factory=list)
-    seed: int = 0
-    stops: tuple[int, ...] = ()      # tokens that end a turn when sampled
-    keep: bool = False               # resident between turns: its slot is kept until closed or evicted
-
-
-class ContextTable:
-    """Which context holds which slot of the dies' memories.  A slot is one
-    resident context's state on every die; there are as many as the memory
-    map gives.  Allocation takes a free slot, then the least recently used
-    idle one, whose context is evicted: its next token, if it has one, will
-    have to start over, which is the host's problem to avoid and the table's
-    to report."""
-
-    def __init__(self, slots: int) -> None:
-        self.slots = slots
-        self.holder: dict[int, int] = {}                 # slot -> context id
-        self.lru: OrderedDict[int, None] = OrderedDict()  # slots by last use, oldest first
-        self.evicted: list[tuple[int, int]] = []          # (context, slot)
-        self.kept = False                                 # the last acquire gave the context the slot it already held
-
-    def acquire(self, ctx: int, busy: Callable[[int], bool]) -> int | None:
-        """A slot for ``ctx``: its own if it has one, else a free one, else the
-        oldest whose holder is not in flight.  None if every slot is busy."""
-        self.kept = False
-        for slot, holder in self.holder.items():
-            if holder == ctx:
-                self.lru.move_to_end(slot)
-                self.kept = True
-                return slot
-        free = [s for s in range(self.slots) if s not in self.holder]
-        if free:
-            slot = free[0]
-        else:
-            slot = next((s for s in self.lru if not busy(self.holder[s])), None)
-            if slot is None:
-                return None
-            self.evicted.append((self.holder[slot], slot))
-        self.holder[slot] = ctx
-        self.lru[slot] = None
-        self.lru.move_to_end(slot)
-        return slot
-
-    def release(self, ctx: int) -> None:
-        for slot, holder in list(self.holder.items()):
-            if holder == ctx:
-                del self.holder[slot]
-                self.lru.pop(slot, None)
+    cancelled: bool = False
 
 
 # --------------------------------------------------------------------------
@@ -407,148 +370,128 @@ class Ring:
 # --------------------------------------------------------------------------
 
 class Controller:
-    """Requests in, tokens out.  Each step injects one item if the ring's first
-    die is free and some context has a token to send -- round robin over the
-    contexts, so every die works on a different context's token and one
-    conversation sees the ring's latency -- and takes the item leaving the
-    ring: a prompt token's lists are dropped, a sampled one's are merged and
-    drawn from, the token appended, and the context goes back in the queue."""
+    """Turns in, tokens out, over ``slots`` resident contexts.  Each step
+    injects one packet if the ring's first die is free and some slot has a
+    token to send -- round robin over the slots, so every die works on a
+    different slot's token and one conversation sees the ring's latency --
+    and takes the packet leaving the ring: a prompt packet's lists are
+    dropped, a sampled one's are merged and drawn from, and the token goes
+    to the host and, if the turn goes on, back into the slot to be sent.
+
+    The host addresses the slots itself (``host.py``).  A turn names its
+    slot and brings the tokens after what the slot has seen; with ``fresh``
+    it starts the slot from zero, which is how the host gives a slot to
+    another conversation.  A slot that has never been used starts fresh."""
 
     def __init__(self, embedding: EmbeddingTable, ring: Ring, slots: int, seed: int = 1,
                  on_token: Callable[[int, int, float, int, bool], None] | None = None,
-                 chunk: int = 1) -> None:
-        self.embedding, self.ring, self.table = embedding, ring, ContextTable(slots)
+                 chunk: int = 1, max_tokens: int = 1 << 17) -> None:
+        self.embedding, self.ring = embedding, ring
+        self.slots = [Slot(i) for i in range(slots)]
+        self.queue: deque[int] = deque()
+        self.rng = np.random.default_rng(seed)
+        self.steps = 0
+        self.max_tokens = max_tokens                     # positions a slot holds
+        # Each sampled token as it is drawn: (slot, token, log-probability,
+        # its position, whether it ends the turn).  The host's completions.
+        self.on_token = on_token
         # A prompt goes in ``chunk`` tokens a packet while that many are
         # known, then a token a packet: the dies hold a program for each of
         # the two sizes, and the packet's token count picks one.
         if not 1 <= chunk <= MAX_TOKENS:
             raise ValueError(f"chunk {chunk}")
         self.chunk = chunk
-        self.contexts: dict[int, Context] = {}
-        self.queue: deque[int] = deque()
-        self.rng = np.random.default_rng(seed)
-        self.next_id = 0
-        self.steps = 0
-        # Each sampled token as it is drawn: (context, token, log-probability,
-        # its position, whether it ends the turn).  The host's completions.
-        self.on_token = on_token
 
-    def submit(self, prompt: Sequence[int], max_new: int, params: SamplingParams = SamplingParams()) -> int:
-        """A one-turn context: the prompt, max_new tokens, then its slot is given back."""
-        cid = self.open(params)
-        self.append(cid, prompt, max_new)
-        self.contexts[cid].keep = False
-        return cid
+    def fits(self, slot: int, tokens: int, max_new: int, fresh: bool = False) -> bool:
+        """Whether a turn stays inside the slot's positions."""
+        s = self.slots[slot]
+        start = 0 if fresh else s.position + len(s.pending)
+        return start + tokens + max_new <= self.max_tokens
 
-    def open(self, params: SamplingParams = SamplingParams(), stops: Sequence[int] = ()) -> int:
-        """A context that stays resident between turns: its state is kept on
-        the dies until it is closed or its slot is taken for another."""
-        ctx = Context(self.next_id, [], 0, 0, params, stops=tuple(stops), keep=True, done=True)
-        self.contexts[ctx.id] = ctx
-        self.next_id += 1
-        return ctx.id
+    def append(self, slot: int, tokens: Sequence[int], max_new: int, params: SamplingParams = SamplingParams(),
+               stops: Sequence[int] = (), fresh: bool = False) -> None:
+        """A turn: ``tokens`` after what the slot has seen, then up to
+        ``max_new`` sampled.  The last token sampled before, if any, goes in
+        first -- it was drawn but never fed through the layers.  ``fresh``
+        forgets the slot's context and starts it from zero."""
+        s = self.slots[slot]
+        if s.busy:
+            raise ValueError("the slot is mid-turn")
+        if max_new < 1:
+            raise ValueError("a turn samples at least one token")
+        if fresh:
+            s.pending, s.position, s.fresh = [], 0, True
+        s.pending += list(tokens)
+        if not s.pending:
+            raise ValueError("a turn needs a token to start from")
+        s.prompt_end = s.position + len(s.pending) - 1
+        s.max_new, s.params, s.stops = max_new, params, tuple(stops)
+        s.generated, s.logprobs, s.cancelled, s.busy = [], [], False, True
+        if slot not in self.queue:
+            self.queue.append(slot)
 
-    def append(self, cid: int, tokens: Sequence[int], max_new: int) -> None:
-        """A turn: tokens after what the context has seen, then up to max_new
-        sampled.  The last token sampled before, if any, goes in first -- it
-        was drawn but never fed through the layers."""
-        ctx = self.contexts[cid]
-        if not ctx.done:
-            raise ValueError("the context is mid-turn")
-        ctx.tokens += list(tokens)
-        ctx.prompt_len, ctx.max_new, ctx.done = len(ctx.tokens), max_new, False
-        if cid not in self.queue:
-            self.queue.append(cid)
-
-    def cancel(self, cid: int) -> None:
-        """End the turn after the token in flight; the context stays open."""
-        ctx = self.contexts[cid]
-        if not ctx.done:
-            sampling = ctx.in_flight and ctx.next_pos - 1 >= ctx.prompt_len - 1     # the token in flight will be drawn from
-            ctx.max_new = len(ctx.tokens) - ctx.prompt_len + int(bool(sampling))
-            if not ctx.in_flight:
-                self._end_turn(ctx)
-
-    def close(self, cid: int) -> None:
-        """Forget the context and give its slot back."""
-        ctx = self.contexts[cid]
-        ctx.done, ctx.keep = True, False
-        if not ctx.in_flight:
-            self.table.release(cid)
-
-    def _end_turn(self, ctx: Context) -> None:
-        ctx.done = True
-        if not ctx.keep:
-            self.table.release(ctx.id)
-
-    def _busy(self, ctx: int) -> bool:
-        """A slot is not taken from a context in flight or in the middle of a
-        turn -- evicted mid-turn it would start over, and two contexts sharing
-        one slot would each keep evicting the other.  Only a resident context
-        between turns is taken, and its next turn starts from its first token."""
-        c = self.contexts[ctx]
-        return c.in_flight > 0 or not c.done
+    def cancel(self, slot: int) -> bool:
+        """End the turn after the token in flight; the slot keeps its context.
+        A prompt still going in goes in, so the slot's state stays whole,
+        and its token is the turn's last.  True if the turn ended here, with
+        no token to come."""
+        s = self.slots[slot]
+        if not s.busy:
+            return False
+        s.cancelled = True
+        sampling = s.in_flight and s.position - 1 >= s.prompt_end     # a packet in flight will be drawn from
+        s.max_new = len(s.generated) + int(bool(sampling) or s.position <= s.prompt_end)
+        if not s.in_flight and s.position > s.prompt_end:
+            s.busy = False
+            return True
+        return False
 
     def _inject(self) -> bool:
-        """One item into the ring: the next known tokens of the next context in
-        turn.  A prompt's tokens are all known, so a context's prompt goes in
+        """One packet into the ring: the next known tokens of the next slot in
+        turn.  A prompt's tokens are all known, so a slot's prompt goes in
         back to back and fills the ring by itself -- its packets follow one
         another through every stage in order, as the ring keeps them -- while
-        a sampled token is known only when it comes back.  One token in
-        flight a context was a prompt at the speed of decode.  And a prompt
-        goes in a chunk a packet: a die reads its weights and a context's
-        state once for the chunk, not once a token."""
+        a sampled token is known only when it comes back.  And a prompt goes
+        in a chunk a packet: a die reads its weights and a slot's state once
+        for the chunk, not once a token."""
         for _ in range(len(self.queue)):
-            cid = self.queue.popleft()
-            ctx = self.contexts[cid]
-            if ctx.done or (ctx.next_pos >= len(ctx.tokens) and not ctx.fresh):
-                self.queue.append(cid)
+            slot = self.queue.popleft()
+            s = self.slots[slot]
+            if not s.busy or not s.pending:
+                if s.busy:
+                    self.queue.append(slot)                 # waiting for its token to come back
                 continue
-            slot = self.table.acquire(cid, self._busy)
-            if slot is None:
-                self.queue.append(cid)                      # every slot is mid-turn: it waits, the holders go on
-                continue
-            if ctx.slot is not None and not self.table.kept:
-                ctx.fresh, ctx.next_pos = True, 0            # evicted meanwhile, even if given the same slot back: start over
-            if ctx.fresh:
-                ctx.next_pos = 0
-            ctx.slot = slot
-            pos = ctx.next_pos
-            n = self.chunk if len(ctx.tokens) - pos >= self.chunk else 1
-            flags = 0
-            if ctx.fresh:
-                flags |= FLAG_FIRST
-            if pos + n - 1 >= ctx.prompt_len - 1:
+            pos = s.position
+            n = self.chunk if len(s.pending) >= self.chunk else 1
+            flags = FLAG_FIRST if s.fresh else 0
+            if pos + n - 1 >= s.prompt_end:
                 flags |= FLAG_SAMPLE
-            rows = [self.embedding.lookup(t) for t in ctx.tokens[pos:pos + n]]
-            item = WorkItem(slot, pos, rows[0] if n == 1 else np.stack(rows), flags)
-            self.ring.inject(pack_item(item))
-            ctx.in_flight += 1
-            ctx.next_pos, ctx.fresh = pos + n, False
-            self.queue.append(cid)
+            rows = [self.embedding.lookup(t) for t in s.pending[:n]]
+            self.ring.inject(pack_item(WorkItem(slot, pos, rows[0] if n == 1 else np.stack(rows), flags)))
+            del s.pending[:n]
+            s.in_flight += 1
+            s.position, s.fresh = pos + n, False
+            self.queue.append(slot)
             return True
         return False
 
     def _retire(self, packet: bytes) -> None:
         item, lists = unpack_item(packet, self.embedding.hidden)
-        cid = self.table.holder.get(item.context)
-        ctx = self.contexts[cid]
-        ctx.in_flight -= 1
-        if ctx.done:                                        # closed while in flight
-            if not ctx.keep and not ctx.in_flight:
-                self.table.release(cid)
+        s = self.slots[item.context]
+        s.in_flight -= 1
+        if not item.flags & FLAG_SAMPLE or not s.busy:
             return
-        if item.flags & FLAG_SAMPLE:
-            rows, logits, total = merge_lists(lists)
-            rnd = int(self.rng.integers(0, 1 << 32))
-            token, i = sample(rows, logits, ctx.params, rnd)
-            ctx.tokens.append(token)
-            ctx.logprobs.append(logprob(int(logits[i]), total))
-            last = len(ctx.tokens) - ctx.prompt_len >= ctx.max_new or token in ctx.stops
-            if self.on_token is not None:
-                self.on_token(cid, token, ctx.logprobs[-1], item.position + item.tokens, last)
-            if last:
-                self._end_turn(ctx)
+        rows, logits, total = merge_lists(lists)
+        rnd = int(self.rng.integers(0, 1 << 32))
+        token, i = sample(rows, logits, s.params, rnd)
+        s.generated.append(token)
+        s.logprobs.append(logprob(int(logits[i]), total))
+        s.pending.append(token)                             # drawn: it goes in next, this turn or the next one
+        last = len(s.generated) >= s.max_new or token in s.stops
+        if last:
+            s.busy = False
+        if self.on_token is not None:
+            self.on_token(item.context, token, s.logprobs[-1], item.position + item.tokens, last)
 
     def step(self) -> None:
         out = self.ring.step(self.embedding.hidden)
@@ -558,16 +501,15 @@ class Controller:
             self._inject()
         self.steps += 1
 
+    def idle(self) -> bool:
+        return not any(s.busy or s.in_flight for s in self.slots) and all(p is None for p in self.ring.stages)
+
     def run(self, max_steps: int = 100_000) -> None:
         for _ in range(max_steps):
-            if all(c.done for c in self.contexts.values()) and all(s is None for s in self.ring.stages):
+            if self.idle():
                 return
             self.step()
         raise RuntimeError("the ring did not drain")
-
-    def generated(self, cid: int) -> list[int]:
-        ctx = self.contexts[cid]
-        return ctx.tokens[ctx.prompt_len:]
 
 
 # --------------------------------------------------------------------------
