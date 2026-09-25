@@ -283,10 +283,10 @@ class SequencerRtlTest(unittest.TestCase):
     """The controller runs each program over stub units in exactly the cycles
     the model predicts, and the trace respects every dependency and engine."""
 
-    def run_program(self, steps: list[S.Step]) -> None:
+    def run_program(self, steps: list[S.Step], before: list[S.Step] = ()) -> None:
         with tempfile.TemporaryDirectory() as directory:
             work = Path(directory)
-            params = S.emit_program(work, steps)
+            params = S.emit_program(work, steps, before)
             args = [f"-Ptb_sequencer.{name}={value}" for name, value in params.items()]
             subprocess.run(["iverilog", "-g2012", "-I", str(RTL), "-s", "tb_sequencer", "-o", "sim.vvp", *args,
                             str(RTL / "fabric_sram.sv"), str(RTL / "fabric_sequencer.sv"), str(RTL / "tb_sequencer.sv")],
@@ -319,6 +319,20 @@ class SequencerRtlTest(unittest.TestCase):
         mm = MemoryMap.from_config(cfg)
         self.run_program(S.stream(S.recurrent_program(cfg, None, TileSpec(), mm), 2))          # 346 steps, tags wrap
         self.run_program(S.stream(S.global_program(cfg, None, TileSpec(), mm, mm.context_tokens - 1), 2))
+
+    def test_a_program_past_the_old_store(self) -> None:
+        # The store holds 4,096 steps, a die's every program one after another,
+        # and the link starts one at its first step.  Two recurrent chunks of
+        # eight at the 9B geometry, 1,788 steps, from step 1,194 -- after a
+        # recurrent and a global chunk -- run to step 2,982.
+        from fixed_llm_poc import ASICLMConfig
+        cfg = ASICLMConfig.qwen3_5_9b()
+        mm = MemoryMap.from_config(cfg)
+        rec8 = S.recurrent_program(cfg, None, TileSpec(), mm, chunk=8)
+        glob8 = S.global_program(cfg, None, TileSpec(), mm, 4095, chunk=8)
+        two = S.stream(rec8, 2)
+        self.assertGreater(len(rec8) + len(glob8) + len(two), 2048)
+        self.run_program(two, rec8 + glob8)
 
 
 if __name__ == "__main__":

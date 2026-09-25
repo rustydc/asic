@@ -1562,17 +1562,28 @@ first FIRST at position 0: the link runs them one after the other, four
 layers each, and the packets that leave and every layer's state and the
 context afterwards are the chained model's bit for bit.
 
-What the program set still needs is a budget. A die holds every program
-it runs in one program memory of 1,024 steps; at the 9B geometry the
-recurrent program is 173 steps and the global 41, which fits with room,
-but a batch of four is 692 recurrent steps and a chunk of eight 894, and
-every shape the table can name is over ten thousand. Which shapes a die
-keeps is the decision left: single tokens at one, two and four lanes and
-chunks a lane at a time is about 2,700 steps.
+The program store holds 4,096 steps, every program a die runs one after
+another, and the die link starts one at its first step. At the 9B
+geometry the recurrent program is 173 steps and the global 41; a batch of
+four is 692 and 164, a chunk of eight 894 and 300, so single tokens at
+one, two and four lanes and chunks a lane at a time -- about 2,700 steps
+-- fit with room. It is 128 KB of SRAM, next to about 500 MB of weights
+in the die's ROM. Every shape the table can name would be over ten
+thousand steps; which shapes a die keeps is the table's to say.
+
+Running a long program on the controller found one thing the cycle model
+did not know. A step's tag is its index modulo 256, and the controller
+gives no step a tag the step 256 before it still holds, so a step that
+outlives the next 256 issues holds the program up. The model has the rule
+now (`sequencer.TAGS`): two recurrent chunks of eight at the 9B geometry,
+1,788 steps, run from step 1,194 of the store to its step 2,982 in exactly
+the model's 402,786 cycles, which were 396,625 before the rule. The
+streams the throughput figures use never meet it; a wider tag would make
+it rarer, at the price of the live table.
 
 What is not covered yet: the ring's physical layer below the words (the
 source-synchronous clocking, the retry on a CRC failure), the management
-SPI that loads the dies' constants, the program store's budget above, the head dies' side of
+SPI that loads the dies' constants, the head dies' side of
 the ring, the queue engine in the gateware, and the Linux driver.
 
 ## RTL

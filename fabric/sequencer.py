@@ -412,6 +412,7 @@ class Timing:
         return int(math.ceil(nbytes / (self.port_bytes_per_cycle * hpi.efficiency(max(1, burst_bytes // BEAT)))))
 
 
+TAGS = 256               # a step's tag is its index modulo this: the controller's live table (rtl/fabric_sequencer.sv)
 POSTED_SLACK = 40        # core cycles of a posted write the bridge's queues hold while the path is busy (64 beats)
 
 
@@ -1228,7 +1229,14 @@ def schedule(steps: list[Step], releases: int = RELEASES) -> Schedule:
     running: dict[int, int] = {}                             # engine port -> the step on it
     pending: dict[int, int] = {}                             # engine port -> a step whose release is held
     cycle, i = 0, 0
-    path_free = 0                                            # the memory path as built: the cycle it is idle
+    path_free = 0
+
+    def waits(k: int) -> list[int]:
+        # A step's tag is its index modulo TAGS, and the controller gives no
+        # step a tag the step TAGS before it still holds: that step's release
+        # is one more thing to wait for.  Only a long program with a step that
+        # outlives the next TAGS issues ever meets it.
+        return steps[k].deps + [k - TAGS] if k >= TAGS else steps[k].deps                                            # the memory path as built: the cycle it is idle
     while i < n or running or pending:
         # A unit that ended at cycle - 1 reports done now; the drains this
         # cycle are the lowest ports of what is held and what just arrived.
@@ -1247,7 +1255,7 @@ def schedule(steps: list[Step], releases: int = RELEASES) -> Schedule:
         if (i < n and (i == 0 or cycle > issue[i - 1])
                 and port_of[i] not in pending and port_of[i] not in running
                 and cycle >= port_free.get(port_of[i], 0)
-                and all(release[d] is not None and release[d] + 2 <= cycle for d in steps[i].deps)):
+                and all(release[d] is not None and release[d] + 2 <= cycle for d in waits(i))):
             # ``cycles`` is what the engine's own spans measure: the cycle the
             # command issued to the cycle its completion arrived.  The unit
             # therefore stops working one before that, and reports done at it.
@@ -1275,14 +1283,14 @@ def schedule(steps: list[Step], releases: int = RELEASES) -> Schedule:
         if running:
             ahead.append(min(end[s] for s in running.values()) + 1)
         if (i < n and port_of[i] not in pending and port_of[i] not in running
-                and all(release[d] is not None for d in steps[i].deps)):
+                and all(release[d] is not None for d in waits(i))):
             # Every candidate here must be past `cycle`, or the loop below
             # stops advancing.  A dependency that released *at* this cycle is
             # not yet visible -- the drain is registered -- so the earliest
             # the head can go is the cycle after the last of them.
             earliest = cycle + 1 if i == 0 else issue[i - 1] + 1
             earliest = max(earliest, port_free.get(port_of[i], 0))
-            for d in steps[i].deps:
+            for d in waits(i):
                 earliest = max(earliest, release[d] + 2)
             ahead.append(earliest)
         cycle = min(ahead) if ahead else cycle + 1
@@ -1364,12 +1372,19 @@ def encode(steps: list[Step], layout=None) -> list[int]:
     return words
 
 
-def emit_program(directory: Path, steps: list[Step]) -> dict:
-    """Write ``program.hex`` and the schedule the RTL must reproduce; returns the testbench parameters."""
-    write_hex(directory / "program.hex", encode(steps), 256)
+PROGRAM_STEPS = 4096     # the sequencer's program store: every program a die runs, one after another
+
+
+def emit_program(directory: Path, steps: list[Step], before: list[Step] = ()) -> dict:
+    """Write ``program.hex`` and the schedule the RTL must reproduce; returns
+    the testbench parameters.  ``before`` goes in the store first, and the
+    program runs from the step after it, as a die's later programs do."""
+    words = encode(list(before)) + encode(steps) if before else encode(steps)
+    assert len(words) <= PROGRAM_STEPS, f"{len(words)} steps, the store holds {PROGRAM_STEPS}"
+    write_hex(directory / "program.hex", words, 256)
     sched = schedule(steps)
     (directory / "expected_issue.txt").write_text("".join(f"{i} {a} {b}\n" for i, (a, b) in enumerate(zip(sched.issue, sched.end))))
-    params = {"N": len(steps), "EXPECTED_CYCLES": sched.last_done}
+    params = {"N": len(steps), "PC0": len(before), "EXPECTED_CYCLES": sched.last_done}
     for name, (uid, engines) in UNITS.items():
         params[f"E{uid}"] = engines
     (directory / "params.json").write_text(json.dumps(params))

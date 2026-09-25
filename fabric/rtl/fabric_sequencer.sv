@@ -41,7 +41,7 @@
 module fabric_sequencer #(
     parameter int NU        = 10,               // units
     parameter int NE        = 4,                // engines per unit at most
-    parameter int DEPTH     = 1024,             // program steps at most
+    parameter int DEPTH     = 4096,             // program steps: every program a die runs, one after another (fabric.sequencer.PROGRAM_STEPS)
     parameter int NID       = 256,              // buffer ids
     parameter int CW        = 6,                // counter width: outstanding writers or readers of one buffer
     parameter int NREL      = 1,                // completions drained a cycle (fabric.sequencer.RELEASES)

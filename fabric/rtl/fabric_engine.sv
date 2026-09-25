@@ -1964,6 +1964,7 @@ module fabric_layer_engine #(
     parameter [63:0] VB_WMAP0 = 64'hFEDCBA9876543210,
     parameter [63:0] VB_WMAP1 = 64'hFEDCBA9876543210,
     parameter     VB_FILE   = "vb_init.hex",
+    parameter int PROG_STEPS = 4096,            // the program store
     parameter     PROG_FILE = "program.hex",
     parameter     LUT_DIR   = "./"
 ) (
@@ -2022,7 +2023,7 @@ module fabric_layer_engine #(
     wire [7:0]         cmd_tag;
     wire [NU*NE-1:0]   done_valid;
     wire [NU*NE*8-1:0] done_tag;
-    fabric_sequencer #(.NU(NU), .NE(NE), .PROG_FILE(PROG_FILE)) u_seq (
+    fabric_sequencer #(.NU(NU), .NE(NE), .DEPTH(PROG_STEPS), .PROG_FILE(PROG_FILE)) u_seq (
         .clk(clk), .rst_n(rst_n), .start(start), .pc_start(pc_start), .n_steps(n_steps), .running(running), .done(done),
         .cmd_valid(cmd_valid), .cmd_engine(cmd_engine), .cmd_len(cmd_len), .cmd_src(cmd_src), .cmd_dst(cmd_dst),
         .cmd_a2(cmd_a2), .cmd_a3(cmd_a3), .cmd_arg(cmd_arg), .cmd_tag(cmd_tag), .cmd_ready(cmd_ready), .done_valid(done_valid), .done_tag(done_tag));

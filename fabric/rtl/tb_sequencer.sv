@@ -59,6 +59,7 @@ endmodule
 
 module tb_sequencer #(
     parameter int N = 4,
+    parameter int PC0 = 0,                             // the program's first step in the store
     parameter int EXPECTED_CYCLES = 0,
     parameter int E0 = 1, E1 = 2, E2 = 1, E3 = 1, E4 = 4, E5 = 1, E6 = 1, E7 = 2, E8 = 4, E9 = 1
 );
@@ -80,7 +81,7 @@ module tb_sequencer #(
     wire [NU*NE-1:0]   done_valid;
     wire [NU*NE*8-1:0] done_tag;
     fabric_sequencer #(.NU(NU), .NE(NE), .PROG_FILE("program.hex")) dut (
-        .clk(clk), .rst_n(rst_n), .start(start), .pc_start(16'd0), .n_steps(N[15:0]), .running(running), .done(done),
+        .clk(clk), .rst_n(rst_n), .start(start), .pc_start(PC0[15:0]), .n_steps(N[15:0]), .running(running), .done(done),
         .cmd_valid(cmd_valid), .cmd_engine(cmd_engine), .cmd_len(cmd_len), .cmd_src(cmd_src), .cmd_dst(cmd_dst),
         .cmd_a2(cmd_a2), .cmd_a3(cmd_a3), .cmd_arg(cmd_arg), .cmd_tag(cmd_tag), .cmd_ready(cmd_ready), .done_valid(done_valid), .done_tag(done_tag));
 
