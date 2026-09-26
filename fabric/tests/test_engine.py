@@ -79,6 +79,39 @@ def run_engine(case: unittest.TestCase, cfg, c, spec, mm, steps: list[S.Step], i
     return took
 
 
+@unittest.skipUnless(shutil.which("iverilog") and shutil.which("vvp"), "iverilog not installed")
+class VectorBufferPathsTest(unittest.TestCase):
+    """The vector buffer's read return as synthesis gets it (the byte-wise
+    gather) and as the simulations run it (a direct read) answer alike, bit
+    for bit, over a random stream: nothing simulates the gather otherwise."""
+
+    def run_tb(self, **params) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            nb, bsh = params.get("NB", 8), params.get("BSH", 9)
+            rng = np.random.default_rng(params.get("SEED", 1))
+            (work / "vb.hex").write_text("".join(f"{b:02x}\n" for b in rng.integers(0, 256, nb << bsh)))
+            args = [f"-Ptb_vb_paths.{k}={v}" for k, v in params.items()]
+            sources = [RTL / n for n in ("fabric_sram.sv", "fabric_vector.sv", "fabric_engine.sv", "tb_vb_paths.sv")]
+            subprocess.run(["iverilog", "-g2012", "-I", str(RTL), "-s", "tb_vb_paths", "-o", "sim.vvp", *args, *map(str, sources)],
+                           cwd=work, check=True, capture_output=True, text=True)
+            out = subprocess.run(["vvp", "sim.vvp"], cwd=work, check=True, capture_output=True, text=True).stdout
+        self.assertNotIn("FAIL", out, out)
+        self.assertIn("PASS", out, out)
+
+    # The gather is what makes a simulation slow -- a few cycles a second at
+    # four banks -- so the streams are short and the geometries small; the
+    # gather does not change shape with them.
+    def test_every_port_its_own(self) -> None:
+        self.run_tb(FOLD=0, NB=4, NR=6, NW=4, BSH=8, CYCLES=300, SEED=3)       # as with lanes: nothing folds
+
+    def test_ports_folded(self) -> None:
+        self.run_tb(FOLD=1, NB=4, NR=6, NW=4, BSH=8, CYCLES=300, SEED=4)
+
+    def test_more_banks(self) -> None:
+        self.run_tb(FOLD=0, NB=8, NR=8, NW=6, BSH=8, CYCLES=150, SEED=5)
+
+
 class LayoutTest(unittest.TestCase):
     def test_layout_places_every_operand_once_and_aligned(self) -> None:
         from fixed_llm_poc import tiny_config

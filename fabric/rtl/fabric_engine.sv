@@ -72,6 +72,9 @@ module fabric_vb #(
     // from each memory, and costs the banks nothing.  -1 is none.
     parameter int WIDE_R = -1,
     parameter int WIDE_W = -1,
+    // The read return in simulation: 1 the gather the engine is built with,
+    // 0 a direct read of the same answer (below).  Synthesis always gets 1.
+    parameter int GATHER = 0,
     parameter     INIT_FILE = ""
 ) (
     input  wire              clk,
@@ -378,8 +381,15 @@ module fabric_vb #(
     // shifter over every bank, and sixteen of those a port does not map.
     reg [NPR*128-1:0] p_data, p_hi;
     genvar gp, gg, gk;
+    // The read path the engine is built with is always the gather; a
+    // simulation may take the direct read below instead (GATHER = 0, the
+    // default), and tb_vb_paths runs the two side by side on one stream.
 `ifdef FABRIC_SYNTH
-    generate
+    localparam int USE_GATHER = 1;
+`else
+    localparam int USE_GATHER = GATHER;
+`endif
+    generate if (USE_GATHER) begin : g_gather
         for (gp = 0; gp < NPR; gp = gp + 1) begin : g_read
             wire [SB-1:0] sel_w = (r_bank[gp] << RSH) + r_slot[gp];   // a concatenation: see RSH
             wire [3:0]    off_w = p_addr[gp*AW +: 4];
@@ -416,26 +426,24 @@ module fabric_vb #(
                 always @(*) p_hi[gp*128 + gg*8 +: 8] = en_l ? win[128 + gg*8 +: 8] : 8'bx;
             end
         end
-    endgenerate
-`else
-    // Simulated, the same answer read directly: the slot, the half and the
-    // offset registered as the copies above are, then the two words and the
-    // shift.  The byte-wise gather above is for the mapper; in a simulator
-    // it is NPR x 16 x NB*RPOT continuous assignments, every one of them
-    // woken by every bank's read, which grows as the square of the banks and
-    // held a run of three lanes at time zero.
-    reg [SB-1:0] s_sel [0:NPR-1];
-    reg [3:0]    s_off [0:NPR-1];
-    reg          s_odd [0:NPR-1], s_en [0:NPR-1];
-    integer      si;
-    always @(posedge clk)
-        for (si = 0; si < NPR; si = si + 1) begin
-            s_sel[si] <= SB'((r_bank[si] << RSH) + r_slot[si]);
-            s_off[si] <= p_addr[si*AW +: 4];
-            s_odd[si] <= p_addr[si*AW + 4];
-            s_en[si]  <= p_en[si] && r_got[si];
-        end
-    generate
+    end else begin : g_direct
+        // Simulated, the same answer read directly: the slot, the half and the
+        // offset registered as the copies above are, then the two words and the
+        // shift.  The byte-wise gather above is for the mapper; in a simulator
+        // it is NPR x 16 x NB*RPOT continuous assignments, every one of them
+        // woken by every bank's read, which grows as the square of the banks and
+        // held a run of three lanes at time zero.
+        reg [SB-1:0] s_sel [0:NPR-1];
+        reg [3:0]    s_off [0:NPR-1];
+        reg          s_odd [0:NPR-1], s_en [0:NPR-1];
+        integer      si;
+        always @(posedge clk)
+            for (si = 0; si < NPR; si = si + 1) begin
+                s_sel[si] <= SB'((r_bank[si] << RSH) + r_slot[si]);
+                s_off[si] <= p_addr[si*AW +: 4];
+                s_odd[si] <= p_addr[si*AW + 4];
+                s_en[si]  <= p_en[si] && r_got[si];
+            end
         for (gp = 0; gp < NPR; gp = gp + 1) begin : g_read_sim
             wire [127:0] ev  = even_q[s_sel[gp]*128 +: 128];
             wire [127:0] od  = odd_q[s_sel[gp]*128 +: 128];
@@ -445,8 +453,7 @@ module fabric_vb #(
                 p_hi[gp*128 +: 128]   = s_en[gp] ? win[255:128] : 128'bx;
             end
         end
-    endgenerate
-`endif
+    end endgenerate
 
     // Every logical port that folded onto a crossbar port reads its answer:
     // wires, since at most one of them asked for it.
