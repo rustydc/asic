@@ -54,7 +54,7 @@ from pathlib import Path
 from fabric import layer as L
 from fabric.sta import run_sta
 from fabric import sram
-from fabric.synth import RTL_DIR, nand2_area, synthesize
+from fabric.synth import RTL_DIR, nand2_area, synthesize, heavy_inputs
 
 VEC = ("fabric_sram.sv", "fabric_vector.sv")
 
@@ -176,11 +176,12 @@ UNITS = [
          "the vector buffer's crossbar, 26 reads and 19 writes folded onto 11 and 8 over eight banks (the banks are macros)", noshare=True),
     # Four lanes, each with its own store and 128 buffer ids (a lane's
     # programs use 85 at the 9B geometry).  The store is a macro, so its
-    # depth costs the logic nothing.
+    # depth costs the logic nothing.  The lane is mapped once: flat, the
+    # four took two and a half hours; kept, three minutes.
     Unit("sequencer", "fabric_sequencer", ("fabric_sram.sv", "fabric_sequencer.sv"),
          {"NU": 10, "NE": 4, "LN": 4, "DEPTH": 512, "NID": 128},
          "the token sequencer, four lanes, each a 512-step program store and 128 buffer ids",
-         files=(("program.hex", _program_image(512)),)),
+         files=(("program.hex", _program_image(512)),), keep_hier=("fabric_seq_lane",)),
 ]
 
 
@@ -239,6 +240,10 @@ def run_unit(unit: Unit, lib_name: str, liberty: Path, target_ps: int, sta: Path
         nand2 = nand2_area(liberty)
         if nand2:
             out["nand2_equiv"] = synth.area_um2 / nand2
+        if unit.keep_hier and Path(netlist).exists():
+            heavy = heavy_inputs(Path(netlist).read_text(), unit.top)
+            if heavy:                                            # unbuffered: the timing below is not the design's
+                out["heavy_inputs"] = heavy
         # The memories are blackboxes to synthesis; the timing tools get a liberty
         # for the ones this design has, so their address and data paths are timed.
         macros, libs = [], [liberty]

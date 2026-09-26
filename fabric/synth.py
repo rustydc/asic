@@ -284,8 +284,12 @@ def synthesize(liberty: Path | Sequence[Path], *, rows: int = 256, cols: int = 8
             # each an interpolated table, and flattened they are most of the
             # 778,111 gates ABC is handed -- which is why that unit's
             # synthesis does not finish rather than why it does not time.
-            # Timing is unaffected: OpenSTA reads the hierarchy and walks
-            # through it either way.
+            # OpenSTA reads the hierarchy and walks through it either way,
+            # but ABC maps each module alone and buffers only nets it makes:
+            # a kept module's input goes unbuffered to every load inside it,
+            # from a driver the parent sized for one pin.  The sequencer's
+            # lane took its issue strobe as an input, 853 loads on one
+            # inverter, 3.4 ns.  `heavy_inputs` finds these.
             # Matched with wildcards: `hierarchy` renames a parameterized
             # module to $paramod\<name>\<params>, so the bare name selects
             # nothing and yosys says so in a warning that is easy to miss
@@ -342,6 +346,26 @@ def synthesize(liberty: Path | Sequence[Path], *, rows: int = 256, cols: int = 8
     per = area / cols if params is None or "COLS" in params else area
     return SynthResult(label, rows, cols, rows_per_cycle, cells, area, per, flops, delay, critical,
                        tail[-3000:], buffered)
+
+
+def heavy_inputs(netlist: str, top: str, limit: int = 64) -> dict[str, int]:
+    """The input bits of the netlist's modules other than ``top`` that drive
+    more than ``limit`` cell pins, as ``module.port[bit]``: loads.  ABC does
+    not buffer a module's inputs, so in a hierarchical map each is a single
+    driver's whole fanout (see `keep_hier`)."""
+    heavy = {}
+    for match in re.finditer(r"^module\s+(\S+)\s*\(.*?^endmodule", netlist, re.S | re.M):
+        name = match.group(1).split("\\")[-1]
+        if name == top:
+            continue
+        body = match.group(0)
+        ports = set(re.findall(r"^\s*input\s+(?:\[[^\]]*\]\s*)?(\w+);", body, re.M))
+        loads: dict[str, int] = {}
+        for pin in re.findall(r"\.\w+\((\w+(?:\[\d+\])?)\)", body):
+            if pin.split("[")[0] in ports and pin.split("[")[0] not in ("clk", "rst_n"):
+                loads[pin] = loads.get(pin, 0) + 1
+        heavy.update({f"{name}.{pin}": n for pin, n in loads.items() if n > limit})
+    return heavy
 
 
 def parse_stat(log: str) -> tuple[int, float, int]:

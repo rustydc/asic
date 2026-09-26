@@ -109,7 +109,7 @@ module fabric_sequencer #(
     // head step against them, and its count of commands outstanding.  What
     // the lanes share is here: the ports' records and the drain, the tags,
     // and the pick of the oldest lane that can go.
-    wire [LN-1:0]  head_v, deps_ok, win;
+    wire [LN-1:0]  head_v, deps_ok, win, go, beaten;
     wire [255:0]   head       [0:LN-1];
     wire [1:0]     head_layer [0:LN-1];
     wire [20:0]    head_page  [0:LN-1];
@@ -118,13 +118,22 @@ module fabric_sequencer #(
     genvar gl;
     generate
         for (gl = 0; gl < LN; gl = gl + 1) begin : g_lane
-            fabric_seq_lane #(.LANE(gl), .DEPTH(DEPTH), .RQ(RQ), .NID(NID), .CW(CW), .NREL(NREL), .PROG_FILE(PROG_FILE)) u (
+            fabric_seq_lane #(.DEPTH(DEPTH), .RQ(RQ), .NID(NID), .CW(CW), .NREL(NREL)) u (
                 .clk(clk), .rst_n(rst_n),
                 .push(push && push_lane == gl), .push_pc(push_pc), .push_steps(push_steps), .push_layer(push_layer),
                 .push_page(push_page), .room(push_room[gl]),
-                .issue(win[gl]), .head_v(head_v[gl]), .head(head[gl]), .head_layer(head_layer[gl]), .head_page(head_page[gl]),
+                .go(go[gl]), .beaten(beaten[gl]), .head_v(head_v[gl]), .head(head[gl]), .head_layer(head_layer[gl]), .head_page(head_page[gl]),
                 .mine(mine[gl*NREL +: NREL]), .d_c(d_c), .d_p(d_p), .deps_ok(deps_ok[gl]),
                 .busy(lane_busy[gl]), .done(lane_done[gl]));
+`ifndef FABRIC_SYNTH
+            // Each lane's store from its own image: loaded from here rather than
+            // by the lane, so the four lanes are one module with one set of
+            // parameters and synthesis maps it once.
+            initial if (PROG_FILE != "") begin
+                if (gl == 0) $readmemh(PROG_FILE, u.u_prog.mem);
+                else         $readmemh($sformatf("lane%0d_%s", gl, PROG_FILE), u.u_prog.mem);
+            end
+`endif
         end
     endgenerate
     assign running = |lane_busy;
@@ -250,23 +259,30 @@ module fabric_sequencer #(
     // older[m][l]: lane m's token came before lane l's.
     reg [LN-1:0] older [0:LN-1];
     reg [LN-1:0] cand;
+    // What the lane itself cannot see: its step's port is free and ready and
+    // a tag is free (`go`); an older lane can go too (`beaten`).  The lane
+    // forms its issue from them.  The net gates every one of its counters
+    // and its queue, 853 loads, and a mapper buffers a net only where it is
+    // made: made here and handed in, it reached them from one inverter.
     reg [PW-1:0] port_of [0:LN-1];
     integer l, m, p, x;
     always @* begin
         for (l = 0; l < LN; l = l + 1) begin
             port_of[l] = head[l][3:0] * NE + head[l][7:4];
-            cand[l] = head_v[l] && deps_ok[l] && !blocked[port_of[l]] && port_ready[port_of[l]] && !tab_live[icount[7:0]];
+            cand[l] = head_v[l] && deps_ok[l] && go[l];
         end
     end
     genvar gw;
     generate
         for (gw = 0; gw < LN; gw = gw + 1) begin : g_win
+            assign go[gw] = !blocked[port_of[gw]] && port_ready[port_of[gw]] && !tab_live[icount[7:0]];
             wire [LN-1:0] elder;
             genvar gm;
             for (gm = 0; gm < LN; gm = gm + 1) begin : g_b
                 assign elder[gm] = older[gm][gw];
             end
-            assign win[gw] = cand[gw] && !(|(cand & elder));
+            assign beaten[gw] = |(cand & elder);
+            assign win[gw] = cand[gw] && !beaten[gw];
         end
     endgenerate
     wire       issue = |win;
@@ -354,13 +370,11 @@ endmodule
 // first step is fetched in the same way, so a lane's runs follow one another
 // as one program.
 module fabric_seq_lane #(
-    parameter int LANE  = 0,
     parameter int DEPTH = 4096,
     parameter int RQ    = 4,
     parameter int NID   = 128,
     parameter int CW    = 6,
-    parameter int NREL  = 1,
-    parameter     PROG_FILE = "program.hex"
+    parameter int NREL  = 1
 ) (
     input  wire          clk,
     input  wire          rst_n,
@@ -370,7 +384,8 @@ module fabric_seq_lane #(
     input  wire [1:0]    push_layer,
     input  wire [20:0]   push_page,
     output wire          room,
-    input  wire          issue,
+    input  wire          go,             // the top's leave: port and tag free
+    input  wire          beaten,         // an older lane issues instead
     output wire          head_v,
     output wire [255:0]  head,
     output wire [1:0]    head_layer,
@@ -387,6 +402,7 @@ module fabric_seq_lane #(
     localparam int NC = 6, NP = 2, IDB = 64 + 4 * 30;
     localparam int PAW = (DEPTH > 1) ? $clog2(DEPTH) : 1;
     localparam int RW  = (RQ > 1) ? $clog2(RQ) : 1;
+    wire issue = head_v && deps_ok && go && !beaten;   // the top's win for this lane
 
     reg [15:0] rq_pc    [0:RQ-1];
     reg [15:0] rq_steps [0:RQ-1];
@@ -435,12 +451,6 @@ module fabric_seq_lane #(
     fabric_sram #(.W(256), .D(DEPTH), .NRD(1), .NWR(1), .MB(256)) u_prog (
         .clk(clk), .rd_en(fetch), .rd_addr(faddr[PAW-1:0]), .rd_data(fetched),
         .wr_en(1'b0), .wr_addr({PAW{1'b0}}), .wr_data(256'd0), .wr_mask(1'b0));
-`ifndef FABRIC_SYNTH
-    initial if (PROG_FILE != "") begin
-        if (LANE == 0) $readmemh(PROG_FILE, u_prog.mem);
-        else           $readmemh($sformatf("lane%0d_%s", LANE, PROG_FILE), u_prog.mem);
-    end
-`endif
 
     integer w;
     always @(posedge clk or negedge rst_n) begin
@@ -571,7 +581,7 @@ module fabric_seq_lane #(
         end
     end
 `ifndef FABRIC_SYNTH
-    always @(posedge clk) if (rst_n && qn > 2'd2) $display("FAIL: lane %0d's fetch queue overran", LANE);
+    always @(posedge clk) if (rst_n && qn > 2'd2) $display("FAIL: %m: the fetch queue overran");
 `endif
 endmodule
 

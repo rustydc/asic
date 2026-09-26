@@ -1855,6 +1855,26 @@ the command -- at 607,102 NAND2-eq against 248,887: the lanes' counters,
 counters are now 128 deep (`LANE_IDS`); the stub tests that run a 9B
 stream of two in one lane build the sequencer with 256.
 
+Flat, the four lanes are one netlist ABC optimizes four times over, and
+the map took two and a half hours (at 128 ids: 2.00 ns, 468,761). So a
+lane is its own module, `fabric_seq_lane` -- its store, fetch queue,
+counters, the check of its head step against them and its count of
+commands outstanding -- and synthesis keeps it (`keep_hier`), maps it
+once and instantiates it four times: three minutes. The top keeps what
+the lanes share: the ports' records, the drain, the tags and the pick.
+The first hierarchical map timed at 5.21 ns, all of it one net: the
+pick's win for a lane went in as the lane's `issue` input and gated all
+853 of its counter and queue flops, and ABC, mapping the lane alone,
+buffers the nets it makes and not the ones it is handed -- the top's
+inverter drove the 853 pins, 1.39 pF, for 3.35 ns. Now the top hands in
+what the lane cannot see (`go`: its port free and ready and a tag free;
+`beaten`: an older lane can go too) and the lane forms its issue itself,
+where the net is buffered like any other: 1.42 ns, 415,705 NAND2-eq and
+13,128 flops, faster and smaller than the flat map, the path again a
+lane's counter through its check and the pick into the top's registers. `synth.heavy_inputs`
+lists any kept module's input bit with more than 64 loads, and
+`synth_units` records them, so a map that times one such net says so.
+
 The checks. `tb_sequencer` runs two lanes of the tiny layers, four runs
 each, and four lanes of the 9B layers on stub units, 856 steps with the
 lanes changing 271 times, every command issued and done in the model's
@@ -2075,6 +2095,7 @@ against them, and the 105 tests pass.
 | vector_buffer | the buffer's crossbar, 26 reads and 19 writes folded onto 11 and 8, over eight banks | 7.88 -> 1.46 | 12.60 -> 0.88 | 407,082 -> 355,461 |
 | sequencer | the token sequencer, a 512-step program memory (a macro) and 256 buffer ids | not mapped -> 9.15 -> 2.04 | not mapped -> 1.23 | 240,621 |
 | sequencer, lanes | four lanes, each a 512-step store and 256 buffer ids (one lane: 1.39 ns, 248,887) | 1.47 | | 607,102 |
+| sequencer, lanes | four lanes, each a 512-step store and 128 buffer ids, the lane mapped once (flat: 2.00 ns, 468,761) | 1.42 | | 415,705 |
 
 Four shapes carried the change.
 
