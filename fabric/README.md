@@ -1846,9 +1846,13 @@ a second port by another lane, buying 4.1 MB of SRAM ports to the
 batches' 4.6); the crossbar is its whole face again, 27 read and 20 write
 ports with the link's, which the fold had taken to 11 and 8 (407,000
 NAND2-eq against 278,000 before the link's two); the program stores are
-four of 2,048 steps rather than one of 4,096; and the sequencer's issue
-check is four checks and a pick, which is the next thing synthesis has to
-say about it.
+four of 2,048 steps rather than one of 4,096; and the sequencer is four
+issue checks and a pick. Synthesized on NanGate 45 (512-step stores, 256
+ids a lane), four lanes close at 1.47 ns against one lane's 1.39 -- the
+pick costs 80 ps, and the path is still a counter through the check into
+the command -- at 607,102 NAND2-eq against 248,887: the lanes' counters,
+19,110 flops to 7,268. A lane's programs use 85 ids, so 128 a lane would
+take most of that back.
 
 The checks. `tb_sequencer` runs two lanes of the tiny layers, four runs
 each, and four lanes of the 9B layers on stub units, 856 steps with the
@@ -2052,6 +2056,7 @@ against them, and the 105 tests pass.
 | mem_arbiter | the memory arbiter, four requesters | 0.73 | 0.45 | 1,660 |
 | vector_buffer | the buffer's crossbar, 26 reads and 19 writes folded onto 11 and 8, over eight banks | 7.88 -> 1.46 | 12.60 -> 0.88 | 407,082 -> 355,461 |
 | sequencer | the token sequencer, a 512-step program memory (a macro) and 256 buffer ids | not mapped -> 9.15 -> 2.04 | not mapped -> 1.23 | 240,621 |
+| sequencer, lanes | four lanes, each a 512-step store and 256 buffer ids (one lane: 1.39 ns, 248,887) | 1.47 | | 607,102 |
 
 Four shapes carried the change.
 
