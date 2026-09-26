@@ -292,11 +292,11 @@ class GlobalEngineRtlTest(unittest.TestCase):
         cal["x2"] = max(cal["x2"], max(float(np.abs(x).max()) for x in cls.xs))
         cls.c = L.compile_global_layer(w, cfg, cls.spec, cal)
 
-    def context_at(self, pos: int) -> tuple[dict, tuple[bytes, bytes]]:
+    def context_at(self, pos: int, mm=None) -> tuple[dict, tuple[bytes, bytes]]:
         """The context after positions before ``pos``, the token's inputs
         (its rows as the memory serves them after its own append) and the
         image before and after."""
-        cfg, mm = self.cfg, self.mm
+        cfg, mm = self.cfg, mm or self.mm
         nkv, hd = cfg.num_key_value_heads, cfg.head_dim
         store = GlobalContextMemory(mm, cfg.top_blocks)
         zero = np.zeros((nkv, 1, hd), dtype=np.int64)
@@ -347,6 +347,16 @@ class GlobalEngineRtlTest(unittest.TestCase):
         inputs, images = self.chunk_at(1, 3)
         prog = S.global_program(self.cfg, self.c, self.spec, self.mm, 1, chunk=3)
         run_engine(self, self.cfg, self.c, self.spec, self.mm, prog, inputs, {"m_ctx": images})
+
+    def test_int8_records(self) -> None:
+        # The records as int8 rather than int4: the rows are moved as they are
+        # in memory whatever their width, and the attention adapter unpacks
+        # them, so its other path is this one.
+        mm = MemoryMap.from_config(self.cfg, context_tokens=256, recurrent_layers=0, kv_bits=8)
+        self.assertEqual(mm.kv_record_bytes, 2 * self.mm.kv_record_bytes)      # each half a beat and a half, padded to two
+        inputs, images = self.context_at(30, mm)
+        prog = S.global_program(self.cfg, self.c, self.spec, mm, 30)
+        run_engine(self, self.cfg, self.c, self.spec, mm, prog, inputs, {"m_ctx": images})
 
     def test_one_program_serves_every_position(self) -> None:
         # The position is the engine's to know, as the slot is: the program's

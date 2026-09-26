@@ -187,7 +187,7 @@ class StoreTest(unittest.TestCase):
 
 @unittest.skipUnless(shutil.which("iverilog") and shutil.which("vvp"), "iverilog not installed")
 class MemoryRtlTest(unittest.TestCase):
-    def check(self, top: str, emit) -> None:
+    def check(self, top: str, emit) -> str:
         with tempfile.TemporaryDirectory() as directory:
             work = Path(directory)
             params = emit(work)
@@ -197,15 +197,27 @@ class MemoryRtlTest(unittest.TestCase):
                            cwd=work, check=True, capture_output=True, text=True)
             result = subprocess.run(["vvp", "sim.vvp"], cwd=work, check=True, capture_output=True, text=True)
         self.assertIn("PASS", result.stdout, result.stdout)
+        return result.stdout
 
     def test_topk(self) -> None:
         rng = np.random.default_rng(20)
         self.check("tb_topk", lambda d: M.emit_topk_vectors(d, rng, 8, 64))
 
     def test_index_scan(self) -> None:
+        from fabric.sequencer import Timing
         rng = np.random.default_rng(21)
-        self.check("tb_index_scan", lambda d: M.emit_index_scan_vectors(d, rng, M.MemoryMap(**SMALL), 40, 8))
-        self.check("tb_index_scan", lambda d: M.emit_index_scan_vectors(d, rng, M.MemoryMap(context_tokens=2048), 100, 32))
+        t = Timing()
+        for mm, blocks, k in ((M.MemoryMap(**SMALL), 40, 8), (M.MemoryMap(context_tokens=2048), 100, 32),
+                              (M.MemoryMap(context_tokens=2048), 60, 32)):
+            out = self.check("tb_index_scan", lambda d: M.emit_index_scan_vectors(d, rng, mm, blocks, k))
+            # Two beats a transfer, in the timing model's cycles: its pages
+            # without the query's coding, which the testbench does not run, and
+            # with a cycle more a request, the testbench memory's latency
+            # being a cycle more than the engine's.
+            rpb, rb = mm.index_burst_records, mm.index_code_beats + 1
+            pages = -(-blocks // rpb)
+            cycles = int(out.split(" in ")[1].split()[0])
+            self.assertEqual(cycles, t.scan(blocks, rb, 1, rpb) - t.scan_latency - t.scan_request + pages + 1, out)
         # A chunk's queries in one pass over the index, each over the blocks its position allows.
         self.check("tb_index_scan", lambda d: M.emit_index_scan_vectors(d, rng, M.MemoryMap(**SMALL), 40, 8, queries=3))
         self.check("tb_index_scan", lambda d: M.emit_index_scan_vectors(d, rng, M.MemoryMap(context_tokens=2048), 60, 32, queries=8))
@@ -214,11 +226,6 @@ class MemoryRtlTest(unittest.TestCase):
         rng = np.random.default_rng(22)
         self.check("tb_kv_append", lambda d: M.emit_kv_append_vectors(d, rng, M.MemoryMap(**SMALL), 22, 2))     # two tokens into a block: the sums are live
         self.check("tb_kv_append", lambda d: M.emit_kv_append_vectors(d, rng, M.MemoryMap(**SMALL, kv_bits=4), 20, 2))
-
-    def test_record_reader_into_attention(self) -> None:
-        rng = np.random.default_rng(23)
-        self.check("tb_record_reader", lambda d: M.emit_record_reader_vectors(d, rng, M.MemoryMap(**SMALL), 30, 2, 2, 16))
-        self.check("tb_record_reader", lambda d: M.emit_record_reader_vectors(d, rng, M.MemoryMap(**SMALL, kv_bits=4), 30, 2, 2, 16))
 
     def test_row_dma_round_trip(self) -> None:
         rng = np.random.default_rng(24)

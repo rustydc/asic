@@ -12,9 +12,9 @@ port as ``fabric/rtl/fabric_memory.sv`` implements them:
 * the recurrent side: state rows and history beats to and from the delta
   engine and the convolution (``fabric_row_dma``);
 * the global side: the window append, block means, the 4-bit index key
-  (``fabric_kv_append``), the index scan and top-K (``fabric_index_scan``,
-  ``fabric_topk``) and the record reader that feeds the attention core
-  (``fabric_record_reader``);
+  (``fabric_kv_append``) and the index scan and top-K (``fabric_index_scan``,
+  ``fabric_topk``); the records the attention reads are moved to it as they
+  are and unpacked by its adapter (``rtl/fabric_engine.sv``);
 * ``GlobalContextMemory`` and ``GlobalContextMemoryFloat``: a context's
   global-layer stores in integer and in float, the float one reproducing
   ``fixed_llm_poc.SparseGlobalMixer`` token by token.
@@ -621,34 +621,6 @@ def emit_kv_append_vectors(directory: Path, rng: np.random.Generator, mm: Memory
                    KV_BITS=mm.kv_bits, W=mm.local_window, WINDOW_BASE=regions["window0"][0],
                    BLOCK_BASE=regions["blocks0"][0], INDEX_BASE=regions["index0"][0], SUMS_BASE=regions["sums0"][0],
                    WORDS=len(store.image.data) // BEAT)
-
-
-def emit_record_reader_vectors(directory: Path, rng: np.random.Generator, mm: MemoryMap, tokens: int, top: int,
-                               g: int, lanes: int) -> dict:
-    """A filled store, one token's retrieval, and the attention over its rows."""
-    from fabric.layer import attention_int
-    directory.mkdir(parents=True, exist_ok=True)
-    write_luts(directory)
-    store = GlobalContextMemory(mm, top)
-    for pos in range(tokens):
-        store.append(pos, rng.integers(-128, 128, (mm.kv_heads, mm.head_dim)),
-                     rng.integers(-128, 128, (mm.kv_heads, mm.head_dim)), rng.integers(-128, 128, mm.index_dim))
-    pos = tokens - 1
-    got = store.retrieve(pos, index_unit(rng.integers(-128, 128, mm.index_dim)))
-    q = rng.integers(-128, 128, (g, mm.head_dim))
-    gate = rng.integers(-128, 128, (g, mm.head_dim))
-    consts = dict(mult_s=int(rng.integers(1 << 12, 1 << 16)), sh_s=18, mult_gate=int(rng.integers(1, 1 << 16)), sh_gate=12,
-                  mult_o=int(rng.integers(1, 1 << 16)), sh_o=24)
-    out = attention_int(q, gate, got["k_rows"][0], got["v_rows"][0], **consts)
-    pack8 = lambda row: int(sum((int(e) & 0xFF) << (8 * j) for j, e in enumerate(row)))
-    store.image.to_hex(directory / "mem.hex")
-    write_hex(directory / "reqs.hex", [(count << 32) | addr for addr, count in got["requests"]], 40)
-    write_hex(directory / "q.hex", [pack8(row) for row in q], 8 * mm.head_dim)
-    write_hex(directory / "gate.hex", [pack8(row) for row in gate], 8 * mm.head_dim)
-    write_hex(directory / "expected_out.hex", [pack8(row) for row in out], 8 * mm.head_dim)
-    return _params(directory, HD=mm.head_dim, KV_BITS=mm.kv_bits, G=g, L=lanes, N=len(got["requests"]),
-                   NREC=len(got["addrs"]), MAXR=mm.window_burst_records, REC_BEATS=mm.kv_record_bytes // BEAT,
-                   WORDS=len(store.image.data) // BEAT, **{k.upper(): v for k, v in consts.items()})
 
 
 def emit_row_dma_vectors(directory: Path, rng: np.random.Generator, k: int, v: int) -> dict:

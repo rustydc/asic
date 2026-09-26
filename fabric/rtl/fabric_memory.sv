@@ -375,13 +375,23 @@ endmodule
 // query by its own scorer; query k takes only the blocks below its own
 // count (n_q[k]), which is the blocks eligible at its token's position, and
 // the scan reads as many as the last of them.
+//
+// XW beats a transfer: the requests are wide and both beats of a transfer
+// are scored at once, their products and the running sum one carry-save
+// tree.  A record is at least two beats, a code beat and the scale, so a
+// transfer ends at most one record.  One that ends in the first lane is
+// scaled as it arrives, from the sum held; one that ends in the second is
+// scaled the cycle after, when its sum is held -- the scale never waits on
+// the tree.  A beat a cycle, the scan was half the memory's rate and, at the
+// end of a long context, most of the global layer's time.
 // ---------------------------------------------------------------------------
 module fabric_index_scan #(
     parameter int DW   = 128,
     parameter int IDIM = 128,
     parameter int IDW  = 16,
     parameter int RPB  = 25,                               // records per request (a page)
-    parameter int NQ   = 1                                 // queries scored at once
+    parameter int NQ   = 1,                                // queries scored at once
+    parameter int XW   = 2                                 // beats a transfer carries (1 or 2)
 ) (
     input  wire              clk,
     input  wire              rst_n,
@@ -396,10 +406,11 @@ module fabric_index_scan #(
     output reg  [NQ*32-1:0]  cand_score,
     output reg               req_valid,
     input  wire              req_ready,
+    output wire              req_wide,
     output wire [31:0]       req_addr,
     output wire [11:0]       req_beats,
     input  wire              rdata_valid,
-    input  wire [DW-1:0]     rdata
+    input  wire [XW*DW-1:0]  rdata
 );
     localparam int CPB  = DW / 4;                          // codes per beat
     localparam int CB   = (IDIM + CPB - 1) / CPB;          // code beats
@@ -408,271 +419,135 @@ module fabric_index_scan #(
     localparam int RW   = $clog2(RPB + 1);
     reg              busy, inflight;
     reg [IDW-1:0]    blk;                                  // the block being scored
-    reg [IDW-1:0]    first;                                // the first block of the request
     reg [RW-1:0]     count, got;                           // records in the request, records finished
-    reg [BW-1:0]     beat;
-    reg [NQ*32-1:0] accs, accc;
+    reg [BW-1:0]     beat;                                 // the first lane's beat of its record
+    reg [11:0]       rleft;                                // beats of the request still to come
+    reg [NQ*32-1:0]  accs, accc;
+    reg              pend;                                 // a record ended in the second lane: scale it now
+    reg [7:0]        pscale;
     wire [IDW-1:0]   left = n_blocks - blk;
     wire [RW-1:0]    want = (left > RPB) ? RPB[RW-1:0] : left[RW-1:0];
     assign req_addr  = base + blk * REC;
     assign req_beats = want * (CB + 1);
-    // Partial dot product of this beat's codes.  Each factor is in [-15, 15]
-    // and each product in [-225, 225], so the beat's sum needs 14 bits, not
-    // 64; the sum is a balanced tree, since a chain of CPB adds is CPB carry
-    // chains deep and ABC cannot restructure them.
-    localparam int PWID = 16;
-    wire [CB-1:0] bsel;
+    assign req_wide  = (XW > 1);
+    // This transfer's beats: the first lane's, and the second's if it carries two.
+    wire             xfer = inflight && rdata_valid;
+    wire             two  = (XW > 1) && (rleft > 1);
+    wire [BW-1:0]    b0   = beat;
+    wire [BW-1:0]    b1   = (beat == CB) ? {BW{1'b0}} : beat + 1'b1;
+    wire             s0   = xfer && (b0 == CB);            // the first lane holds a record's scale
+    wire             s1   = xfer && two && (b1 == CB);     // or the second does
+    wire [DW-1:0]    lo   = rdata[DW-1:0];
+    wire [DW-1:0]    hi   = rdata[XW*DW-1 -: DW];
+    wire             ends = s0 || pend;                    // a record is scaled this cycle
+    wire [7:0]       fsc  = pend ? pscale : lo[7:0];
+    // The codes of each lane's beat.  Each product of two levels 2c - 15 is
+    // in [-225, 225]; a lane whose beat is a scale, or absent, adds nothing.
+    wire [CB-1:0] bsel0, bsel1;
     genvar gb;
     generate
         for (gb = 0; gb < CB; gb = gb + 1) begin : g_bsel
-            assign bsel[gb] = (beat == gb[BW-1:0]);
+            assign bsel0[gb] = (b0 == gb[BW-1:0]);
+            assign bsel1[gb] = two && (b1 == gb[BW-1:0]);
         end
     endgenerate
     localparam int ACCW = 32;
-    wire [NQ*32-1:0] final_score, asum_q, acar_q;
-    genvar gq, gp, ga;
+    wire [NQ*32-1:0] final_score, nxt_s, nxt_c;
+    genvar gq, gp;
     generate
         for (gq = 0; gq < NQ; gq = gq + 1) begin : g_q
             integer c, b;
-        reg [CPB*4-1:0] q_beat;
-        reg [CPB-1:0]   q_live;                                // codes of this beat inside IDIM
-        always @* begin
-            q_beat = 0;
-            q_live = 0;
-            for (b = 0; b < CB; b = b + 1)
-                for (c = 0; c < CPB; c = c + 1)
-                    if (b * CPB + c < IDIM) begin
-                        q_beat[c*4 +: 4] = q_beat[c*4 +: 4] | (q_codes[gq*IDIM*4 + (b*CPB + c)*4 +: 4] & {4{bsel[b]}});
-                        q_live[c] = q_live[c] | bsel[b];
-                    end
-        end
-        // The products, reduced carry-save rather than by an adder tree.  Five
-        // levels of sixteen-bit adds is five ripple carries in series -- sixty
-        // gates of this unit's path -- where a carry-save layer is one.  One
-        // real add resolves the pair at the end.
-        wire [CPB*PWID-1:0] prod;
+            reg [CPB*4-1:0] q0, q1;                        // the query's codes for each lane's beat
+            reg [CPB-1:0]   l0, l1;                        // those inside IDIM
+            always @* begin
+                q0 = 0; q1 = 0; l0 = 0; l1 = 0;
+                for (b = 0; b < CB; b = b + 1)
+                    for (c = 0; c < CPB; c = c + 1)
+                        if (b * CPB + c < IDIM) begin
+                            q0[c*4 +: 4] = q0[c*4 +: 4] | (q_codes[gq*IDIM*4 + (b*CPB + c)*4 +: 4] & {4{bsel0[b]}});
+                            q1[c*4 +: 4] = q1[c*4 +: 4] | (q_codes[gq*IDIM*4 + (b*CPB + c)*4 +: 4] & {4{bsel1[b]}});
+                            l0[c] = l0[c] | bsel0[b];
+                            l1[c] = l1[c] | bsel1[b];
+                        end
+            end
+            // The products of both lanes and the running sum, reduced
+            // carry-save in one tree.  The sum is left out when the record it
+            // belongs to is being scaled: this transfer's second lane, if it
+            // has codes, starts the next one.
+            wire [(2*CPB+2)*ACCW-1:0] ops;
             for (gp = 0; gp < CPB; gp = gp + 1) begin : g_prod
                 // A code is four bits, so its level 2c - 15 is six and the
-                // product of two of them is twelve.  Written against 16-bit
-                // literals the levels were 16 bits and every code bought a 16 by
-                // 16 multiply, CPB of them to a beat, for a number that never
-                // leaves [-225, 225].
-                wire signed [5:0]  ql = {1'b0, q_beat[gp*4 +: 4], 1'b0} - 6'sd15;
-                wire signed [5:0]  rl = {1'b0, rdata[gp*4 +: 4], 1'b0} - 6'sd15;
-                wire signed [11:0] pr = ql * rl;
-                assign prod[gp*PWID +: PWID] =
-                    q_live[gp] ? {{(PWID-12){pr[11]}}, pr} : {PWID{1'b0}};
+                // product of two of them is twelve.
+                wire signed [5:0]  ql0 = {1'b0, q0[gp*4 +: 4], 1'b0} - 6'sd15;
+                wire signed [5:0]  rl0 = {1'b0, lo[gp*4 +: 4], 1'b0} - 6'sd15;
+                wire signed [11:0] pr0 = ql0 * rl0;
+                wire signed [5:0]  ql1 = {1'b0, q1[gp*4 +: 4], 1'b0} - 6'sd15;
+                wire signed [5:0]  rl1 = {1'b0, hi[gp*4 +: 4], 1'b0} - 6'sd15;
+                wire signed [11:0] pr1 = ql1 * rl1;
+                assign ops[gp*ACCW +: ACCW]         = l0[gp] ? {{(ACCW-12){pr0[11]}}, pr0} : {ACCW{1'b0}};
+                assign ops[(CPB+gp)*ACCW +: ACCW]   = l1[gp] ? {{(ACCW-12){pr1[11]}}, pr1} : {ACCW{1'b0}};
             end
-        // The accumulator is one more operand of the same tree.  Reduced to a
-        // pair and then resolved and added into `acc`, the beat spends two carry
-        // propagations -- the tree's own and a 32-bit add -- and that was 2,248
-        // ps of a unit whose next path is 1,664.  One tree, one resolve.  It runs
-        // at the accumulator's width: a product is a value and may be
-        // sign-extended into it, where a carry-save pair may not.
-        wire [(CPB+2)*ACCW-1:0] aops;
-            for (ga = 0; ga < CPB; ga = ga + 1) begin : g_aop
-                assign aops[ga*ACCW +: ACCW] =
-                    {{(ACCW-PWID){prod[ga*PWID + PWID-1]}}, prod[ga*PWID +: PWID]};
-            end
-        assign aops[CPB*ACCW +: ACCW]     = accs[gq*32 +: 32];
-        assign aops[(CPB+1)*ACCW +: ACCW] = {accc[gq*32 +: ACCW-1], 1'b0};
-        wire [ACCW-1:0] asum, acar;
-        fabric_csa_tree #(.N(CPB+2), .W(ACCW)) u_acc (.ops(aops), .s(asum), .c(acar));
-        // The accumulator stays carry-save, so the beat has no resolve at all --
-        // it was 600 of that stage's 2,008 ps, behind the select and the
-        // products.  The score keeps only 32 bits, and accs + 2*accc is the
-        // accumulator modulo 2^32, so scaling the pair and scaling the number
-        // agree there: the wrap that makes a carry-save multiplicand wrong in
-        // general is exactly what is discarded here.  Two products of the same
-        // 8-bit scale, merged and resolved once.
-        wire [ACCW-1:0] fs0, fc0, fs1, fc1;
-        fabric_mul_cs #(.AW(ACCW), .BW(8), .PW(ACCW), .ADD(1)) u_f0 (
-            .a(accs[gq*32 +: 32]), .b(rdata[7:0]), .addend({ACCW{1'b0}}), .s(fs0), .c(fc0));
-        fabric_mul_cs #(.AW(ACCW), .BW(8), .PW(ACCW), .ADD(1)) u_f1 (
-            .a({accc[gq*32 +: ACCW-1], 1'b0}), .b(rdata[7:0]), .addend({ACCW{1'b0}}), .s(fs1), .c(fc1));
-        wire [4*ACCW-1:0] fops;
-        assign fops[0*ACCW +: ACCW] = fs0;
-        assign fops[1*ACCW +: ACCW] = {fc0[ACCW-2:0], 1'b0};
-        assign fops[2*ACCW +: ACCW] = fs1;
-        assign fops[3*ACCW +: ACCW] = {fc1[ACCW-2:0], 1'b0};
-        wire [ACCW-1:0] fts, ftc;
-        fabric_csa_tree #(.N(4), .W(ACCW)) u_ft (.ops(fops), .s(fts), .c(ftc));
-        assign final_score[gq*32 +: 32] = fts + {ftc[ACCW-2:0], 1'b0};
-        assign asum_q[gq*32 +: 32] = asum;
-        assign acar_q[gq*32 +: 32] = acar;
+            assign ops[2*CPB*ACCW +: ACCW]     = ends ? {ACCW{1'b0}} : accs[gq*32 +: 32];
+            assign ops[(2*CPB+1)*ACCW +: ACCW] = ends ? {ACCW{1'b0}} : {accc[gq*32 +: ACCW-1], 1'b0};
+            wire [ACCW-1:0] as, ac;
+            fabric_csa_tree #(.N(2*CPB+2), .W(ACCW)) u_acc (.ops(ops), .s(as), .c(ac));
+            // The score: the sum held, times the scale.  The accumulator stays
+            // carry-save and keeps 32 bits, and accs + 2 accc is the sum modulo
+            // 2^32, so scaling the pair and scaling the number agree there.  Two
+            // products of the same 8-bit scale, merged and resolved once.
+            wire [ACCW-1:0] fs0, fc0, fs1, fc1;
+            fabric_mul_cs #(.AW(ACCW), .BW(8), .PW(ACCW), .ADD(1)) u_f0 (
+                .a(accs[gq*32 +: 32]), .b(fsc), .addend({ACCW{1'b0}}), .s(fs0), .c(fc0));
+            fabric_mul_cs #(.AW(ACCW), .BW(8), .PW(ACCW), .ADD(1)) u_f1 (
+                .a({accc[gq*32 +: ACCW-1], 1'b0}), .b(fsc), .addend({ACCW{1'b0}}), .s(fs1), .c(fc1));
+            wire [4*ACCW-1:0] fops;
+            assign fops[0*ACCW +: ACCW] = fs0;
+            assign fops[1*ACCW +: ACCW] = {fc0[ACCW-2:0], 1'b0};
+            assign fops[2*ACCW +: ACCW] = fs1;
+            assign fops[3*ACCW +: ACCW] = {fc1[ACCW-2:0], 1'b0};
+            wire [ACCW-1:0] fts, ftc;
+            fabric_csa_tree #(.N(4), .W(ACCW)) u_ft (.ops(fops), .s(fts), .c(ftc));
+            assign final_score[gq*32 +: 32] = fts + {ftc[ACCW-2:0], 1'b0};
+            assign nxt_s[gq*32 +: 32] = as;
+            assign nxt_c[gq*32 +: 32] = ac;
         end
     endgenerate
+    wire [BW:0] adv = {1'b0, beat} + (two ? 2 : 1);
     integer qi;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            busy <= 1'b0; inflight <= 1'b0; blk <= 0; first <= 0; count <= 0; got <= 0; beat <= 0; accs <= 0; accc <= 0;
-            req_valid <= 1'b0; done <= 1'b0; cand_valid <= {NQ{1'b0}};
+            busy <= 1'b0; inflight <= 1'b0; blk <= 0; count <= 0; got <= 0; beat <= 0; rleft <= 0; accs <= 0; accc <= 0;
+            req_valid <= 1'b0; done <= 1'b0; cand_valid <= {NQ{1'b0}}; pend <= 1'b0; pscale <= 0;
         end else begin
             done <= 1'b0;
             cand_valid <= {NQ{1'b0}};
             if (start) begin
-                blk <= 0; beat <= 0; accs <= 0; accc <= 0; inflight <= 1'b0;
+                blk <= 0; beat <= 0; accs <= 0; accc <= 0; inflight <= 1'b0; pend <= 1'b0;
                 if (n_blocks == 0) done <= 1'b1;
                 else begin busy <= 1'b1; req_valid <= 1'b1; end
             end else if (busy) begin
                 if (req_valid && req_ready) begin
-                    req_valid <= 1'b0; inflight <= 1'b1; beat <= 0; accs <= 0; accc <= 0; count <= want; got <= 0;
+                    req_valid <= 1'b0; inflight <= 1'b1; beat <= 0; count <= want; got <= 0;
+                    rleft <= req_beats;
                 end
-                if (inflight && rdata_valid) begin
-                    if (beat < CB) begin
-                        accs <= asum_q; accc <= acar_q;
-                        beat <= beat + 1'b1;
-                    end else begin
-                        for (qi = 0; qi < NQ; qi = qi + 1) cand_valid[qi] <= (blk < n_q[qi*IDW +: IDW]);
-                        cand_id <= blk; cand_score <= final_score;
-                        beat <= 0; accs <= 0; accc <= 0;
-                        blk <= blk + 1'b1;
-                        got <= got + 1'b1;
-                        if (got == count - 1) begin
-                            inflight <= 1'b0;
-                            if (blk == n_blocks - 1) begin busy <= 1'b0; done <= 1'b1; end
-                            else req_valid <= 1'b1;
-                        end
+                // The sum moves when a transfer comes, and empties when its record is scaled.
+                if (xfer || ends) begin accs <= nxt_s; accc <= nxt_c; end
+                pend <= s1; if (s1) pscale <= hi[7:0];
+                if (xfer) begin
+                    beat <= (adv > CB) ? BW'(adv - (CB + 1)) : BW'(adv);
+                    rleft <= rleft - (two ? 12'd2 : 12'd1);
+                    if (rleft == (two ? 12'd2 : 12'd1)) inflight <= 1'b0;
+                end
+                if (ends) begin
+                    for (qi = 0; qi < NQ; qi = qi + 1) cand_valid[qi] <= (blk < n_q[qi*IDW +: IDW]);
+                    cand_id <= blk; cand_score <= final_score;
+                    blk <= blk + 1'b1;
+                    got <= got + 1'b1;
+                    if (got == count - 1) begin
+                        if (blk == n_blocks - 1) begin busy <= 1'b0; done <= 1'b1; end
+                        else req_valid <= 1'b1;
                     end
                 end
-            end
-        end
-    end
-endmodule
-
-// ---------------------------------------------------------------------------
-// Record reader: each request names `count` consecutive key-then-value
-// records of one KV head (a page of the head-major window, or one block
-// record); they are read in one burst into a ring of 2*MAXR records,
-// unpacked from KV_BITS to int8, and streamed record by record to the
-// attention core as HD/L key beats (kind 2) then HD/L value beats (kind 3),
-// honouring its ready.  Requests arrive on a valid/ready queue; rec_done
-// pulses per record.
-//
-// A record streams out as soon as it has arrived, under the arrival of the
-// ones after it, and the next request is taken as soon as the last one's
-// records have all arrived and the ring has room for it -- so its port
-// latency and its first record's arrival run under this one's stream too.
-// With room for one request only, each request's latency and first record
-// were the stream stopped: at the 9B geometry 96 requests a group, a page
-// of 8 window records or one block each, about 25 cycles apiece.
-// ---------------------------------------------------------------------------
-module fabric_record_reader #(
-    parameter int DW      = 128,
-    parameter int HD      = 256,
-    parameter int KV_BITS = 8,
-    parameter int L       = 64,
-    parameter int MAXR    = 8                              // records per request at most
-) (
-    input  wire           clk,
-    input  wire           rst_n,
-    input  wire           addr_valid,
-    output wire           addr_ready,
-    input  wire [31:0]    addr,
-    input  wire [7:0]     addr_count,
-    output reg            req_valid,
-    input  wire           req_ready,
-    output reg  [31:0]    req_addr,
-    output reg  [11:0]    req_beats,
-    input  wire           rdata_valid,
-    input  wire [DW-1:0]  rdata,
-    output reg            out_valid,
-    input  wire           out_ready,
-    output reg  [1:0]     out_kind,
-    output reg  [L*8-1:0] out_data,
-    output reg            rec_done
-);
-    localparam int HALF_BEATS = (HD * KV_BITS + DW - 1) / DW;
-    localparam int REC_BEATS  = 2 * HALF_BEATS;
-    localparam int EPB        = DW / KV_BITS;             // elements per beat
-    localparam int OUT_BEATS  = 2 * (HD / L);
-    localparam int CAP        = 2 * MAXR;                  // records the ring holds
-    localparam int BW         = $clog2(REC_BEATS) + 1;
-    localparam int OW         = $clog2(OUT_BEATS) + 1;
-    localparam int RW         = $clog2(MAXR) + 1;
-    localparam int CW         = $clog2(CAP) + 1;
-    // The records are a memory, not a register array.  Read as registers,
-    // "record rslot, beat ob" is one mux over the ring's bytes whose first
-    // select bit drives five hundred loads -- two of the unit's two and a half
-    // nanoseconds -- and in silicon this is a small SRAM anyway.  Its word is
-    // the beat that arrives, so a write is a word; a beat out is L of the
-    // word's bytes, and the address leads the data by a cycle.
-    localparam int MW         = EPB * 8;                   // memory word: one unpacked beat
-    localparam int OPW        = (EPB > L) ? EPB / L : 1;   // out beats a word holds
-    localparam int MD         = CAP * REC_BEATS;
-    localparam int MAW        = (MD > 1) ? $clog2(MD) : 1;
-    reg              inflight, emitting;
-    reg [BW-1:0]     beat;
-    reg [OW-1:0]     ob;
-    reg [RW-1:0]     left;                                 // records of the request still to arrive
-    reg [CW-1:0]     wslot, rslot, filled;                 // ring slots being filled and emitted; arrived, not yet out
-    // A request is taken when the last one has arrived and its records fit.
-    assign addr_ready = !req_valid && !inflight && (filled + addr_count <= CAP);
-    // Unpack one beat to EPB int8 elements.
-    integer e;
-    reg [EPB*8-1:0] unpacked;
-    always @* begin
-        for (e = 0; e < EPB; e = e + 1)
-            if (KV_BITS == 8) unpacked[e*8 +: 8] = rdata[e*8 +: 8];
-            else              unpacked[e*8 +: 8] = {rdata[e*4 +: 4], 4'b0};
-    end
-    wire out_fire = out_valid && out_ready;
-    wire have_rec = (filled != 0);                         // an arrived record awaits emission
-    wire arrived  = inflight && rdata_valid && (beat == REC_BEATS - 1);
-    wire retired  = !emitting && out_fire;
-    // The beat the memory is asked for is the one that will be wanted: the
-    // next if this cycle takes a word, the first if emission starts here.
-    // Each half of a record starts at a word of its own -- HD need not be a
-    // whole number of beats (24 elements of 8 bits is a beat and a half), and
-    // the beats that arrive are what the halves are padded to.
-    localparam int HB2 = OUT_BEATS / 2;                    // out beats in a half
-    wire            take   = emitting && (!out_valid || out_fire);
-    wire            begins = !emitting && !out_valid && have_rec;
-    wire [OW-1:0]   ob_a   = begins ? {OW{1'b0}}
-                                    : ((take && ob != OUT_BEATS - 1) ? ob + 1'b1 : ob);
-    wire            hi_a   = (ob_a >= HB2);
-    wire [OW-1:0]   eo_a   = hi_a ? (ob_a - HB2[OW-1:0]) : ob_a;
-    wire [MAW-1:0]  rd_w   = (rslot * REC_BEATS + (hi_a ? HALF_BEATS : 0) + (eo_a * L) / EPB);
-    wire [OW-1:0]   eo     = (ob >= HB2) ? (ob - HB2[OW-1:0]) : ob;
-    wire [MAW-1:0]  wr_w   = (wslot * REC_BEATS + beat);
-    wire [MW-1:0]   rec_q;
-    fabric_sram #(.W(MW), .D(MD), .NRD(1), .NWR(1), .MB(MW)) u_recs (
-        .clk(clk), .rd_en(1'b1), .rd_addr(rd_w), .rd_data(rec_q),
-        .wr_en(inflight && rdata_valid), .wr_addr(wr_w), .wr_data(unpacked), .wr_mask(1'b1));
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            inflight <= 1'b0; emitting <= 1'b0; beat <= 0; ob <= 0; left <= 0; wslot <= 0; rslot <= 0; filled <= 0;
-            req_valid <= 1'b0; req_addr <= 0; req_beats <= 0; out_valid <= 1'b0; rec_done <= 1'b0;
-        end else begin
-            rec_done <= 1'b0;
-            if (addr_valid && addr_ready) begin
-                req_valid <= 1'b1; req_addr <= addr; req_beats <= addr_count * REC_BEATS;
-                left <= addr_count[RW-1:0]; beat <= 0;
-            end
-            if (req_valid && req_ready) begin req_valid <= 1'b0; inflight <= 1'b1; end
-            if (inflight && rdata_valid) begin
-                // Beat b of the record in ring slot wslot is word wslot*REC_BEATS + b.
-                if (beat == REC_BEATS - 1) begin
-                    beat <= 0; wslot <= (wslot == CAP - 1) ? 0 : wslot + 1'b1;
-                    left <= left - 1'b1;
-                    if (left == 1) inflight <= 1'b0;
-                end else beat <= beat + 1'b1;
-            end
-            filled <= filled + arrived - retired;
-            if (emitting) begin
-                if (!out_valid || out_fire) begin
-                    out_valid <= 1'b1;
-                    out_kind  <= (ob < OUT_BEATS / 2) ? 2'd2 : 2'd3;
-                    out_data  <= rec_q[((eo % OPW) * L * 8) +: L*8];
-                    ob <= ob + 1'b1;
-                    if (ob == OUT_BEATS - 1) emitting <= 1'b0;
-                end
-            end else if (out_fire) begin
-                out_valid <= 1'b0;
-                rec_done <= 1'b1;
-                rslot <= (rslot == CAP - 1) ? 0 : rslot + 1'b1;
-            end else if (have_rec) begin
-                emitting <= 1'b1; ob <= 0;
             end
         end
     end

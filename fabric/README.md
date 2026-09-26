@@ -742,16 +742,16 @@ transaction at a time. The units:
   unit, its absolute maximum as the scale, and
   `code = round((u / scale + 1) * 15 / 2)` by the reciprocal unit.
 * `fabric_index_scan` reads the eligible index records a page at a time
-  (25 records per request), scores each as `scale * sum (2q - 15)(2k - 15)`
-  against the query's codes (32 codes per beat), and hands the candidates
-  to `fabric_topk`, a sorted list of K entries that a candidate enters
-  above the first it strictly beats.
-* `fabric_record_reader` takes requests of consecutive records (a page of
-  the window, or one block record), reads them in one burst into a record
-  buffer, unpacks int4 to int8 where needed, and streams them record by
-  record to the attention core as key beats then value beats; the test
-  drives a retrieval's requests through it into `fabric_attention` and
-  checks the heads' outputs.
+  (25 records per request), two beats a transfer, scores each as
+  `scale * sum (2q - 15)(2k - 15)` against the query's codes (32 codes per
+  beat, both beats of a transfer at once), and hands the candidates to
+  `fabric_topk`, a sorted list of K entries that a candidate enters above
+  the first it strictly beats.
+* The records the attention reads -- a page of the window, or one block
+  record, a request -- are the beat mover's: moved into the head's rows
+  buffer as they are in memory, two beats a cycle, and unpacked from int4
+  (or int8) by the attention adapter as its core takes them. A record
+  reader used to unpack them on the way (below).
 
 Retrieval semantics are the reference model's, and `GlobalContextMemoryFloat`
 reproduces `SparseGlobalMixer` token by token to 1e-6 over a sequence
@@ -770,7 +770,7 @@ The sequencer's schedule made the global layer the larger of the two once
 the state was int8, so its three memory terms were taken in turn:
 
 * **The window is head-major.** A KV head's positions are consecutive
-  (`kv_head * W + pos mod W`), so the record reader reads the window in
+  (`kv_head * W + pos mod W`), so the window is read in
   page bursts of eight int4 records (four at int8) at 96 percent burst
   efficiency instead of a record per request at 86 (76 at int4), and the
   append's four records per token go to four addresses instead of one.
@@ -1060,19 +1060,19 @@ four devices and over sixteen, plus the random push-out the device model
 draws for a read (`PathTimingTest`). With it, `Timing(devices=...)`
 charges every memory step its requests on the path: the mover's reads
 whole, its writes posted (the step ends when the bridge has the data, and
-the next request waits for the path), the record reader's and the scan's
-pages as they arrive. The engine run over the device models lands within
+the next request waits for the path), the rows' and the scan's pages as
+they arrive. The engine run over the device models lands within
 three per cent of that schedule, 3,598 cycles against 3,643 for the
-recurrent layer and 4,424 against 4,515 for the global one, where the
-ideal port said 1,382 and 1,766.
+recurrent layer and 4,424 against 4,515 for the global one (with the
+record reader, below), where the ideal port said 1,382 and 1,766.
 
 The path as built is far from the devices' own rate, for two reasons the
 measurement makes plain. The stripe unit takes one request at a time and
 holds it to the end, and a read chunk is filled into its channel's page
 buffer before any of it is drained; so a 16 KB state slot moves at 7 GB/s,
 not 15. And a stripe is 1 KB, so anything of a kilobyte or less goes to
-one device at 1 GB/s: the record reader's two-kilobyte window pages and the
-scan's pages of 25 index records each reach two devices of sixteen, one
+one device at 1 GB/s: the rows' two-kilobyte window pages and the scan's
+pages of 25 index records each reach two devices of sixteen, one
 request at a time, and at the end of a 128K context the scan's 655 KB of
 index is most of the global layer's time.
 
@@ -1080,20 +1080,24 @@ At 600 MHz, per die, streamed:
 
 | Memory | Recurrent | Global, 4K | Global, 128K | Tokens/s, 4K | Tokens/s, 128K |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| the ideal port | 40,365 | 75,823 | 115,503 | 3,047 | 2,536 |
-| 16 PSRAMs, the path as built | 95,416 | 244,500 | 502,511 | 1,130 | 761 |
-| pipelined: reads streamed, requests overlapped | 54,766 | 212,137 | 438,065 | 1,594 | 996 |
-| and the scan and the reader asking ahead | 54,766 | 78,587 | 118,057 | 2,470 | 2,125 |
-| the same, every read burst pushed out | 56,998 | 78,803 | 118,225 | 2,402 | 2,075 |
+| the ideal port | 40,365 | 27,094 | 42,371 | 4,049 | 3,670 |
+| 16 PSRAMs, the path as built | 95,416 | 239,431 | 482,842 | 1,141 | 780 |
+| pipelined: reads streamed, requests overlapped | 54,766 | 226,042 | 451,970 | 1,537 | 974 |
+| and the scan and the rows asking ahead | 54,766 | 46,508 | 72,231 | 2,846 | 2,537 |
+| the same, every read burst pushed out | 56,998 | 49,892 | 76,527 | 2,716 | 2,424 |
 
-(With a pass walking only its own tiles, below; the first figures here
-were 41,605 cycles and 2,497 tokens/s for the ideal port.)
+(With a pass walking only its own tiles, and the rows and the scan at
+the memory's rate, below. The first figures here were 41,605 cycles and
+2,497 tokens/s for the ideal port; before the rows and the scan were
+widened the global layer was 75,823 and 115,503 cycles on the ideal port
+and 78,587 and 118,057 with the units asking ahead, and the die 2,536
+and 2,125 tokens/s at 128K.)
 
-So the 2.5K of the ideal port is 760 tokens/s on the parts as the
-controller is built, and 2.1K with three changes to it: drain a read
+So the 3.7K of the ideal port is 780 tokens/s on the parts as the
+controller is built, and 2.5K with three changes to it: drain a read
 chunk as it arrives, take the next request while the last one's chunks
-run, and let the scan and the record reader keep requests in flight so
-their pages spread over the devices. The last is what the global layer
+run, and let the scan and the rows keep requests in flight so their pages
+spread over the devices. The last is what the global layer
 needs; the first two are what the recurrent layer's state needs, and even
 then its 1 MB a token of state at the devices' 14.9 GB/s is 70 µs of the
 91 µs it takes. The push-out costs two per cent at worst.
@@ -1105,10 +1109,10 @@ controller, per die:
 | PSRAMs a die | Capacity | Contexts at 128K | Tokens/s, 4K | Tokens/s, 128K |
 | ---: | ---: | ---: | ---: | ---: |
 | 4 | 256 MB | 23 | 881 | 765 |
-| 8 | 512 MB | 46 | 1,572 | 1,386 |
-| 12 | 768 MB | 70 | 1,638 | 1,479 |
-| 16 | 1 GB | 93 | 2,470 | 2,125 |
-| 24 | 1.5 GB | 140 | 2,584 | 2,208 |
+| 8 | 512 MB | 46 | 1,618 | 1,421 |
+| 12 | 768 MB | 70 | 1,760 | 1,599 |
+| 16 | 1 GB | 93 | 2,846 | 2,537 |
+| 24 | 1.5 GB | 140 | 3,023 | 2,699 |
 
 Twelve buys little over eight and twenty-four little over sixteen, because
 a state slot is sixteen stripes: at twelve devices four of them take two,
@@ -1190,20 +1194,20 @@ vector through the head norm (a second norm instance with 16-bit output
 and the norm weight as a gain table), rotates it by the table and
 requantizes it to int8. The attention adapter feeds one core the group's
 queries, its gates from the pass output, then each record's key and value
-beats from the head's rows buffer, reading a beat and presenting it until
-the core takes it, so the core's exponential stalls are honoured by the
-handshake. The memory unit grew from a beat mover into the die's memory
-port proper: the mover (the recurrent DMAs), the append, the index scan
-with its top-K and the record reader are four requesters behind
-`fabric_mem_arbiter`, and the port speaks the request protocol of
+beats from the head's rows buffer, unpacking the stored int4 to int8 as
+it goes, reading a beat and presenting it until the core takes it, so the
+core's exponential stalls are honoured by the handshake. The memory unit
+grew from a beat mover into the die's memory port proper: the mover (the
+recurrent DMAs and the rows), the append and the index scan with its
+top-K are three requesters behind `fabric_mem_arbiter`, and the port speaks the request protocol of
 `fabric_memory.sv` (the same the HPI bridge presents). The append command
 loads the token's keys, values and index projection from the buffer and
 the context's running block sums from memory, runs `fabric_kv_append`
 and writes the sums back; the scan command codes the unit index query
 exactly as the append codes its keys, scores the eligible index records
-and writes the top-K ids; the rows command turns the selection into
-requests, the window in page runs then one record per chosen block, and
-lays the reader's int8 rows into the head's buffer. A prefill chunk has
+and writes the top-K ids; the rows command turns the selection into the
+mover's reads, the window in page runs then one record per chosen block,
+into the head's buffer as the records are stored. A prefill chunk has
 three more (below): a head's window records before the chunk, the chunk's
 own, and every token's blocks, all into one rows buffer the chunk's tokens
 share, and its scan takes all the chunk's queries. The block sums moved
@@ -1303,7 +1307,8 @@ Per die, at 600 MHz, a chunk of eight in every layer now prefills at
 4,403 tokens a second at 128K on the ideal port (2,787 before) and 3,815
 on sixteen PSRAMs with the pipelined controller asking ahead (2,730). It
 had been better to run the global layer streamed while the recurrent
-layers were chunked; now the chunk wins in every layer.
+layers were chunked; now the chunk wins in every layer. (With the rows
+and the scan at the memory's rate, next, 4,749 and 3,965.)
 
 At the 9B geometry a chunk of eight gives the recurrent layer 26,033
 cycles per token (32.5 µs) and 134 KB of memory traffic per token
@@ -1316,6 +1321,73 @@ vector units' lanes. The global layer's chunk, at first, gained nothing
 (70,738 cycles per token): each token read its own window and blocks,
 and the chunk only put the tokens' memory steps behind one another. The
 shared window and scan, above, changed that.
+
+### The rows and the scan at the memory's rate
+
+A token's global layer was mostly its memory unit, and the memory unit
+was mostly two units reading at half the memory's rate or less. At the
+9B geometry and 128K, one token's 158,349 cycles were 115,482 of memory
+steps: 74K of the heads' rows and 41K of the index scan.
+
+* **The rows are the mover's.** The record reader read a head's records
+  into a ring, unpacked them from int4 to int8 and wrote them into the
+  rows buffer at the attention's sixteen lanes -- 34 cycles a 256-byte
+  record, where the port gives one in eight. Nothing needed them int8
+  in the buffer: the attention core takes sixteen lanes a cycle, and
+  sixteen int4 elements are eight bytes of one buffer read. So the
+  records now go into the rows buffer as they are in memory, a page of
+  the window or a block record a move of the beat mover, two beats a
+  cycle, and the attention adapter unpacks them as the core takes them
+  (an int4 element is the high nibble of its int8, as the reader had
+  it). The reader and its ring are gone, and the rows buffer is half the
+  size: 136 KB a head for one token, 193 KB for a chunk of eight.
+* **The scan takes two beats a transfer.** Its requests are wide, and
+  both beats of a transfer are scored at once: the two lanes' products
+  and the running sum are one carry-save tree, a level deeper than the
+  one-lane tree. A record is at least a code beat and its scale, so a
+  transfer ends at most one record; one that ends in the second lane is
+  scaled the cycle after, from the sum held, so the scale never waits on
+  the tree, and the top-K still sees a candidate a cycle at most. It
+  synthesizes faster than it did, 1.79 ns on NanGate 45 against 2.07,
+  at 23,168 NAND2-eq against 13,404.
+
+The timing model's rows are the mover's requests, and its scan a page of
+transfers and one cycle more when the page's last record ends in the
+second lane. The unit testbench measures the scan's pages exactly (the
+test asserts it), and the engine runs the single token and both chunks
+in the model's cycles step for step: 1,297, 3,303 and 2,486 cycles
+against 1,511, 3,489 and 2,544 with the reader. A test with int8 records
+takes the adapter's other unpacking, and found the append's model wrong
+in a way int4 had hidden: it charged a record's write three cycles a
+beat, where the append writes a beat a cycle after a longer request --
+the same for a two-beat record, not for a four-beat one. Over the four
+device models the global token is 4,198 cycles against the model's
+4,310, 2.7 per cent; most of the gap is the append, whose writes are
+posted and queue at the bridge, which the model charges one after
+another less the index record's coding that runs under them. (It was
+2.2 per cent with the reader, 4,229 against 4,323: the model had the
+reader's rows a little under, which hid part of the append's gap.) At the 9B geometry, one token's
+global layer:
+
+| | 4K | 128K |
+| --- | ---: | ---: |
+| memory steps a token, before | 75,802 | 115,482 |
+| memory steps a token, now | 21,079 | 42,350 |
+| the layer, one token alone, before | 118,669 | 158,349 |
+| the layer, one token alone, now | 63,946 | 85,217 |
+| a chunk of eight, a token, now | 35,986 | 38,645 |
+
+Per die at 600 MHz, the ideal port decodes 3,670 tokens a second at 128K
+streamed (2,536 before) and 3,217 in batches of four lanes (2,311); a
+single user gets 294 (228), and a chunk of eight prefills at 4,749
+(4,403). On sixteen PSRAMs with the pipelined controller asking ahead it
+is 2,537 streamed (2,125), 2,311 in batches (1,964) and 3,965 prefill
+(3,815). Without asking ahead the global layer is the path's, and a
+little worse than the reader's (974 streamed against 996): the reader
+emitted one request's records while the next arrived, and the mover's
+requests wait for each other. The scan is now 22K of the 42K memory
+cycles at 128K, and still grows with the context; the rows are 20K, of
+which the window's 512 records at the port's rate are most.
 
 ## The controller
 
@@ -1697,10 +1769,9 @@ Verilator and may be what its build needed too.
 
 `rtl/fabric_memory.sv` holds the memory side: the behavioural
 `fabric_mem_model` for the testbenches, `fabric_mem_arbiter`,
-`fabric_row_dma`, `fabric_topk`, `fabric_index_scan`,
-`fabric_record_reader` and `fabric_kv_append`, with the testbenches
-`tb_topk`, `tb_index_scan`, `tb_kv_append`, `tb_record_reader` and
-`tb_row_dma` checking memory images and outputs against `fabric.memory`
+`fabric_row_dma`, `fabric_topk`, `fabric_index_scan` and
+`fabric_kv_append`, with the testbenches `tb_topk`, `tb_index_scan`,
+`tb_kv_append` and `tb_row_dma` checking memory images and outputs against `fabric.memory`
 bit for bit, at int8 and int4 KV and with the 128-wide index and the
 128 x 128 state.
 
@@ -1803,9 +1874,8 @@ against them, and the 105 tests pass.
 | rotary | the rotation, two lanes | 5.71 -> 2.50 -> 1.93 | 5.00 -> 1.54 | 25,338 |
 | rotary_table | the rotary table | 2.48 -> 1.67 | 1.93 -> 1.12 | 15,144 |
 | attention | the attention core, one head of 32, two lanes | 59.62 -> 11.35 -> 2.13 | 33.94 -> 29.68 -> 1.51 | 90,514 |
-| index_scan | the index scan, 32 codes | 13.94 -> 2.07 | 12.73 -> 2.60 | 13,404 |
+| index_scan | the index scan, 32 codes, two beats a transfer | 13.94 -> 2.07 -> 1.79 | 12.73 -> 2.60 -> 1.56 | 23,168 |
 | topk | top-K of eight | 0.71 | 0.48 | 6,840 |
-| record_reader | the record reader, two records of 32 | 2.42 -> 0.94 | 3.10 -> 0.49 | 2,220 |
 | kv_append | the append, one head of 32 | 52.14 -> 4.36 -> 1.88 | 15.52 -> 3.41 -> 1.17 | 63,943 |
 | mem_arbiter | the memory arbiter, four requesters | 0.73 | 0.45 | 1,660 |
 | vector_buffer | the buffer's crossbar, 26 reads and 19 writes folded onto 11 and 8, over eight banks | 7.88 -> 1.46 | 12.60 -> 0.88 | 407,082 -> 355,461 |
@@ -1968,8 +2038,9 @@ one looking for resource sharing before the machine runs out of memory.
 Flattening a bank's slots at a power-of-two stride makes every one of
 them a shift and a concatenation instead.
 
-The record reader was the fourth of the units above, and belongs with the
-memories rather than with the splits. Eleven cells deep, two of its two
+The record reader was the fourth of the units above (it is gone since:
+the rows are the mover's now, and the attention adapter unpacks them), and
+belongs with the memories rather than with the splits. Eleven cells deep, two of its two
 and a half nanoseconds were one flop driving 519 loads: "record `rrec`,
 beat `ob`" read as registers is one mux over `MAXR * 2 * HD` bytes, whose
 first select bit sees half of it. That array is a small SRAM in silicon,

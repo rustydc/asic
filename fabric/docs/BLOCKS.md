@@ -91,8 +91,8 @@ One command per cycle at most. The sequencer drives the operands of the head ste
 | swiglu | beats | gate | y | up |  | constant set |
 | residual | beats | h | h out | y |  | constant set |
 | rotary |  | head vector (op 1) | table / rotated head | table (op 1) | position (op 0) | [3:0] op (0 table, 1 head), [7:4] kind (q or k) |
-| attention | N records | queries | output | gate base (stride 2 x HD) | rows buffer |  |
-| memory | beats | memory beat address (rd) / buffer (wr, append v) | buffer (rd) / memory (wr) | v (append), head (rows) | context page | [3:0] op (0 rd, 1 wr, 2 append, 3 scan, 4 rows), [31:4] position |
+| attention | N records | queries | output | gate base (stride 2 x HD) | rows buffer (records as stored) | [31] rows from the position, [30] a chunk's shared rows, [23:16] its tokens, [15:0] the token's place |
+| memory | beats, or a chunk's tokens | memory beat address (rd) / buffer (wr, append v) | buffer (rd) / memory (wr) | v (append), head (rows) | context page | [3:0] op (0 rd, 1 wr, 2 append, 3 scan, 4 rows, 5/6 a chunk's window before and after its appends, 7 its blocks), [31:4] the token's place in its chunk |
 
 ## Vector buffer port
 
@@ -156,11 +156,10 @@ Each vector unit is a streaming datapath of L lanes per beat: in_valid presents 
 | --- | --- | --- | --- |
 | fabric_row_dma (mover) | rd_start/rd_base, wr_start/wr_base, row streams | one request port | Reads or writes ROWS rows of ROW_BITS as one burst; the state slots and histories. |
 | fabric_kv_append | start, pos, window/block/index bases, k_rows, v_rows, idx_k, running sums in | one request port (writes) | Writes the token's keys and values into the window at pos; adds them to the block sums; at a block end pools the block into a block record and codes its index record (4-bit codes and a scale); sums out for the memory. |
-| fabric_index_scan | start, base, n_blocks, q_codes | one request port (reads RPB records a page) | Streams every eligible block's index record, scores it against the coded query (a dot product of 4-bit codes times the record's scale) and emits (cand_id, cand_score). |
+| fabric_index_scan | start, base, n_blocks, NQ queries' q_codes and counts | one request port (reads RPB records a page, two beats a transfer) | Streams every eligible block's index record, scores it against each coded query (a dot product of 4-bit codes times the record's scale), both beats of a transfer at once, and emits (cand_id, cand_score) for every query whose count takes the block. |
 | fabric_topk | clear, cand_valid/cand_id/cand_score, finish |  | Keeps the K best candidates; after finish streams them out (out_valid, out_id, out_score, out_last) and pulses done. |
-| fabric_record_reader | addr_valid/addr_ready, addr, addr_count | one request port (reads up to MAXR records) | Each request names count consecutive key-then-value records of one head; unpacked from KV_BITS to int8 and streamed to the attention core as key beats (kind 2) then value beats (kind 3), honouring out_ready; rec_done per record. |
 
-The memory unit's adapter turns the program's memory commands into these: op 0 and 1 are the mover's reads and writes between beat addresses and the buffer, op 2 the append of the token in the buffer, op 3 the scan of the context's index into the top-K ids, op 4 the rows command that turns a selection into requests (the window in page runs, then one record per chosen block) and lays the reader's rows into the head's buffer.
+The memory unit's adapter turns the program's memory commands into these: op 0 and 1 are the mover's reads and writes between beat addresses and the buffer, op 2 the append of the token in the buffer, op 3 the scan of the context's index into the top-K ids, op 4 the rows command that turns a selection into the mover's reads (the window in page runs, then one record per chosen block), the records into the head's buffer as they are stored, for the attention adapter to unpack; ops 5 to 7 are a prefill chunk's: its window before and after its appends and its tokens' blocks, into one rows buffer the chunk's tokens share.
 
 ## Sources
 

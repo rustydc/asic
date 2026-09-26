@@ -77,12 +77,13 @@ class ScheduleTest(unittest.TestCase):
         mm = MemoryMap.from_config(cfg)
         rec = S.recurrent_program(cfg, None, TileSpec(), mm)
         glob = S.global_program(cfg, None, TileSpec(), mm, mm.context_tokens - 1)
-        for steps in (rec, glob):
+        for steps, share in ((rec, 0.55), (glob, 0.45)):
             sched = S.schedule(steps)
             # The port is still the busiest unit by far, though the mover's two
             # beats a transfer took a recurrent token from two thirds of it to
-            # just under three fifths.
-            self.assertGreater(sched.busy("mem") / sched.cycles, 0.55)
+            # just under three fifths, and the rows and the scan at the port's
+            # rate took a global one from nearly three quarters to a half.
+            self.assertGreater(sched.busy("mem") / sched.cycles, share)
             self.assertEqual(max(S.UNITS, key=lambda u: sched.busy(u) / S.UNITS[u][1]), "mem")
             self.assertEqual(sched.busy("tiles"), sum(s.cycles for s in steps if s.unit == "tiles"))
         self.assertEqual(len([s for s in rec if s.unit == "tiles"]), 4)              # four passes

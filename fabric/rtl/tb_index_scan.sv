@@ -1,7 +1,7 @@
 // Self-checking testbench for fabric_index_scan feeding fabric_topk over the
 // memory model, against fabric.memory.emit_index_scan_vectors: NQ queries
 // scored in one pass over the index, each against its own blocks and into
-// its own top-K.
+// its own top-K.  The requests are wide, two beats a transfer.
 
 `timescale 1ns/1ps
 `default_nettype none
@@ -25,13 +25,13 @@ module tb_index_scan #(
     reg [15:0] eid [0:NQ*K-1];
     reg [31:0] esc [0:NQ*K-1];
 
-    wire          req_valid, req_ready, rdata_valid;
+    wire          req_valid, req_ready, req_wide, rdata_valid;
     wire [31:0]   req_addr;
     wire [11:0]   req_beats;
-    wire [DW-1:0] rdata;
-    fabric_mem_model #(.DW(DW), .WORDS(WORDS), .LAT(3), .FILE("mem.hex")) mem (
-        .clk(clk), .rst_n(rst_n), .req_valid(req_valid), .req_ready(req_ready), .req_write(1'b0), .req_addr(req_addr),
-        .req_beats(req_beats), .wdata_valid(1'b0), .wdata_ready(), .wdata({DW{1'b0}}), .rdata_valid(rdata_valid), .rdata(rdata));
+    wire [2*DW-1:0] rdata;
+    fabric_mem_model #(.DW(DW), .XW(2), .WORDS(WORDS), .LAT(3), .FILE("mem.hex")) mem (
+        .clk(clk), .rst_n(rst_n), .req_valid(req_valid), .req_ready(req_ready), .req_write(1'b0), .req_wide(req_wide), .req_addr(req_addr),
+        .req_beats(req_beats), .wdata_valid(1'b0), .wdata_ready(), .wdata({2*DW{1'b0}}), .rdata_valid(rdata_valid), .rdata(rdata));
 
     reg              start = 0;
     wire             scan_done;
@@ -43,7 +43,7 @@ module tb_index_scan #(
     fabric_index_scan #(.DW(DW), .IDIM(IDIM), .IDW(16), .RPB(RPB), .NQ(NQ)) scan (
         .clk(clk), .rst_n(rst_n), .start(start), .base(BASE[31:0]), .n_blocks(BLOCKS[15:0]), .n_q(n_all), .q_codes(q_all),
         .done(scan_done), .cand_valid(cand_valid), .cand_id(cand_id), .cand_score(cand_score),
-        .req_valid(req_valid), .req_ready(req_ready), .req_addr(req_addr), .req_beats(req_beats),
+        .req_valid(req_valid), .req_ready(req_ready), .req_wide(req_wide), .req_addr(req_addr), .req_beats(req_beats),
         .rdata_valid(rdata_valid), .rdata(rdata));
 
     reg clear = 0, finish = 0;
@@ -76,7 +76,12 @@ module tb_index_scan #(
             end
         end
     endgenerate
-    always @(posedge clk) if (scan_done) seen_scan <= 1;
+    integer cyc = 0, t_scan = 0;
+    always @(posedge clk) begin
+        cyc = cyc + 1;
+        if (scan_done && !seen_scan) t_scan = cyc;
+        if (scan_done) seen_scan <= 1;
+    end
 
     initial begin
         $readmemh("q_codes.hex", qm);
@@ -96,6 +101,7 @@ module tb_index_scan #(
         clear = 1; start = 1;
         @(negedge clk);
         clear = 0; start = 0;
+        cyc = 0;
         guard = 0;
         while (!seen_scan && guard < BLOCKS * (REC_BEATS + 8) + 20) begin @(posedge clk); #1; guard = guard + 1; end
         if (!seen_scan) begin $display("FAIL: scan never done"); $finish; end
@@ -108,7 +114,7 @@ module tb_index_scan #(
         if (seen_done != {NQ{1'b1}}) $display("FAIL: never done");
         for (q = 0; q < NQ; q = q + 1)
             if (got[q] != en[q]) begin errors = errors + 1; $display("FAIL: query %0d: %0d entries, expected %0d", q, got[q], en[q]); end
-        if (errors == 0) $display("PASS: %0d queries, top %0d of %0d blocks, %0d records per request", NQ, K, BLOCKS, RPB);
+        if (errors == 0) $display("PASS: %0d queries, top %0d of %0d blocks, %0d records per request, in %0d cycles", NQ, K, BLOCKS, RPB, t_scan);
         else $display("FAIL: %0d mismatches", errors);
         $finish;
     end
