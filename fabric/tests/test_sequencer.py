@@ -84,7 +84,10 @@ class ScheduleTest(unittest.TestCase):
             # just under three fifths, and the rows and the scan at the port's
             # rate took a global one from nearly three quarters to a half.
             self.assertGreater(sched.busy("mem") / sched.cycles, share)
-            self.assertEqual(max(S.UNITS, key=lambda u: sched.busy(u) / S.UNITS[u][1]), "mem")
+            # A unit's engines share its load, but the memory unit's are its
+            # commands in flight on one port, not units of their own.
+            engines = lambda u: 1 if u == "mem" else S.UNITS[u][1]
+            self.assertEqual(max(S.UNITS, key=lambda u: sched.busy(u) / engines(u)), "mem")
             self.assertEqual(sched.busy("tiles"), sum(s.cycles for s in steps if s.unit == "tiles"))
         self.assertEqual(len([s for s in rec if s.unit == "tiles"]), 4)              # four passes
         self.assertEqual(len([s for s in rec if s.name.startswith("delta")]), cfg.linear_num_value_heads)

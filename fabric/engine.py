@@ -178,7 +178,10 @@ def port_colours(programs: list[S.Step] | list[list[S.Step]], write: bool = Fals
             return []
         fixed = wf if write else rf
         n = len(fixed) if fixed else 1
-        return [index[(step.unit, step.engine, k)] for k in range(n) if (step.unit, step.engine, k) in index]
+        # The memory unit's engines are its commands in flight, not adapters of
+        # their own: they share its one pair of ports.
+        engine = 0 if step.unit == "mem" else step.engine
+        return [index[(step.unit, engine, k)] for k in range(n) if (step.unit, engine, k) in index]
 
     for steps in shapes:
         live = live_together(steps)

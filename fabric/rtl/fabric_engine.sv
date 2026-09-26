@@ -1571,6 +1571,7 @@ module fabric_mem_unit #(
     input  wire [3:0]    first,
     input  wire [4*32-1:0] position,         // and its position: arg[31:4] is the token's place in its chunk
     input  wire          cmd_valid,
+    input  wire [1:0]    cmd_engine,
     input  wire [15:0]   cmd_len,
     input  wire [29:0]   cmd_src,
     input  wire [29:0]   cmd_dst,
@@ -1579,8 +1580,8 @@ module fabric_mem_unit #(
     input  wire [31:0]   cmd_arg,
     input  wire [7:0]    cmd_tag,
     output wire          cmd_ready,
-    output reg           done_valid,
-    output reg  [7:0]    done_tag,
+    output reg  [3:0]    done_valid,     // an engine each: a read on engine e is done on e
+    output reg  [31:0]   done_tag,
     output reg  [AW-1:0] rd_addr,
     output wire          rd_en,          // the loader, or a move out of the buffer; else the port is idle
     input  wire [127:0]  rd_data,
@@ -1767,16 +1768,32 @@ module fabric_mem_unit #(
     // of window records or a block record each, queued by the rows command and
     // asked for as the port takes them; each one's data goes to its place in
     // the buffer, two beats a cycle, as it comes back.
+    // It takes the reads of memory into the buffer too, each a command of
+    // its own on the engine it came on, which the fetcher reports done when
+    // its data is in: the unit takes the next command at once, so reads on
+    // other engines -- the recurrent layer's state reads ahead -- are in
+    // flight together.  A fill (a fresh read on a FIRST token) is a move too,
+    // of zeros and no request, taken in its turn once the reads before it
+    // are in and holding back the reads behind it until it is written.
     reg [31:0]    f_maddr [0:FD-1];
     reg [AW-1:0]  f_vaddr [0:FD-1];
     reg [11:0]    f_beats [0:FD-1];
+    reg           f_fill [0:FD-1], f_hdr [0:FD-1], f_rep [0:FD-1];
+    reg [1:0]     f_eng [0:FD-1];
+    reg [7:0]     f_tag [0:FD-1];
     reg [FW:0]    f_wr, f_iss, f_rd;
     reg [11:0]    f_got;
+    reg           f_fin;                   // a reported move's last beat was written: its done next
+    reg [1:0]     f_fin_eng;
+    reg [7:0]     f_fin_tag;
     wire          f_room  = ((f_wr - f_rd) != FD);
     wire          f_idle  = (f_wr == f_rd);
     wire [11:0]   f_hb    = f_beats[f_rd[FW-1:0]];
     wire          f_two   = (f_hb - f_got > 1);
-    assign r_req_valid[3] = (f_iss != f_wr);
+    wire          f_hfill = (f_rd != f_iss) && f_fill[f_rd[FW-1:0]];     // a fill at the head, being written
+    wire          f_nfill = (f_iss != f_wr) && f_fill[f_iss[FW-1:0]];     // the next to issue is a fill
+    wire          f_step  = f_hfill || r_rdata_valid[3];                  // the head move's beats this cycle
+    assign r_req_valid[3] = (f_iss != f_wr) && !f_nfill && !f_hfill;
     assign r_req_write[3] = 1'b0;
     assign r_req_addr[3*32 +: 32]  = f_maddr[f_iss[FW-1:0]];
     assign r_req_beats[3*12 +: 12] = f_beats[f_iss[FW-1:0]];
@@ -1830,21 +1847,24 @@ module fabric_mem_unit #(
                      S_SC_LOAD = 8, S_SC_SCALE = 9, S_SC_RECIP = 10, S_SC_CODES = 11, S_SC_RUN = 12, S_SC_COLLECT = 13, S_SC_WRITE = 14,
                      S_RW_LOAD = 15, S_RW_REQ = 16, S_RW_WAIT = 17, S_WN = 18;
     reg [4:0] state;
-    assign cmd_ready = (state == S_IDLE);
+    assign cmd_ready = (state == S_IDLE) && f_room;
+    reg        w_pend, w_fin;              // a posted write on the mover, and its done
+    reg [7:0]  w_tag;
     integer j;
     reg signed [63:0] t, mx;
     reg [IDIM*4-1:0]  q_codes_one;
     wire [15:0]       ntok_len = (n == 0) ? 16'd1 : n;   // a chunk command's tokens (its length)
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            state <= S_IDLE; done_valid <= 1'b0; wr_en <= 1'b0; wr_hi_be <= 16'd0; ld_on <= 1'b0; cmd_first <= 1'b0; ldv <= 1'b0; ld_i <= 0; ld_n <= 0;
+            state <= S_IDLE; done_valid <= 4'd0; wr_en <= 1'b0; wr_hi_be <= 16'd0; ld_on <= 1'b0; cmd_first <= 1'b0; ldv <= 1'b0; ld_i <= 0; ld_n <= 0;
             mv_go <= 1'b0; mv_busy <= 1'b0; mv_req <= 1'b0; mv_done <= 1'b0; mv_present <= 1'b0; mv_i <= 0; mv_fill <= 1'b0; mv_hdr <= 1'b0;
             mv_a <= 0; mv_q <= 1'b0; mv_hv <= 1'b0;
             ap_start <= 1'b0; sc_start <= 1'b0; tk_clear <= 1'b0; tk_finish <= 1'b0; sc_done_d <= 1'b0; rc_start <= 1'b0;
             rw_p <= 0; rw_j <= 0; rw_rec <= 0; rw_blocks <= 1'b0; sel_cnt <= 0; f_wr <= 0; f_iss <= 0; f_rd <= 0; f_got <= 0;
+            f_fin <= 1'b0; w_pend <= 1'b0; w_fin <= 1'b0;
             sq <= 0; ntok <= 1; tk_seen <= 0;
         end else begin
-            done_valid <= 1'b0; wr_en <= 1'b0; wr_hi_be <= 16'd0; ap_start <= 1'b0; sc_start <= 1'b0; tk_clear <= 1'b0; tk_finish <= 1'b0; rc_start <= 1'b0;
+            done_valid <= 4'd0; wr_en <= 1'b0; wr_hi_be <= 16'd0; ap_start <= 1'b0; sc_start <= 1'b0; tk_clear <= 1'b0; tk_finish <= 1'b0; rc_start <= 1'b0;
             mv_go <= 1'b0; mv_done <= 1'b0;
             // Loader data lands a cycle after its issue.
             ldv <= ld_on; ld_i_d <= ld_i; ld_tgt_d <= ld_tgt;
@@ -1908,23 +1928,47 @@ module fabric_mem_unit #(
                     sel_cnt[j*8 +: 8] <= sel_cnt[j*8 +: 8] + 1'b1;
                 end
             tk_seen <= tk_seen | tk_done;
-            // The fetcher: a move asked for when the port takes it, its data into the buffer as it comes.
+            // The fetcher: a move asked for when the port takes it (a fill once
+            // the moves before it are in), its data into the buffer as it
+            // comes (a fill's zeros two beats a cycle), and a reported move's
+            // done on its engine the cycle after its last beat is written.
             if (r_req_valid[3] && r_req_ready[3]) f_iss <= f_iss + 1'b1;
-            if (r_rdata_valid[3]) begin
+            else if (f_nfill && f_rd == f_iss) f_iss <= f_iss + 1'b1;
+            f_fin <= 1'b0;
+            if (f_step) begin
                 wr_en <= 1'b1; wr_addr <= f_vaddr[f_rd[FW-1:0]] + f_got * 16; wr_be <= 16'hFFFF;
-                wr_data <= r_rdata[DW-1:0]; wr_hi <= r_rdata[2*DW-1:DW]; wr_hi_be <= f_two ? 16'hFFFF : 16'd0;
-                if (f_got + (f_two ? 12'd2 : 12'd1) == f_hb) begin f_got <= 0; f_rd <= f_rd + 1'b1; end
-                else f_got <= f_got + (f_two ? 12'd2 : 12'd1);
+                wr_hi_be <= f_two ? 16'hFFFF : 16'd0;
+                if (f_hfill) begin
+                    wr_data <= (f_hdr[f_rd[FW-1:0]] && f_got == 0) ? STATE_ONE[15:0] : {DW{1'b0}}; wr_hi <= {DW{1'b0}};
+                end else begin
+                    wr_data <= r_rdata[DW-1:0]; wr_hi <= r_rdata[2*DW-1:DW];
+                end
+                if (f_got + (f_two ? 12'd2 : 12'd1) == f_hb) begin
+                    f_got <= 0; f_rd <= f_rd + 1'b1;
+                    f_fin <= f_rep[f_rd[FW-1:0]]; f_fin_eng <= f_eng[f_rd[FW-1:0]]; f_fin_tag <= f_tag[f_rd[FW-1:0]];
+                end else f_got <= f_got + (f_two ? 12'd2 : 12'd1);
             end
+            if (f_fin) begin done_valid[f_fin_eng] <= 1'b1; done_tag[f_fin_eng*8 +: 8] <= f_fin_tag; end
+            // A posted write's done: two cycles after the mover has handed its last beat to the port.
+            w_fin <= 1'b0;
+            if (w_pend && mv_done) begin w_pend <= 1'b0; w_fin <= 1'b1; end
+            if (w_fin) begin done_valid[0] <= 1'b1; done_tag[7:0] <= w_tag; end
             case (state)
                 S_IDLE: if (cmd_valid) begin
                     op <= cmd_arg[3:0]; pos <= position[32*cmd_tok +: 32] + {4'd0, cmd_arg[31:4]}; ctx_base <= {cmd_a3[20:0] + cmd_page, 11'd0};
                     cmd_first <= first[cmd_tok];
                     n <= cmd_len; src <= cmd_src[AW-1:0]; dst <= cmd_dst[AW-1:0]; arg_lo <= cmd_a2[AW-1:0]; head <= cmd_a2[7:0]; tag <= cmd_tag;
                     case (cmd_arg[3:0])
-                        4'd0: begin mv_go <= 1'b1; mv_mode <= MV_RD_VB; mv_maddr <= {cmd_src[27:0], 4'd0} + cmd_slot; mv_vaddr <= cmd_dst[AW-1:0]; mv_n <= cmd_len[11:0]; state <= S_MV;
-                              mv_fill <= first[cmd_tok] && (cmd_arg[5:4] != 2'b00); mv_hdr <= cmd_arg[5]; end
-                        4'd1: begin mv_go <= 1'b1; mv_fill <= 1'b0; mv_mode <= MV_WR_VB; mv_maddr <= {cmd_dst[27:0], 4'd0} + cmd_slot; mv_vaddr <= cmd_src[AW-1:0]; mv_n <= cmd_len[11:0]; state <= S_MV; end
+                        // A read is the fetcher's, done on its engine when its data is in;
+                        // a write is the mover's, posted: the unit is free for the next command.
+                        4'd0: begin
+                            f_maddr[f_wr[FW-1:0]] <= {cmd_src[27:0], 4'd0} + cmd_slot; f_vaddr[f_wr[FW-1:0]] <= cmd_dst[AW-1:0];
+                            f_beats[f_wr[FW-1:0]] <= cmd_len[11:0]; f_fill[f_wr[FW-1:0]] <= first[cmd_tok] && (cmd_arg[5:4] != 2'b00);
+                            f_hdr[f_wr[FW-1:0]] <= cmd_arg[5]; f_rep[f_wr[FW-1:0]] <= 1'b1; f_eng[f_wr[FW-1:0]] <= cmd_engine;
+                            f_tag[f_wr[FW-1:0]] <= cmd_tag; f_wr <= f_wr + 1'b1; state <= S_IDLE;
+                        end
+                        4'd1: begin mv_go <= 1'b1; mv_fill <= 1'b0; mv_mode <= MV_WR_VB; mv_maddr <= {cmd_dst[27:0], 4'd0} + cmd_slot; mv_vaddr <= cmd_src[AW-1:0]; mv_n <= cmd_len[11:0];
+                              w_pend <= 1'b1; w_tag <= cmd_tag; state <= S_IDLE; end
                         4'd2: begin ld_on <= 1'b1; ld_tgt <= T_K; ld_base <= cmd_src[AW-1:0]; ld_i <= 0; ld_n <= KB; state <= S_AP_LOAD; end
                         4'd3: begin ld_on <= 1'b1; ld_tgt <= T_U; ld_base <= cmd_src[AW-1:0]; ld_i <= 0; ld_n <= IB; state <= S_SC_LOAD;
                               sq <= 0; ntok <= (cmd_len == 0) ? 8'd1 : cmd_len[7:0]; n_q <= 0; end
@@ -2018,13 +2062,13 @@ module fabric_mem_unit #(
                     if (!rw_blocks && rw_p <= rw_last) begin
                         f_maddr[f_wr[FW-1:0]] <= ctx_base + WINDOW_OFF + (head * W + rw_p % W) * REC_BYTES;
                         f_vaddr[f_wr[FW-1:0]] <= rw_base + rw_rec * RB; f_beats[f_wr[FW-1:0]] <= rw_cnt * REC_BEATS;
-                        f_wr <= f_wr + 1'b1;
+                        f_fill[f_wr[FW-1:0]] <= 1'b0; f_rep[f_wr[FW-1:0]] <= 1'b0; f_wr <= f_wr + 1'b1;
                         rw_p <= rw_p + rw_cnt; rw_rec <= rw_rec + rw_cnt;
                     end else if (rw_j < sel_r[7:0]) begin
                         rw_blocks <= 1'b1;
                         f_maddr[f_wr[FW-1:0]] <= ctx_base + BLOCK_OFF + (sel_r[16 + rw_j*16 +: 16] * NKV + head) * REC_BYTES;
                         f_vaddr[f_wr[FW-1:0]] <= rw_base + rw_rec * RB; f_beats[f_wr[FW-1:0]] <= REC_BEATS;
-                        f_wr <= f_wr + 1'b1;
+                        f_fill[f_wr[FW-1:0]] <= 1'b0; f_rep[f_wr[FW-1:0]] <= 1'b0; f_wr <= f_wr + 1'b1;
                         rw_j <= rw_j + 1'b1; rw_rec <= rw_rec + 1'b1;
                     end else state <= S_RW_WAIT;
                 end
@@ -2036,7 +2080,7 @@ module fabric_mem_unit #(
                         state <= S_RW_LOAD;
                     end else if (f_idle) state <= S_DONE;
                 end
-                default: begin done_valid <= 1'b1; done_tag <= tag; state <= S_IDLE; end
+                default: begin done_valid[0] <= 1'b1; done_tag[7:0] <= tag; state <= S_IDLE; end
             endcase
         end
     end
@@ -2222,7 +2266,7 @@ module fabric_layer_engine #(
     assign cmd_ready[U_RESIDUAL] = (cmd_engine == 0) && ready_residual;
     assign cmd_ready[U_ROTARY]   = (cmd_engine < 2) && ready_rotary[cmd_engine];
     assign cmd_ready[U_ATTN]     = ready_attn[cmd_engine];
-    assign cmd_ready[U_MEM]      = (cmd_engine == 0) && ready_mem;
+    assign cmd_ready[U_MEM]      = ready_mem;
     assign done_valid[U_TILES*NE + 1 +: 3] = 0;    assign done_tag[(U_TILES*NE + 1)*8 +: 24] = 0;
     assign done_valid[U_NORM*NE + 2 +: 2] = 0;     assign done_tag[(U_NORM*NE + 2)*8 +: 16] = 0;
     assign done_valid[U_CONV*NE + 1 +: 3] = 0;     assign done_tag[(U_CONV*NE + 1)*8 +: 24] = 0;
@@ -2230,7 +2274,6 @@ module fabric_layer_engine #(
     assign done_valid[U_SWIGLU*NE + 1 +: 3] = 0;   assign done_tag[(U_SWIGLU*NE + 1)*8 +: 24] = 0;
     assign done_valid[U_RESIDUAL*NE + 1 +: 3] = 0; assign done_tag[(U_RESIDUAL*NE + 1)*8 +: 24] = 0;
     assign done_valid[U_ROTARY*NE + 2 +: 2] = 0;   assign done_tag[(U_ROTARY*NE + 2)*8 +: 16] = 0;
-    assign done_valid[U_MEM*NE + 1 +: 3] = 0;      assign done_tag[(U_MEM*NE + 1)*8 +: 24] = 0;
     assign ready_norm[3:2] = 0;
     assign ready_rotary[3:2] = 0;
 
@@ -2330,8 +2373,8 @@ module fabric_layer_engine #(
     fabric_mem_unit #(.TMAX(TMAX), .HD(HD), .NKV(NKV), .IDIM(IDIM), .BS(BS), .W(W), .TOP(TOP), .KV_BITS(KV_BITS), .REC_BYTES(REC_BYTES),
                       .RPB(RPB), .MAXR(MAXR), .WINDOW_OFF(WINDOW_OFF), .BLOCK_OFF(BLOCK_OFF), .INDEX_OFF(INDEX_OFF), .SUMS_OFF(SUMS_OFF),
                       .AW(AW), .LUT_DIR(LUT_DIR)) u_mem (
-        .clk(clk), .rst_n(rst_n), .slot_page(slot_r), .first(first_r), .position(pos_r), .cmd_valid(cmd_valid[U_MEM] && cmd_engine == 0), .cmd_len(cmd_len), .cmd_src(cmd_src), .cmd_dst(cmd_dst),
-        .cmd_a2(cmd_a2), .cmd_a3(cmd_a3), .cmd_arg(cmd_arg), .cmd_tag(cmd_tag), .cmd_ready(ready_mem), .done_valid(done_valid[U_MEM*NE]), .done_tag(done_tag[U_MEM*NE*8 +: 8]),
+        .clk(clk), .rst_n(rst_n), .slot_page(slot_r), .first(first_r), .position(pos_r), .cmd_valid(cmd_valid[U_MEM]), .cmd_engine(cmd_engine[1:0]), .cmd_len(cmd_len), .cmd_src(cmd_src), .cmd_dst(cmd_dst),
+        .cmd_a2(cmd_a2), .cmd_a3(cmd_a3), .cmd_arg(cmd_arg), .cmd_tag(cmd_tag), .cmd_ready(ready_mem), .done_valid(done_valid[U_MEM*NE +: 4]), .done_tag(done_tag[U_MEM*NE*8 +: 32]),
         .rd_addr(mu_rd_addr), .rd_en(mu_rd_en), .rd_data(rd_data[R_MEM*128 +: 128]), .rd_hi(mem_rd_hi),
         .wr_en(mu_wr_en), .wr_addr(mu_wr_addr), .wr_data(mu_wr_data), .wr_be(mu_wr_be),
         .wr_hi(mem_wr_hi), .wr_hi_be(mu_wr_hi_be),

@@ -284,6 +284,17 @@ class PathModel:
         cross = self.cross_write if requests and requests[-1][0] else self.cross_read
         return (first or 0.0) + cross, end + cross
 
+    def occupancy(self, write: bool, beats: int, addr: int = 0) -> int:
+        """What a request occupies of the path: its busiest device's bursts
+        or its beats on the port, whichever is longer -- the time before the
+        next of a unit's requests, in flight beside it, has the devices.  A
+        chunk holds its device for its burst, tCPH and the turn to the next
+        (the channel's done and idle, and the stripe's issue)."""
+        load: dict[int, float] = {}
+        for dev, _, s in chunks(addr, beats, self.ndev):
+            load[dev] = load.get(dev, 0.0) + self._burst(write, s) + self.cph + 3
+        return self._core(max(max(load.values()), math.ceil(beats / self.xb)))
+
     def cost(self, write: bool, beats: int, addr: int = 0) -> int:
         """What a request costs the unit that makes it, in a run of them.  As
         built that is the whole request, since the stripe holds it to the

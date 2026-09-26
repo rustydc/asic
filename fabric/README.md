@@ -1098,6 +1098,18 @@ been written as what the part allows before there was RTL for it:
   in flight, and the rows are a fetcher's -- a queue of moves, each a
   window run or a block record, eight in flight, each one's data into its
   place in the rows buffer as it comes back.
+* **The state reads ask ahead.** Every read of memory into the buffer is
+  the fetcher's now, reported done on the engine it came on when its data
+  is in, and the memory unit has four engines in the sequencer's sense:
+  the recurrent layer's state reads ahead go on engines one to three, so
+  three heads' slots are in flight while the unit takes the next command,
+  and a posted write frees it at once. A FIRST token's fresh slot is a
+  fetcher move too, of zeros. A 16 KB slot read waited out was its
+  devices' bursts and then its drain behind the slowest of them, twice
+  what the devices take for it; three in flight, the next one's bursts
+  run under the last one's drain. The read ahead also goes before the
+  last head's write-back in the program, since it waits only for its own
+  slot.
 
 And the requests are stripe-aligned. The stripe unit issues chunks in
 order, so a request that ends inside a stripe shares that stripe's
@@ -1117,10 +1129,12 @@ time. The run model is the one-request model carried on over the
 requests, and it has a depth for a unit's limit on requests in flight.
 In the schedule a posted write holds the path for the devices it
 occupies, and a read after it waits for them; the rows' and the scan's
-requests are a run of the unit's own. Over one device the engine lands
-within two per cent of that schedule, 3,254 cycles against 3,218 for the
-recurrent token and 3,918 against 3,881 for the global one. Over four
-the schedule is only a bound (2,947 against 3,218, 3,022 against 3,669):
+requests are a run of the unit's own, and a state read in flight beside
+others holds the path for its devices' bursts, the next overlapping its
+drain. Over one device the engine lands within two per cent of that
+schedule, 2,867 cycles against 2,821 for the recurrent token and 3,918
+against 3,881 for the global one. Over four the schedule is only a bound
+(2,240 against 2,821, 3,022 against 3,669):
 at the tiny geometry every request is a stripe or less and the schedule
 does not know which device it reaches, so it cannot see two of them
 overlap. At the 9B geometry a state slot is every device's.
@@ -1129,29 +1143,32 @@ At 600 MHz, per die, streamed:
 
 | Memory | Recurrent | Global, 4K | Global, 128K | Tokens/s, 4K | Tokens/s, 128K |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| the ideal port | 40,365 | 25,131 | 39,880 | 4,103 | 3,727 |
-| 16 PSRAMs, the controller as first built | 95,416 | 234,462 | 344,574 | 1,152 | 951 |
-| as now built, a unit's requests one at a time | 73,845 | 216,099 | 319,391 | 1,371 | 1,109 |
-| as now built, the units asking ahead | 73,845 | 33,080 | 58,923 | 2,356 | 2,139 |
-| the same, every read burst pushed out | 74,541 | 34,328 | 61,083 | 2,326 | 2,107 |
+| the ideal port | 37,092 | 25,125 | 39,753 | 4,399 | 3,973 |
+| 16 PSRAMs, the controller as first built | 90,102 | 234,463 | 344,575 | 1,189 | 976 |
+| as now built, a unit's requests one at a time | 69,870 | 216,100 | 319,392 | 1,409 | 1,134 |
+| as now built, the units asking ahead | 51,412 | 33,081 | 58,924 | 3,203 | 2,815 |
+| the same, every read burst pushed out | 53,129 | 34,329 | 61,084 | 3,097 | 2,721 |
 
 (With a pass walking only its own tiles, the rows and the scan at the
-memory's rate and the requests stripe-aligned, below. The first figures
-here were 41,605 cycles and 2,497 tokens/s for the ideal port. Before the
+memory's rate, the requests stripe-aligned and the state read ahead,
+below. The first figures here were 41,605 cycles and 2,497 tokens/s for
+the ideal port; with the units asking ahead but the state reads waited
+out, the recurrent layer was 73,845 and the die 2,139 at 128K. Before the
 controller was built to it the model's pipelined path said 54,766 cycles
 for the recurrent layer and 2,537 tokens/s at 128K: its mover's reads
 and writes overlapped more than a mover that waits for its reads can,
 and its scan was one request over every device, which pages of 2,000
 bytes were not.)
 
-So the 3.7K of the ideal port is 2.1K on the parts, where it was 950 on
-the controller as first built. What is left is the recurrent layers:
-each moves about 1 MB of state a token, read and written, and three of
-them are 220K of the die's 280K cycles a token. The global layer at 128K
-is 59K, most of it the index scan at the devices' rate. The push-out
-costs two per cent at worst. Decoding in batches of four lanes, the die
-does 1,984 tokens/s at 128K (920 as first built), a single user 206
-(105), and a prefill chunk of eight 4,477 (3,133).
+So the 4.0K of the ideal port is 2.8K on the parts, where it was 980 on
+the controller as first built. The recurrent layers are still most of a
+token: each moves about 1 MB of state, read and written, which at the
+devices' 14.9 GB/s is 42K cycles, and takes 51K; three of them are 154K
+of the die's 213K cycles a token. The global layer at 128K is 59K, most
+of it the index scan at the devices' rate. The push-out costs three per
+cent at worst. Decoding in batches of four lanes, the die does 2,560
+tokens/s at 128K (944 as first built), a single user 249 (107), and a
+prefill chunk of eight 4,786 (3,282).
 
 The device count is a cost question -- a part is about $5 in hundreds,
 and sixteen a die is 128 of them on the board. With the controller as
@@ -1159,11 +1176,11 @@ built, per die:
 
 | PSRAMs a die | Capacity | Contexts at 128K | Tokens/s, 4K | Tokens/s, 128K |
 | ---: | ---: | ---: | ---: | ---: |
-| 4 | 256 MB | 23 | 894 | 775 |
-| 8 | 512 MB | 46 | 1,603 | 1,409 |
-| 12 | 768 MB | 70 | 1,790 | 1,623 |
-| 16 | 1 GB | 93 | 2,356 | 2,139 |
-| 24 | 1.5 GB | 140 | 2,404 | 2,183 |
+| 4 | 256 MB | 23 | 917 | 792 |
+| 8 | 512 MB | 46 | 1,781 | 1,545 |
+| 12 | 768 MB | 70 | 1,943 | 1,747 |
+| 16 | 1 GB | 93 | 3,203 | 2,815 |
+| 24 | 1.5 GB | 140 | 3,409 | 2,981 |
 
 Twelve buys little over eight and twenty-four little over sixteen, because
 a state slot is sixteen stripes: at twelve devices four of them take two,
@@ -1434,7 +1451,7 @@ single user gets 294 (228), and a chunk of eight prefills at 4,749
 (4,403). On sixteen PSRAMs with the pipelined controller asking ahead it
 is 2,537 streamed (2,125), 2,311 in batches (1,964) and 3,965 prefill
 (3,815) -- figures of the model's pipelined path before the controller
-was built to it; as built (above), 2,139, 1,984 and 4,477. Without asking ahead the global layer is the path's, and a
+was built to it; as built (above), 2,815, 2,560 and 4,786. Without asking ahead the global layer is the path's, and a
 little worse than the reader's (974 streamed against 996): the reader
 emitted one request's records while the next arrived, and the mover's
 requests wait for each other. The scan is now 22K of the 42K memory

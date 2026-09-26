@@ -68,7 +68,7 @@ MAX_PRODUCE = 2              # buffers a step may produce
 MAX_IDS = 255                # buffer ids per program image (0xFF is "none")
 UNITS: dict[str, tuple[int, int]] = {   # name -> (id, engines)
     "tiles": (0, 1), "norm": (1, 2), "conv": (2, 1), "gates": (3, 1), "delta": (4, 4),
-    "swiglu": (5, 1), "residual": (6, 1), "rotary": (7, 2), "attn": (8, 4), "mem": (9, 1),
+    "swiglu": (5, 1), "residual": (6, 1), "rotary": (7, 2), "attn": (8, 4), "mem": (9, 4),
 }
 NE = max(engines for _, engines in UNITS.values())    # engine ports a unit has in the controller's port map
 RELEASES = 1                 # completions the controller drains a cycle (rtl/fabric_sequencer.sv NREL)
@@ -181,6 +181,9 @@ class Timing:
     port_read_beat: int = 1          # a read beat a cycle
     port_write_beat: int = 1         # the mover's addresses run a beat ahead of its data
     mem_read_latency: int = 8
+    fetch_latency: int = 6           # a read through the fetcher on the testbench's memory: its request to its done
+    fetch_hold: int = 3              # and the port it holds beyond its transfers: the next read's request and latency
+    write_hold: int = 3              # a write's hold on the testbench's memory beyond its transfers
     fill_latency: int = 4            # FIRST: a fresh read's fill, two beats a cycle with no request on the port
     append_first_saving: int = 4     # FIRST: the append's block sums filled rather than read
     mem_write_latency: int = 6
@@ -217,10 +220,10 @@ class Timing:
     memory_mode: str = "pipelined"
     pushout: float | None = None
     # The scan and the rows fetcher ask ahead, ``depth`` requests in flight,
-    # so a page of records is one of several the devices read at once.
-    # Without it (``deep_requests`` false) they keep one request in flight
-    # and wait for it, as they did, and a page reaches one or two devices of
-    # the sixteen.
+    # so a page of records is one of several the devices read at once, and
+    # the state reads are in flight three at a time.  Without it
+    # (``deep_requests`` false) they keep one request in flight and wait for
+    # it, as they did, and a page reaches one or two devices of the sixteen.
     deep_requests: bool = True
     depth: int = 8                   # the requests the scan and the rows fetcher keep in flight (rtl/fabric_engine.sv)
     stripe_beats: int = hpi.STRIPE_BYTES // BEAT
@@ -315,7 +318,7 @@ class Timing:
                 return max(taken, -(-beats // 2)) + self.mem_write_latency
             return self.path.request(False, beats) + self.mem_read_latency
         transfers = -(-beats // 2)
-        return (self.port_write_beat * transfers + self.mem_write_latency) if write else (transfers + self.mem_read_latency)
+        return (self.port_write_beat * transfers + self.mem_write_latency) if write else (transfers + self.fetch_latency)
 
     def port(self, beats: int, write: bool) -> tuple[int, bool]:
         """A mover request's hold on the path, and whether it is a posted
@@ -324,9 +327,19 @@ class Timing:
         devices the write occupies, not for the write's whole request: the
         read's chunks start as the write's own finish, device by device."""
         if self.path is None:
-            return 0, False
-        if write and self.path.mode == "pipelined":
-            return self.path.cost(True, beats), True
+            # The testbench's memory takes one request at a time, so the
+            # state moves, several in flight, take it in turn.
+            transfers = -(-beats // 2)
+            return transfers + (self.write_hold if write else self.fetch_hold), False, True
+        if self.path.mode == "pipelined":
+            # A read the unit keeps in flight beside others holds the path
+            # for its devices' bursts; the next one's chunks start as its own
+            # finish, and drain behind it.  (Without ``deep_requests`` the
+            # units wait out their reads, as they did.)
+            if write:
+                return self.path.cost(True, beats), True
+            if self.deep_requests:
+                return self.path.occupancy(False, beats), False, True
         return self.path.request(write, beats), write
 
     def rows(self, requests: list[int], record_beats: int, blocks: int = 0, first: int = 0) -> int:
@@ -480,6 +493,7 @@ class Step:
     # occupy.
     port: int = 0
     posted: bool = False
+    overlap: bool = False            # a read that holds the path for ``port`` only, the next one overlapping its drain
 
     def __post_init__(self) -> None:
         self.cycles = max(1, int(self.cycles))       # a command occupies its unit for at least a cycle
@@ -676,7 +690,8 @@ def recurrent_program(cfg, c: L.RecurrentConsts | None, spec: TileSpec, mm: Memo
     steps: list[Step] = []
 
     def add(name, unit, src, dst, cycles, func=None, engine=0, nbytes=0, ops=None, port=(0, False)):
-        steps.append(Step(name, unit, engine, tuple(src), tuple(dst), int(cycles), func, nbytes, ops=ops, port=port[0], posted=port[1]))
+        steps.append(Step(name, unit, engine, tuple(src), tuple(dst), int(cycles), func, nbytes, ops=ops, port=port[0], posted=port[1],
+                          overlap=len(port) > 2 and port[2]))
 
     def fabric(q):
         return lambda x: L._fabric(q, x, spec)
@@ -715,7 +730,7 @@ def recurrent_program(cfg, c: L.RecurrentConsts | None, spec: TileSpec, mm: Memo
             else:
                 e[slot] = rows
         add(f"dma.s_rd[{h}]", "mem", (), (slot,), t.fill(slot_beats) if first else t.move(slot_beats, write=False), s_rd,
-            nbytes=0 if first else head_bytes,
+            engine=1 + h % (UNITS["mem"][1] - 1), nbytes=0 if first else head_bytes,
             ops=operands(src=(f"m_s[{h}]", 0), dst=(slot, 0), arg=MEM_RD | MEM_FRESH_SLOT, len=slot_beats),
             port=(0, False) if first else t.port(slot_beats, False))
     for h in range(min(read_ahead, nv)):
@@ -789,10 +804,13 @@ def recurrent_program(cfg, c: L.RecurrentConsts | None, spec: TileSpec, mm: Memo
                 e["s_mem"][h], e["scale_mem"][h] = e[slot]
             else:
                 e["s_mem"][h] = e[slot]
-        add(f"dma.s_wr[{h}]", "mem", (slot,), (), t.move(slot_beats, write=True), s_wr, nbytes=head_bytes,
-            ops=operands(src=(slot, 0), dst=(f"m_s[{h}]", 0), arg=MEM_WR, len=slot_beats), port=t.port(slot_beats, True))
+        # The read ahead goes first: it waits only for its slot, whose last
+        # head's write-back is long done, and reaches the port ahead of this
+        # head's write-back rather than behind it.
         if read_ahead and h + read_ahead < nv:
             s_read(h + read_ahead)
+        add(f"dma.s_wr[{h}]", "mem", (slot,), (), t.move(slot_beats, write=True), s_wr, nbytes=head_bytes,
+            ops=operands(src=(slot, 0), dst=(f"m_s[{h}]", 0), arg=MEM_WR, len=slot_beats), port=t.port(slot_beats, True))
         for i in range(T):
             def gnorm(e, h=h, i=i):
                 gate = L.silu_fixed(L.requant(get(e, "z", i)[h * hv:(h + 1) * hv], c.z_mult, c.z_shift, 16))
@@ -908,7 +926,8 @@ def global_program(cfg, c: L.GlobalConsts | None, spec: TileSpec, mm: MemoryMap,
     steps: list[Step] = []
 
     def add(name, unit, src, dst, cycles, func=None, engine=0, nbytes=0, ops=None, port=(0, False)):
-        steps.append(Step(name, unit, engine, tuple(src), tuple(dst), int(cycles), func, nbytes, ops=ops, port=port[0], posted=port[1]))
+        steps.append(Step(name, unit, engine, tuple(src), tuple(dst), int(cycles), func, nbytes, ops=ops, port=port[0], posted=port[1],
+                          overlap=len(port) > 2 and port[2]))
 
     def tok(name: str, i: int) -> str:
         return name if chunk == 1 else f"{name}<{i}>"
@@ -1127,7 +1146,8 @@ def retarget(steps: list[Step], token: int) -> list[Step]:
     for s in steps:
         ops = None if s.ops is None else {k: _rename_value(v, token) for k, v in s.ops.items()}
         out.append(Step(s.name, s.unit, s.engine, tuple(_renamed(n, token) for n in s.src),
-                        tuple(_renamed(n, token) for n in s.dst), s.cycles, s.func, s.nbytes, token, ops=ops, port=s.port, posted=s.posted))
+                        tuple(_renamed(n, token) for n in s.dst), s.cycles, s.func, s.nbytes, token, ops=ops, port=s.port, posted=s.posted,
+                        overlap=s.overlap))
     return out
 
 
@@ -1302,7 +1322,7 @@ class Schedule:
         return "\n".join(lines)
 
 
-def schedule(steps: list[Step], releases: int = RELEASES) -> Schedule:
+def schedule(steps: list[Step], releases: int = RELEASES, memory: bool = True) -> Schedule:
     """The controller's issue rules, cycle for cycle (rtl/fabric_sequencer.sv).
 
     In program order: the head step issues at the earliest cycle after the
@@ -1366,7 +1386,7 @@ def schedule(steps: list[Step], releases: int = RELEASES) -> Schedule:
             # therefore stops working one before that, and reports done at it.
             issue[i], end[i] = cycle, cycle + steps[i].cycles - 1
             st = steps[i]
-            if st.port:
+            if st.port and memory:
                 # The memory path as built takes one request at a time: a
                 # read waits for the one before it, and a posted write's data
                 # is taken once the path is free (bar what its queues hold).
@@ -1379,7 +1399,10 @@ def schedule(steps: list[Step], releases: int = RELEASES) -> Schedule:
                     path_free = start + st.port
                 else:
                     end[i] = start + st.cycles - 1
-                    path_free = end[i] + 1
+                    # A read kept in flight beside others lets the next start
+                    # once its devices are through; one waited out holds the
+                    # path to its end.
+                    path_free = start + st.port if st.overlap else end[i] + 1
             running[port_of[i]] = i
             i += 1
         # The next cycle anything can happen: a drain, a completion, or --
@@ -1487,7 +1510,9 @@ def emit_program(directory: Path, steps: list[Step], before: list[Step] = ()) ->
     words = encode(list(before)) + encode(steps) if before else encode(steps)
     assert len(words) <= PROGRAM_STEPS, f"{len(words)} steps, the store holds {PROGRAM_STEPS}"
     write_hex(directory / "program.hex", words, 256)
-    sched = schedule(steps)
+    # The testbench's units take each step's cycles and have no memory
+    # behind them, so the issue rules alone: no step waits for the path.
+    sched = schedule(steps, memory=False)
     (directory / "expected_issue.txt").write_text("".join(f"{i} {a} {b}\n" for i, (a, b) in enumerate(zip(sched.issue, sched.end))))
     params = {"N": len(steps), "PC0": len(before), "EXPECTED_CYCLES": sched.last_done}
     for name, (uid, engines) in UNITS.items():

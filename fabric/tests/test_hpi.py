@@ -213,6 +213,7 @@ class PathTimingTest(unittest.TestCase):
         "a state slot out and in": [(True, 1024, 0), (False, 1024, 1 << 20)],
         "two": [(True, 1024, 0), (False, 1024, 1 << 20), (True, 1024, 16384), (False, 1024, (1 << 20) + 16384)],
         "block records": [(False, 16, (i * 37 % 64) * 1024) for i in range(8)],
+        "state slots read ahead": [(False, 1024, (1 << 20) + i * 16384) for i in range(3)],
     }
 
     def run_whole(self, ndev: int, spec) -> int:
