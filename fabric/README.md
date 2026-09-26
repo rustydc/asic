@@ -1798,7 +1798,7 @@ the sequencer's own:
   tokens a second, worse than batches. Two slots a lane are the eight
   the die had, and a lane reads one head ahead into the other; eight a
   lane measured no better. With nothing shared but the units, the lanes'
-  counters are separate too, and a lane's programs use 85 of its 256 ids
+  counters are separate too, and a lane's programs use 85 of its 128 ids
   at the 9B geometry, where a batch of four's recurrent program alone
   needed 260 and could not be encoded.
 * **The layer rides with the command.** A run carries its layer and its
@@ -1851,8 +1851,9 @@ issue checks and a pick. Synthesized on NanGate 45 (512-step stores, 256
 ids a lane), four lanes close at 1.47 ns against one lane's 1.39 -- the
 pick costs 80 ps, and the path is still a counter through the check into
 the command -- at 607,102 NAND2-eq against 248,887: the lanes' counters,
-19,110 flops to 7,268. A lane's programs use 85 ids, so 128 a lane would
-take most of that back.
+19,110 flops to 7,268. A lane's programs use 85 ids, so the lanes'
+counters are now 128 deep (`LANE_IDS`); the stub tests that run a 9B
+stream of two in one lane build the sequencer with 256.
 
 The checks. `tb_sequencer` runs two lanes of the tiny layers, four runs
 each, and four lanes of the 9B layers on stub units, 856 steps with the

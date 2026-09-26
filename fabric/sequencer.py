@@ -91,6 +91,7 @@ SHARED_PREFIX = "s_slot"     # buffers shared by every token in flight: the stat
 # head ahead into the other.
 LANES = 4
 LANE_SLOTS = 2
+LANE_IDS = 128               # buffer ids a lane's counters hold (rtl/fabric_sequencer.sv NID): its programs use 85 at 9B
 MEM_PREFIX = "m_"            # names of buffers in the memory image (the rest live in the vector buffer)
 
 # Operand conventions of the layer engine's adapters (rtl/fabric_engine.sv).
@@ -1606,7 +1607,7 @@ def buffer_ids(steps: list[Step]) -> dict[str, int]:
     return ids
 
 
-def encode(steps: list[Step], layout=None, ids: dict[str, int] | None = None) -> list[int]:
+def encode(steps: list[Step], layout=None, ids: dict[str, int] | None = None, limit: int = MAX_IDS) -> list[int]:
     """Each step as a 256-bit word: unit, engine, last, the length the unit
     is given, a 32-bit argument, four 30-bit address operands (source,
     destination, two more), then up to six consumed buffer ids, two
@@ -1619,8 +1620,10 @@ def encode(steps: list[Step], layout=None, ids: dict[str, int] | None = None) ->
     context rows -- while a real command's length is always its beats.
 
     ``ids`` is the buffer numbering to use, for programs a lane runs one
-    after another: their steps overlap, so they must agree on it."""
+    after another: their steps overlap, so they must agree on it.  ``limit``
+    is how many the counters it runs on hold (``LANE_IDS`` on the engine)."""
     ids = ids if ids is not None else buffer_ids(steps)
+    assert len(ids) <= limit, f"{len(ids)} buffers, a lane's counters hold {limit}"
     words = []
     for i, step in enumerate(steps):
         assert step.cycles < (1 << 32) and step.engine < 16
@@ -1683,9 +1686,10 @@ def emit_lanes(directory: Path, lanes: list[list[list[Step]]], before: list[Step
     one a cycle -- and the schedule the RTL must reproduce; returns the
     testbench parameters.  ``before`` goes in lane 0's store first, and its
     runs start after it, as a die's later programs do."""
-    progs, pushes, start = [], [], []
+    progs, pushes, start, need = [], [], [], 0
     for l, runs in enumerate(lanes):
         prog = chain(runs)
+        need = max(need, len(buffer_ids(prog)), len(buffer_ids(list(before))) if l == 0 and before else 0)
         words = (encode(list(before)) if l == 0 and before else []) + encode(prog)
         assert len(words) <= PROGRAM_STEPS, f"{len(words)} steps, the store holds {PROGRAM_STEPS}"
         write_hex(directory / lane_store_name(l), words, 256)
@@ -1703,7 +1707,11 @@ def emit_lanes(directory: Path, lanes: list[list[list[Step]]], before: list[Step
     sched = schedule_lanes(progs, start, memory=False)
     rows = [(UNITS[progs[l][k].unit][0], progs[l][k].engine, sched.lanes[l].issue[k], sched.lanes[l].end[k] + 1) for l, k in sched.order]
     (directory / "expected.txt").write_text("".join(" ".join(map(str, r)) + "\n" for r in rows))
-    params = {"N": sum(len(p) for p in progs), "RUNS": len(pushes), "LANES_USED": len(lanes), "EXPECTED_CYCLES": sched.last_done}
+    # A lane's counters hold LANE_IDS; a stream of two 9B tokens in one lane
+    # (the controller's old in-order programs) needs more, and gets a build
+    # with 256.
+    params = {"N": sum(len(p) for p in progs), "RUNS": len(pushes), "LANES_USED": len(lanes), "EXPECTED_CYCLES": sched.last_done,
+              "NID": LANE_IDS if need <= LANE_IDS else MAX_IDS + 1}
     for name, (uid, engines) in UNITS.items():
         params[f"E{uid}"] = engines
     (directory / "params.json").write_text(json.dumps(params))

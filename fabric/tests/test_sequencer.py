@@ -188,6 +188,18 @@ class LaneScheduleTest(unittest.TestCase):
                     a, b = S.schedule(prog), S.schedule_lanes([prog]).lanes[0]
                     self.assertEqual((a.issue, a.end, a.release), (b.issue, b.end, b.release))
 
+    def test_a_lanes_programs_fit_its_counters(self) -> None:
+        # Everything a lane runs at the 9B geometry -- the token and the chunk
+        # programs of both layers on one numbering -- fits LANE_IDS.
+        from fixed_llm_poc import ASICLMConfig
+        cfg = ASICLMConfig.qwen3_5_9b()
+        mm = MemoryMap.from_config(cfg)
+        progs = [S.recurrent_program(cfg, None, TileSpec(), mm, chunk=c, slots=S.LANE_SLOTS) for c in (1, 8)]
+        progs += [S.global_program(cfg, None, TileSpec(), mm, 100, chunk=c) for c in (1, 8)]
+        ids = S.buffer_ids(S.lane_program(progs, 3))
+        self.assertLessEqual(len(ids), S.LANE_IDS)
+        S.encode(S.lane_program(progs, 3), None, ids, S.LANE_IDS)
+
     def test_lanes_keep_the_rules_and_beat_batches(self) -> None:
         # Four lanes at the 9B geometry on sixteen PSRAMs, each taking a new
         # context's token a link's turnaround after its last: every rule

@@ -174,12 +174,12 @@ UNITS = [
           "RMAP0": 5305655462704809316, "RMAP1": 2259224409,
           "WMAP0": 5143726797662605616, "WMAP1": 5},
          "the vector buffer's crossbar, 26 reads and 19 writes folded onto 11 and 8 over eight banks (the banks are macros)", noshare=True),
-    # Four lanes, each with its own store and 256 buffer ids (a lane's
+    # Four lanes, each with its own store and 128 buffer ids (a lane's
     # programs use 85 at the 9B geometry).  The store is a macro, so its
     # depth costs the logic nothing.
     Unit("sequencer", "fabric_sequencer", ("fabric_sram.sv", "fabric_sequencer.sv"),
-         {"NU": 10, "NE": 4, "LN": 4, "DEPTH": 512, "NID": 256},
-         "the token sequencer, four lanes, each a 512-step program store and 256 buffer ids",
+         {"NU": 10, "NE": 4, "LN": 4, "DEPTH": 512, "NID": 128},
+         "the token sequencer, four lanes, each a 512-step program store and 128 buffer ids",
          files=(("program.hex", _program_image(512)),)),
 ]
 

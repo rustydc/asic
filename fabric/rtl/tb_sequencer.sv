@@ -65,6 +65,7 @@ module tb_sequencer #(
     parameter int RUNS = 1,                            // runs to push (runs.hex)
     parameter int LANES_USED = 1,
     parameter int EXPECTED_CYCLES = 0,
+    parameter int NID = 128,                           // buffer ids a lane
     parameter int E0 = 1, E1 = 2, E2 = 1, E3 = 1, E4 = 4, E5 = 1, E6 = 1, E7 = 2, E8 = 4, E9 = 1
 );
     localparam int NU = 10, NE = 4;
@@ -90,7 +91,7 @@ module tb_sequencer #(
     wire [7:0]         cmd_tag;
     wire [NU*NE-1:0]   done_valid;
     wire [NU*NE*8-1:0] done_tag;
-    fabric_sequencer #(.NU(NU), .NE(NE), .PROG_FILE("program.hex")) dut (
+    fabric_sequencer #(.NU(NU), .NE(NE), .NID(NID), .PROG_FILE("program.hex")) dut (
         .clk(clk), .rst_n(rst_n), .push(push), .push_lane(push_lane), .push_pc(push_pc), .push_steps(push_steps),
         .push_layer(2'd0), .push_page(21'd0), .push_room(room), .lane_busy(lane_busy), .lane_done(lane_done), .running(running),
         .cmd_valid(cmd_valid), .cmd_engine(cmd_engine), .cmd_len(cmd_len), .cmd_src(cmd_src), .cmd_dst(cmd_dst),

@@ -766,7 +766,7 @@ class EngineRun:
         if progs:
             pushes, start = [], []
             for l, runs in enumerate(lanes):
-                write_hex(directory / S.lane_store_name(l), S.encode(progs[l], self.layout), 256)
+                write_hex(directory / S.lane_store_name(l), S.encode(progs[l], self.layout, limit=S.LANE_IDS), 256)
                 start.append(len(pushes))
                 pc = 0
                 for run in runs:
@@ -774,7 +774,7 @@ class EngineRun:
                     pc += len(run)
             self.schedule_cycles = S.schedule_lanes(progs, start).cycles
         else:
-            write_hex(directory / "program.hex", S.encode(steps, self.layout), 256)
+            write_hex(directory / "program.hex", S.encode(steps, self.layout, limit=S.LANE_IDS), 256)
             pushes = [(0xF << 57) | len(steps)]
             self.schedule_cycles = S.schedule(steps).cycles
         write_hex(directory / "runs.hex", pushes, 64)
@@ -1080,7 +1080,8 @@ class DieRun:
         # and the lane runs them back to back.
         for l, (r, g) in enumerate(lane_runs):
             ids = S.buffer_ids(r + g)
-            words = S.encode(r, _LaneOperands(self.lr, self.lv), ids) + S.encode(g, _LaneOperands(self.lg, self.lv), ids)
+            words = (S.encode(r, _LaneOperands(self.lr, self.lv), ids, S.LANE_IDS)
+                     + S.encode(g, _LaneOperands(self.lg, self.lv), ids, S.LANE_IDS))
             write_hex(directory / S.lane_store_name(l), words, 256)
         nt = _tiles(directory, consts[0], cfg, spec, layers=consts)
         sw = L.sw_for(16, cfg.hidden_size)

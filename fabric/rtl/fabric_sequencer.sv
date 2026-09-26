@@ -58,7 +58,7 @@ module fabric_sequencer #(
     parameter int NE        = 4,                // engines per unit at most
     parameter int LN        = 4,                // lanes, at most four (fabric.sequencer.LANES)
     parameter int DEPTH     = 4096,             // a lane's program store: every program the lane runs
-    parameter int NID       = 256,              // buffer ids a lane
+    parameter int NID       = 128,              // buffer ids a lane: a lane's programs use 85 at the 9B geometry (fabric.sequencer.LANE_IDS)
     parameter int CW        = 6,                // counter width: outstanding writers or readers of one buffer
     parameter int NREL      = 1,                // completions drained a cycle (fabric.sequencer.RELEASES)
     parameter int RQ        = 4,                // runs a lane holds: a token's layers
