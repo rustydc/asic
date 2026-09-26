@@ -74,7 +74,7 @@ module fabric_csa_tree #(
     localparam int NF = after(N, LV);        // one or two
     // Every layer is narrower than the one before it, so one N-operand slot
     // per layer holds all of them.
-    wire [(LV+1)*N*W-1:0] lvl;
+    wire [(LV+1)*N*W-1:0] lvl /*verilator split_var*/;   // one net a level to a simulator that would otherwise see a loop
     assign lvl[0 +: N*W] = ops;
     genvar v, i;
     generate

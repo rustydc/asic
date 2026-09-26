@@ -1923,13 +1923,30 @@ units; `rtl/fabric_engine.sv` the layer engine (the vector buffer, an
 adapter per unit, the memory unit with its arbiter and the top), with
 `tb_layer_engine` running both layers' programs of `fabric.engine` over
 the real units against the integer model and the memory model, with the
-memory model or the HPI path behind the port. Verilator 5 runs the
-engine too (`--binary --timing`, the vector buffer's array writes made
-blocking for it): the tiny one-token case is bit-exact and cycle-exact
-with Icarus and simulates in under a second against Icarus's 44 s. The
-full-size engine, 834 tiles and the 128 x 128 state engines, is another
-matter. Flat, Verilator's elaboration passes 9.8 GB, more than this
-container has. With the column modules marked `hier_block` and
+memory model or the HPI path behind the port.
+
+The engine's and the die's testbenches run on Verilator 5 where it is
+installed (`fabric/sim.py`; `FABRIC_SIM=icarus` forces Icarus). It
+compiles the RTL to C++ with `--binary --timing`, and the build is the
+cost -- a minute or two for an engine -- so each build is cached under
+`fabric/.simcache`, keyed by the sources' contents, the top and its
+parameters, and a test that repeats a configuration reuses the binary.
+Runs are cycle for cycle and bit for bit the same as Icarus's:
+`EngineRtlTest.test_icarus_agrees` runs one token on both and compares
+the cycle counts. The engine tests take 954 s and the global layer's and
+the die's 1,620 s, where Icarus took about 1,440 s for the first group
+alone. Two things Icarus let through Verilator does not.
+The multiplier's carry-save tree (`fabric_csa_tree`) is one flat vector
+of levels, which Verilator saw as a combinational loop and evaluated as
+one: the build wrote a 100 MB C++ file and ran out of memory until the
+vector was marked `split_var`. And a parameter past 64 bits -- the
+folded port map, computed for a lane engine that does not fold -- was a
+build error rather than Icarus's silent truncation; the map is now left
+out when nothing folds, and asserted to fit when it does.
+
+The full-size engine, 834 tiles and the 128 x 128 state engines, is
+another matter. Flat, Verilator's elaboration passes 9.8 GB, more than
+this container has. With the column modules marked `hier_block` and
 `--hierarchical` (the top's parameters in a wrapper module, since the
 `-G` flags reach the child; the executable linked by hand, since
 `--main` reaches it too) the tile compiles once and elaboration fits,
@@ -1941,8 +1958,8 @@ only unroll; those writes are blocking now (each element reads and
 writes only itself, in one phase) so the loops stay loops, but the files
 were the same size with them kept, so the bulk was the top itself: the
 pass adapter's flat per-tile vectors, since replaced by per-tile nets
-for Icarus's sake (the layer engine section), which is untried under
-Verilator and may be what its build needed too.
+for Icarus's sake (the layer engine section), and the carry-save tree's
+loop above, both untried at full size since.
 
 `rtl/fabric_memory.sv` holds the memory side: the behavioural
 `fabric_mem_model` for the testbenches, `fabric_mem_arbiter`,

@@ -646,7 +646,7 @@ def _consts(directory: Path, c, cfg, sw: int) -> None:
 
 
 def _geometry(cfg, spec: TileSpec, mm: MemoryMap, layout: "Layout", programs: list[list[S.Step]], chunk: int, nt: int,
-              model_tiles: bool = False) -> dict:
+              model_tiles: bool = False, fold: bool = True) -> dict:
     """The engine's elaboration: its units' geometry, the global layer's
     memory map, the tile array and the vector buffer's banks and ports."""
     d, nk, nv = cfg.hidden_size, cfg.linear_num_key_heads, cfg.linear_num_value_heads
@@ -666,7 +666,9 @@ def _geometry(cfg, spec: TileSpec, mm: MemoryMap, layout: "Layout", programs: li
             "VB_RCAP2": layout.cap_mask(layout.bank_reads, 2),
             "VB_RCAP3": layout.cap_mask(layout.bank_reads, 3),
             "VB_WCAP2": layout.cap_mask(layout.bank_writes, 2),
-            **port_params(programs, chunk)}
+            # With lanes nothing folds (fabric_vb): every logical port is its own.
+            **(port_params(programs, chunk) if fold else
+               {"VB_FOLD": 0, "VB_NPR": _port_index(RD_PORT_MAP, chunk)[1], "VB_NPW": _port_index(WR_PORT_MAP, chunk)[1]})}
 
 
 def port_params(programs: list[S.Step] | list[list[S.Step]], chunk: int = 1) -> dict:
@@ -675,6 +677,7 @@ def port_params(programs: list[S.Step] | list[list[S.Step]], chunk: int = 1) -> 
     out = {}
     for kind, write in (("R", False), ("W", True)):
         colours, count = port_colours(programs, write=write, chunk=chunk)
+        assert count <= 16, f"{count} crossbar {kind} ports: the map is four bits a port"
         out[f"VB_NP{kind}"] = count
         for half in (0, 1):
             word = 0
@@ -781,10 +784,7 @@ class EngineRun:
         nt = _tiles(directory, c, cfg, spec)
         sw = L.sw_for(16, d)
         _consts(directory, c, cfg, sw)
-        geometry = _geometry(cfg, spec, mm, self.layout, [steps], self.chunk, nt, model_tiles)
-        if progs:                                                    # nothing folds: see fabric_vb
-            geometry.update({"VB_FOLD": 0, "VB_NPR": _port_index(RD_PORT_MAP, self.chunk)[1],
-                             "VB_NPW": _port_index(WR_PORT_MAP, self.chunk)[1]})
+        geometry = _geometry(cfg, spec, mm, self.layout, [steps], self.chunk, nt, model_tiles, fold=not progs)
         self.params = {"N": len(steps), "RUNS": len(pushes), "LANES_USED": len(lanes) if lanes else 1, "FFN": ffn,
                        **geometry,
                        "MEM_BEATS": self.layout.mem_beats,
@@ -1109,8 +1109,7 @@ class DieRun:
         write_hex(directory / "die_table.hex", table, 256)
         write_hex(directory / "die_layers.hex", [int(layer == 3) | (self.layer_page[layer] << 1) for layer in range(4)], 32)
         self.params = {"N": len(tokens) * (3 * len(self.rec) + len(self.glob)), "FFN": cfg.layer_intermediate_size(0),
-                       **_geometry(cfg, spec, mm_g, self.lv, [self.rec, self.glob], 1, nt),
-                       "VB_FOLD": 0, "VB_NPR": _port_index(RD_PORT_MAP)[1], "VB_NPW": _port_index(WR_PORT_MAP)[1],
+                       **_geometry(cfg, spec, mm_g, self.lv, [self.rec, self.glob], 1, nt, fold=False),
                        "MEM_BEATS": len(mem) // BEAT, "SCHEDULE_CYCLES": 0, "USE_HPI": 0, "LAYERS": 4,
                        "RING": 1, "RING_PACKETS": len(tokens), "RING_IN": len(ins), "RING_OUT": len(outs), "RING_LANES": lanes,
                        "RING_CHUNK": 1, "RING_SLOT_PAGES": self.slot_pages, "RING_PAGE_BASE": page_base, "RING_LAYERS": 4}

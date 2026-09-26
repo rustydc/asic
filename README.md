@@ -90,7 +90,7 @@ PyTorch installed:
 python fixed_llm_poc.py
 python -m unittest discover -s training/tests -t .
 python -m unittest discover -s sim/tests -t .
-python -m unittest discover -s fabric/tests -t .   # RTL tests need iverilog
+python -m unittest discover -s fabric/tests -t .   # RTL tests need iverilog; engine tests use verilator if present
 python -m unittest discover -s hw/tests -t .
 ```
 

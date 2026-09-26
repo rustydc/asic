@@ -10,6 +10,7 @@ from pathlib import Path
 import numpy as np
 
 from fabric import engine as E
+from fabric import sim as SIM
 from fabric import layer as L
 from fabric import sequencer as S
 from fabric.memory import GlobalContextMemory, MemoryMap
@@ -28,23 +29,21 @@ SOURCES = [RTL / name for name in ("fabric_sram.sv", "fabric_vector.sv", "fabric
 
 def run_engine(case: unittest.TestCase, cfg, c, spec, mm, steps: list[S.Step], inputs: dict, memory=None, ndev: int = 0,
                model_tiles: bool = False, log=None, first: bool = False, base_page: int = 0, ring: bool = False,
-               bound: bool = False, lanes=None) -> int:
+               bound: bool = False, lanes=None, simulator: str | None = None) -> int:
     """Emit, simulate and check one program; returns the engine's cycle count.  With ``ndev`` the memory is the HPI path,
     with ``model_tiles`` the tiles' behavioural columns (full-size runs), with ``first`` the token is FIRST, with ``ring``
-    the tokens come and go as packets through the die's ring link."""
+    the tokens come and go as packets through the die's ring link.  ``simulator`` is ``fabric.sim``'s (its default: Verilator
+    where there is one)."""
     with tempfile.TemporaryDirectory() as directory:
         work = Path(directory)
         t0 = time.time()
         run = E.EngineRun(work, cfg, c, spec, mm, steps, inputs, memory, ndev, model_tiles, first, base_page, ring, lanes)
         steps = run.steps
-        args = [f"-Ptb_layer_engine.{name}={value}" for name, value in run.params.items()]
         t1 = time.time()
-        subprocess.run(["iverilog", "-g2012", "-I", str(RTL), "-s", "tb_layer_engine", "-o", "sim.vvp", *args, *map(str, SOURCES)],
-                       cwd=work, check=True, capture_output=True, text=True)
-        t2 = time.time()
-        out = subprocess.run(["vvp", "sim.vvp"], cwd=work, check=True, capture_output=True, text=True).stdout
+        out = SIM.run(work, "tb_layer_engine", SOURCES, run.params, simulator)
         if log is not None:
-            log(f"emit {t1 - t0:.0f} s, compile {t2 - t1:.0f} s, simulate {time.time() - t2:.0f} s: {out.strip().splitlines()[-2]}")
+            log(f"emit {t1 - t0:.0f} s, build and simulate {time.time() - t1:.0f} s: "
+                f"{next(line for line in out.splitlines() if 'PASS' in line or 'FAIL' in line)}")
         case.assertIn("PASS", out, out)
         case.assertEqual(run.check(work), [])
         issue = [tuple(int(v) for v in line.split()) for line in (work / "issue.txt").read_text().splitlines()]
@@ -224,8 +223,8 @@ class EngineRtlTest(unittest.TestCase):
             s, sc, hist = r["s_next"], r["scale_next"], r["hist_next"]
         return {"x": np.rint(self.xs[tokens] / self.c.s_h).astype(np.int64), "s_mem": s, "scale_mem": sc, "hist_mem": hist}
 
-    def run_engine(self, steps: list[S.Step], inputs: dict, ndev: int = 0) -> int:
-        return run_engine(self, self.cfg, self.c, self.spec, self.mm, steps, inputs, ndev=ndev)
+    def run_engine(self, steps: list[S.Step], inputs: dict, ndev: int = 0, simulator: str | None = None) -> int:
+        return run_engine(self, self.cfg, self.c, self.spec, self.mm, steps, inputs, ndev=ndev, simulator=simulator)
 
     def test_one_token_from_a_running_context(self) -> None:
         inputs = self.context_after(2)
@@ -245,6 +244,12 @@ class EngineRtlTest(unittest.TestCase):
             lanes.append([S.retarget(prog, l, private=True)] * runs)
             inputs.update({f"{k}@{l}": v for k, v in self.context_after(tokens).items()})
         run_engine(self, self.cfg, self.c, self.spec, self.mm, [], inputs, lanes=lanes)
+
+    def test_icarus_agrees(self) -> None:
+        # The engine tests run on Verilator where it is installed; this one
+        # token runs on Icarus too, in the same cycles, bit for bit.
+        cycles = {sim: self.run_engine(self.prog, self.context_after(2), simulator=sim) for sim in ("icarus", SIM.default())}
+        self.assertEqual(len(set(cycles.values())), 1, cycles)
 
     def test_one_token_over_the_hpi_devices(self) -> None:
         # The same token with the bridge, the stripe unit and PSRAM models
@@ -560,10 +565,7 @@ class DieRtlTest(unittest.TestCase):
             work = Path(directory)
             run = E.DieRun(work, self.cfg, self.consts, self.spec, self.mm_r, self.mm_g, tokens)
             self.assertNotEqual(run.outputs[0].tolist(), tokens[0][1].tolist())
-            args = [f"-Ptb_layer_engine.{name}={value}" for name, value in run.params.items()]
-            subprocess.run(["iverilog", "-g2012", "-I", str(RTL), "-s", "tb_layer_engine", "-o", "sim.vvp", *args, *map(str, SOURCES)],
-                           cwd=work, check=True, capture_output=True, text=True)
-            out = subprocess.run(["vvp", "sim.vvp"], cwd=work, check=True, capture_output=True, text=True).stdout
+            out = SIM.run(work, "tb_layer_engine", SOURCES, run.params)
             self.assertIn("PASS", out, out)
             self.assertEqual(run.check(work), [])
 

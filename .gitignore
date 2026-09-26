@@ -7,3 +7,4 @@ hw/kicad/board_layers.png
 hw/kicad/*-backups/
 hw/kicad/fp-info-cache
 hw/kicad/*.kicad_prl
+fabric/.simcache/
