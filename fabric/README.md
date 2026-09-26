@@ -979,7 +979,8 @@ full-size programs of both layers and for two-token streams of them (33,
 23, 173, 41, 66, 346 and 82 steps). The three timing rules the two share:
 a step issues after the previous issue, one cycle after the last of its
 dependencies completed, and one cycle after its engine's previous step
-completed.
+completed. (It now runs four such programs at once, a lane each, each in
+its own order: see the lanes, under the controller below.)
 
 ### Streams of tokens
 
@@ -1168,7 +1169,9 @@ of the die's 213K cycles a token. The global layer at 128K is 59K, most
 of it the index scan at the devices' rate. The push-out costs three per
 cent at worst. Decoding in batches of four lanes, the die does 2,560
 tokens/s at 128K (944 as first built), a single user 249 (107), and a
-prefill chunk of eight 4,786 (3,282).
+prefill chunk of eight 4,786 (3,282). With the lanes the sequencer now
+has (below), four contexts' tokens each in a lane of its own, the die
+does 2,923 at 128K and 3,317 at 4K, past the streamed figures here.
 
 The device count is a cost question -- a part is about $5 in hundreds,
 and sixteen a die is 128 of them on the board. With the controller as
@@ -1657,57 +1660,59 @@ through the ring the position comes off the packet.
 ### The ring link on the die
 
 `rtl/fabric_die_link.sv` is a layer die's front end, between the ring and
-the engine; `die.py` is its model. Packets come off the ring into lanes,
-up to four, each lane's vectors written into the engine's vector buffer
-as they arrive. The lanes are a batch the engine runs as one program --
-the sequencer's streams, the tokens of different contexts interleaved --
-so a batch is one shape, a token a lane or a chunk a lane, and it runs
-when it is full, when a packet of the other shape arrives, or when the
-link has been quiet for sixteen cycles. The engine is started with:
+the engine; `die.py` is its model. A packet coming off the ring takes a
+lane of the engine as it arrives -- the lowest that is free, unless a lane
+still holds its context -- and its vectors are written into the lane's
+buffers in the vector buffer as they arrive, through ports of the link's
+own, while the other lanes run. Then the lane is given a run for each of
+the die's layers (the lanes are below):
 
-* the program for the batch's shape and size, from a table of eight
-  entries, each a first step and a length; the sequencer now takes a
-  first step, so a die holds all its programs in one program memory;
-* each lane's slot as a page: the packet's context field is the
-  controller's slot number, and a slot is a fixed number of pages from a
-  base;
-* each lane's FIRST, from the packet's flag.
+* the program for the layer's kind and the packet's shape, a token or a
+  chunk, from a table of four entries, each a first step and a length --
+  every lane's store holds the die's programs at the same steps;
+* the layer and the page its part of the slot starts at;
+* the lane's token: its slot as a page -- the packet's context field is
+  the controller's slot number, and a slot is a fixed number of pages from
+  a base -- its FIRST, from the packet's flag, and its position.
 
-When the engine is done each lane's packet leaves with the output vectors
-in place of the input and the header as it came. The link reaches the
-vector buffer through the memory unit's ports, which nothing else uses
-while the engine is idle, so a batch's successors wait on the link while
-it runs: a few thousand cycles of words against the few hundred thousand
-a token spends in a die's four layers. A packet whose CRC fails takes no
-lane (its vectors are overwritten by the next), and one the die has no
-program for -- not a work item, a token count other than one or the
-chunk, a length other than the vectors -- is read off and dropped; both
-are counted.
+When the lane is done its packet leaves with the output vectors in place
+of the input and the header as it came; the lanes' packets leave in the
+order they finish, so another context's may overtake, and a context's own
+never do. A packet whose CRC fails gives its lane back (its vectors are
+overwritten by the next), and one the die has no program for -- not a
+work item, a token count other than one or the chunk, a length other than
+the vectors -- is read off and dropped; both are counted.
 
-`tb_die_link` runs 24 packets in seven groups through a stand-in engine
--- a full batch and a part one, a change of shape, CRC failures, packets
-with no program, a chunk batch, the next die stalling -- against the
-model's batches, engine starts and packets out. And the engine test runs
-the real thing: with `ring` the vector buffer starts with no input in it,
-the tokens come in as packets, the link starts the engine, and what leaves
-is the model's packets bit for bit -- two recurrent contexts as two lanes
-in slots away from the base, and a global chunk of three as one packet.
+`tb_die_link` runs 28 packets through a stand-in engine whose higher lanes
+take longer, so they finish out of order -- more packets than lanes,
+shapes side by side, CRC failures, packets with no program, a prompt's
+packets from one slot, the next die stalling -- and `die.check_die_link_run`
+holds the record against the model: every item's runs as the model has
+them, in the order the items came, no slot in two lanes at once, every
+packet out and each context's in order; and the link never touches a
+running lane's vectors. And the engine test runs the real thing: with
+`ring` the vector buffer starts with no input in it, the tokens come in as
+packets, the link pushes the lanes, and what leaves is the model's packets
+bit for bit -- two recurrent contexts as two lanes in slots away from the
+base, in the model's cycles from the link's pushes, and a global chunk of
+three as one packet.
 
 ### A die's four layers
 
 A layer die runs three recurrent layers and a global one for every token,
-and now the engine does: the die link runs a batch's four layers in turn,
-starting the engine for each with its program, its layer and its part of
-the slot, and sends the packets on after the fourth. What that took:
+and now the engine does: the die link gives a packet's lane its four
+layers as runs, each with its program, its layer and its part of the
+slot, and sends the packet on after the fourth (the lanes are below). What
+that took:
 
 * **The weights and constants banked by layer.** The tile array holds all
   four layers' tiles, one layer after another, and layer L's passes are
   4 L to 4 L + 3 in the pass table; every unit's constants -- the norms'
   sets, the conv taps, the gates, SwiGLU, the residual adds, the rotary's
   gains and frequencies, the attention's scales -- are four banks deep.
-  The engine is started with its layer, and a command's pass or constant
-  set is looked up in that layer's bank, so the three recurrent layers run
-  one program.
+  A run carries its layer, every command of it carries the layer to its
+  unit, and a command's pass or constant set is looked up in that layer's
+  bank, so the three recurrent layers run one program.
 * **A pass walks its own tiles.** The pass adapter's write phase used to
   step over every tile of the array, a cycle each for the ones not in the
   pass, which made the array's size part of every pass's cost -- and a
@@ -1733,8 +1738,8 @@ the slot, and sends the packets on after the fourth. What that took:
   starts at, which it adds to the slot's page as it starts the layer.
 * **A slot takes one lane.** A prompt's packets come from one slot back to
   back, and two tokens of one context cannot run at once on its state, so
-  a packet whose slot is already in the batch closes it; the link and its
-  model both do this, which they did not before.
+  a packet whose context is in a lane that has not finished waits on the
+  link for it; the link and its model both do this.
 
 `engine.DieRun` builds it all for the tiny geometry: four layers compiled
 at one residual scale (it is the packet's), the two programs, the banked
@@ -1742,18 +1747,17 @@ tables, the slot with the recurrent state garbage and the global context
 another context's, and the chain on the integer model -- the three
 recurrent layers and the global one with its context memory, token after
 token. `DieRtlTest` sends two tokens of one context through the ring, the
-first FIRST at position 0: the link runs them one after the other, four
-layers each, and the packets that leave and every layer's state and the
-context afterwards are the chained model's bit for bit.
+first FIRST at position 0: the second waits on the link for the first,
+then takes the next lane, four layers each, and the packets that leave and
+every layer's state and the context afterwards are the chained model's
+bit for bit.
 
-The program store holds 4,096 steps, every program a die runs one after
-another, and the die link starts one at its first step. At the 9B
-geometry the recurrent program is 173 steps and the global 41; a batch of
-four is 692 and 164, a chunk of eight 894 and 273, so single tokens at
-one, two and four lanes and chunks a lane at a time -- about 2,700 steps
--- fit with room. It is 128 KB of SRAM, next to about 500 MB of weights
-in the die's ROM. Every shape the table can name would be over ten
-thousand steps; which shapes a die keeps is the table's to say.
+Each lane's program store holds the die's programs at its own addresses,
+at the same steps in every lane: at the 9B geometry the recurrent program
+is 173 steps and the global 41, a chunk of eight 894 and 273 -- 1,381
+steps, a store of 2,048 a lane, 256 KB for four lanes next to about
+500 MB of weights in the die's ROM. (A batch's merged programs were one
+shape a lane count; a lane only ever runs one token's.)
 
 Running a long program on the controller found one thing the cycle model
 did not know. A step's tag is its index modulo 256, and the controller
@@ -1764,6 +1768,105 @@ now (`sequencer.TAGS`): two recurrent chunks of eight at the 9B geometry,
 the model's 402,786 cycles, which were 396,625 before the rule. The
 streams the throughput figures use never meet it; a wider tag would make
 it rarer, at the price of the live table.
+
+### Lanes
+
+The batches left a tenth of the die idle. A batch was one program, its
+tokens merged ahead of time, and the link ran it once a layer, so each of
+the four runs started with the tiles waiting for the first state read and
+ended with the memory idle under the last token's compute: at 128K on
+sixteen PSRAMs, batches of four made 2,560 tokens a second where the
+stream the model had always assumed made 2,815. Letting the four runs
+follow one another without stopping gained 0.2 per cent -- the next
+layer's first step is its norm of lane 0's residual, and in program order
+it waits behind lane 3's residual add, the last layer's last step.
+Nothing issued in one order could have overlapped them. So the lanes are
+the sequencer's own:
+
+* **A lane is a token.** The sequencer has four lanes, each running one
+  context's token (or a chunk of its prompt) through the die's layers:
+  the link pushes the lane a run a layer, and the lane fetches them one
+  after another with nothing between, as one program. Each lane issues in
+  its own order by the old rules; each cycle, of the lanes whose next
+  step could issue, the oldest does. A lane is as old as its token, so
+  the lanes take turns being first and none starves.
+  (`sequencer.schedule_lanes`, `rtl/fabric_sequencer.sv`; one lane is the
+  in-order controller, step for step.)
+* **A lane's buffers are its own, the state slots too.** Shared, the
+  eight state slots made the lanes take turns -- a lane could not read
+  into a slot another would still read into -- and four lanes did 2,005
+  tokens a second, worse than batches. Two slots a lane are the eight
+  the die had, and a lane reads one head ahead into the other; eight a
+  lane measured no better. With nothing shared but the units, the lanes'
+  counters are separate too, and a lane's programs use 85 of its 256 ids
+  at the 9B geometry, where a batch of four's recurrent program alone
+  needed 260 and could not be encoded.
+* **The layer rides with the command.** A run carries its layer and its
+  part of the slot; the sequencer hands both out with every command of
+  it, each engine port keeps its command's layer for the units'
+  constant banks, and the memory unit takes the token's slot and the
+  run's part when it takes the command. Two lanes on different layers
+  each get their own.
+* **A lane's banks are its own.** Any step of another lane may run beside
+  any step of this one, which no colouring by issue order can see, so the
+  lanes' buffers are coloured alike and each lane has its own copy of the
+  banks (`engine.Layout(lanes=...)`); nothing another lane does meets
+  them. For the same reason no logical port of the crossbar folds onto
+  another any more (`VB_FOLD = 0`).
+* **No gathering.** The link gives a packet the lowest free lane as it
+  arrives, writes its vectors through ports of its own on the vector
+  buffer while the other lanes run, pushes its four runs, and sends it on
+  when its lane is done: packets leave in the order their lanes finish,
+  another context's overtaking, a context's own never. The quiet wait,
+  the batch shapes and the engine's idle-time use of the memory unit's
+  port are gone.
+
+At the 9B geometry on sixteen PSRAMs, each lane taking a new context's
+token a link turnaround (4,096 cycles) after its last:
+
+| Lanes | Tokens/s, 128K | A lane's token |
+| ---: | ---: | ---: |
+| 1 | 1,939 | 309,404 cycles |
+| 2 | 2,525 | 471,259 |
+| 3 | 2,930 | 605,228 |
+| 4 | 2,935 | 809,718 |
+| 6 | 2,914 | 1,224,070 |
+
+Four lanes do 3,317 tokens a second at 4K and 2,923 at 128K against the
+batches' 2,560 and the old streamed estimate's 2,815 -- the lanes pass the
+figure the batches were measured against -- and three lanes do as well as
+four. A single user is unchanged at 249: a lane alone is the in-order
+controller. Chunks of eight in four lanes, four prompts filling at once,
+prefill 12,395 tokens a second at 128K, where one prompt, whose chunks
+cannot overlap, stays at 4,786.
+
+What it costs, at the 9B geometry: the vector buffer is forty banks
+rather than sixteen, holding the same 3.0 MB (and, with no bank asked for
+a second port by another lane, buying 4.1 MB of SRAM ports to the
+batches' 4.6); the crossbar is its whole face again, 27 read and 20 write
+ports with the link's, which the fold had taken to 11 and 8 (407,000
+NAND2-eq against 278,000 before the link's two); the program stores are
+four of 2,048 steps rather than one of 4,096; and the sequencer's issue
+check is four checks and a pick, which is the next thing synthesis has to
+say about it.
+
+The checks. `tb_sequencer` runs two lanes of the tiny layers, four runs
+each, and four lanes of the 9B layers on stub units, 856 steps with the
+lanes changing 271 times, every command issued and done in the model's
+cycle. On the engine, three lanes of the recurrent layer -- one given the
+layer twice, as a lane is given its layers -- come out bit for bit in
+the model's 2,590 cycles; two contexts through the ring, a lane each,
+match the model's cycles from the link's pushes; and `tb_die_link` runs
+28 packets through a stand-in engine whose higher lanes take longer, so
+lanes finish out of order, against the link's model: every item's runs,
+no context in two lanes at once, every packet out and each context's in
+order. Simulating it found the vector buffer's crossbar model the cost of
+every multi-lane run: its read return is a gather of every bank's every
+slot, a byte at a time a port, written for the mapper, and a simulator
+wakes all of it for every bank's read -- the square of the banks. Under
+simulation the answer is now read directly (the mapper still sees the
+gather), and a two-lane run went from stalled to a thousand cycles in
+under a minute.
 
 What is not covered yet: the ring's physical layer below the words (the
 source-synchronous clocking, the retry on a CRC failure), the management

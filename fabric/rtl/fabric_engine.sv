@@ -53,7 +53,10 @@ module fabric_vb #(
     // issues in order, so most of them can never be asking at once, and
     // `fabric.engine.port_colours` says which may share.  Four bits a port,
     // sixteen ports to a word.  NPR = NR and the identity map is the face
-    // itself, which is what the checks below are written against.
+    // itself, which is what the checks below are written against.  With
+    // lanes nothing folds: any adapter may be running another lane's command
+    // beside any other, so FOLD is 0 and every logical port is its own.
+    parameter int FOLD  = 1,
     parameter int NPR   = NR,
     parameter int NPW   = NW,
     parameter [63:0] RMAP0 = 64'hFEDCBA9876543210,
@@ -124,10 +127,10 @@ module fabric_vb #(
         wcap_of = 1 + (WCAP2[bb] ? 1 : 0);
     endfunction
     function automatic integer rmap_of(input integer i);
-        rmap_of = (i < 16) ? RMAP0[i*4 +: 4] : RMAP1[(i-16)*4 +: 4];
+        rmap_of = !FOLD ? i : (i < 16) ? RMAP0[i*4 +: 4] : RMAP1[(i-16)*4 +: 4];
     endfunction
     function automatic integer wmap_of(input integer i);
-        wmap_of = (i < 16) ? WMAP0[i*4 +: 4] : WMAP1[(i-16)*4 +: 4];
+        wmap_of = !FOLD ? i : (i < 16) ? WMAP0[i*4 +: 4] : WMAP1[(i-16)*4 +: 4];
     endfunction
 
     // The fold: the logical ports' addresses or'd onto the crossbar port they
@@ -375,6 +378,7 @@ module fabric_vb #(
     // shifter over every bank, and sixteen of those a port does not map.
     reg [NPR*128-1:0] p_data, p_hi;
     genvar gp, gg, gk;
+`ifdef FABRIC_SYNTH
     generate
         for (gp = 0; gp < NPR; gp = gp + 1) begin : g_read
             wire [SB-1:0] sel_w = (r_bank[gp] << RSH) + r_slot[gp];   // a concatenation: see RSH
@@ -413,6 +417,36 @@ module fabric_vb #(
             end
         end
     endgenerate
+`else
+    // Simulated, the same answer read directly: the slot, the half and the
+    // offset registered as the copies above are, then the two words and the
+    // shift.  The byte-wise gather above is for the mapper; in a simulator
+    // it is NPR x 16 x NB*RPOT continuous assignments, every one of them
+    // woken by every bank's read, which grows as the square of the banks and
+    // held a run of three lanes at time zero.
+    reg [SB-1:0] s_sel [0:NPR-1];
+    reg [3:0]    s_off [0:NPR-1];
+    reg          s_odd [0:NPR-1], s_en [0:NPR-1];
+    integer      si;
+    always @(posedge clk)
+        for (si = 0; si < NPR; si = si + 1) begin
+            s_sel[si] <= SB'((r_bank[si] << RSH) + r_slot[si]);
+            s_off[si] <= p_addr[si*AW +: 4];
+            s_odd[si] <= p_addr[si*AW + 4];
+            s_en[si]  <= p_en[si] && r_got[si];
+        end
+    generate
+        for (gp = 0; gp < NPR; gp = gp + 1) begin : g_read_sim
+            wire [127:0] ev  = even_q[s_sel[gp]*128 +: 128];
+            wire [127:0] od  = odd_q[s_sel[gp]*128 +: 128];
+            wire [255:0] win = s_odd[gp] ? {ev, od} : {od, ev};
+            always @(*) begin
+                p_data[gp*128 +: 128] = s_en[gp] ? win[s_off[gp]*8 +: 128] : 128'bx;
+                p_hi[gp*128 +: 128]   = s_en[gp] ? win[255:128] : 128'bx;
+            end
+        end
+    endgenerate
+`endif
 
     // Every logical port that folded onto a crossbar port reads its answer:
     // wires, since at most one of them asked for it.
@@ -2135,8 +2169,9 @@ module fabric_layer_engine #(
     parameter [63:0] VB_RCAP2 = 0,
     parameter [63:0] VB_RCAP3 = 0,
     parameter [63:0] VB_WCAP2 = 0,
-    parameter int VB_NPR = 24,                  // crossbar ports the logical ones fold onto
-    parameter int VB_NPW = 19,
+    parameter int VB_FOLD = 1,                  // 0 with lanes: no logical port shares a crossbar port
+    parameter int VB_NPR = 25,                  // crossbar ports the logical ones fold onto
+    parameter int VB_NPW = 20,
     parameter [63:0] VB_RMAP0 = 64'hFEDCBA9876543210,
     parameter [63:0] VB_RMAP1 = 64'hFEDCBA9876543210,
     parameter [63:0] VB_WMAP0 = 64'hFEDCBA9876543210,
@@ -2148,15 +2183,26 @@ module fabric_layer_engine #(
 ) (
     input  wire         clk,
     input  wire         rst_n,
-    input  wire         start,
-    input  wire [3:0]   first,               // FIRST, per token in flight (latched at start)
-    input  wire [4*21-1:0] slot_page,        // each token in flight's slot, in 2 KB pages (latched at start)
-    input  wire [4*32-1:0] position,         // each token in flight's position (latched at start)
-    input  wire [1:0]   layer,               // the layer this run is: its bank of weights and constants (latched at start)
-    input  wire [15:0]  pc_start,            // the program's first step
-    input  wire [15:0]  n_steps,
+    // A run for a lane (fabric_sequencer's push): a program in the lane's
+    // store, its layer -- its bank of weights and constants -- and where its
+    // part of the slot starts, in pages from the slot's first.  The tokens in
+    // flight named by `push_set` take their FIRST, slot and position with it:
+    // a lane's token is the token in flight of the lane's number, and a
+    // program of several tokens in one lane (a stream) sets them all.
+    input  wire         push,
+    input  wire [1:0]   push_lane,
+    input  wire [15:0]  push_pc,
+    input  wire [15:0]  push_steps,
+    input  wire [1:0]   push_layer,
+    input  wire [20:0]  push_page,
+    input  wire [3:0]   push_set,
+    input  wire [3:0]   first,               // FIRST, per token in flight
+    input  wire [4*21-1:0] slot_page,        // each token in flight's slot's first page, in 2 KB pages
+    input  wire [4*32-1:0] position,         // each token in flight's position
+    output wire [3:0]   push_room,
+    output wire [3:0]   lane_busy,
+    output wire [3:0]   lane_done,
     output wire         running,
-    output wire         done,
     // the memory port (fabric_memory.sv's request protocol)
     output wire         m_req_valid,
     input  wire         m_req_ready,
@@ -2169,10 +2215,10 @@ module fabric_layer_engine #(
     output wire [255:0] m_wdata,
     input  wire         m_rdata_valid,
     input  wire [255:0] m_rdata,
-    // The vector buffer from outside, while the engine is idle: the die's
-    // ring link writes a packet's vectors in and reads the output out on the
-    // memory unit's ports, which nothing else uses then.
-    input  wire         ext_sel,
+    // The vector buffer from outside: the die's ring link writes a packet's
+    // vectors into a lane that is not running and reads a done one's out, on
+    // ports of its own, while the other lanes run.  A lane's buffers are in
+    // banks of its own, so the link and the lanes never meet on one.
     input  wire         ext_wr_en,
     input  wire [AW-1:0] ext_wr_addr,
     input  wire [127:0] ext_wr_data,
@@ -2189,12 +2235,15 @@ module fabric_layer_engine #(
     localparam int U_TILES = 0, U_NORM = 1, U_CONV = 2, U_GATES = 3, U_DELTA = 4, U_SWIGLU = 5, U_RESIDUAL = 6, U_ROTARY = 7, U_ATTN = 8, U_MEM = 9;
     // Vector-buffer ports.
     localparam int R_NORM = 0, R_TILES = 4, R_CONV = R_TILES + TMAX, R_GATES = R_CONV + 2, R_DELTA = R_GATES + 2, R_SWIGLU = R_DELTA + 4,
-                   R_RESIDUAL = R_SWIGLU + 2, R_MEM = R_RESIDUAL + 2, R_ROTARY = R_MEM + 1, R_ATTN = R_ROTARY + 2, NR = R_ATTN + 4;
+                   R_RESIDUAL = R_SWIGLU + 2, R_MEM = R_RESIDUAL + 2, R_ROTARY = R_MEM + 1, R_ATTN = R_ROTARY + 2, R_LINK = R_ATTN + 4, NR = R_LINK + 1;
     localparam int W_NORM = 0, W_TILES = 2, W_CONV = 3, W_GATES = 5, W_DELTA = 6, W_SWIGLU = 10, W_RESIDUAL = 11, W_MEM = 12,
-                   W_ROTARY = 13, W_ATTN = 15, NW = 19;
+                   W_ROTARY = 13, W_ATTN = 15, W_LINK = 19, NW = 20;
 
-    wire [NU-1:0]      cmd_valid, cmd_ready;
+    wire [NU-1:0]      cmd_valid;
+    wire [NU*NE-1:0]   port_ready;
     wire [3:0]         cmd_engine;
+    wire [1:0]         cmd_lane, cmd_layer;
+    wire [20:0]        cmd_page;
     wire [15:0]        cmd_len;
     wire [29:0]        cmd_src, cmd_dst, cmd_a2, cmd_a3;
     wire [31:0]        cmd_arg;
@@ -2202,9 +2251,28 @@ module fabric_layer_engine #(
     wire [NU*NE-1:0]   done_valid;
     wire [NU*NE*8-1:0] done_tag;
     fabric_sequencer #(.NU(NU), .NE(NE), .DEPTH(PROG_STEPS), .PROG_FILE(PROG_FILE)) u_seq (
-        .clk(clk), .rst_n(rst_n), .start(start), .pc_start(pc_start), .n_steps(n_steps), .running(running), .done(done),
+        .clk(clk), .rst_n(rst_n), .push(push), .push_lane(push_lane), .push_pc(push_pc), .push_steps(push_steps),
+        .push_layer(push_layer), .push_page(push_page), .push_room(push_room), .lane_busy(lane_busy), .lane_done(lane_done),
+        .running(running),
         .cmd_valid(cmd_valid), .cmd_engine(cmd_engine), .cmd_len(cmd_len), .cmd_src(cmd_src), .cmd_dst(cmd_dst),
-        .cmd_a2(cmd_a2), .cmd_a3(cmd_a3), .cmd_arg(cmd_arg), .cmd_tag(cmd_tag), .cmd_ready(cmd_ready), .done_valid(done_valid), .done_tag(done_tag));
+        .cmd_a2(cmd_a2), .cmd_a3(cmd_a3), .cmd_arg(cmd_arg), .cmd_tag(cmd_tag), .cmd_lane(cmd_lane), .cmd_layer(cmd_layer),
+        .cmd_page(cmd_page), .port_ready(port_ready), .done_valid(done_valid), .done_tag(done_tag));
+
+    // Each engine port's layer: the command it is running's, from the cycle
+    // it takes the command -- an adapter reads its constants' bank then and
+    // after -- so two lanes on different layers each have their own.
+    reg  [1:0] lay_q [0:NU*NE-1];
+    wire [1:0] lay_p [0:NU*NE-1];
+    genvar gp;
+    generate
+        for (gp = 0; gp < NU*NE; gp = gp + 1) begin : g_lay
+            wire here = cmd_valid[gp / NE] && cmd_engine == 4'(gp % NE);
+            assign lay_p[gp] = here ? cmd_layer : lay_q[gp];
+            always @(posedge clk or negedge rst_n)
+                if (!rst_n) lay_q[gp] <= 2'd0;
+                else if (here) lay_q[gp] <= cmd_layer;
+        end
+    endgenerate
 
     wire [NR*AW-1:0]  rd_addr;
     wire [NR*128-1:0] rd_data;
@@ -2240,33 +2308,43 @@ module fabric_layer_engine #(
     endgenerate
 
     wire [127:0] mem_rd_hi, mem_wr_hi;               // the memory unit's second word: the buffer's wide port
+    // The tokens in flight: FIRST, slot and position, set with a push.
     reg  [3:0]      first_r;
     reg  [4*21-1:0] slot_r;
     reg  [4*32-1:0] pos_r;
-    reg  [1:0]      layer_r;
+    integer tk;
     always @(posedge clk or negedge rst_n)
-        if (!rst_n) begin first_r <= 4'd0; slot_r <= 0; pos_r <= 0; layer_r <= 2'd0; end
-        else if (start) begin first_r <= first; slot_r <= slot_page; pos_r <= position; layer_r <= layer; end
+        if (!rst_n) begin first_r <= 4'd0; slot_r <= 0; pos_r <= 0; end
+        else if (push)
+            for (tk = 0; tk < 4; tk = tk + 1)
+                if (push_set[tk]) begin
+                    first_r[tk] <= first[tk]; slot_r[21*tk +: 21] <= slot_page[21*tk +: 21]; pos_r[32*tk +: 32] <= position[32*tk +: 32];
+                end
+    // The memory unit takes a token's slot when it takes the command: the
+    // slot's first page and the command's run's part of it.
+    wire [4*21-1:0] mem_page = {slot_r[63 +: 21] + cmd_page, slot_r[42 +: 21] + cmd_page, slot_r[21 +: 21] + cmd_page, slot_r[0 +: 21] + cmd_page};
     wire [15:0]  mem_wr_hi_be;
     fabric_vb #(.BYTES(VB_BYTES), .NR(NR), .NW(NW), .AW(AW), .NB(VB_BANKS), .BSH(VB_BANK_SHIFT),
                 .RCAP2(VB_RCAP2), .RCAP3(VB_RCAP3), .WCAP2(VB_WCAP2),
-                .NPR(VB_NPR), .NPW(VB_NPW), .RMAP0(VB_RMAP0), .RMAP1(VB_RMAP1),
+                .FOLD(VB_FOLD), .NPR(VB_NPR), .NPW(VB_NPW), .RMAP0(VB_RMAP0), .RMAP1(VB_RMAP1),
                 .WMAP0(VB_WMAP0), .WMAP1(VB_WMAP1), .WIDE_R(R_MEM), .WIDE_W(W_MEM), .INIT_FILE(VB_FILE)) u_vb (
         .clk(clk), .rd_en(rd_en), .rd_addr(rd_addr), .rd_data(rd_data), .rd_hi(mem_rd_hi), .wr_en(wr_en), .wr_addr(wr_addr),
         .wr_data(wr_data), .wr_be(wr_be), .wr_hi(mem_wr_hi), .wr_hi_be(mem_wr_hi_be));
 
     wire [NE-1:0] ready_norm, ready_delta, ready_rotary, ready_attn;
     wire ready_tiles, ready_conv, ready_gates, ready_swiglu, ready_residual, ready_mem;
-    assign cmd_ready[U_TILES]    = (cmd_engine == 0) && ready_tiles;
-    assign cmd_ready[U_NORM]     = (cmd_engine < 2) && ready_norm[cmd_engine];
-    assign cmd_ready[U_CONV]     = (cmd_engine == 0) && ready_conv;
-    assign cmd_ready[U_GATES]    = (cmd_engine == 0) && ready_gates;
-    assign cmd_ready[U_DELTA]    = ready_delta[cmd_engine];
-    assign cmd_ready[U_SWIGLU]   = (cmd_engine == 0) && ready_swiglu;
-    assign cmd_ready[U_RESIDUAL] = (cmd_engine == 0) && ready_residual;
-    assign cmd_ready[U_ROTARY]   = (cmd_engine < 2) && ready_rotary[cmd_engine];
-    assign cmd_ready[U_ATTN]     = ready_attn[cmd_engine];
-    assign cmd_ready[U_MEM]      = ready_mem;
+    // Each engine port free for a command.  The memory unit's engines are its
+    // commands in flight, which it takes whenever it can take one.
+    assign port_ready[U_TILES*NE +: NE]    = {3'b000, ready_tiles};
+    assign port_ready[U_NORM*NE +: NE]     = {2'b00, ready_norm[1:0]};
+    assign port_ready[U_CONV*NE +: NE]     = {3'b000, ready_conv};
+    assign port_ready[U_GATES*NE +: NE]    = {3'b000, ready_gates};
+    assign port_ready[U_DELTA*NE +: NE]    = ready_delta;
+    assign port_ready[U_SWIGLU*NE +: NE]   = {3'b000, ready_swiglu};
+    assign port_ready[U_RESIDUAL*NE +: NE] = {3'b000, ready_residual};
+    assign port_ready[U_ROTARY*NE +: NE]   = {2'b00, ready_rotary[1:0]};
+    assign port_ready[U_ATTN*NE +: NE]     = ready_attn;
+    assign port_ready[U_MEM*NE +: NE]      = {4{ready_mem}};
     assign done_valid[U_TILES*NE + 1 +: 3] = 0;    assign done_tag[(U_TILES*NE + 1)*8 +: 24] = 0;
     assign done_valid[U_NORM*NE + 2 +: 2] = 0;     assign done_tag[(U_NORM*NE + 2)*8 +: 16] = 0;
     assign done_valid[U_CONV*NE + 1 +: 3] = 0;     assign done_tag[(U_CONV*NE + 1)*8 +: 24] = 0;
@@ -2281,7 +2359,7 @@ module fabric_layer_engine #(
     generate
         for (e = 0; e < 2; e = e + 1) begin : g_norm
             fabric_norm_adapter #(.LAYERS(LAYERS), .NL(NL), .DMAX(D), .SW(SW), .NCONST(4), .AW(AW), .LUT_DIR(LUT_DIR)) u (
-                .clk(clk), .rst_n(rst_n), .layer(layer_r), .cmd_valid(cmd_valid[U_NORM] && cmd_engine == e), .cmd_len(cmd_len), .cmd_src(cmd_src),
+                .clk(clk), .rst_n(rst_n), .layer(lay_p[U_NORM*NE + e]), .cmd_valid(cmd_valid[U_NORM] && cmd_engine == e), .cmd_len(cmd_len), .cmd_src(cmd_src),
                 .cmd_dst(cmd_dst), .cmd_a2(cmd_a2), .cmd_a3(cmd_a3), .cmd_arg(cmd_arg), .cmd_tag(cmd_tag), .cmd_ready(ready_norm[e]),
                 .done_valid(done_valid[U_NORM*NE + e]), .done_tag(done_tag[(U_NORM*NE + e)*8 +: 8]),
                 .rd_addr_x(rd_addr[(R_NORM + 2*e)*AW +: AW]), .rd_addr_g(rd_addr[(R_NORM + 2*e + 1)*AW +: AW]), .rd_en_g(norm_gain_en[e]),
@@ -2300,7 +2378,7 @@ module fabric_layer_engine #(
         end
         for (e = 0; e < 2; e = e + 1) begin : g_rotary
             fabric_rotary_adapter #(.LAYERS(LAYERS), .HD(HD), .R(RD), .NL(ATT_L), .SW(SW), .AW(AW), .LUT_DIR(LUT_DIR)) u (
-                .clk(clk), .rst_n(rst_n), .layer(layer_r), .position(pos_r), .cmd_valid(cmd_valid[U_ROTARY] && cmd_engine == e), .cmd_src(cmd_src), .cmd_dst(cmd_dst),
+                .clk(clk), .rst_n(rst_n), .layer(lay_p[U_ROTARY*NE + e]), .position(pos_r), .cmd_valid(cmd_valid[U_ROTARY] && cmd_engine == e), .cmd_src(cmd_src), .cmd_dst(cmd_dst),
                 .cmd_a2(cmd_a2), .cmd_a3(cmd_a3), .cmd_arg(cmd_arg), .cmd_tag(cmd_tag), .cmd_ready(ready_rotary[e]),
                 .done_valid(done_valid[U_ROTARY*NE + e]), .done_tag(done_tag[(U_ROTARY*NE + e)*8 +: 8]),
                 .rd_addr(rd_addr[(R_ROTARY + e)*AW +: AW]), .rd_data(rd_data[(R_ROTARY + e)*128 +: 128]),
@@ -2310,7 +2388,7 @@ module fabric_layer_engine #(
         for (e = 0; e < NE; e = e + 1) begin : g_attn
             fabric_attn_adapter #(.LAYERS(LAYERS), .HD(HD), .G(GROUP), .L(ATT_L), .AW(AW), .W(W), .BS(BS), .TOP(TOP), .KV_BITS(KV_BITS),
                                  .REC_BYTES(REC_BYTES), .LUT_DIR(LUT_DIR)) u (
-                .clk(clk), .rst_n(rst_n), .layer(layer_r), .position(pos_r), .cmd_valid(cmd_valid[U_ATTN] && cmd_engine == e), .cmd_len(cmd_len), .cmd_src(cmd_src),
+                .clk(clk), .rst_n(rst_n), .layer(lay_p[U_ATTN*NE + e]), .position(pos_r), .cmd_valid(cmd_valid[U_ATTN] && cmd_engine == e), .cmd_len(cmd_len), .cmd_src(cmd_src),
                 .cmd_dst(cmd_dst), .cmd_a2(cmd_a2), .cmd_a3(cmd_a3), .cmd_arg(cmd_arg), .cmd_tag(cmd_tag), .cmd_ready(ready_attn[e]),
                 .done_valid(done_valid[U_ATTN*NE + e]), .done_tag(done_tag[(U_ATTN*NE + e)*8 +: 8]),
                 .rd_addr(rd_addr[(R_ATTN + e)*AW +: AW]), .rd_data(rd_data[(R_ATTN + e)*128 +: 128]),
@@ -2321,13 +2399,13 @@ module fabric_layer_engine #(
 
     fabric_pass_adapter #(.LAYERS(LAYERS), .NT(NT), .ROWS(ROWS), .COLS(COLS), .WB(WB), .AB(8), .P(P), .ACC(ACC), .SB(SB), .SHB(SHB), .TMAX(TMAX),
                           .MODEL_TILES(MODEL_TILES), .AW(AW)) u_tiles (
-        .clk(clk), .rst_n(rst_n), .layer(layer_r), .cmd_valid(cmd_valid[U_TILES] && cmd_engine == 0), .cmd_len(cmd_len), .cmd_src(cmd_src), .cmd_dst(cmd_dst),
+        .clk(clk), .rst_n(rst_n), .layer(lay_p[U_TILES*NE]), .cmd_valid(cmd_valid[U_TILES] && cmd_engine == 0), .cmd_len(cmd_len), .cmd_src(cmd_src), .cmd_dst(cmd_dst),
         .cmd_a2(cmd_a2), .cmd_a3(cmd_a3), .cmd_arg(cmd_arg), .cmd_tag(cmd_tag), .cmd_ready(ready_tiles), .done_valid(done_valid[U_TILES*NE]), .done_tag(done_tag[U_TILES*NE*8 +: 8]),
         .rd_addr(rd_addr[R_TILES*AW +: TMAX*AW]), .rd_data(rd_data[R_TILES*128 +: TMAX*128]),
         .wr_en(wr_en[W_TILES]), .wr_addr(wr_addr[W_TILES*AW +: AW]), .wr_data(wr_data[W_TILES*128 +: 128]), .wr_be(wr_be[W_TILES*16 +: 16]));
 
     fabric_conv_adapter #(.LAYERS(LAYERS), .CL(CL), .KK(KK), .C(CONV), .AW(AW), .LUT_DIR(LUT_DIR)) u_conv (
-        .clk(clk), .rst_n(rst_n), .layer(layer_r), .cmd_valid(cmd_valid[U_CONV] && cmd_engine == 0), .cmd_len(cmd_len), .cmd_src(cmd_src), .cmd_dst(cmd_dst),
+        .clk(clk), .rst_n(rst_n), .layer(lay_p[U_CONV*NE]), .cmd_valid(cmd_valid[U_CONV] && cmd_engine == 0), .cmd_len(cmd_len), .cmd_src(cmd_src), .cmd_dst(cmd_dst),
         .cmd_a2(cmd_a2), .cmd_a3(cmd_a3), .cmd_arg(cmd_arg), .cmd_tag(cmd_tag), .cmd_ready(ready_conv), .done_valid(done_valid[U_CONV*NE]),
         .done_tag(done_tag[U_CONV*NE*8 +: 8]),
         .rd_addr_x(rd_addr[R_CONV*AW +: AW]), .rd_addr_h(rd_addr[(R_CONV+1)*AW +: AW]),
@@ -2336,44 +2414,50 @@ module fabric_layer_engine #(
         .wr_en_h(wr_en[W_CONV+1]), .wr_addr_h(wr_addr[(W_CONV+1)*AW +: AW]), .wr_data_h(wr_data[(W_CONV+1)*128 +: 128]), .wr_be_h(wr_be[(W_CONV+1)*16 +: 16]));
 
     fabric_gates_adapter #(.LAYERS(LAYERS), .NVMAX(NV), .ACC(ACC), .AW(AW), .LUT_DIR(LUT_DIR)) u_gates (
-        .clk(clk), .rst_n(rst_n), .layer(layer_r), .cmd_valid(cmd_valid[U_GATES] && cmd_engine == 0), .cmd_len(cmd_len), .cmd_src(cmd_src), .cmd_dst(cmd_dst),
+        .clk(clk), .rst_n(rst_n), .layer(lay_p[U_GATES*NE]), .cmd_valid(cmd_valid[U_GATES] && cmd_engine == 0), .cmd_len(cmd_len), .cmd_src(cmd_src), .cmd_dst(cmd_dst),
         .cmd_a2(cmd_a2), .cmd_a3(cmd_a3), .cmd_arg(cmd_arg), .cmd_tag(cmd_tag), .cmd_ready(ready_gates), .done_valid(done_valid[U_GATES*NE]), .done_tag(done_tag[U_GATES*NE*8 +: 8]),
         .rd_addr_b(rd_addr[R_GATES*AW +: AW]), .rd_addr_a(rd_addr[(R_GATES+1)*AW +: AW]),
         .rd_data_b(rd_data[R_GATES*128 +: 128]), .rd_data_a(rd_data[(R_GATES+1)*128 +: 128]),
         .wr_en(wr_en[W_GATES]), .wr_addr(wr_addr[W_GATES*AW +: AW]), .wr_data(wr_data[W_GATES*128 +: 128]), .wr_be(wr_be[W_GATES*16 +: 16]));
 
     fabric_swiglu_adapter #(.LAYERS(LAYERS), .NL(SW_L), .AW(AW), .LUT_DIR(LUT_DIR)) u_swiglu (
-        .clk(clk), .rst_n(rst_n), .layer(layer_r), .cmd_valid(cmd_valid[U_SWIGLU] && cmd_engine == 0), .cmd_len(cmd_len), .cmd_src(cmd_src), .cmd_dst(cmd_dst),
+        .clk(clk), .rst_n(rst_n), .layer(lay_p[U_SWIGLU*NE]), .cmd_valid(cmd_valid[U_SWIGLU] && cmd_engine == 0), .cmd_len(cmd_len), .cmd_src(cmd_src), .cmd_dst(cmd_dst),
         .cmd_a2(cmd_a2), .cmd_a3(cmd_a3), .cmd_arg(cmd_arg), .cmd_tag(cmd_tag), .cmd_ready(ready_swiglu), .done_valid(done_valid[U_SWIGLU*NE]), .done_tag(done_tag[U_SWIGLU*NE*8 +: 8]),
         .rd_addr_g(rd_addr[R_SWIGLU*AW +: AW]), .rd_addr_u(rd_addr[(R_SWIGLU+1)*AW +: AW]),
         .rd_data_g(rd_data[R_SWIGLU*128 +: 128]), .rd_data_u(rd_data[(R_SWIGLU+1)*128 +: 128]),
         .wr_en(wr_en[W_SWIGLU]), .wr_addr(wr_addr[W_SWIGLU*AW +: AW]), .wr_data(wr_data[W_SWIGLU*128 +: 128]), .wr_be(wr_be[W_SWIGLU*16 +: 16]));
 
     fabric_residual_adapter #(.LAYERS(LAYERS), .NL(NL), .AW(AW)) u_residual (
-        .clk(clk), .rst_n(rst_n), .layer(layer_r), .cmd_valid(cmd_valid[U_RESIDUAL] && cmd_engine == 0), .cmd_len(cmd_len), .cmd_src(cmd_src), .cmd_dst(cmd_dst),
+        .clk(clk), .rst_n(rst_n), .layer(lay_p[U_RESIDUAL*NE]), .cmd_valid(cmd_valid[U_RESIDUAL] && cmd_engine == 0), .cmd_len(cmd_len), .cmd_src(cmd_src), .cmd_dst(cmd_dst),
         .cmd_a2(cmd_a2), .cmd_a3(cmd_a3), .cmd_arg(cmd_arg), .cmd_tag(cmd_tag), .cmd_ready(ready_residual), .done_valid(done_valid[U_RESIDUAL*NE]), .done_tag(done_tag[U_RESIDUAL*NE*8 +: 8]),
         .rd_addr_h(rd_addr[R_RESIDUAL*AW +: AW]), .rd_addr_y(rd_addr[(R_RESIDUAL+1)*AW +: AW]),
         .rd_data_h(rd_data[R_RESIDUAL*128 +: 128]), .rd_data_y(rd_data[(R_RESIDUAL+1)*128 +: 128]),
         .wr_en(wr_en[W_RESIDUAL]), .wr_addr(wr_addr[W_RESIDUAL*AW +: AW]), .wr_data(wr_data[W_RESIDUAL*128 +: 128]), .wr_be(wr_be[W_RESIDUAL*16 +: 16]));
 
-    // The memory unit's buffer ports, or the ring link's while the engine is idle.
+    // The memory unit's buffer ports, and the ring link's.
     wire          mu_rd_en, mu_wr_en;
     wire [AW-1:0] mu_rd_addr, mu_wr_addr;
     wire [127:0]  mu_wr_data;
     wire [15:0]   mu_wr_be, mu_wr_hi_be;
-    assign rd_en[R_MEM]              = ext_sel ? ext_rd_en   : mu_rd_en;
-    assign rd_addr[R_MEM*AW +: AW]   = ext_sel ? ext_rd_addr : mu_rd_addr;
-    assign wr_en[W_MEM]              = ext_sel ? ext_wr_en   : mu_wr_en;
-    assign wr_addr[W_MEM*AW +: AW]   = ext_sel ? ext_wr_addr : mu_wr_addr;
-    assign wr_data[W_MEM*128 +: 128] = ext_sel ? ext_wr_data : mu_wr_data;
-    assign wr_be[W_MEM*16 +: 16]     = ext_sel ? 16'hFFFF    : mu_wr_be;
-    assign mem_wr_hi_be              = ext_sel ? 16'h0000    : mu_wr_hi_be;
-    assign ext_rd_data               = rd_data[R_MEM*128 +: 128];
+    assign rd_en[R_MEM]               = mu_rd_en;
+    assign rd_addr[R_MEM*AW +: AW]    = mu_rd_addr;
+    assign wr_en[W_MEM]               = mu_wr_en;
+    assign wr_addr[W_MEM*AW +: AW]    = mu_wr_addr;
+    assign wr_data[W_MEM*128 +: 128]  = mu_wr_data;
+    assign wr_be[W_MEM*16 +: 16]      = mu_wr_be;
+    assign mem_wr_hi_be               = mu_wr_hi_be;
+    assign rd_en[R_LINK]              = ext_rd_en;
+    assign rd_addr[R_LINK*AW +: AW]   = ext_rd_addr;
+    assign wr_en[W_LINK]              = ext_wr_en;
+    assign wr_addr[W_LINK*AW +: AW]   = ext_wr_addr;
+    assign wr_data[W_LINK*128 +: 128] = ext_wr_data;
+    assign wr_be[W_LINK*16 +: 16]     = 16'hFFFF;
+    assign ext_rd_data                = rd_data[R_LINK*128 +: 128];
 
     fabric_mem_unit #(.TMAX(TMAX), .HD(HD), .NKV(NKV), .IDIM(IDIM), .BS(BS), .W(W), .TOP(TOP), .KV_BITS(KV_BITS), .REC_BYTES(REC_BYTES),
                       .RPB(RPB), .MAXR(MAXR), .WINDOW_OFF(WINDOW_OFF), .BLOCK_OFF(BLOCK_OFF), .INDEX_OFF(INDEX_OFF), .SUMS_OFF(SUMS_OFF),
                       .AW(AW), .LUT_DIR(LUT_DIR)) u_mem (
-        .clk(clk), .rst_n(rst_n), .slot_page(slot_r), .first(first_r), .position(pos_r), .cmd_valid(cmd_valid[U_MEM]), .cmd_engine(cmd_engine[1:0]), .cmd_len(cmd_len), .cmd_src(cmd_src), .cmd_dst(cmd_dst),
+        .clk(clk), .rst_n(rst_n), .slot_page(mem_page), .first(first_r), .position(pos_r), .cmd_valid(cmd_valid[U_MEM]), .cmd_engine(cmd_engine[1:0]), .cmd_len(cmd_len), .cmd_src(cmd_src), .cmd_dst(cmd_dst),
         .cmd_a2(cmd_a2), .cmd_a3(cmd_a3), .cmd_arg(cmd_arg), .cmd_tag(cmd_tag), .cmd_ready(ready_mem), .done_valid(done_valid[U_MEM*NE +: 4]), .done_tag(done_tag[U_MEM*NE*8 +: 32]),
         .rd_addr(mu_rd_addr), .rd_en(mu_rd_en), .rd_data(rd_data[R_MEM*128 +: 128]), .rd_hi(mem_rd_hi),
         .wr_en(mu_wr_en), .wr_addr(mu_wr_addr), .wr_data(mu_wr_data), .wr_be(mu_wr_be),

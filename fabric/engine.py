@@ -125,9 +125,9 @@ def ports(step: S.Step, chunk: int = 1) -> tuple[list[str], list[str], list[str]
 # when the chunk does.  It writes its result a beat at a time, through one
 # port, so the write side does not move.
 RD_PORT_MAP = (("norm", 2, 2), ("tiles", None, 1), ("conv", 2, 1), ("gates", 2, 1), ("delta", 1, 4),
-               ("swiglu", 2, 1), ("residual", 2, 1), ("mem", 1, 1), ("rotary", 1, 2), ("attn", 1, 4))
+               ("swiglu", 2, 1), ("residual", 2, 1), ("mem", 1, 1), ("rotary", 1, 2), ("attn", 1, 4), ("link", 1, 1))
 WR_PORT_MAP = (("norm", 1, 2), ("tiles", 1, 1), ("conv", 2, 1), ("gates", 1, 1), ("delta", 1, 4),
-               ("swiglu", 1, 1), ("residual", 1, 1), ("mem", 1, 1), ("rotary", 1, 2), ("attn", 1, 4))
+               ("swiglu", 1, 1), ("residual", 1, 1), ("mem", 1, 1), ("rotary", 1, 2), ("attn", 1, 4), ("link", 1, 1))
 
 
 def _port_index(table, chunk: int = 1) -> tuple[dict, int]:
@@ -193,6 +193,8 @@ def port_colours(programs: list[S.Step] | list[list[S.Step]], write: bool = Fals
     for (unit, engine, _), a in index.items():           # an adapter's own ports are asked for together
         for (unit2, engine2, _), b in index.items():
             if unit == unit2 and engine == engine2:
+                edge(a, b)
+            if unit == "link":                           # and the ring link's beside any of them: it has a port of its own
                 edge(a, b)
     colour: dict[int, int] = {}
     for p in sorted(range(total), key=lambda q: -len(conflict[q])):
@@ -318,11 +320,17 @@ class Layout:
     any slot."""
 
     def __init__(self, steps: list[S.Step], sizes: dict[str, int], chunk: int = 1, base_page: int = 0,
-                 programs: list[list[S.Step]] | None = None) -> None:
+                 programs: list[list[S.Step]] | None = None, lanes: list[list[S.Step]] | None = None) -> None:
         """``programs``, if given, are every program the engine will run from
         this one buffer placement -- a die's recurrent and global layers --
         and the buffers are placed and banked over all of them, so a name is
-        at one address in each; the memory names are ``steps``'s own."""
+        at one address in each; the memory names are ``steps``'s own.
+
+        ``lanes``, if given, are the lanes' programs (``sequencer.chain`` of
+        each one's runs, its names carrying its suffix): each lane has banks
+        of its own, since any step of another lane may run beside any of its
+        steps, and every lane's are coloured alike, over the plain names of
+        all of them."""
         self.sizes, self.chunk = sizes, chunk
         self.vb: dict[str, int] = {}
         self.mem: dict[str, int] = {}
@@ -346,16 +354,19 @@ class Layout:
                 self.mem[name] = mem_next
                 mem_next += -(-beats // PAGE_BEATS) * PAGE_BEATS
         self.mem_beats = mem_next
-        if programs:                                     # the names in the programs' order, so every layout of the set agrees
+        if programs or lanes:                            # the names in the programs' order, so every layout of the set agrees
             names = []
-        programs = programs or [steps]
+        programs = programs or lanes or [steps]
         for prog in programs:
             for step in prog:
                 for value in (step.ops or {}).values():
                     for name in _refs(value):
                         if not name.startswith(S.MEM_PREFIX) and name not in names:
                             names.append(name)
-        self._place(programs, names)
+        if lanes:
+            self._place_lanes(lanes, names)
+        else:
+            self._place(programs, names)
 
     def slot_pages(self) -> dict[int, int]:
         """Each token in flight's slot, as a page: what the engine is started with."""
@@ -390,6 +401,34 @@ class Layout:
         for name in names:
             b = self.bank[name]
             self.vb[name] = b, fill[b]                   # resolved once the stride is known
+            fill[b] += -(-self.size(name) // BEAT) * BEAT
+        self.bank_shift = max(1, max(fill, default=1) - 1).bit_length()
+        self.bank_bytes = 1 << self.bank_shift
+        self.vb = {n: (b << self.bank_shift) + off for n, (b, off) in self.vb.items()}
+        self.vb_bytes = self.banks << self.bank_shift
+
+    def _place_lanes(self, lanes: list[list[S.Step]], names: list[str]) -> None:
+        """The lanes' banks: one colouring of the plain names over every
+        lane's program, and lane l on its own copy of the banks."""
+        plain = lambda n: n.rsplit("@", 1)[0]
+        lane_of = lambda n: int(n.rsplit("@", 1)[1])
+        graph: dict[str, set[str]] = {}
+        for prog in lanes:
+            for name, edges in bank_conflicts(prog, self.chunk).items():
+                graph.setdefault(plain(name), set()).update(plain(e) for e in edges if plain(e) != plain(name))
+        at = colour_banks(graph, lambda n: -(-self.size(n) // BEAT) * BEAT)
+        per = max(at.values()) + 1 if at else 1
+        self.bank = {n: at.get(plain(n), 0) + per * lane_of(n) for n in names}
+        self.banks = per * len(lanes)
+        self.bank_reads, self.bank_writes = [0] * self.banks, [0] * self.banks
+        for prog in lanes:
+            reads, writes = bank_ports(prog, self.bank, self.chunk)
+            self.bank_reads = [max(a, b) for a, b in zip(self.bank_reads, reads + [0] * (self.banks - len(reads)))]
+            self.bank_writes = [max(a, b) for a, b in zip(self.bank_writes, writes + [0] * (self.banks - len(writes)))]
+        fill = [0] * self.banks
+        for name in names:
+            b = self.bank[name]
+            self.vb[name] = b, fill[b]
             fill[b] += -(-self.size(name) // BEAT) * BEAT
         self.bank_shift = max(1, max(fill, default=1) - 1).bit_length()
         self.bank_bytes = 1 << self.bank_shift
@@ -663,12 +702,22 @@ class EngineRun:
     commands carry the token's place in its chunk, and the engine adds the
     position it was started with.  The positions are the programs' own
     (their memory steps say which), and go in as ``POS<k>``, or on the
-    packets through the ring."""
+    packets through the ring.
+
+    With ``lanes`` the steps are the lanes': each lane's runs (programs
+    retargeted to it, ``sequencer.retarget(..., private=True)``), pushed
+    lane by lane, the lanes' tokens in flight being their own numbers.  The
+    engine runs them together and must take the model's cycles
+    (``sequencer.schedule_lanes``)."""
 
     def __init__(self, directory: Path, cfg, c, spec: TileSpec, mm: MemoryMap, steps: list[S.Step], inputs: dict,
                  memory: dict[str, tuple[bytes, bytes]] | None = None, ndev: int = 0, model_tiles: bool = False,
-                 first: bool = False, base_page: int = 0, ring: bool = False) -> None:
+                 first: bool = False, base_page: int = 0, ring: bool = False,
+                 lanes: list[list[list[S.Step]]] | None = None) -> None:
         directory.mkdir(parents=True, exist_ok=True)
+        progs = [S.chain(runs) for runs in lanes] if lanes else None
+        if progs:
+            steps = [s for p in progs for s in p]
         self.cfg, self.steps, self.mm, self.ndev = cfg, steps, mm, ndev
         self.recurrent = isinstance(c, L.RecurrentConsts)
         self.nv, self.hk, self.hv = cfg.linear_num_value_heads, cfg.linear_key_head_dim, cfg.linear_value_head_dim
@@ -678,7 +727,7 @@ class EngineRun:
         self.chunk = xs[0].shape[0] if np.ndim(xs[0]) == 2 else 1          # tokens per pass: the residual's shape says
         lay = S.recurrent_layout(cfg, spec, mm, self.chunk) if self.recurrent else S.global_layout(cfg, spec, mm, self.chunk)
         _LAYOUTS[id(c)] = lay
-        self.layout = Layout(steps, lay["sizes"], self.chunk, base_page)
+        self.layout = Layout(steps, lay["sizes"], self.chunk, base_page, lanes=progs)
         self.suffixes = sorted({"" if "@" not in key else "@" + key.split("@")[1] for key in inputs})
         self.positions = {s.token or 0: s.ops["position"] for s in steps if s.ops and "position" in s.ops}
         # Images: the vector buffer holds each token's x, the memory its context.
@@ -713,27 +762,56 @@ class EngineRun:
         self.expected = S.run_program(steps, copies)
         # The program and everything the units load.
         L.write_luts(directory)
-        write_hex(directory / "program.hex", S.encode(steps, self.layout), 256)
+        # The lanes' stores and the runs pushed, lane by lane: {set, page, layer, lane, pc, steps}.
+        if progs:
+            pushes, start = [], []
+            for l, runs in enumerate(lanes):
+                write_hex(directory / S.lane_store_name(l), S.encode(progs[l], self.layout), 256)
+                start.append(len(pushes))
+                pc = 0
+                for run in runs:
+                    pushes.append((1 << (57 + l)) | (l << 32) | (pc << 16) | len(run))
+                    pc += len(run)
+            self.schedule_cycles = S.schedule_lanes(progs, start).cycles
+        else:
+            write_hex(directory / "program.hex", S.encode(steps, self.layout), 256)
+            pushes = [(0xF << 57) | len(steps)]
+            self.schedule_cycles = S.schedule(steps).cycles
+        write_hex(directory / "runs.hex", pushes, 64)
         nt = _tiles(directory, c, cfg, spec)
         sw = L.sw_for(16, d)
         _consts(directory, c, cfg, sw)
-        self.params = {"N": len(steps), "FFN": ffn,
-                       **_geometry(cfg, spec, mm, self.layout, [steps], self.chunk, nt, model_tiles),
+        geometry = _geometry(cfg, spec, mm, self.layout, [steps], self.chunk, nt, model_tiles)
+        if progs:                                                    # nothing folds: see fabric_vb
+            geometry.update({"VB_FOLD": 0, "VB_NPR": _port_index(RD_PORT_MAP, self.chunk)[1],
+                             "VB_NPW": _port_index(WR_PORT_MAP, self.chunk)[1]})
+        self.params = {"N": len(steps), "RUNS": len(pushes), "LANES_USED": len(lanes) if lanes else 1, "FFN": ffn,
+                       **geometry,
                        "MEM_BEATS": self.layout.mem_beats,
-                       "SCHEDULE_CYCLES": S.schedule(steps).cycles, **hpi_params,
+                       "SCHEDULE_CYCLES": self.schedule_cycles, **hpi_params,
                        # The tokens in flight: each one's slot, and FIRST for all of them or none.
                        **{f"SLOT{k}": page for k, page in self.layout.slot_pages().items()},
                        "FIRST": ((1 << len(self.layout.region)) - 1) if first else 0,
                        **{f"POS{k}": pos for k, pos in self.positions.items()}}
+        self.progs, self.ring = progs, ring
         if ring:
+            assert progs, "through the ring the tokens are lanes"
             self.params.update(self._ring(directory, inputs, first, base_page))
         (directory / "params.json").write_text(json.dumps(self.params))
+
+    def expected_cycles(self, directory: Path) -> int:
+        """The model's count for the run.  Through the ring the lanes start
+        when the link pushes them, which the testbench records."""
+        if not self.ring:
+            return self.schedule_cycles
+        return S.schedule_lanes(self.progs, ring_starts(directory, len(self.progs))).cycles
 
     def _ring(self, directory: Path, inputs: dict, first: bool, base_page: int) -> dict:
         """The packets in, a lane per token in flight, and the ones the model
         says leave; the die's program table; the link's parameters.  A lane's
         slot number is where its context's region is in the memory image: the
-        regions are a slot each, the same size, from ``base_page`` on."""
+        regions are a slot each, the same size, from ``base_page`` on.  The
+        packets take the lanes in order, all being free."""
         from fabric import controller as C
         starts = sorted(self.layout.region.values())
         sizes = {b - a for a, b in zip(starts, starts[1:] + [self.layout.mem_beats])}
@@ -758,14 +836,24 @@ class EngineRun:
         for k, sfx in enumerate(lanes):
             addresses |= self.layout.vb["x" + sfx] << (32 + 24 * k)
             addresses |= self.layout.vb["x2" + sfx] << (128 + 24 * k)
-        shape = ((int(self.chunk > 1)) << 2) | (len(lanes) - 1)
-        table = [addresses | ((len(self.steps) << 16) if e == shape else 0) for e in range(8)]
+        steps = {len(p) for p in self.progs}
+        assert len(steps) == 1, "every lane's store holds the program at the same steps"
+        table = [0] * 4                                              # {kind, chunked}: the program at step 0
+        table[int(self.chunk > 1)] = addresses | (steps.pop() << 16)
         write_hex(directory / "die_table.hex", table, 256)
         write_hex(directory / "ring_in.hex", ins, 32)
         write_hex(directory / "ring_len.hex", lengths, 16)
         write_hex(directory / "ring_out.hex", outs, 32)
         return {"RING": 1, "RING_PACKETS": len(lanes), "RING_IN": len(ins), "RING_OUT": len(outs), "RING_LANES": len(lanes),
                 "RING_CHUNK": self.chunk, "RING_SLOT_PAGES": per_slot, "RING_PAGE_BASE": page_base}
+
+    def ring_problems(self, directory: Path) -> list[str]:
+        """What left on the ring against the model's packets: all of them, each
+        context's in order (``die.order_problems``)."""
+        from fabric import die
+        want = die.packets_of(int(w, 16) for w in (directory / "ring_out.hex").read_text().split())
+        got = die.packets_of(int(w, 16) for w in (directory / "ring_got.hex").read_text().split())
+        return die.order_problems(want, got)
 
     def _place(self, image: bytearray, name: str, data: bytes) -> None:
         base = self.layout.address(name) * (BEAT if name.startswith(S.MEM_PREFIX) else 1)
@@ -813,6 +901,8 @@ class EngineRun:
                 if tuple(scale) != tuple(int(v) for v in self.expected["scale_mem" + sfx][h]):
                     problems.append(f"scale{sfx} head {h}: {scale} expected {tuple(self.expected['scale_mem' + sfx][h])}")
         problems += self.check_banks(directory)
+        if self.ring:
+            problems += self.ring_problems(directory)
         return problems
 
     def check_banks(self, directory: Path) -> list[str]:
@@ -838,6 +928,32 @@ class EngineRun:
         return problems
 
 
+class _LaneOperands:
+    """A lane's operands: its memory names' offsets in their part of the
+    slot, from the program's own layout, and its buffers' addresses, from the
+    lanes'."""
+
+    def __init__(self, mem: Layout, vb: Layout) -> None:
+        self.mem, self.vb = mem, vb
+
+    def operand(self, name: str) -> int:
+        if name.startswith(S.MEM_PREFIX):
+            return self.mem.operand(name.rsplit("@", 1)[0])
+        return self.vb.vb[name]
+
+    address = operand
+
+
+def ring_starts(directory: Path, lanes: int) -> list[int]:
+    """Each lane's first push, from the first lane's, as the testbench
+    recorded them (``pushes.txt``): when the model's lanes may start."""
+    first: dict[int, int] = {}
+    for line in (directory / "pushes.txt").read_text().splitlines():
+        cycle, lane = (int(v) for v in line.split())
+        first.setdefault(lane, cycle)
+    return [first[l] - first[0] for l in range(lanes)]
+
+
 class DieRun:
     """A layer die on the engine: its three recurrent layers and its global
     layer, one token after another of one context through the ring.
@@ -855,12 +971,16 @@ class DieRun:
     ``consts`` are the four layers' compiled constants, in order, all at one
     residual scale (the packet's).  ``tokens`` are ``(position, x, first)``
     for one context in slot ``slot``: they go in as packets back to back,
-    and each runs the four layers before the next, since a slot takes one
-    lane of a batch.  The expected results are the chained integer model's:
-    the packets out and every layer's state after the last token."""
+    and each runs the four layers before the next, since two tokens of a
+    context cannot run at once -- the second waits on the link, then takes
+    the next lane.  Every lane's store holds the two programs at the same
+    steps, each lane's copy on its own buffers.  The expected results are the
+    chained integer model's: the packets out and every layer's state after
+    the last token."""
 
     def __init__(self, directory: Path, cfg, consts: list, spec: TileSpec, mm_r: MemoryMap, mm_g: MemoryMap,
-                 tokens: list[tuple[int, np.ndarray, bool]], slot: int = 3, page_base: int = 5, seed: int = 11) -> None:
+                 tokens: list[tuple[int, np.ndarray, bool]], slot: int = 3, page_base: int = 5, seed: int = 11,
+                 lanes: int = 2) -> None:
         from fabric import controller as C
         from fabric.memory import GlobalContextMemory
         directory.mkdir(parents=True, exist_ok=True)
@@ -872,15 +992,18 @@ class DieRun:
         for c in consts[:3]:
             _LAYOUTS[id(c)] = lay_r
         _LAYOUTS[id(consts[3])] = lay_g
-        # The two programs, in place, and one buffer placement over both.
-        self.rec = S.in_place(S.recurrent_program(cfg, consts[0], spec, mm_r))
+        # The two programs, in place; a layer's part of the slot laid out by
+        # its program, and the lanes' buffers over every lane's four layers.
+        self.rec = S.in_place(S.recurrent_program(cfg, consts[0], spec, mm_r, slots=S.LANE_SLOTS))
         self.glob = S.in_place(S.global_program(cfg, consts[3], spec, mm_g, tokens[0][0]))
         sizes = dict(lay_r["sizes"])
         for name, n in lay_g["sizes"].items():
             sizes[name] = max(n, sizes.get(name, 0))
-        self.lr = Layout(self.rec, sizes, programs=[self.rec, self.glob])
-        self.lg = Layout(self.glob, sizes, programs=[self.rec, self.glob])
-        assert self.lr.vb == self.lg.vb and self.lr.banks == self.lg.banks
+        self.lr, self.lg = Layout(self.rec, sizes), Layout(self.glob, sizes)
+        self.lanes = lanes
+        lane_runs = [[S.retarget(prog, l, private=True) for prog in (self.rec, self.glob)] for l in range(lanes)]
+        self.lv = Layout([st for runs in lane_runs for run in runs for st in run], sizes,
+                         lanes=[S.chain([r, r, r, g]) for r, g in lane_runs])
         # A slot: three recurrent regions, then the global one.
         pages_r, pages_g = self.lr.mem_beats // PAGE_BEATS, self.lg.mem_beats // PAGE_BEATS
         self.layer_page = [0, pages_r, 2 * pages_r, 3 * pages_r]
@@ -949,11 +1072,16 @@ class DieRun:
         self.region = region
 
         # The images and the tables.
-        _write_bytes(directory / "vb_init.hex", bytes(self.lr.vb_bytes))
+        _write_bytes(directory / "vb_init.hex", bytes(self.lv.vb_bytes))
         _write_beats(directory / "mem_init.hex", bytes(mem))
         L.write_luts(directory)
-        words_r, words_g = S.encode(self.rec, self.lr), S.encode(self.glob, self.lg)
-        write_hex(directory / "program.hex", words_r + words_g, 256)
+        # A lane's store: the recurrent program, then the global one, on one
+        # numbering of the buffers -- the link pushes all four layers at once
+        # and the lane runs them back to back.
+        for l, (r, g) in enumerate(lane_runs):
+            ids = S.buffer_ids(r + g)
+            words = S.encode(r, _LaneOperands(self.lr, self.lv), ids) + S.encode(g, _LaneOperands(self.lg, self.lv), ids)
+            write_hex(directory / S.lane_store_name(l), words, 256)
         nt = _tiles(directory, consts[0], cfg, spec, layers=consts)
         sw = L.sw_for(16, cfg.hidden_size)
         tables: dict[str, list[str]] = {}
@@ -971,16 +1099,19 @@ class DieRun:
         write_hex(directory / "ring_in.hex", ins, 32)
         write_hex(directory / "ring_len.hex", [len(p) // 4 for p in packets_in], 16)
         write_hex(directory / "ring_out.hex", outs, 32)
-        lanes = self.lr.vb["x"] << 32 | self.lr.vb["x"] << 128   # lane 0's input and output: the same buffer, in place
-        table = [0] * 16
-        table[0] = lanes | (len(self.rec) << 16)                   # kind 0, a token a lane, one lane: pc 0
-        table[8] = lanes | (len(self.rec) + (len(self.glob) << 16))  # kind 1, after it
+        addresses = 0                                              # each lane's input and output: one buffer, in place
+        for l in range(lanes):
+            addresses |= self.lv.vb[f"x@{l}"] << (32 + 24 * l) | self.lv.vb[f"x@{l}"] << (128 + 24 * l)
+        table = [0] * 4                                            # {kind, chunked}
+        table[0] = addresses | (len(self.rec) << 16)               # the recurrent layers: step 0
+        table[2] = addresses | len(self.rec) | (len(self.glob) << 16)   # the global one, after it
         write_hex(directory / "die_table.hex", table, 256)
         write_hex(directory / "die_layers.hex", [int(layer == 3) | (self.layer_page[layer] << 1) for layer in range(4)], 32)
         self.params = {"N": len(tokens) * (3 * len(self.rec) + len(self.glob)), "FFN": cfg.layer_intermediate_size(0),
-                       **_geometry(cfg, spec, mm_g, self.lr, [self.rec, self.glob], 1, nt),
+                       **_geometry(cfg, spec, mm_g, self.lv, [self.rec, self.glob], 1, nt),
+                       "VB_FOLD": 0, "VB_NPR": _port_index(RD_PORT_MAP)[1], "VB_NPW": _port_index(WR_PORT_MAP)[1],
                        "MEM_BEATS": len(mem) // BEAT, "SCHEDULE_CYCLES": 0, "USE_HPI": 0, "LAYERS": 4,
-                       "RING": 1, "RING_PACKETS": len(tokens), "RING_IN": len(ins), "RING_OUT": len(outs), "RING_LANES": 1,
+                       "RING": 1, "RING_PACKETS": len(tokens), "RING_IN": len(ins), "RING_OUT": len(outs), "RING_LANES": lanes,
                        "RING_CHUNK": 1, "RING_SLOT_PAGES": self.slot_pages, "RING_PAGE_BASE": page_base, "RING_LAYERS": 4}
         (directory / "params.json").write_text(json.dumps(self.params))
 
@@ -1008,4 +1139,7 @@ class DieRun:
         if got != want:
             first = next(i for i in range(len(want)) if got[i] != want[i])
             problems.append(f"layer 3: the context differs first at byte {first}")
-        return problems
+        from fabric import die
+        want_out = die.packets_of(int(w, 16) for w in (directory / "ring_out.hex").read_text().split())
+        got_out = die.packets_of(int(w, 16) for w in (directory / "ring_got.hex").read_text().split())
+        return problems + die.order_problems(want_out, got_out)

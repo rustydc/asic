@@ -1,19 +1,32 @@
-// The token sequencer: a microcoded issue engine that runs a layer's
-// program (fabric/sequencer.py) over the tiles, the vector units and the
-// DMAs, several tokens of different contexts interleaved in one stream.
+// The token sequencer: a microcoded issue engine that runs a die's
+// programs (fabric/sequencer.py) over the tiles, the vector units and the
+// DMAs, for up to LN tokens of different contexts at once, one a lane.
 //
 // The program is a list of steps.  Each step is a command to one unit
 // (unit id, engine, a length, a 32-bit argument and four 30-bit address
 // operands), up to six buffer ids it consumes, up to two it produces
 // (each either a write or a contribution to a whole vector), and a last
-// flag.  The controller issues in program order.  Per buffer id it keeps
-// the number of outstanding writers and readers; the head step issues when
-// every consumed buffer has no outstanding writer, every produced buffer
-// no outstanding reader and (for a write, not a contribution) no
+// flag.  A lane issues its steps in program order.  Per buffer id it keeps
+// the number of outstanding writers and readers; the head step may issue
+// when every consumed buffer has no outstanding writer, every produced
+// buffer no outstanding reader and (for a write, not a contribution) no
 // outstanding writer, and the unit reports the addressed engine free.  On
 // issue the step's ids are remembered against its engine port and counted;
 // a unit returns the tag on its engine's done port and the counts are
-// released, forwarded into the same cycle's issue check.
+// released.
+//
+// The lanes.  A lane is given runs -- a program in its own store, the layer
+// it is and the page its part of the context's slot is at -- and fetches
+// them one after another with nothing between, so a token's four layers are
+// one program to it.  Its buffers are its own, so are its counters, and so
+// its steps wait on nothing of another lane's but the engines they share.
+// Of the lanes whose head step may issue this cycle the oldest does: a lane
+// is as old as its token, the first run pushed after it last reported done.
+// When one lane's head waits -- the next layer's first step on the last
+// one's residual, a head's update on its state read -- another's goes, which
+// a single in-order program could not do: its next step was behind the one
+// waiting.  A lane reports done when everything it was given has drained.
+// (fabric.sequencer.schedule_lanes; one lane is the in-order controller.)
 //
 // The release is bounded.  Taking every completion in a cycle means every
 // engine port's ids may decrement the same counter, which is NU*NE*(NC+NP)
@@ -29,11 +42,13 @@
 // completion returned the newer command's ids for the older one.
 //
 // Timing, which fabric/sequencer.py reproduces cycle for cycle: a step
-// issues at the earliest cycle that is after the previous issue, at or
-// after the cycle its last dependency's release drained, and at or after
-// the cycle its engine reported free.  A drain with nothing held is the
-// cycle the completion arrives, which is one cycle after the unit's last
-// working cycle, so an unheld release is what it always was.
+// issues at the earliest cycle that is after the previous issue of any lane,
+// at or after the cycle its last dependency's release drained, and at or
+// after the cycle its engine reported free, if no older lane's step issues
+// then.  A drain with nothing held is the cycle the completion arrives,
+// which is one cycle after the unit's last working cycle, so an unheld
+// release is what it always was.  A lane's first step may issue three
+// cycles after its first run is pushed: the run is taken, fetched, queued.
 
 `timescale 1ns/1ps
 `default_nettype none
@@ -41,20 +56,30 @@
 module fabric_sequencer #(
     parameter int NU        = 10,               // units
     parameter int NE        = 4,                // engines per unit at most
-    parameter int DEPTH     = 4096,             // program steps: every program a die runs, one after another (fabric.sequencer.PROGRAM_STEPS)
-    parameter int NID       = 256,              // buffer ids
+    parameter int LN        = 4,                // lanes, at most four (fabric.sequencer.LANES)
+    parameter int DEPTH     = 4096,             // a lane's program store: every program the lane runs
+    parameter int NID       = 256,              // buffer ids a lane
     parameter int CW        = 6,                // counter width: outstanding writers or readers of one buffer
     parameter int NREL      = 1,                // completions drained a cycle (fabric.sequencer.RELEASES)
-    parameter     PROG_FILE = "program.hex"
+    parameter int RQ        = 4,                // runs a lane holds: a token's layers
+    parameter     PROG_FILE = "program.hex"     // lane 0's store; lane l's is lane<l>_<PROG_FILE>
 ) (
     input  wire                 clk,
     input  wire                 rst_n,
-    input  wire                 start,
-    input  wire [15:0]          pc_start,       // the program's first step: a die holds several
-    input  wire [15:0]          n_steps,
-    output reg                  running,
-    output reg                  done,
-    // the command bus: one unit addressed per cycle
+    // A run for a lane: its first step and length in the lane's store, the
+    // layer it is (the units' bank of constants) and the page its part of
+    // the slot starts at, from the slot's first.
+    input  wire                 push,
+    input  wire [1:0]           push_lane,
+    input  wire [15:0]          push_pc,
+    input  wire [15:0]          push_steps,
+    input  wire [1:0]           push_layer,
+    input  wire [20:0]          push_page,
+    output wire [LN-1:0]        push_room,
+    output reg  [LN-1:0]        lane_busy,      // given runs it has not reported done
+    output reg  [LN-1:0]        lane_done,      // a cycle: everything the lane was given has drained
+    output wire                 running,
+    // the command bus: one unit addressed per cycle, valid only on issue
     output wire [NU-1:0]        cmd_valid,
     output wire [3:0]           cmd_engine,
     output wire [15:0]          cmd_len,
@@ -64,91 +89,55 @@ module fabric_sequencer #(
     output wire [29:0]          cmd_a3,
     output wire [31:0]          cmd_arg,
     output wire [7:0]           cmd_tag,
-    input  wire [NU-1:0]        cmd_ready,      // the addressed engine of that unit is free
+    output wire [1:0]           cmd_lane,
+    output wire [1:0]           cmd_layer,
+    output wire [20:0]          cmd_page,
+    input  wire [NU*NE-1:0]     port_ready,     // each engine port free for a command
     // completions, one port per engine
     input  wire [NU*NE-1:0]     done_valid,
     input  wire [NU*NE*8-1:0]   done_tag
 );
     localparam int NC = 6, NP = 2, IDB = 64 + 4 * 30;   // the ids follow the four address operands
-    localparam int PAW = (DEPTH > 1) ? $clog2(DEPTH) : 1;
+    localparam int NPORT = NU * NE;
+    localparam int PW = $clog2(NPORT);
 
-    // The program is fetched ahead of the step being checked.  Read where it
-    // is used, it is a DEPTH-entry mux of 256-bit words in the same cycle as
-    // the issue check -- which indexes a counter per buffer id the step names
-    // -- and the two together were 37 levels of logic and the whole of this
-    // module's path.  They are a memory now, which wants its address a cycle
-    // early anyway, so `fpc` runs ahead on its own and the head step and the
-    // one after it wait in `q0` and `q1`.  Two deep because a step may issue
-    // every cycle and a one-deep queue would give up every other one.
-    reg  [15:0]  pc;                                    // the step being checked
-    reg  [PAW-1:0] fpc;                                 // the step being fetched
-    reg  [15:0]  fend;                                  // and the one after the program
-    reg  [255:0] q0, q1;
-    reg  [1:0]   qn;                                    // steps in hand
-    reg          fetched_v;                             // the memory answers this cycle
-    wire [255:0] fetched;
-    wire         issue;
-    // Room for what a fetch started now would bring: the memory answers the
-    // cycle after its address, so one step may already be on its way.
-    wire [2:0]   after = {1'b0, qn} + {2'b0, fetched_v} - {2'b0, issue};
-    wire         fetch = running && (after < 3'd2) && ({16'd0, fpc} != {16'd0, fend});
-    // `fetched_v` selects what each of the queue's 512 bits takes, so one flop
-    // held 490 loads and 798 fF: two nanoseconds of clock-to-output, and the
-    // whole of this module's path once the counting above came off it.  The
-    // mapper buffers what it drives and cannot help the flop itself, so the
-    // flop is replicated, a copy per slice of the queue -- the same trick as
-    // fabric_const_copy for a lane's shift amount and fabric_strobe_copy for
-    // the tile's strobe.  Every copy takes `fetch`, so all of them and
-    // `fetched_v` (which keeps the few loads that are left) always agree.
-    localparam int NQC = 16;                            // copies, one per queue slice
-    localparam int QSL = 256 / NQC;
-    wire [NQC-1:0] fetched_vc;
-    genvar gq;
+    // ---------------------------------------------------------------------
+    // The lanes' heads.
+    // ---------------------------------------------------------------------
+    wire [LN-1:0]  head_v, lane_idle, win;
+    wire [255:0]   head       [0:LN-1];
+    wire [1:0]     head_layer [0:LN-1];
+    wire [20:0]    head_page  [0:LN-1];
+    genvar gl;
     generate
-        for (gq = 0; gq < NQC; gq = gq + 1) begin : g_fv
-            fabric_seq_copy u_fv (.clk(clk), .rst_n(rst_n), .d(fetch), .q(fetched_vc[gq]));
+        for (gl = 0; gl < LN; gl = gl + 1) begin : g_lane
+            fabric_seq_lane #(.LANE(gl), .DEPTH(DEPTH), .RQ(RQ), .PROG_FILE(PROG_FILE)) u (
+                .clk(clk), .rst_n(rst_n),
+                .push(push && push_lane == gl), .push_pc(push_pc), .push_steps(push_steps), .push_layer(push_layer),
+                .push_page(push_page), .room(push_room[gl]),
+                .issue(win[gl]), .head_v(head_v[gl]), .head(head[gl]), .head_layer(head_layer[gl]), .head_page(head_page[gl]),
+                .idle(lane_idle[gl]));
         end
     endgenerate
-    fabric_sram #(.W(256), .D(DEPTH), .NRD(1), .NWR(1), .MB(256)) u_prog (
-        .clk(clk), .rd_en(fetch), .rd_addr(fpc), .rd_data(fetched),
-        .wr_en(1'b0), .wr_addr({PAW{1'b0}}), .wr_data(256'd0), .wr_mask(1'b0));
-`ifndef FABRIC_SYNTH
-    initial if (PROG_FILE != "") $readmemh(PROG_FILE, u_prog.mem);
-`endif
+    assign running = |lane_busy;
 
-    wire [255:0] cur      = q0;
-    wire [3:0]   cur_unit = cur[3:0];
-    wire         cur_last = cur[8];
-    assign cmd_engine = cur[7:4];
-    assign cmd_len    = cur[31:16];
-    assign cmd_arg    = cur[63:32];
-    assign cmd_src    = cur[64 +: 30];
-    assign cmd_dst    = cur[94 +: 30];
-    assign cmd_a2     = cur[124 +: 30];
-    assign cmd_a3     = cur[154 +: 30];
-    assign cmd_tag    = pc[7:0];
-    wire [7:0]   cur_c [0:NC-1];
-    wire [7:0]   cur_p [0:NP-1];
-    wire [NP-1:0] cur_contrib = cur[IDB + 8*(NC+NP) +: NP];
-    genvar gi;
-    generate
-        for (gi = 0; gi < NC; gi = gi + 1) begin : g_c assign cur_c[gi] = cur[IDB + 8*gi +: 8]; end
-        for (gi = 0; gi < NP; gi = gi + 1) begin : g_p assign cur_p[gi] = cur[IDB + 8*NC + 8*gi +: 8]; end
-    endgenerate
-
+    // ---------------------------------------------------------------------
+    // The ports' records and the drain.
+    // ---------------------------------------------------------------------
     // The ids of the command each engine is running, for the release at
     // completion.  Held per engine port rather than per tag: a table of 256
     // entries read by every done port's tag is forty 256-to-1 muxes of the
     // whole id set, repeated at each of the issue check's call sites, which
     // does not map.  The port is known at issue, so the release reads a
     // register.  The tag still marks the step live, so a program longer than
-    // 256 steps cannot have two of the same tag in flight.
-    localparam int NPORT = NU * NE;
-    reg [NC*8-1:0] slot_c [0:NPORT-1];
-    reg [NP*8-1:0] slot_p [0:NPORT-1];
-    reg [7:0]      slot_tag [0:NPORT-1];
+    // 256 steps cannot have two of the same tag in flight.  The port also
+    // records the lane, whose counters the release returns to.
+    reg [NC*8-1:0] slot_c    [0:NPORT-1];
+    reg [NP*8-1:0] slot_p    [0:NPORT-1];
+    reg [7:0]      slot_tag  [0:NPORT-1];
+    reg [1:0]      slot_lane [0:NPORT-1];
     reg [255:0]    tab_live;
-    wire [$clog2(NPORT)-1:0] cur_port = cur_unit * NE + cmd_engine;
+    reg [15:0]     icount;                              // steps issued: the tag is its low byte
 
     // Which completions drain this cycle: the NREL lowest ports of what a
     // unit is reporting now and what an earlier cycle could not take.  The
@@ -162,6 +151,7 @@ module fabric_sequencer #(
     reg  [NREL*NC*8-1:0] rel_c;                   // consumed and produced ids at the
     reg  [NREL*NC*8-1:0] rel_p;                   // same stride, so one scan serves both
     reg  [NREL*8-1:0]    rel_tag;
+    reg  [NREL*2-1:0]    rel_lane;
     // "The lowest port still to drain" is one-hot, not a scan.  Written as a
     // scan it is NPORT stages of "nothing found yet", each selecting that
     // port's ids, which is a chain of forty gates of fanout sixty -- 15 of the
@@ -176,29 +166,33 @@ module fabric_sequencer #(
     reg [NC*8-1:0]  sel_c;
     reg [NP*8-1:0]  sel_p;
     reg [7:0]       sel_tag;
+    reg [1:0]       sel_lane;
     integer q, r;
     always @* begin
-        rel_now = 0;
-        rel_en  = 0;
-        rel_c   = {(NREL*NC){8'hFF}};
-        rel_p   = {(NREL*NC){8'hFF}};
-        rel_tag = 0;
+        rel_now  = 0;
+        rel_en   = 0;
+        rel_c    = {(NREL*NC){8'hFF}};
+        rel_p    = {(NREL*NC){8'hFF}};
+        rel_tag  = 0;
+        rel_lane = 0;
         remaining = want_rel;
         for (r = 0; r < NREL; r = r + 1) begin
             lower = {remaining[NPORT-2:0], 1'b0};              // lower[i] = remaining[i-1]
             for (sh = 1; sh < NPORT; sh = sh * 2) lower = lower | (lower << sh);
             one = remaining & ~lower;
-            sel_c = 0; sel_p = 0; sel_tag = 0;
+            sel_c = 0; sel_p = 0; sel_tag = 0; sel_lane = 0;
             for (q = 0; q < NPORT; q = q + 1) begin
-                sel_c   = sel_c   | (slot_c[q]   & {(NC*8){one[q]}});
-                sel_p   = sel_p   | (slot_p[q]   & {(NP*8){one[q]}});
-                sel_tag = sel_tag | (slot_tag[q] & {8{one[q]}});
+                sel_c    = sel_c    | (slot_c[q]    & {(NC*8){one[q]}});
+                sel_p    = sel_p    | (slot_p[q]    & {(NP*8){one[q]}});
+                sel_tag  = sel_tag  | (slot_tag[q]  & {8{one[q]}});
+                sel_lane = sel_lane | (slot_lane[q] & {2{one[q]}});
             end
             if (|one) begin
                 rel_en[r] = 1'b1;
                 rel_c[r*NC*8 +: NC*8] = sel_c;
                 rel_p[r*NC*8 +: NP*8] = sel_p;
                 rel_tag[r*8 +: 8]     = sel_tag;
+                rel_lane[r*2 +: 2]    = sel_lane;
             end
             rel_now   = rel_now | one;
             remaining = remaining & ~one;
@@ -217,14 +211,15 @@ module fabric_sequencer #(
     reg [NREL-1:0]      d_en;
     reg [NREL*NC*8-1:0] d_c, d_p;
     reg [NREL*8-1:0]    d_tag;
+    reg [NREL*2-1:0]    d_lane;
     reg [NPORT-1:0]     d_now;
-    // `d_en` gates every one of the 512 counter updates, and registering it
-    // is exactly what the mapper cannot buffer: one flop at 495 loads and 739
+    // `d_en` gates every one of the counter updates, and registering it is
+    // exactly what the mapper cannot buffer: one flop at 495 loads and 739
     // fF, 1,857 of this module's 2,833 ps spent before any logic runs.  It is
     // the shape `fetched_v` had and the fix is the same -- a copy per slice
     // of the counters, each taking the same combinational pick, so every copy
     // and `d_en` are one register.
-    localparam int NDC = 16;                       // copies, one per slice of the counters
+    localparam int NDC = 16;                       // copies, one per slice of a lane's counters
     localparam int IPC = NID / NDC;                // ids to a slice
     wire [NDC*NREL-1:0] d_en_c;
     genvar gdc, gdx;
@@ -250,155 +245,306 @@ module fabric_sequencer #(
     reg  [NPORT-1:0] busy;
     wire [NPORT-1:0] blocked = busy & ~d_now;
 
-    // Outstanding writers and readers per buffer.  The issue check sees the
-    // head step's ids with this cycle's drains forwarded; the counters
-    // themselves are updated by the drains and then the issue.
-    reg [CW-1:0] wr_cnt [0:NID-1];
-    reg [CW-1:0] rd_cnt [0:NID-1];
-    integer p, k, m, id, x, w;
+    // ---------------------------------------------------------------------
+    // The issue: each lane's check against its own counters, then the oldest.
+    // ---------------------------------------------------------------------
+    // Outstanding writers and readers per buffer, a set a lane.  The drains
+    // are registered, so the counters already hold every release that has
+    // landed and the check is a read.
+    reg [CW-1:0] wr_cnt [0:LN*NID-1];
+    reg [CW-1:0] rd_cnt [0:LN*NID-1];
+    // older[m][l]: lane m's token came before lane l's.
+    reg [LN-1:0] older [0:LN-1];
+    reg [LN-1:0] deps_ok, cand;
+    reg [PW-1:0] port_of [0:LN-1];
+    integer l, k, m, p, id, x, w;
+    reg [7:0] cid, pid;
+    always @* begin
+        for (l = 0; l < LN; l = l + 1) begin
+            port_of[l] = head[l][3:0] * NE + head[l][7:4];
+            deps_ok[l] = 1'b1;
+            for (k = 0; k < NC; k = k + 1) begin
+                cid = head[l][IDB + 8*k +: 8];
+                if (cid != 8'hFF && wr_cnt[l*NID + cid] != 0) deps_ok[l] = 1'b0;
+            end
+            for (k = 0; k < NP; k = k + 1) begin
+                pid = head[l][IDB + 8*NC + 8*k +: 8];
+                if (pid != 8'hFF && (rd_cnt[l*NID + pid] != 0
+                                     || (!head[l][IDB + 8*(NC+NP) + k] && wr_cnt[l*NID + pid] != 0))) deps_ok[l] = 1'b0;
+            end
+            cand[l] = head_v[l] && deps_ok[l] && !blocked[port_of[l]] && port_ready[port_of[l]] && !tab_live[icount[7:0]];
+        end
+    end
+    genvar gw;
+    generate
+        for (gw = 0; gw < LN; gw = gw + 1) begin : g_win
+            wire [LN-1:0] elder;
+            genvar gm;
+            for (gm = 0; gm < LN; gm = gm + 1) begin : g_b
+                assign elder[gm] = older[gm][gw];
+            end
+            assign win[gw] = cand[gw] && !(|(cand & elder));
+        end
+    endgenerate
+    wire       issue = |win;
+    reg  [1:0] sel;
+    always @* begin
+        sel = 0;
+        for (m = 0; m < LN; m = m + 1) if (win[m]) sel = 2'(m);
+    end
+    wire [255:0] cur      = head[sel];
+    wire [3:0]   cur_unit = cur[3:0];
+    wire [PW-1:0] cur_port = port_of[sel];
+    wire [NP-1:0] cur_contrib = cur[IDB + 8*(NC+NP) +: NP];
+    assign cmd_valid  = issue ? (1 << cur_unit) : 0;
+    assign cmd_engine = cur[7:4];
+    assign cmd_len    = cur[31:16];
+    assign cmd_arg    = cur[63:32];
+    assign cmd_src    = cur[64 +: 30];
+    assign cmd_dst    = cur[94 +: 30];
+    assign cmd_a2     = cur[124 +: 30];
+    assign cmd_a3     = cur[154 +: 30];
+    assign cmd_tag    = icount[7:0];
+    assign cmd_lane   = sel;
+    assign cmd_layer  = head_layer[sel];
+    assign cmd_page   = head_page[sel];
+
+    // Commands issued and not yet returned, a count a lane.  Counted against
+    // the drains, which are at most NREL a cycle, and not against the
+    // completions, which are up to NPORT: a population count of the forty
+    // done ports is forty chained increments.  A command that has completed
+    // and not drained is still outstanding, so reaching zero is every step
+    // the lane issued having returned its buffers.
+    reg  [9:0]  outstanding [0:LN-1];
+    reg  [9:0]  out_next    [0:LN-1];
+    always @* begin
+        for (l = 0; l < LN; l = l + 1) begin
+            out_next[l] = outstanding[l] + {9'd0, win[l]};
+            for (x = 0; x < NREL; x = x + 1)
+                if (d_en[x] && d_lane[x*2 +: 2] == 2'(l)) out_next[l] = out_next[l] - 1'b1;
+        end
+    end
+
     reg signed [CW:0] dr, dw;                            // a counter's move this cycle
-
-    // The drained ids travel as arguments, not as a reference to rel_c and
-    // rel_p: what a function reads is not in an always @* block's sensitivity,
-    // only what it is passed, and a stale deps_ok deadlocks.
-    // With the drain registered the counters already hold every release that
-    // has landed, so the check is a read.  It used to forward this cycle's
-    // drains into itself through `released`, which counted matches as one
-    // `+ 1` per id in play -- six of them, and yosys leaves that a chain of
-    // six carry-propagate adds -- at eight call sites, all of them behind a
-    // 256-to-1 mux of the counter array.
-    reg deps_ok;
-    always @* begin
-        deps_ok = 1'b1;
-        for (k = 0; k < NC; k = k + 1)
-            if (cur_c[k] != 8'hFF && wr_cnt[cur_c[k]] != 0) deps_ok = 1'b0;
-        for (k = 0; k < NP; k = k + 1)
-            if (cur_p[k] != 8'hFF && (rd_cnt[cur_p[k]] != 0
-                                      || (!cur_contrib[k] && wr_cnt[cur_p[k]] != 0))) deps_ok = 1'b0;
-    end
-
-    // Commands issued and not yet returned.  Counted against the drains,
-    // which are at most NREL a cycle, and not against the completions, which
-    // are up to NPORT: a population count of the forty done ports is forty
-    // chained increments, and synthesis leaves it a chain -- 38 levels and
-    // 1.75 of this module's 2.44 nanoseconds, for a number read nowhere but
-    // the test below.  A command that has completed and not drained is still
-    // outstanding, so reaching zero is what it always was: every step issued
-    // has returned its buffers, which is also what `held == 0` said.
-    localparam int RW = (NREL > 1) ? $clog2(NREL + 1) : 1;
-    reg  [RW-1:0] n_rel;
-    integer z;
-    always @* begin
-        n_rel = 0;
-        for (z = 0; z < NREL; z = z + 1) if (d_en[z]) n_rel = n_rel + 1'b1;
-    end
-    reg  [9:0]  outstanding;
-    wire [9:0]  out_next = outstanding + {9'd0, issue} - {{(10-RW){1'b0}}, n_rel};
-    reg         finishing;
-    wire        want  = running && !finishing && qn != 2'd0 && deps_ok && !tab_live[pc[7:0]]
-                        && !blocked[cur_port];
-    assign cmd_valid = want ? (1 << cur_unit) : 0;
-    assign      issue = want && cmd_ready[cur_unit];
-
+    reg touch;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            pc <= 0; running <= 1'b0; done <= 1'b0; outstanding <= 0; finishing <= 1'b0; tab_live <= 0; pend <= 0; busy <= 0;
-                d_en <= 0; d_now <= 0;
-            fpc <= 0; fend <= 0; qn <= 0; fetched_v <= 1'b0;
-            for (id = 0; id < NID; id = id + 1) begin wr_cnt[id] = 0; rd_cnt[id] = 0; end
+            lane_busy <= 0; lane_done <= 0; icount <= 0; tab_live <= 0; pend <= 0; busy <= 0;
+            d_en <= 0; d_now <= 0; d_lane <= 0;
+            for (l = 0; l < LN; l = l + 1) begin
+                outstanding[l] <= 0;
+                for (m = 0; m < LN; m = m + 1) older[l][m] <= (l < m);
+            end
+            for (id = 0; id < LN*NID; id = id + 1) begin wr_cnt[id] = 0; rd_cnt[id] = 0; end
         end else begin
-            done <= 1'b0;
-            if (start && !running) begin
-                pc <= 0; running <= 1'b1; outstanding <= 0; finishing <= 1'b0; tab_live <= 0; pend <= 0; busy <= 0;
-                d_en <= 0; d_now <= 0;
-                fpc <= pc_start[PAW-1:0]; fend <= pc_start + n_steps; qn <= 0; fetched_v <= 1'b0;
-                for (id = 0; id < NID; id = id + 1) begin wr_cnt[id] = 0; rd_cnt[id] = 0; end
-            end else begin
-                // Not gated on `running`: when it is low nothing issues and no
-                // unit is busy, so none of this moves anyway, and the gate cost
-                // more than everything else here -- one flop's enable reaching
-                // every counter and every live bit was 835 loads, and the three
-                // gates behind it were 42 of the module's 43 nanoseconds.
-                // The fetch runs ahead of the check: the memory answers the cycle
-                // after its address, so `fetched_v` says a step arrives now and
-                // the queue takes it while the head one issues.
-                fetched_v <= fetch;
-                if (fetch) fpc <= fpc + 1'b1;
-                // Each slice of the queue reads its own copy of `fetched_v`.
-                for (w = 0; w < NQC; w = w + 1) begin
-                    if (fetched_vc[w] && issue)
-                        q0[w*QSL +: QSL] <= (qn == 2'd1) ? fetched[w*QSL +: QSL] : q1[w*QSL +: QSL];
-                    else if (fetched_vc[w])
-                        begin if (qn == 2'd0) q0[w*QSL +: QSL] <= fetched[w*QSL +: QSL];
-                              else            q1[w*QSL +: QSL] <= fetched[w*QSL +: QSL]; end
-                    else if (issue)
-                        q0[w*QSL +: QSL] <= q1[w*QSL +: QSL];
-                    if (fetched_vc[w] && issue && qn == 2'd2) q1[w*QSL +: QSL] <= fetched[w*QSL +: QSL];
-                end
-                qn <= qn + {1'b0, fetched_v} - {1'b0, issue};
-                if (issue) pc <= pc + 1'b1;
-                // The drains: NREL completions return their buffers; the rest wait.
-                pend <= held;
-                // This cycle's pick, for the next one to apply.
-                d_en <= rel_en; d_c <= rel_c; d_p <= rel_p; d_tag <= rel_tag; d_now <= rel_now;
-                for (p = 0; p < NPORT; p = p + 1)
-                    if (d_now[p]) busy[p] <= 1'b0;
-                for (x = 0; x < NREL; x = x + 1)
-                    if (d_en[x]) tab_live[d_tag[x*8 +: 8]] <= 1'b0;
-                // Every counter moves by what this cycle did to it, once.
-                // Written as the drain's decrements and then the issue's
-                // increments, each a read-modify-write of a 256-entry array at
-                // a computed index, it was sixteen of those chained: 118 gates
-                // from a done port to a counter, and the whole of this
-                // module's path.  The ids in play are at most NREL*(NC+NP)
-                // returning and NC+NP taken, so a counter's delta is a couple
-                // of dozen compares against them, and all of them in parallel.
-                for (id = 0; id < NID; id = id + 1) begin
-                    dr = 0;
-                    dw = 0;
-                    for (x = 0; x < NREL; x = x + 1)
-                        if (d_en_c[(id / IPC) * NREL + x]) begin
+            lane_done <= 0;
+            // The drains: NREL completions return their buffers; the rest wait.
+            pend <= held;
+            // This cycle's pick, for the next one to apply.
+            d_en <= rel_en; d_c <= rel_c; d_p <= rel_p; d_tag <= rel_tag; d_lane <= rel_lane; d_now <= rel_now;
+            for (p = 0; p < NPORT; p = p + 1)
+                if (d_now[p]) busy[p] <= 1'b0;
+            for (x = 0; x < NREL; x = x + 1)
+                if (d_en[x]) tab_live[d_tag[x*8 +: 8]] <= 1'b0;
+            // Every counter moves by what this cycle did to it, once: the ids
+            // in play are at most NREL*(NC+NP) returning and NC+NP taken, so
+            // a counter's delta is a couple of dozen compares against them,
+            // all of them in parallel.  A lane neither issuing nor draining
+            // this cycle has nothing to move.
+            for (l = 0; l < LN; l = l + 1) begin
+                touch = win[l];
+                for (x = 0; x < NREL; x = x + 1) if (d_en[x] && d_lane[x*2 +: 2] == 2'(l)) touch = 1'b1;
+                if (touch)
+                    for (id = 0; id < NID; id = id + 1) begin
+                        dr = 0;
+                        dw = 0;
+                        for (x = 0; x < NREL; x = x + 1)
+                            if (d_en_c[(id / IPC) * NREL + x] && d_lane[x*2 +: 2] == 2'(l)) begin
+                                for (k = 0; k < NC; k = k + 1)
+                                    if (d_c[x*NC*8 + k*8 +: 8] == id[7:0]) dr = dr - 1;
+                                for (k = 0; k < NP; k = k + 1)
+                                    if (d_p[x*NC*8 + k*8 +: 8] == id[7:0]) dw = dw - 1;
+                            end
+                        if (win[l]) begin
                             for (k = 0; k < NC; k = k + 1)
-                                if (d_c[x*NC*8 + k*8 +: 8] == id[7:0]) dr = dr - 1;
+                                if (head[l][IDB + 8*k +: 8] == id[7:0]) dr = dr + 1;
                             for (k = 0; k < NP; k = k + 1)
-                                if (d_p[x*NC*8 + k*8 +: 8] == id[7:0]) dw = dw - 1;
+                                if (head[l][IDB + 8*NC + 8*k +: 8] == id[7:0]) dw = dw + 1;
                         end
-                    if (issue) begin
-                        for (k = 0; k < NC; k = k + 1)
-                            if (cur_c[k] == id[7:0]) dr = dr + 1;
-                        for (k = 0; k < NP; k = k + 1)
-                            if (cur_p[k] == id[7:0]) dw = dw + 1;
+                        if (dr != 0) rd_cnt[l*NID + id] = rd_cnt[l*NID + id] + dr[CW-1:0];
+                        if (dw != 0) wr_cnt[l*NID + id] = wr_cnt[l*NID + id] + dw[CW-1:0];
                     end
-                    if (dr != 0) rd_cnt[id] = rd_cnt[id] + dr[CW-1:0];
-                    if (dw != 0) wr_cnt[id] = wr_cnt[id] + dw[CW-1:0];
+                outstanding[l] <= out_next[l];
+                // Done: everything given fetched and issued, and returned.
+                if (lane_busy[l] && lane_idle[l] && out_next[l] == 10'd0) begin
+                    lane_busy[l] <= 1'b0; lane_done[l] <= 1'b1;
                 end
-                outstanding <= out_next;
-                if (issue) begin
-                    busy[cur_port] <= 1'b1;                  // after the drains: a port reissued in its drain cycle stays busy
-                    slot_c[cur_port] <= cur[IDB +: NC*8];
-                    slot_p[cur_port] <= cur[IDB + 8*NC +: NP*8];
-                    slot_tag[cur_port] <= pc[7:0];
-                    tab_live[pc[7:0]] <= 1'b1;
-                    if (cur_last || pc + 1 == n_steps) finishing <= 1'b1;
-                end
-                if (running && finishing && out_next == 10'd0) begin
-                    running <= 1'b0; done <= 1'b1;
-                end
+            end
+            if (issue) begin
+                busy[cur_port] <= 1'b1;                  // after the drains: a port reissued in its drain cycle stays busy
+                slot_c[cur_port] <= cur[IDB +: NC*8];
+                slot_p[cur_port] <= cur[IDB + 8*NC +: NP*8];
+                slot_tag[cur_port] <= icount[7:0];
+                slot_lane[cur_port] <= sel;
+                tab_live[icount[7:0]] <= 1'b1;
+                icount <= icount + 1'b1;
+            end
+            // A run for an idle lane starts its token: the lane is the youngest.
+            if (push) begin
+                lane_busy[push_lane] <= 1'b1;
+                if (!lane_busy[push_lane])
+                    for (m = 0; m < LN; m = m + 1)
+                        if (m != push_lane) begin older[m][push_lane] <= 1'b1; older[push_lane][m] <= 1'b0; end
             end
         end
     end
 
 `ifndef FABRIC_SYNTH
-    always @(posedge clk) if (rst_n && qn > 2'd2) $display("FAIL: the fetch queue overran");
     // The port's own record of the command and the tag the unit returns are
     // the same command: the release reads the register, not the reply.  This
     // is what `busy` is for, and it was firing before there was one.
     always @(posedge clk)
-        if (rst_n && running)
-            for (m = 0; m < NPORT; m = m + 1)
-                if (done_valid[m] && (!busy[m] || done_tag[m*8 +: 8] !== slot_tag[m]))
-                    $display("FAIL: port %0d returned tag %0d, it was given %0d%s", m, done_tag[m*8 +: 8], slot_tag[m],
-                             busy[m] ? "" : " and had no command outstanding");
+        if (rst_n)
+            for (p = 0; p < NPORT; p = p + 1)
+                if (done_valid[p] && (!busy[p] || done_tag[p*8 +: 8] !== slot_tag[p]))
+                    $display("FAIL: port %0d returned tag %0d, it was given %0d%s", p, done_tag[p*8 +: 8], slot_tag[p],
+                             busy[p] ? "" : " and had no command outstanding");
+    always @(posedge clk)
+        if (rst_n && push && !push_room[push_lane]) $display("FAIL: a run pushed into lane %0d, which is full", push_lane);
+`endif
+endmodule
+
+// A lane: its program store, the runs it has been given, and the fetch that
+// keeps two steps in hand.
+//
+// The fetch runs ahead of the check.  Read where it is used, the store is a
+// DEPTH-entry mux of 256-bit words in the same cycle as the issue check --
+// which indexes a counter per buffer id the step names -- and the two
+// together were 37 levels of logic and the whole of the sequencer's path.
+// It is a memory, which wants its address a cycle early anyway, so `fpc`
+// runs ahead on its own and the head step and the one after it wait in `q0`
+// and `q1`.  Two deep because a step may issue every cycle and a one-deep
+// queue would give up every other one.  At the end of a run the next one's
+// first step is fetched in the same way, so a lane's runs follow one another
+// as one program.
+module fabric_seq_lane #(
+    parameter int LANE  = 0,
+    parameter int DEPTH = 4096,
+    parameter int RQ    = 4,
+    parameter     PROG_FILE = "program.hex"
+) (
+    input  wire          clk,
+    input  wire          rst_n,
+    input  wire          push,
+    input  wire [15:0]   push_pc,
+    input  wire [15:0]   push_steps,
+    input  wire [1:0]    push_layer,
+    input  wire [20:0]   push_page,
+    output wire          room,
+    input  wire          issue,
+    output wire          head_v,
+    output wire [255:0]  head,
+    output wire [1:0]    head_layer,
+    output wire [20:0]   head_page,
+    output wire          idle            // nothing left to fetch or issue
+);
+    localparam int PAW = (DEPTH > 1) ? $clog2(DEPTH) : 1;
+    localparam int RW  = (RQ > 1) ? $clog2(RQ) : 1;
+
+    reg [15:0] rq_pc    [0:RQ-1];
+    reg [15:0] rq_steps [0:RQ-1];
+    reg [22:0] rq_side  [0:RQ-1];            // {layer, page}
+    reg [RW-1:0] rq_rd, rq_wr;
+    reg [RW:0]   rq_n;
+    assign room = rq_n != (RW+1)'(RQ);
+
+    reg  [15:0]  fpc, fend;                  // the step being fetched, and the one after its run
+    reg  [22:0]  f_side;
+    reg  [255:0] q0, q1;
+    reg  [22:0]  s0, s1, fs;                 // the queue's runs' sides, and the side of the word on its way
+    reg  [1:0]   qn;                         // steps in hand
+    reg          fetched_v;                  // the memory answers this cycle
+    wire [255:0] fetched;
+    wire         more  = fpc != fend;
+    wire         can   = more || (rq_n != 0);
+    // Room for what a fetch started now would bring: the memory answers the
+    // cycle after its address, so one step may already be on its way.
+    wire [2:0]   after = {1'b0, qn} + {2'b0, fetched_v} - {2'b0, issue};
+    wire         fetch = can && (after < 3'd2);
+    wire [15:0]  faddr = more ? fpc : rq_pc[rq_rd];
+    wire [22:0]  fside = more ? f_side : rq_side[rq_rd];
+    assign head_v     = qn != 2'd0;
+    assign head       = q0;
+    assign head_layer = s0[22:21];
+    assign head_page  = s0[20:0];
+    assign idle       = !can && qn == 2'd0 && !fetched_v;
+
+    // `fetched_v` selects what each of the queue's 512 bits takes, so one flop
+    // held 490 loads and 798 fF: two nanoseconds of clock-to-output.  The
+    // mapper buffers what it drives and cannot help the flop itself, so the
+    // flop is replicated, a copy per slice of the queue -- the same trick as
+    // fabric_const_copy for a lane's shift amount and fabric_strobe_copy for
+    // the tile's strobe.  Every copy takes `fetch`, so all of them and
+    // `fetched_v` (which keeps the few loads that are left) always agree.
+    localparam int NQC = 16;                 // copies, one per queue slice
+    localparam int QSL = 256 / NQC;
+    wire [NQC-1:0] fetched_vc;
+    genvar gq;
+    generate
+        for (gq = 0; gq < NQC; gq = gq + 1) begin : g_fv
+            fabric_seq_copy u_fv (.clk(clk), .rst_n(rst_n), .d(fetch), .q(fetched_vc[gq]));
+        end
+    endgenerate
+    fabric_sram #(.W(256), .D(DEPTH), .NRD(1), .NWR(1), .MB(256)) u_prog (
+        .clk(clk), .rd_en(fetch), .rd_addr(faddr[PAW-1:0]), .rd_data(fetched),
+        .wr_en(1'b0), .wr_addr({PAW{1'b0}}), .wr_data(256'd0), .wr_mask(1'b0));
+`ifndef FABRIC_SYNTH
+    initial if (PROG_FILE != "") begin
+        if (LANE == 0) $readmemh(PROG_FILE, u_prog.mem);
+        else           $readmemh($sformatf("lane%0d_%s", LANE, PROG_FILE), u_prog.mem);
+    end
+`endif
+
+    integer w;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            rq_rd <= 0; rq_wr <= 0; rq_n <= 0;
+            fpc <= 0; fend <= 0; f_side <= 0; qn <= 0; fetched_v <= 1'b0; fs <= 0; s0 <= 0; s1 <= 0;
+        end else begin
+            fetched_v <= fetch;
+            if (fetch) begin
+                fs <= fside;
+                if (more) fpc <= fpc + 1'b1;
+                else begin                          // the next run: its first step now, the rest after
+                    fpc <= rq_pc[rq_rd] + 1'b1; fend <= rq_pc[rq_rd] + rq_steps[rq_rd]; f_side <= rq_side[rq_rd];
+                    rq_rd <= rq_rd + 1'b1;
+                end
+            end
+            if (push) begin
+                rq_pc[rq_wr] <= push_pc; rq_steps[rq_wr] <= push_steps; rq_side[rq_wr] <= {push_layer, push_page};
+                rq_wr <= rq_wr + 1'b1;
+            end
+            rq_n <= rq_n + {{RW{1'b0}}, push} - {{RW{1'b0}}, fetch && !more};
+            // Each slice of the queue reads its own copy of `fetched_v`.
+            for (w = 0; w < NQC; w = w + 1) begin
+                if (fetched_vc[w] && issue)
+                    q0[w*QSL +: QSL] <= (qn == 2'd1) ? fetched[w*QSL +: QSL] : q1[w*QSL +: QSL];
+                else if (fetched_vc[w])
+                    begin if (qn == 2'd0) q0[w*QSL +: QSL] <= fetched[w*QSL +: QSL];
+                          else            q1[w*QSL +: QSL] <= fetched[w*QSL +: QSL]; end
+                else if (issue)
+                    q0[w*QSL +: QSL] <= q1[w*QSL +: QSL];
+                if (fetched_vc[w] && issue && qn == 2'd2) q1[w*QSL +: QSL] <= fetched[w*QSL +: QSL];
+            end
+            if (fetched_v && issue)  s0 <= (qn == 2'd1) ? fs : s1;
+            else if (fetched_v)      begin if (qn == 2'd0) s0 <= fs; else s1 <= fs; end
+            else if (issue)          s0 <= s1;
+            if (fetched_v && issue && qn == 2'd2) s1 <= fs;
+            qn <= qn + {1'b0, fetched_v} - {1'b0, issue};
+        end
+    end
+`ifndef FABRIC_SYNTH
+    always @(posedge clk) if (rst_n && qn > 2'd2) $display("FAIL: lane %0d's fetch queue overran", LANE);
 `endif
 endmodule
 

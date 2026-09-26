@@ -11,11 +11,13 @@
 `default_nettype none
 
 module tb_layer_engine #(
-    parameter int N    = 33,
+    parameter int N    = 33,                                 // steps, every lane's
+    parameter int RUNS = 1,                                  // runs pushed (runs.hex), lane by lane, a cycle each
+    parameter int LANES_USED = 1,
     parameter int FIRST = 0,                              // FIRST, a bit per token in flight: its slot starts from zero
     parameter int SLOT0 = 0, SLOT1 = 0, SLOT2 = 0, SLOT3 = 0,  // each token in flight's slot, in 2 KB pages
     parameter int POS0 = 0, POS1 = 0, POS2 = 0, POS3 = 0,      // and its position
-    parameter int LAYER = 0, LAYERS = 1,                     // the layer run, of the layers the weights are banked for
+    parameter int LAYERS = 1,                                // the layers the weights are banked for
     parameter int D    = 96,
     parameter int NK   = 2,
     parameter int NV   = 4,
@@ -57,6 +59,7 @@ module tb_layer_engine #(
     parameter int VB_BYTES  = 4096,
     parameter int VB_BANKS  = 1,
     parameter int VB_BANK_SHIFT = 12,
+    parameter int VB_FOLD = 1,
     parameter int VB_NPR = 24,
     parameter int VB_NPW = 19,
     parameter [63:0] VB_RMAP0 = 64'hFEDCBA9876543210,
@@ -76,7 +79,7 @@ module tb_layer_engine #(
     parameter int MR4       = 8'h60,
     parameter int MR8       = 8'h43,
     // RING: the tokens come in as packets through fabric_die_link, which
-    // starts the engine; what leaves is checked against ring_out.hex.
+    // pushes the engine's lanes; what leaves goes to ring_got.hex for the Python side.
     parameter int RING            = 0,
     parameter int RING_PACKETS    = 1,
     parameter int RING_IN         = 1,
@@ -92,15 +95,18 @@ module tb_layer_engine #(
     integer cycle = 0;
     always @(posedge clk) cycle <= cycle + 1;
 
-    reg          start = 0;
-    wire         running, done;
+    reg          push = 0;
+    reg  [60:0]  run = 0;                                 // {set, page, layer, lane, pc, steps}: runs.hex
+    wire [3:0]   room, lane_busy, lane_done;
+    wire         running;
     // The ring link, when the tokens come that way.
-    wire         l_start, l_sel, l_wr_en, l_rd_en, u_ready, d_valid, d_sop;
+    wire         l_push, l_wr_en, l_rd_en, u_ready, d_valid, d_sop;
+    wire [1:0]   l_lane, l_layer;
     wire [15:0]  l_pc, l_steps, l_crc, l_bad;
-    wire [3:0]   l_first;
+    wire [20:0]  l_page;
+    wire [3:0]   l_set, l_first;
     wire [4*21-1:0] l_slot;
     wire [4*32-1:0] l_pos;
-    wire [1:0]      l_layer;
     wire [AW-1:0] l_wr_addr, l_rd_addr;
     wire [127:0] l_wr_data, l_rd_data;
     wire [31:0]  d_data;
@@ -111,8 +117,9 @@ module tb_layer_engine #(
                       .LAYER_FILE(RING_LAYERS > 1 ? "die_layers.hex" : "")) u_link (
         .clk(clk), .rst_n(rst_n), .u_valid(u_valid), .u_data(u_data), .u_sop(u_sop), .u_ready(u_ready),
         .d_valid(d_valid), .d_data(d_data), .d_sop(d_sop), .d_ready(1'b1),
-        .e_start(l_start), .e_pc(l_pc), .e_steps(l_steps), .e_first(l_first), .e_slot_page(l_slot), .e_position(l_pos), .e_layer(l_layer), .e_done(done),
-        .v_sel(l_sel), .v_wr_en(l_wr_en), .v_wr_addr(l_wr_addr), .v_wr_data(l_wr_data),
+        .e_push(l_push), .e_lane(l_lane), .e_pc(l_pc), .e_steps(l_steps), .e_layer(l_layer), .e_page(l_page), .e_set(l_set),
+        .e_first(l_first), .e_slot_page(l_slot), .e_position(l_pos), .e_done(lane_done),
+        .v_wr_en(l_wr_en), .v_wr_addr(l_wr_addr), .v_wr_data(l_wr_data),
         .v_rd_en(l_rd_en), .v_rd_addr(l_rd_addr), .v_rd_data(l_rd_data), .crc_errors(l_crc), .malformed(l_bad));
     wire         req_valid, req_ready, req_write, req_wide, wdata_valid, wdata_ready, rdata_valid;
     wire [31:0]  req_addr;
@@ -122,26 +129,27 @@ module tb_layer_engine #(
                           .W(W), .BS(BS), .TOP(TOP), .KV_BITS(KV_BITS), .REC_BYTES(REC_BYTES), .RPB(RPB), .MAXR(MAXR),
                           .WINDOW_OFF(WINDOW_OFF), .BLOCK_OFF(BLOCK_OFF), .INDEX_OFF(INDEX_OFF), .SUMS_OFF(SUMS_OFF), .ATT_L(ATT_L), .SW_L(SW_L),
                           .ROWS(ROWS), .COLS(COLS), .P(P), .NT(NT), .TMAX(TMAX), .MODEL_TILES(MODEL_TILES), .LAYERS(LAYERS), .WB(WB), .ACC(ACC), .SB(SB), .SHB(SHB), .SW(SW), .YSH(YSH), .VB_BYTES(VB_BYTES), .AW(AW),
-                          .VB_BANKS(VB_BANKS), .VB_BANK_SHIFT(VB_BANK_SHIFT), .VB_NPR(VB_NPR), .VB_NPW(VB_NPW), .VB_RMAP0(VB_RMAP0), .VB_RMAP1(VB_RMAP1),
+                          .VB_BANKS(VB_BANKS), .VB_BANK_SHIFT(VB_BANK_SHIFT), .VB_FOLD(VB_FOLD), .VB_NPR(VB_NPR), .VB_NPW(VB_NPW), .VB_RMAP0(VB_RMAP0), .VB_RMAP1(VB_RMAP1),
         .VB_WMAP0(VB_WMAP0), .VB_WMAP1(VB_WMAP1), .VB_RCAP2(VB_RCAP2), .VB_RCAP3(VB_RCAP3), .VB_WCAP2(VB_WCAP2)) dut (
-        .clk(clk), .rst_n(rst_n), .start(RING ? l_start : start), .first(RING ? l_first : FIRST[3:0]),
+        .clk(clk), .rst_n(rst_n), .push(RING ? l_push : push), .push_lane(RING ? l_lane : run[33:32]),
+        .push_pc(RING ? l_pc : run[31:16]), .push_steps(RING ? l_steps : run[15:0]), .push_layer(RING ? l_layer : run[35:34]),
+        .push_page(RING ? l_page : run[56:36]), .push_set(RING ? l_set : run[60:57]), .first(RING ? l_first : FIRST[3:0]),
         .slot_page(RING ? l_slot : {SLOT3[20:0], SLOT2[20:0], SLOT1[20:0], SLOT0[20:0]}),
-        .position(RING ? l_pos : {32'(POS3), 32'(POS2), 32'(POS1), 32'(POS0)}), .layer(RING ? l_layer : 2'(LAYER)),
-        .pc_start(RING ? l_pc : 16'd0), .n_steps(RING ? l_steps : N[15:0]), .running(running), .done(done),
+        .position(RING ? l_pos : {32'(POS3), 32'(POS2), 32'(POS1), 32'(POS0)}),
+        .push_room(room), .lane_busy(lane_busy), .lane_done(lane_done), .running(running),
         .m_req_valid(req_valid), .m_req_ready(req_ready), .m_req_write(req_write), .m_req_wide(req_wide), .m_req_addr(req_addr),
         .m_req_beats(req_beats), .m_wdata_valid(wdata_valid), .m_wdata_ready(wdata_ready), .m_wdata(wdata), .m_rdata_valid(rdata_valid),
         .m_rdata(rdata),
-        .ext_sel(RING != 0 && l_sel), .ext_wr_en(l_wr_en), .ext_wr_addr(l_wr_addr), .ext_wr_data(l_wr_data),
+        .ext_wr_en(l_wr_en), .ext_wr_addr(l_wr_addr), .ext_wr_data(l_wr_data),
         .ext_rd_en(l_rd_en), .ext_rd_addr(l_rd_addr), .ext_rd_data(l_rd_data));
 
-    // The packets out, against the model's.
+    // The packets out, for the Python side: they leave as their lanes finish,
+    // so another context's may overtake (fabric.die.order_problems).
     reg  [31:0] ring_out [0:RING_OUT-1];
-    integer     r_ow = 0, r_err = 0;
+    integer     r_ow = 0, r_err = 0, r_got;
+    initial if (RING) r_got = $fopen("ring_got.hex", "w");
     always @(posedge clk) if (RING && d_valid) begin
-        if (r_ow >= RING_OUT || d_data !== ring_out[r_ow]) begin
-            r_err = r_err + 1;
-            if (r_err <= 5) $display("ring out word %0d: got %h expected %h", r_ow, d_data, r_ow < RING_OUT ? ring_out[r_ow] : 0);
-        end
+        $fdisplay(r_got, "%h", d_data); $fflush(r_got);
         r_ow = r_ow + 1;
     end
     wire mem_ready;                                       // the memory can take requests
@@ -224,11 +232,14 @@ module tb_layer_engine #(
     endgenerate
 
     // The issue trace, for the Python side's dependency check.
-    integer trace, issues = 0, t0 = 0, guard, took = 0;
+    integer trace, issues = 0, t0 = 0, guard, took = 0, r_k, n_fin, last_lane_done = 0, pushes_f;
+    initial pushes_f = $fopen("pushes.txt", "w");
+    always @(posedge clk) if (dut.push) begin $fdisplay(pushes_f, "%0d %0d", cycle, dut.push_lane); $fflush(pushes_f); end
+    reg [63:0] runs [0:RUNS-1];
     reg finished = 0;
-    always @(posedge clk) if (|(dut.cmd_valid & dut.cmd_ready)) begin
+    always @(posedge clk) if (|dut.cmd_valid) begin
         if (issues == 0) t0 = cycle;
-        $fdisplay(trace, "%0d %0d %0d %0d", issues, dut.cmd_tag, cycle, dut.u_seq.cur_unit);
+        $fdisplay(trace, "%0d %0d %0d %0d %0d", issues, dut.cmd_tag, cycle, dut.u_seq.cur_unit, dut.cmd_lane);
         $fflush(trace);                                    // a full-size run takes hours: the trace is its progress
         issues = issues + 1;
     end
@@ -249,7 +260,7 @@ module tb_layer_engine #(
     // the cycle they write their last beat and report done the cycle after, so
     // the controller can hand a port its next command before the last one's
     // completion arrives.
-    localparam int PNU = 10, PNE = 4, PNW = 19, PQ = 4;
+    localparam int PNU = 10, PNE = 4, PNW = 20, PQ = 4;
     function automatic integer rd_w(input integer u);
         case (u)
             0: rd_w = TMAX;                               // tiles
@@ -300,7 +311,7 @@ module tb_layer_engine #(
                 phead[p_i] = phead[p_i] + 1;
             end
         for (p_i = 0; p_i < PNU; p_i = p_i + 1)
-            if (dut.cmd_valid[p_i] && dut.cmd_ready[p_i]) begin
+            if (dut.cmd_valid[p_i]) begin
                 p_e = p_i * PNE + dut.cmd_engine;
                 p_q = p_e * PQ + ptail[p_e] % PQ;
                 pstep[p_q] = nissue;
@@ -367,15 +378,34 @@ module tb_layer_engine #(
         while (!mem_ready && guard < 200000) begin @(posedge clk); guard = guard + 1; end
         if (!mem_ready) begin $display("FAIL: the memory never came up"); $finish; end
         @(posedge clk); #0.1;
-        if (RING) ring_send;
-        else begin start = 1; @(posedge clk); #0.1; start = 0; end
-        guard = 0;
-        while (!done && guard < 4000000) begin @(posedge clk); guard = guard + 1; end
-        finished = done;
-        took = cycle - t0;                        // here, not after the dumps: those take clocks of their own
-        if (RING) begin                           // the packets leave
+        if (RING) begin
+            // The packets go in as the link takes them; every one comes back
+            // out when its lane is done.  The run is first issue to last done.
+            fork ring_send; join_none
             guard = 0;
-            while (r_ow < RING_OUT && guard < 100000) begin @(posedge clk); guard = guard + 1; end
+            while (r_ow < RING_OUT && guard < 8000000) begin
+                @(posedge clk); guard = guard + 1;
+                if (|lane_done) last_lane_done = cycle;
+            end
+            finished = (r_ow == RING_OUT);
+            took = last_lane_done - t0;
+        end else begin
+            $readmemh("runs.hex", runs);
+            for (r_k = 0; r_k < RUNS; r_k = r_k + 1) begin
+                push = 1; run = runs[r_k][60:0];
+                @(posedge clk); #0.1;
+            end
+            push = 0;
+            guard = 0;
+            n_fin = 0;
+            while (n_fin < LANES_USED && guard < 8000000) begin
+                @(posedge clk); guard = guard + 1;
+                for (r_k = 0; r_k < 4; r_k = r_k + 1) if (lane_done[r_k]) n_fin = n_fin + 1;
+            end
+            finished = (n_fin == LANES_USED);
+            took = cycle - t0;                    // here, not after the dumps: those take clocks of their own
+        end
+        if (RING) begin                           // the packets leave
             if (r_ow != RING_OUT || r_err != 0 || l_crc != 0 || l_bad != 0) begin
                 $display("FAIL: the ring: %0d words out of %0d, %0d wrong, %0d dropped", r_ow, RING_OUT, r_err, l_crc + l_bad);
                 $finish;

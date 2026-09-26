@@ -38,14 +38,15 @@ SECTIONS = [
     ("A layer die", [
         ("diagram", "layer_die"),
         "The die is a token sequencer, a vector buffer, the units behind their adapters, and one memory path. The "
-        "sequencer runs a layer program (a list of unit commands with the buffers each consumes and produces) in order, "
-        "issuing a command when its buffers' scoreboards are clear and the addressed engine is free; the engine returns "
-        "the command's tag when its last write has landed. Every unit reads its operands from and writes its results to "
+        "sequencer runs up to four lanes, each a context's token through the die's layer programs (lists of unit commands "
+        "with the buffers each consumes and produces) in its own order, and each cycle issues the oldest lane's next "
+        "command whose buffers' scoreboards are clear and whose engine is free; the engine returns the command's tag "
+        "when its last write has landed. Every unit reads its operands from and writes its results to "
         "the vector buffer at byte addresses the program carries, so the buffer is the only coupling between units. The "
         "memory unit is the one requester of the die's memory port: the state and history moves of the recurrent layers, "
         "the append, the index scan and the record reads of the global layer.",
         ("table", ["Block", "Role", "Instances (9B die)"], [
-            ["Token sequencer", "Microcoded issue engine: program memory of 256-bit words, per-buffer-id writer and reader counters, tag table", "1"],
+            ["Token sequencer", "Microcoded issue engine of four lanes: a program store of 256-bit words, a run queue and writer and reader counters per buffer id a lane; tag table", "1"],
             ["Vector buffer", "Byte-addressed SRAM, 16-byte beats, one read port per unit stream and 19 write ports", "1, 312 KB for a recurrent token, 1.2 MB for a global token"],
             ["Tile array (pass adapter)", "The four passes of a layer (in, out+gates, FFN gate/up, FFN down) over NT tiles of 4096 x 64 via-ROM coefficients", "3306 tiles"],
             ["Norm", "RMS norm with a gain; the L2 normaliser and the gated norm by its arguments", "2 engines"],
@@ -77,20 +78,23 @@ SECTIONS = [
         ]),
     ]),
     ("Command bus: sequencer to adapters", [
-        "One command per cycle at most. The sequencer drives the operands of the head step and asserts cmd_valid for its "
-        "unit; the adapter of the addressed engine answers cmd_ready when idle and takes the command that cycle. When the "
-        "engine's last write has landed it pulses done_valid with the tag; the sequencer releases the step's buffers in "
-        "the same cycle and may issue a dependent step the next.",
+        "One command per cycle at most. Each engine port reports itself free; the sequencer picks the oldest lane whose "
+        "head step's engine is free and whose buffers are clear, drives its operands and asserts cmd_valid for its unit, "
+        "and the addressed engine takes the command that cycle. When the engine's last write has landed it pulses "
+        "done_valid with the tag; the sequencer drains one completion a cycle and may issue a dependent step two cycles "
+        "after it.",
         ("table", ["Signal", "Direction", "Width", "Meaning"], [
             ["cmd_valid[NU]", "seq to units", "NU=10", "One-hot by unit id: tiles 0, norm 1, conv 2, gates 3, state 4, swiglu 5, residual 6, rotary 7, attention 8, memory 9."],
             ["cmd_engine", "seq to units", "4", "Engine index within the unit (norm 0-1, state 0-3, rotary 0-1, attention 0-3, others 0)."],
             ["cmd_len", "seq to units", "16", "Beat count of the stream, or the token count T for a pass."],
             ["cmd_src, cmd_dst, cmd_a2, cmd_a3", "seq to units", "4 x 30", "Byte addresses into the vector buffer (or beat addresses into memory for the memory unit's DMA operands)."],
             ["cmd_arg", "seq to units", "32", "Unit-specific argument (constant set, flags, operation, position); see the operand conventions."],
-            ["cmd_tag", "seq to units", "8", "The step index modulo 256; returned on completion."],
-            ["cmd_ready[NU]", "units to seq", "NU", "The addressed engine of that unit is free this cycle."],
+            ["cmd_tag", "seq to units", "8", "The issue count modulo 256; returned on completion."],
+            ["cmd_lane, cmd_layer, cmd_page", "seq to units", "2, 2, 21", "The command's lane (its token in flight), its run's layer (the units' constant bank, which each port keeps for its command) and its run's part of the slot (the memory unit adds it to the token's slot)."],
+            ["port_ready[NU x NE]", "units to seq", "40", "Each engine port free for a command this cycle."],
             ["done_valid[NU x NE], done_tag", "units to seq", "40, 40 x 8", "One port per engine; a one-cycle pulse with the tag of the completed command."],
-            ["start, n_steps / running, done", "top", "1, 16 / 1, 1", "Run a program of n_steps (or to the first step with the last flag); done pulses when every issued step has completed."],
+            ["push, push_lane, push_pc, push_steps, push_layer, push_page", "top", "1, 2, 16, 16, 2, 21", "A run for a lane: a program in the lane's store, its layer and its part of the slot; a lane holds four, and fetches them one after another."],
+            ["push_room, lane_busy, lane_done / running", "top", "4, 4, 4 / 1", "Per lane: room for a run, runs outstanding, and a pulse when everything it was given has completed."],
         ]),
         ("table", ["Program word bits", "Field", "Meaning"], [
             ["[3:0]", "unit", "Unit id"],

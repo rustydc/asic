@@ -83,6 +83,14 @@ RELEASES = 1                 # completions the controller drains a cycle (rtl/fa
 # 73,943 cycles (two to seven: 73,943-77,668), against 77,712 in order (0).
 STATE_READ_AHEAD = 3
 SHARED_PREFIX = "s_slot"     # buffers shared by every token in flight: the state engines' slots
+# The sequencer's lanes: each runs one context's token (or chunk) through a
+# die's layers in order, and each cycle the oldest lane whose next step can
+# go issues it (``schedule_lanes``, rtl/fabric_sequencer.sv).  A lane's
+# buffers are its own, the state slots too: shared, the slots made the lanes
+# take turns.  Two a lane are the eight the die had, and a lane reads one
+# head ahead into the other.
+LANES = 4
+LANE_SLOTS = 2
 MEM_PREFIX = "m_"            # names of buffers in the memory image (the rest live in the vector buffer)
 
 # Operand conventions of the layer engine's adapters (rtl/fabric_engine.sv).
@@ -574,11 +582,11 @@ def operands(**fields) -> dict:
     return {k: v for k, v in fields.items() if v is not None}
 
 
-def _rename_value(value, token: int):
+def _rename_value(value, token: int, private: bool = False):
     if isinstance(value, tuple):
-        return (_renamed(value[0], token),) + value[1:]
+        return (_renamed(value[0], token, private),) + value[1:]
     if isinstance(value, list):
-        return [(sh, _rename_value(v, token)) for sh, v in value]
+        return [(sh, _rename_value(v, token, private)) for sh, v in value]
     return value
 
 
@@ -664,11 +672,17 @@ def _contrib(name: str, chunk: int) -> str:
 
 
 def recurrent_program(cfg, c: L.RecurrentConsts | None, spec: TileSpec, mm: MemoryMap, t: Timing = Timing(),
-                      chunk: int = 1, read_ahead: int = STATE_READ_AHEAD, first: bool = False) -> list[Step]:
+                      chunk: int = 1, read_ahead: int = STATE_READ_AHEAD, first: bool = False,
+                      slots: int | None = None) -> list[Step]:
     """One token through a recurrent layer, or a chunk of ``chunk``
     consecutive tokens of one context (prefill): the passes carry the whole
     chunk at once, the vector units and state engines take the tokens in
     turn, and each head's state is read and written once per chunk.
+
+    ``slots`` is how many state slots the heads take in turn: by default two
+    per state engine, a head on its engine's; a lane's program has its own
+    ``LANE_SLOTS``, whichever engine a head is on, and reads ahead only as
+    far as a slot is free.
 
     Inputs in the environment: ``x`` (int16 residual; ``[chunk, d]`` for a
     chunk), ``s_mem[h]`` (the state rows of each head) and, for the int8
@@ -720,8 +734,13 @@ def recurrent_program(cfg, c: L.RecurrentConsts | None, spec: TileSpec, mm: Memo
     # STATE_READ_AHEAD before it.
     slot_beats = lay["sizes"][_slot(0, 0)] // BEAT
 
+    def slot_of(h: int) -> str:
+        return _slot(h % n_delta, h // n_delta) if slots is None else f"{SHARED_PREFIX}[{h % slots}]"
+    if slots is not None:
+        read_ahead = min(read_ahead, slots - 1)
+
     def s_read(h: int) -> None:
-        slot = _slot(h % n_delta, h // n_delta)
+        slot = slot_of(h)
 
         def s_rd(e, h=h, slot=slot):                       # the slot holds the rows and, for int8, the scale beat
             rows = np.zeros_like(e["s_mem"][h]) if first else e["s_mem"][h]
@@ -779,8 +798,8 @@ def recurrent_program(cfg, c: L.RecurrentConsts | None, spec: TileSpec, mm: Memo
                     ops=operands(src=("conv", i * conv_dim + off + j * hk), dst=(f"qk_unit[{j}]", i * 2 * hk + (hk if which == "k" else 0)),
                                  arg=NORM_UNIT, len=hk // t.lanes))
     for h in range(nv):
-        e_id, k = h % n_delta, h // n_delta
-        slot = _slot(e_id, k)
+        e_id = h % n_delta
+        slot = slot_of(h)
         if not read_ahead:
             s_read(h)
         for i in range(T):
@@ -1136,18 +1155,19 @@ def _shared(name: str) -> bool:
     return _plain(name).startswith(SHARED_PREFIX)
 
 
-def _renamed(name: str, token: int) -> str:
-    return name if _shared(name) else f"{name}@{token}"
+def _renamed(name: str, token: int, private: bool = False) -> str:
+    return name if _shared(name) and not private else f"{name}@{token}"
 
 
-def retarget(steps: list[Step], token: int) -> list[Step]:
-    """A copy of a token's program with its private buffers renamed for that token."""
+def retarget(steps: list[Step], token: int, private: bool = False) -> list[Step]:
+    """A copy of a token's program with its private buffers renamed for
+    that token; with ``private`` the state slots too, as a lane's are."""
     out = []
     for s in steps:
-        ops = None if s.ops is None else {k: _rename_value(v, token) for k, v in s.ops.items()}
-        out.append(Step(s.name, s.unit, s.engine, tuple(_renamed(n, token) for n in s.src),
-                        tuple(_renamed(n, token) for n in s.dst), s.cycles, s.func, s.nbytes, token, ops=ops, port=s.port, posted=s.posted,
-                        overlap=s.overlap))
+        ops = None if s.ops is None else {k: _rename_value(v, token, private) for k, v in s.ops.items()}
+        out.append(Step(s.name, s.unit, s.engine, tuple(_renamed(n, token, private) for n in s.src),
+                        tuple(_renamed(n, token, private) for n in s.dst), s.cycles, s.func, s.nbytes, token, ops=ops, port=s.port,
+                        posted=s.posted, overlap=s.overlap))
     return out
 
 
@@ -1433,6 +1453,146 @@ def token_interval(program: list[Step], tokens: int = 3) -> int:
 
 
 # --------------------------------------------------------------------------
+# Lanes
+# --------------------------------------------------------------------------
+
+def lane_program(runs: list[list[Step]], lane: int) -> list[Step]:
+    """A lane's work: its runs -- a token's layers, one program each -- one
+    after another, its buffers renamed for the lane, and linked as one
+    program, since the lane issues them in order with nothing between."""
+    return chain([retarget(run, lane, private=True) for run in runs])
+
+
+@dataclasses.dataclass
+class LaneSchedule:
+    lanes: list[Schedule]                   # each lane's steps, their issue, end and release
+    order: list[tuple[int, int]]            # (lane, step) in issue order
+
+    def lane_cycles(self, lane: int) -> int:
+        """The cycle the lane reports done: after its last release drained, as ``Schedule.cycles``."""
+        return self.lanes[lane].cycles
+
+    @property
+    def cycles(self) -> int:
+        return max((s.cycles for s in self.lanes if s.steps), default=0)
+
+    @property
+    def last_done(self) -> int:
+        return max((s.last_done for s in self.lanes if s.steps), default=0)
+
+
+def schedule_lanes(lanes: list[list[Step]], start: list[int] | None = None, releases: int = RELEASES,
+                   memory: bool = True, jobs: list[list[int]] | None = None, gap: int = 0) -> LaneSchedule:
+    """The controller with lanes, cycle for cycle (rtl/fabric_sequencer.sv).
+
+    Each lane is a program the controller issues in order, by the rules of
+    ``schedule``; the lanes share the units' engine ports, the drain and the
+    memory path, and one step issues a cycle.  Of the lanes whose next step
+    could issue this cycle, the oldest does, and the others wait for the
+    next.  Their buffers are their own (``lane_program``), so no step waits
+    on another lane's but for its engine.  ``start[l]`` is the first cycle
+    lane ``l`` may issue in, cycle 0 being the first lane's first issue.  The
+    tags are the issue count, so a step waits for the release of the step
+    issued ``TAGS`` issues before it, whichever lane that was.
+
+    A lane's work may be several jobs -- tokens, each its layers --
+    ``jobs[l]`` being the steps each later one starts at.  A job after the
+    first is the link's next packet into the lane: it is started ``gap``
+    cycles after the lane reports the one before it done, and a lane is as
+    old as its job, so the lanes' order turns over as they take new ones
+    (ties to the lower lane)."""
+    nl = len(lanes)
+    start = list(start) if start is not None else [0] * nl
+    bounds = [sorted(jobs[l]) if jobs else [] for l in range(nl)]
+    age = list(start)
+    issue = [[0] * len(p) for p in lanes]
+    end = [[0] * len(p) for p in lanes]
+    release: list[list[int | None]] = [[None] * len(p) for p in lanes]
+    port_of = [[UNITS[s.unit][0] * NE + s.engine for s in p] for p in lanes]
+    ptr = [0] * nl
+    port_free: dict[int, int] = {}
+    running: dict[int, tuple[int, int]] = {}
+    pending: dict[int, tuple[int, int]] = {}
+    order: list[tuple[int, int]] = []
+    cycle, last_issue, path_free = 0, -1, 0
+
+    def waits(l: int, k: int) -> list[int | None]:
+        rel = [release[l][d] for d in lanes[l][k].deps]
+        if len(order) >= TAGS:
+            lt, kt = order[len(order) - TAGS]
+            rel.append(release[lt][kt])
+        return rel
+
+    opened: list[set[int]] = [set() for _ in range(nl)]
+
+    def open_job(l: int) -> bool:
+        # A job waits for the one before it to be done; then the lane starts
+        # it ``gap`` later, and is as old as that.
+        k = ptr[l]
+        if k not in bounds[l] or k in opened[l]:
+            return True
+        prev = max([0] + [b for b in bounds[l] if b < k])
+        rel = release[l][prev:k]
+        if any(r is None for r in rel):
+            return False
+        start[l] = age[l] = max(rel) + 2 + gap
+        opened[l].add(k)
+        return True
+
+    def blocked(l: int) -> bool:
+        k = ptr[l]
+        return k >= len(lanes[l]) or not open_job(l) or port_of[l][k] in pending or port_of[l][k] in running
+
+    while any(ptr[l] < len(lanes[l]) for l in range(nl)) or running or pending:
+        want = dict(pending)
+        for port, (l, s) in list(running.items()):
+            if end[l][s] + 1 == cycle:
+                want[port] = (l, s)
+                del running[port]
+        for port in sorted(want)[:releases]:
+            l, s = want.pop(port)
+            release[l][s] = cycle
+            port_free[port] = cycle + 1
+        pending = want
+        for l in sorted(range(nl), key=lambda m: (age[m], m)):     # the oldest lane that can goes
+            k = ptr[l]
+            if (not blocked(l) and cycle >= start[l] and cycle > last_issue
+                    and cycle >= port_free.get(port_of[l][k], 0)
+                    and all(r is not None and r + 2 <= cycle for r in waits(l, k))):
+                st = lanes[l][k]
+                issue[l][k], end[l][k] = cycle, cycle + st.cycles - 1
+                if st.port and memory:
+                    s0 = max(cycle, path_free)
+                    if st.posted:
+                        if st.port > 0 and st.cycles > POSTED_SLACK:
+                            end[l][k] = max(end[l][k], s0 + st.cycles - 1 - POSTED_SLACK)
+                        path_free = s0 + st.port
+                    else:
+                        end[l][k] = s0 + st.cycles - 1
+                        path_free = s0 + st.port if st.overlap else end[l][k] + 1
+                running[port_of[l][k]] = (l, k)
+                order.append((l, k))
+                last_issue = cycle
+                ptr[l] += 1
+                break
+        ahead = [cycle + 1] if pending else []
+        if running:
+            ahead.append(min(end[l][s] for l, s in running.values()) + 1)
+        for l in range(nl):
+            if blocked(l):
+                continue
+            rel = waits(l, ptr[l])
+            if all(r is not None for r in rel):
+                earliest = max(cycle + 1, last_issue + 1, start[l], port_free.get(port_of[l][ptr[l]], 0))
+                for r in rel:
+                    earliest = max(earliest, r + 2)
+                ahead.append(earliest)
+        cycle = min(ahead) if ahead else cycle + 1
+    scheds = [Schedule(issue[l], end[l], lanes[l], [r if r is not None else 0 for r in release[l]]) for l in range(nl)]
+    return LaneSchedule(scheds, order)
+
+
+# --------------------------------------------------------------------------
 # The program image for the controller
 # --------------------------------------------------------------------------
 
@@ -1446,7 +1606,7 @@ def buffer_ids(steps: list[Step]) -> dict[str, int]:
     return ids
 
 
-def encode(steps: list[Step], layout=None) -> list[int]:
+def encode(steps: list[Step], layout=None, ids: dict[str, int] | None = None) -> list[int]:
     """Each step as a 256-bit word: unit, engine, last, the length the unit
     is given, a 32-bit argument, four 30-bit address operands (source,
     destination, two more), then up to six consumed buffer ids, two
@@ -1456,8 +1616,11 @@ def encode(steps: list[Step], layout=None) -> list[int]:
     step's operands.  A stub unit takes its duration from ``arg`` rather
     than the length, because a full-size command can run longer than the
     length field is wide -- one attention core streams tens of thousands of
-    context rows -- while a real command's length is always its beats."""
-    ids = buffer_ids(steps)
+    context rows -- while a real command's length is always its beats.
+
+    ``ids`` is the buffer numbering to use, for programs a lane runs one
+    after another: their steps overlap, so they must agree on it."""
+    ids = ids if ids is not None else buffer_ids(steps)
     words = []
     for i, step in enumerate(steps):
         assert step.cycles < (1 << 32) and step.engine < 16
@@ -1503,22 +1666,72 @@ def encode(steps: list[Step], layout=None) -> list[int]:
 PROGRAM_STEPS = 4096     # the sequencer's program store: every program a die runs, one after another
 
 
-def emit_program(directory: Path, steps: list[Step], before: list[Step] = ()) -> dict:
-    """Write ``program.hex`` and the schedule the RTL must reproduce; returns
-    the testbench parameters.  ``before`` goes in the store first, and the
-    program runs from the step after it, as a die's later programs do."""
-    words = encode(list(before)) + encode(steps) if before else encode(steps)
-    assert len(words) <= PROGRAM_STEPS, f"{len(words)} steps, the store holds {PROGRAM_STEPS}"
-    write_hex(directory / "program.hex", words, 256)
+def lane_store_name(lane: int, name: str = "program.hex") -> str:
+    """A lane's program store's image: lane 0's is ``name``, lane l's ``lane<l>_name`` (rtl/fabric_sequencer.sv)."""
+    return name if lane == 0 else f"lane{lane}_{name}"
+
+
+def chain(runs: list[list[Step]]) -> list[Step]:
+    """Runs one after another as one program, linked afresh (the steps are copies)."""
+    steps = [dataclasses.replace(s, deps=[]) for run in runs for s in run]
+    link(steps)
+    return steps
+
+
+def emit_lanes(directory: Path, lanes: list[list[list[Step]]], before: list[Step] = ()) -> dict:
+    """Each lane's runs in its own store, the runs to push -- lane by lane,
+    one a cycle -- and the schedule the RTL must reproduce; returns the
+    testbench parameters.  ``before`` goes in lane 0's store first, and its
+    runs start after it, as a die's later programs do."""
+    progs, pushes, start = [], [], []
+    for l, runs in enumerate(lanes):
+        prog = chain(runs)
+        words = (encode(list(before)) if l == 0 and before else []) + encode(prog)
+        assert len(words) <= PROGRAM_STEPS, f"{len(words)} steps, the store holds {PROGRAM_STEPS}"
+        write_hex(directory / lane_store_name(l), words, 256)
+        pc = len(before) if l == 0 else 0
+        start.append(len(pushes))
+        for run in runs:
+            pushes.append((l, pc, len(run)))
+            pc += len(run)
+        progs.append(prog)
+    write_hex(directory / "runs.hex", [(l << 32) | (pc << 16) | n for l, pc, n in pushes], 64)
     # The testbench's units take each step's cycles and have no memory
-    # behind them, so the issue rules alone: no step waits for the path.
-    sched = schedule(steps, memory=False)
-    (directory / "expected_issue.txt").write_text("".join(f"{i} {a} {b}\n" for i, (a, b) in enumerate(zip(sched.issue, sched.end))))
-    params = {"N": len(steps), "PC0": len(before), "EXPECTED_CYCLES": sched.last_done}
+    # behind them, so the issue rules alone: no step waits for the path.  A
+    # lane's first issue is three cycles after its first push, the first
+    # lane's being cycle 0.
+    sched = schedule_lanes(progs, start, memory=False)
+    rows = [(UNITS[progs[l][k].unit][0], progs[l][k].engine, sched.lanes[l].issue[k], sched.lanes[l].end[k] + 1) for l, k in sched.order]
+    (directory / "expected.txt").write_text("".join(" ".join(map(str, r)) + "\n" for r in rows))
+    params = {"N": sum(len(p) for p in progs), "RUNS": len(pushes), "LANES_USED": len(lanes), "EXPECTED_CYCLES": sched.last_done}
     for name, (uid, engines) in UNITS.items():
         params[f"E{uid}"] = engines
     (directory / "params.json").write_text(json.dumps(params))
     return params
+
+
+def emit_program(directory: Path, steps: list[Step], before: list[Step] = ()) -> dict:
+    """One program in lane 0 (``emit_lanes``)."""
+    return emit_lanes(directory, [[steps]], before)
+
+
+def lane_trace_problems(directory: Path, trace: str) -> list[str]:
+    """A testbench's trace (``tag unit engine issue done``) against the
+    lanes' schedule, issue by issue: the same command on the same engine,
+    issued and completed in the same cycles (from the first issue)."""
+    got = sorted(tuple(int(v) for v in line.split()) for line in trace.strip().splitlines() if line.strip())
+    got = sorted(got, key=lambda r: r[3])
+    want = [tuple(int(v) for v in line.split()) for line in (directory / "expected.txt").read_text().splitlines()]
+    if len(got) != len(want):
+        return [f"{len(got)} commands for {len(want)}"]
+    t0 = got[0][3] if got else 0
+    problems = []
+    for k, ((tag, unit, engine, t_issue, t_done), w) in enumerate(zip(got, want)):
+        if tag != k % TAGS:
+            problems.append(f"issue {k} carried tag {tag}")
+        if (unit, engine, t_issue - t0, t_done - t0) != w:
+            problems.append(f"issue {k}: unit {unit} engine {engine} at {t_issue - t0}-{t_done - t0}, the model has {w}")
+    return problems[:10]
 
 
 def check_trace(steps: list[Step], trace: str) -> list[str]:

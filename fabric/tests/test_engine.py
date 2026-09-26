@@ -28,14 +28,15 @@ SOURCES = [RTL / name for name in ("fabric_sram.sv", "fabric_vector.sv", "fabric
 
 def run_engine(case: unittest.TestCase, cfg, c, spec, mm, steps: list[S.Step], inputs: dict, memory=None, ndev: int = 0,
                model_tiles: bool = False, log=None, first: bool = False, base_page: int = 0, ring: bool = False,
-               bound: bool = False) -> int:
+               bound: bool = False, lanes=None) -> int:
     """Emit, simulate and check one program; returns the engine's cycle count.  With ``ndev`` the memory is the HPI path,
     with ``model_tiles`` the tiles' behavioural columns (full-size runs), with ``first`` the token is FIRST, with ``ring``
     the tokens come and go as packets through the die's ring link."""
     with tempfile.TemporaryDirectory() as directory:
         work = Path(directory)
         t0 = time.time()
-        run = E.EngineRun(work, cfg, c, spec, mm, steps, inputs, memory, ndev, model_tiles, first, base_page, ring)
+        run = E.EngineRun(work, cfg, c, spec, mm, steps, inputs, memory, ndev, model_tiles, first, base_page, ring, lanes)
+        steps = run.steps
         args = [f"-Ptb_layer_engine.{name}={value}" for name, value in run.params.items()]
         t1 = time.time()
         subprocess.run(["iverilog", "-g2012", "-I", str(RTL), "-s", "tb_layer_engine", "-o", "sim.vvp", *args, *map(str, SOURCES)],
@@ -47,6 +48,7 @@ def run_engine(case: unittest.TestCase, cfg, c, spec, mm, steps: list[S.Step], i
         case.assertIn("PASS", out, out)
         case.assertEqual(run.check(work), [])
         issue = [tuple(int(v) for v in line.split()) for line in (work / "issue.txt").read_text().splitlines()]
+        expected = run.expected_cycles(work)
     case.assertEqual([row[1] for row in issue], [i % 256 for i in range(len(steps))])     # program order, tags in step order
     passed = next(line for line in out.splitlines() if line.startswith("PASS"))
     took = int(passed.split(" in ")[1].split()[0])
@@ -69,11 +71,11 @@ def run_engine(case: unittest.TestCase, cfg, c, spec, mm, steps: list[S.Step], i
     # a stripe or less, one device, and the schedule is only a bound (``bound``).
     # At the 9B geometry a state slot is every device's, and the bound is close.
     if not ndev:
-        case.assertEqual(took, S.schedule(steps).cycles, passed)
+        case.assertEqual(took, expected, passed)
     elif bound:
-        case.assertLessEqual(took, S.schedule(steps).cycles, passed)
+        case.assertLessEqual(took, expected, passed)
     else:
-        case.assertLessEqual(abs(took - S.schedule(steps).cycles), 0.03 * took, passed)
+        case.assertLessEqual(abs(took - expected), 0.03 * took, passed)
     return took
 
 
@@ -198,6 +200,19 @@ class EngineRtlTest(unittest.TestCase):
         cycles = self.run_engine(self.prog, inputs)
         self.assertGreater(cycles, S.schedule(self.prog).cycles // 2)
 
+    def test_lanes(self) -> None:
+        # Three contexts' tokens, a lane each, on two state slots and banks of
+        # their own; the middle lane is given the layer twice, as a die gives
+        # a lane its layers, one run after another.  The lanes' steps go as
+        # they are ready: every lane's results bit for bit, in the model's
+        # cycles.
+        prog = S.recurrent_program(self.cfg, self.c, self.spec, self.mm, slots=S.LANE_SLOTS)
+        lanes, inputs = [], {}
+        for l, (tokens, runs) in enumerate(((2, 1), (0, 2), (4, 1))):
+            lanes.append([S.retarget(prog, l, private=True)] * runs)
+            inputs.update({f"{k}@{l}": v for k, v in self.context_after(tokens).items()})
+        run_engine(self, self.cfg, self.c, self.spec, self.mm, [], inputs, lanes=lanes)
+
     def test_one_token_over_the_hpi_devices(self) -> None:
         # The same token with the bridge, the stripe unit and PSRAM models
         # behind the memory port, against the schedule on the path's timing:
@@ -266,13 +281,15 @@ class EngineRtlTest(unittest.TestCase):
     def test_two_contexts_through_the_ring(self) -> None:
         # The die as the ring sees it: two packets in, a lane each, from
         # contexts in slots other than the first; the link writes their
-        # vectors into the buffer, starts the stream's program with their
-        # slots, and sends their outputs on as the model's packets.
-        two = S.stream(self.prog, 2)
-        inputs = {}
-        for token, tokens in ((0, 3), (1, 1)):
-            inputs.update({f"{k}@{token}": v for k, v in self.context_after(tokens).items()})
-        run_engine(self, self.cfg, self.c, self.spec, self.mm, two, inputs, base_page=37, ring=True)
+        # vectors into their lanes, pushes each lane its program with its
+        # slot as it arrives, and sends each output on as the model's packet
+        # when its lane is done -- in the model's cycles from those pushes.
+        prog = S.recurrent_program(self.cfg, self.c, self.spec, self.mm, slots=S.LANE_SLOTS)
+        inputs, lanes = {}, []
+        for lane, tokens in ((0, 3), (1, 1)):
+            inputs.update({f"{k}@{lane}": v for k, v in self.context_after(tokens).items()})
+            lanes.append([S.retarget(prog, lane, private=True)])
+        run_engine(self, self.cfg, self.c, self.spec, self.mm, [], inputs, base_page=37, ring=True, lanes=lanes)
 
 
 @unittest.skipUnless(shutil.which("iverilog") and shutil.which("vvp"), "iverilog not installed")
@@ -398,7 +415,8 @@ class GlobalEngineRtlTest(unittest.TestCase):
         # into the buffer, the chunk's program, and three out.
         inputs, images = self.chunk_at(30, 3)
         prog = S.global_program(self.cfg, self.c, self.spec, self.mm, 30, chunk=3)
-        run_engine(self, self.cfg, self.c, self.spec, self.mm, prog, inputs, {"m_ctx": images}, ring=True)
+        run_engine(self, self.cfg, self.c, self.spec, self.mm, [], {f"{k}@0": v for k, v in inputs.items()}, {"m_ctx@0": images},
+                   ring=True, lanes=[[S.retarget(prog, 0, private=True)]])
 
     def test_a_first_token_over_a_used_slot(self) -> None:
         # FIRST at position 0 in a context image another context left behind:

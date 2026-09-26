@@ -1,38 +1,39 @@
-// A layer die's front end: the ring in, the engine, the ring out.
+// A layer die's front end: the ring in, the engine's lanes, the ring out.
 //
 // Packets arrive from the die before (or the controller) on fabric_ring_rx.
 // Each is a work item -- one token, or a chunk of a prompt's tokens
-// (fabric/controller.py) -- and takes a lane: its hidden vectors are written
-// into the engine's vector buffer at that lane's input, and its slot, flags,
-// position and token count are kept.  The engine runs a program over up to
-// LANES packets at once, the tokens of different contexts interleaved (the
-// sequencer's streams), so the lanes are gathered into a batch, and the
-// batch runs when it is full, when a packet that cannot join it arrives, or
-// when the link has been quiet for GATHER_WAIT cycles.  Then each lane's
-// packet goes on to the next die with its output vectors in place of the
-// input, the header otherwise as it came.
+// (fabric/controller.py) -- and takes a lane of the engine as it arrives:
+// its hidden vectors are written into the vector buffer at that lane's
+// input, and its slot, flags, position and token count are kept.  The engine
+// runs its lanes at once, each lane's steps issuing as they are ready
+// (fabric_sequencer), so there is nothing to gather: a packet waits only for
+// a free lane, and for a lane that holds its own context to finish -- two
+// tokens of one context cannot run at once on its state, and a prompt's
+// packets come back to back from one slot.  When a lane is done its packet
+// goes on to the next die with its output vectors in place of the input,
+// the header otherwise as it came, the lanes' packets in the order they
+// finished: another context's may overtake, a context's own never do.
 //
-// What the engine is given, per batch:
+// What the engine is given, per packet: a run for each of the die's layers,
+// pushed to the packet's lane one a cycle --
 //   * the program: its first step and length, from a table indexed by the
-//     batch's shape -- a token a lane or a chunk a lane, and how many lanes
-//     -- since the dies hold a program for each (fabric/engine.py lays
-//     each one out, and the table carries where each lane's input and
-//     output are in the vector buffer for that program);
-//   * each lane's slot as a page of the die's memory: the packet's context
-//     field is the controller's slot number, and a slot is SLOT_PAGES pages
-//     from PAGE_BASE on;
-//   * FIRST per lane, from the packet's flag;
-//   * each lane's position, from the packet: the global layer's commands
-//     carry a token's place in its chunk and the engine adds it.
+//     layer's kind and the packet's shape (a token or a chunk), since every
+//     lane's store holds the die's programs at the same steps
+//     (fabric/engine.py lays each lane's out, and the table carries where
+//     each lane's vectors are in the vector buffer);
+//   * the layer, and where its part of the slot starts (the layer table);
+// and with them the lane's token: its slot as a page of the die's memory --
+// the packet's context field is the controller's slot number, and a slot is
+// SLOT_PAGES pages from PAGE_BASE on -- its FIRST and its position.
 //
-// The vector buffer is the engine's: this unit uses the memory unit's ports
-// while the engine is idle (`v_sel`), so a packet's payload waits on the
-// link while a batch runs -- a few thousand cycles against a few hundred
-// thousand a token spends in the die's layers.
+// The link has ports of its own on the vector buffer, a write and a read:
+// a packet is written into a lane that is not running and read out of one
+// that is done while the other lanes run, and a lane's buffers are in banks
+// of its own, so nothing the engine does meets them.
 //
-// A packet whose CRC fails takes no lane: its vectors are overwritten by the
-// next.  A packet that is not a work item of a shape the die has a program
-// for is read off the link and dropped.  Both are counted.
+// A packet whose CRC fails gives its lane back: its vectors are overwritten
+// by the next.  A packet that is not a work item of a shape the die has a
+// program for is read off the link and dropped.  Both are counted.
 
 `timescale 1ns/1ps
 `default_nettype none
@@ -40,13 +41,12 @@
 module fabric_die_link #(
     parameter int D           = 8,              // hidden elements a token, int16; a multiple of eight
     parameter int CHUNK       = 1,              // the chunk the die has programs for, besides a single token
-    parameter int LANES       = 4,              // packets a batch, at most four
+    parameter int LANES       = 4,              // the engine's lanes, at most four
     parameter int SLOT_PAGES  = 16,             // a slot's pages of the die's memory
     parameter int PAGE_BASE   = 0,
-    parameter int GATHER_WAIT = 16,             // quiet cycles before a part-full batch runs
     parameter int AW          = 24,             // vector-buffer address bits
     parameter int KIND        = 8'h57,
-    parameter int LAYERS      = 1,              // layers a token takes on this die, run in turn: four on a layer die
+    parameter int LAYERS      = 1,              // layers a token takes on this die, a run each: four on a layer die
     parameter     TABLE_FILE  = "die_table.hex",
     parameter     LAYER_FILE  = ""              // each layer's kind and its part of a slot (below); none: one layer at the slot's start
 ) (
@@ -62,17 +62,19 @@ module fabric_die_link #(
     output wire [31:0]       d_data,
     output wire              d_sop,
     input  wire              d_ready,
-    // the engine
-    output reg               e_start,
+    // the engine's lanes: a run pushed to one, and each one's done
+    output reg               e_push,
+    output reg  [1:0]        e_lane,
     output reg  [15:0]       e_pc,
     output reg  [15:0]       e_steps,
+    output reg  [1:0]        e_layer,
+    output reg  [20:0]       e_page,
+    output reg  [3:0]        e_set,
     output reg  [3:0]        e_first,
     output reg  [4*21-1:0]   e_slot_page,
     output reg  [4*32-1:0]   e_position,
-    output reg  [1:0]        e_layer,
-    input  wire              e_done,
-    // the vector buffer, while the engine is idle
-    output wire              v_sel,
+    input  wire [3:0]        e_done,
+    // the link's own ports on the vector buffer
     output reg               v_wr_en,
     output reg  [AW-1:0]     v_wr_addr,
     output reg  [127:0]      v_wr_data,
@@ -87,17 +89,17 @@ module fabric_die_link #(
     localparam int TB = D / 8;                  // vector-buffer beats a token
 
     // ---------------------------------------------------------------------
-    // The program table: an entry a layer kind and batch shape,
-    // {kind, chunk, lanes - 1}.  A kind is a program: a die's three recurrent
-    // layers run one program and its global layer the other, each layer on
-    // its own bank of weights and constants (the engine's layer) and its own
-    // part of the slot (the layer table).
+    // The program table: an entry a layer kind and packet shape, {kind,
+    // chunk}.  A kind is a program: a die's three recurrent layers run one
+    // program and its global layer the other, each layer on its own bank of
+    // weights and constants (the engine's layer) and its own part of the
+    // slot (the layer table).  A lane's vectors are in place: its input and
+    // its output are one buffer, whatever the layer.
     //   [15:0] first step   [31:16] steps
     //   [32 + 24k +: 24] lane k's input   [128 + 24k +: 24] lane k's output
     // ---------------------------------------------------------------------
-    reg [255:0] table_mem [0:15];
+    reg [255:0] table_mem [0:3];
     initial if (TABLE_FILE != "") $readmemh(TABLE_FILE, table_mem);
-    reg [255:0] entry;
     // The layer table: [0] the layer's kind, [21:1] the page its part of a
     // slot starts at, from the slot's first.
     reg [31:0]  layer_mem [0:3];
@@ -106,20 +108,35 @@ module fabric_die_link #(
         for (li = 0; li < 4; li = li + 1) layer_mem[li] = 0;
         if (LAYER_FILE != "") $readmemh(LAYER_FILE, layer_mem);
     end
-    reg [1:0]   lay;                            // the layer running
 
     // ---------------------------------------------------------------------
     // The lanes.
     // ---------------------------------------------------------------------
-    reg [2:0]  lanes;                           // lanes gathered
-    reg        cls;                             // the batch's shape: a chunk a lane
+    localparam [2:0] L_FREE = 0, L_LOAD = 1, L_PUSH = 2, L_RUN = 3, L_OUT = 4;
+    reg [2:0]  l_st      [0:3];
+    reg        l_cls     [0:3];                 // a chunk
     reg [7:0]  l_flags   [0:3];
     reg [15:0] l_context [0:3];
     reg [31:0] l_position[0:3];
     reg [7:0]  l_tokens  [0:3];
-    reg [7:0]  h_flags, h_tokens;               // the packet coming in, until it takes its lane
+    reg [15:0] l_seq     [0:3];                 // the order the lanes finished in
+    reg [15:0] seq;
+    reg [7:0]  h_flags, h_tokens;               // the packet coming in
     reg [15:0] h_context;
     reg [31:0] h_position;
+    reg        h_cls;
+    reg [1:0]  rlane;                           // the lane it is going into
+
+    // A free lane, the lowest; and whether a context is in a lane that has
+    // not finished with its state.
+    reg        any_free;
+    reg [1:0]  free_lane;
+    integer    fk;
+    always @* begin
+        any_free = 1'b0; free_lane = 0;
+        for (fk = LANES - 1; fk >= 0; fk = fk - 1)
+            if (l_st[fk] == L_FREE) begin any_free = 1'b1; free_lane = 2'(fk); end
+    end
 
     // ---------------------------------------------------------------------
     // In.
@@ -137,31 +154,37 @@ module fabric_die_link #(
         .p_valid(rp_valid), .p_data(rp_data), .p_last(rp_last), .done(r_done), .ok(r_ok));
 
     localparam [1:0] R_HDR = 0, R_PAY = 1, R_DROP = 2, R_HOLD = 3;
-    localparam [2:0] X_IDLE = 0, X_LOOK = 1, X_START = 2, X_RUN = 3, X_THDR = 4, X_TPAY = 5, X_TEND = 6;
-    reg [1:0]  rstate;
-    reg [2:0]  xstate;
+    localparam [1:0] X_IDLE = 0, X_THDR = 1, X_TPAY = 2, X_TEND = 3;
+    reg [1:0]  rstate, xstate;
     reg [1:0]  wsub;                            // a word's place in its beat
     reg [AW-1:0] waddr;
-    reg [15:0] quiet;
 
     // A header the die has a program for: a work item of one token or of the
     // chunk, its length exactly the vectors.
     wire        shape_ok = (rh_kind == KIND[7:0]) && (rh_tokens == 8'd1 || rh_tokens == CHUNK[7:0])
                            && (rh_length == 24'(rh_tokens) * 24'(2 * D));
     wire        rh_cls   = (rh_tokens != 8'd1);
-    // It joins the batch being gathered: the engine is idle, there is room,
-    // it is the batch's shape (or the batch is empty), and its slot is not in
-    // the batch already -- a prompt's packets come back to back, and two
-    // tokens of one context cannot run at once on its state.
-    wire        dup      = (lanes > 0 && l_context[0] == rh_context) || (lanes > 1 && l_context[1] == rh_context)
-                        || (lanes > 2 && l_context[2] == rh_context);
-    wire        joins    = (xstate == X_IDLE) && (lanes < LANES) && (lanes == 0 || (rh_cls == cls && !dup));
+    // Written out here rather than as a function of the context: what a
+    // function reads is not in an always block's sensitivity, only what it
+    // is passed, and a stale answer here holds a packet for good.
+    reg         rh_busy, h_busy;
+    integer     bk;
+    always @* begin
+        rh_busy = 1'b0; h_busy = 1'b0;
+        for (bk = 0; bk < LANES; bk = bk + 1)
+            if (l_st[bk] == L_LOAD || l_st[bk] == L_PUSH || l_st[bk] == L_RUN) begin
+                if (l_context[bk] == rh_context) rh_busy = 1'b1;
+                if (l_context[bk] == h_context)  h_busy  = 1'b1;
+            end
+    end
+    wire        takes    = any_free && !rh_busy;
+    wire        h_takes  = any_free && !h_busy;
 
     // The payload is read off the link only into a lane or to be dropped; a
     // header is always taken, and its payload held there until it can be.
     always @* begin
         case (rstate)
-            R_HDR:   rx_ready = !rh_valid || !shape_ok || joins;
+            R_HDR:   rx_ready = !rh_valid || !shape_ok || takes;
             R_PAY:   rx_ready = 1'b1;
             R_DROP:  rx_ready = 1'b1;
             default: rx_ready = 1'b0;
@@ -172,7 +195,7 @@ module fabric_die_link #(
     // Out.
     // ---------------------------------------------------------------------
     reg         t_hdr;
-    reg  [2:0]  tlane;
+    reg  [1:0]  tlane;
     reg  [23:0] tleft;                          // payload words of the lane still to send
     reg  [23:0] tfetch;                         // and its beats still to read
     reg  [AW-1:0] raddr;
@@ -183,9 +206,9 @@ module fabric_die_link #(
     wire        t_hdr_ready, t_p_ready;
     fabric_ring_tx u_tx (
         .clk(clk), .rst_n(rst_n),
-        .hdr_valid(t_hdr), .hdr_ready(t_hdr_ready), .hdr_kind(KIND[7:0]), .hdr_flags(l_flags[tlane[1:0]]),
-        .hdr_context(l_context[tlane[1:0]]), .hdr_position(l_position[tlane[1:0]]), .hdr_tokens(l_tokens[tlane[1:0]]),
-        .hdr_length(24'(l_tokens[tlane[1:0]]) * 24'(2 * D)),
+        .hdr_valid(t_hdr), .hdr_ready(t_hdr_ready), .hdr_kind(KIND[7:0]), .hdr_flags(l_flags[tlane]),
+        .hdr_context(l_context[tlane]), .hdr_position(l_position[tlane]), .hdr_tokens(l_tokens[tlane]),
+        .hdr_length(24'(l_tokens[tlane]) * 24'(2 * D)),
         .p_valid(have), .p_ready(t_p_ready), .p_data(beat[32*tsub +: 32]),
         .l_valid(d_valid), .l_data(d_data), .l_sop(d_sop), .l_ready(d_ready));
 
@@ -195,18 +218,45 @@ module fabric_die_link #(
     wire        refill    = (xstate == X_TPAY) && !rbusy && (tfetch != 0) && (!have || (take_word && tsub == 2'd3));
     assign v_rd_en   = refill;
     assign v_rd_addr = raddr;
-    assign v_sel     = (xstate == X_IDLE) || (xstate == X_THDR) || (xstate == X_TPAY) || (xstate == X_TEND);
+
+    // The lane done longest: the next to leave.
+    reg        any_out;
+    reg [1:0]  out_lane;
+    integer    ok_;
+    always @* begin
+        any_out = 1'b0; out_lane = 0;
+        for (ok_ = 0; ok_ < LANES; ok_ = ok_ + 1)
+            if (l_st[ok_] == L_OUT && (!any_out || l_seq[ok_] < l_seq[out_lane])) begin any_out = 1'b1; out_lane = 2'(ok_); end
+    end
+
+    // ---------------------------------------------------------------------
+    // The pushes: a lane whose packet is in gets its layers, a run a cycle.
+    // Its queue is empty -- it was free -- and holds a token's layers.
+    // ---------------------------------------------------------------------
+    reg        pbusy;
+    reg [1:0]  plane, play;
+    reg        any_push;
+    reg [1:0]  push_lane;
+    integer    pk;
+    always @* begin
+        any_push = 1'b0; push_lane = 0;
+        for (pk = LANES - 1; pk >= 0; pk = pk - 1)
+            if (l_st[pk] == L_PUSH) begin any_push = 1'b1; push_lane = 2'(pk); end
+    end
+    wire [255:0] p_entry = table_mem[{layer_mem[play][0], l_cls[plane]}];
 
     integer k;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            rstate <= R_HDR; xstate <= X_IDLE; lanes <= 0; cls <= 1'b0; wsub <= 0; quiet <= 0;
-            v_wr_en <= 1'b0; e_start <= 1'b0; e_pc <= 0; e_steps <= 0; e_first <= 0; e_slot_page <= 0; e_position <= 0; e_layer <= 0; lay <= 0;
+            rstate <= R_HDR; xstate <= X_IDLE; wsub <= 0; seq <= 0; pbusy <= 1'b0; plane <= 0; play <= 0;
+            v_wr_en <= 1'b0; e_push <= 1'b0; e_lane <= 0; e_pc <= 0; e_steps <= 0; e_layer <= 0; e_page <= 0; e_set <= 0;
+            e_first <= 0; e_slot_page <= 0; e_position <= 0;
             t_hdr <= 1'b0; tlane <= 0; tleft <= 0; tfetch <= 0; rbusy <= 1'b0; have <= 1'b0; tsub <= 0;
             crc_errors <= 0; malformed <= 0;
+            for (k = 0; k < 4; k = k + 1) begin l_st[k] <= L_FREE; l_seq[k] <= 0; l_context[k] <= 0; end
         end else begin
             v_wr_en <= 1'b0;
-            e_start <= 1'b0;
+            e_push <= 1'b0;
 
             // ---- in ----
             case (rstate)
@@ -215,15 +265,20 @@ module fabric_die_link #(
                         malformed <= malformed + 1'b1;
                         rstate <= R_DROP;
                     end else begin
-                        h_flags <= rh_flags; h_context <= rh_context; h_position <= rh_position; h_tokens <= rh_tokens;
+                        h_flags <= rh_flags; h_context <= rh_context; h_position <= rh_position; h_tokens <= rh_tokens; h_cls <= rh_cls;
                         wsub <= 0;
-                        if (joins) begin
-                            if (lanes == 0) cls <= rh_cls;
-                            waddr <= entry_in(lanes, rh_cls);
+                        if (takes) begin
+                            rlane <= free_lane; l_st[free_lane] <= L_LOAD; l_context[free_lane] <= rh_context;
+                            waddr <= table_mem[{layer_mem[0][0], rh_cls}][32 + 24*free_lane +: AW];
                             rstate <= R_PAY;
                         end else
-                            rstate <= R_HOLD;               // its payload waits on the link for the next batch
+                            rstate <= R_HOLD;               // its payload waits on the link for a lane
                     end
+                end
+                R_HOLD: if (h_takes) begin
+                    rlane <= free_lane; l_st[free_lane] <= L_LOAD; l_context[free_lane] <= h_context;
+                    waddr <= table_mem[{layer_mem[0][0], h_cls}][32 + 24*free_lane +: AW];
+                    rstate <= R_PAY;
                 end
                 R_PAY: begin
                     if (rp_valid) begin
@@ -236,60 +291,49 @@ module fabric_die_link #(
                     end
                     if (r_done) begin
                         if (r_ok) begin
-                            l_flags[lanes[1:0]] <= h_flags; l_context[lanes[1:0]] <= h_context;
-                            l_position[lanes[1:0]] <= h_position; l_tokens[lanes[1:0]] <= h_tokens;
-                            lanes <= lanes + 1'b1;
-                        end else
+                            l_flags[rlane] <= h_flags; l_position[rlane] <= h_position; l_tokens[rlane] <= h_tokens; l_cls[rlane] <= h_cls;
+                            l_st[rlane] <= L_PUSH;
+                        end else begin
                             crc_errors <= crc_errors + 1'b1;
+                            l_st[rlane] <= L_FREE;
+                        end
                         rstate <= R_HDR;
                     end
                 end
                 R_DROP: if (r_done) rstate <= R_HDR;
-                R_HOLD: ;                                   // released below, when a batch can take it
                 default: rstate <= R_HDR;
             endcase
 
-            // ---- the batch ----
+            // ---- the pushes ----
+            if (!pbusy) begin
+                if (any_push) begin plane <= push_lane; play <= 0; pbusy <= 1'b1; end
+            end else begin
+                e_push <= 1'b1; e_lane <= plane;
+                e_pc <= p_entry[15:0]; e_steps <= p_entry[31:16]; e_layer <= play; e_page <= layer_mem[play][21:1];
+                e_set <= 4'b0001 << plane;
+                for (k = 0; k < 4; k = k + 1) begin
+                    e_first[k] <= l_flags[plane][1];                                   // FLAG_FIRST
+                    e_slot_page[21*k +: 21] <= 21'(PAGE_BASE) + 21'(l_context[plane]) * 21'(SLOT_PAGES);
+                    e_position[32*k +: 32] <= l_position[plane];
+                end
+                if (play == 2'(LAYERS - 1)) begin l_st[plane] <= L_RUN; pbusy <= 1'b0; end
+                else play <= play + 1'b1;
+            end
+
+            // ---- done ----
+            for (k = 0; k < LANES; k = k + 1)
+                if (e_done[k] && l_st[k] == L_RUN) begin l_st[k] <= L_OUT; l_seq[k] <= seq; end
+            if (|e_done) seq <= seq + 1'b1;
+
+            // ---- out ----
             case (xstate)
-                X_IDLE: begin
-                    quiet <= (rstate == R_HDR && !rh_valid && !u_valid) ? quiet + 1'b1 : 16'd0;
-                    if (rstate == R_HOLD && lanes == 0) begin
-                        // The held packet starts the next batch.
-                        cls <= (h_tokens != 8'd1);
-                        waddr <= entry_in(3'd0, h_tokens != 8'd1);
-                        rstate <= R_PAY;
-                    end else if (lanes != 0 && ((rstate == R_HOLD) ||
-                                                (rstate == R_HDR && !rh_valid && (lanes == LANES || quiet >= GATHER_WAIT)))) begin
-                        lay <= 0;
-                        entry <= table_mem[{layer_mem[0][0], cls, 2'(lanes - 1)}];
-                        xstate <= X_LOOK;
-                    end
-                end
-                X_LOOK: begin
-                    e_pc <= entry[15:0]; e_steps <= entry[31:16]; e_layer <= lay;
-                    for (k = 0; k < 4; k = k + 1) begin
-                        e_first[k] <= (k < lanes) && l_flags[k][1];                // FLAG_FIRST
-                        e_position[32*k +: 32] <= (k < lanes) ? l_position[k] : 32'd0;
-                        e_slot_page[21*k +: 21] <= 21'(PAGE_BASE) + layer_mem[lay][21:1]
-                                                   + ((k < lanes) ? 21'(l_context[k]) * 21'(SLOT_PAGES) : 21'd0);
-                    end
-                    xstate <= X_START;
-                end
-                X_START: begin e_start <= 1'b1; xstate <= X_RUN; end
-                X_RUN: if (e_done) begin
-                    if (lay == 2'(LAYERS - 1)) begin tlane <= 0; t_hdr <= 1'b1; xstate <= X_THDR; end
-                    else begin                          // the next layer, on the same lanes: its output is in place of its input
-                        lay <= lay + 1'b1;
-                        entry <= table_mem[{layer_mem[lay + 1'b1][0], cls, 2'(lanes - 1)}];
-                        xstate <= X_LOOK;
-                    end
-                end
+                X_IDLE: if (any_out) begin tlane <= out_lane; t_hdr <= 1'b1; xstate <= X_THDR; end
                 X_THDR: if (t_hdr_ready) begin
                     // The tx takes the header this cycle; the lane's words follow.
                     t_hdr <= 1'b0;
-                    tleft <= 24'(l_tokens[tlane[1:0]]) * 24'(TW);
-                    tfetch <= 24'(l_tokens[tlane[1:0]]) * 24'(TB);
-                    raddr <= entry[128 + 24*tlane +: 24];
+                    tleft <= 24'(l_tokens[tlane]) * 24'(TW);
+                    tfetch <= 24'(l_tokens[tlane]) * 24'(TB);
+                    raddr <= table_mem[{layer_mem[LAYERS - 1][0], l_cls[tlane]}][128 + 24*tlane +: AW];
                     have <= 1'b0; rbusy <= 1'b0; tsub <= 0;
                     xstate <= X_TPAY;
                 end
@@ -304,28 +348,15 @@ module fabric_die_link #(
                     if (tleft == 1 && take_word) xstate <= X_TEND;
                 end
                 X_TEND: if (t_hdr_ready) begin                // the tx has sent the CRC
-                    if (tlane + 1 == lanes) begin
-                        lanes <= 0; xstate <= X_IDLE;
-                    end else begin
-                        tlane <= tlane + 1'b1; t_hdr <= 1'b1; xstate <= X_THDR;
-                    end
+                    l_st[tlane] <= L_FREE; xstate <= X_IDLE;
                 end
                 default: xstate <= X_IDLE;
             endcase
         end
     end
-
-    // Lane k's input for a batch of the given shape.  The table's entries of
-    // one shape agree on a lane's input whatever the batch's size, since a
-    // lane is written before the batch's size is known: fabric/engine.py
-    // lays the programs out so.
-    function automatic [AW-1:0] entry_in(input [2:0] k, input c);
-        reg [255:0] e;
-        begin
-            e = table_mem[{1'b0, c, 2'(LANES - 1)}];
-            entry_in = e[32 + 24*k +: AW];
-        end
-    endfunction
+`ifndef FABRIC_SYNTH
+    initial if (LAYERS > 4) $display("FAIL: a lane's queue holds four runs; LAYERS is %0d", LAYERS);
+`endif
 endmodule
 
 `default_nettype wire

@@ -1,9 +1,10 @@
-// Self-checking testbench for fabric_sequencer: the controller runs a
-// program written by fabric.sequencer.emit_program over stub units, each
-// with a number of engines that are busy for the commanded length.  The
-// stubs write a trace (tag, unit, engine, issue cycle, done cycle) that
-// the Python test checks against the program's dependencies, and the
-// cycle count must equal the Python schedule's.
+// Self-checking testbench for fabric_sequencer: the controller runs the
+// lanes' programs written by fabric.sequencer.emit_lanes over stub units,
+// each with a number of engines that are busy for the commanded length.  The
+// runs are pushed lane by lane, one a cycle.  The stubs write a trace (tag,
+// unit, engine, issue cycle, done cycle) that the Python test checks
+// against the model's schedule command by command, and the cycle count must
+// equal the model's.
 
 `timescale 1ns/1ps
 `default_nettype none
@@ -20,14 +21,15 @@ module fabric_unit_stub #(
     input  wire [15:0]   cmd_len,
     input  wire [31:0]   cmd_arg,
     input  wire [7:0]    cmd_tag,
-    output wire          cmd_ready,
+    output wire [NE-1:0] port_ready,
     output reg  [NE-1:0] done_valid,
     output reg  [NE*8-1:0] done_tag
 );
     reg [31:0] remaining [0:NE-1];
     reg [7:0]  tag_r     [0:NE-1];
     reg [NE-1:0] busy;
-    assign cmd_ready = (cmd_engine < E) && !busy[cmd_engine];
+    genvar ge;
+    generate for (ge = 0; ge < NE; ge = ge + 1) begin : g_r assign port_ready[ge] = (ge < E) && !busy[ge]; end endgenerate
     integer e;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -46,7 +48,8 @@ module fabric_unit_stub #(
                     end else remaining[e] <= remaining[e] - 1'b1;
                 end
             end
-            if (cmd_valid && cmd_ready) begin
+            if (cmd_valid) begin                       // only on issue, to a free engine
+                if (!port_ready[cmd_engine]) $display("FAIL: unit %0d engine %0d given a command while busy", UID, cmd_engine);
                 // arg is the command's whole span, issue to completion, as a real
                 // adapter's is; the first of those cycles is this one.  It is not
                 // the length, which is sixteen bits and holds a real command's beats.
@@ -58,8 +61,9 @@ module fabric_unit_stub #(
 endmodule
 
 module tb_sequencer #(
-    parameter int N = 4,
-    parameter int PC0 = 0,                             // the program's first step in the store
+    parameter int N = 4,                               // steps, every lane's
+    parameter int RUNS = 1,                            // runs to push (runs.hex)
+    parameter int LANES_USED = 1,
     parameter int EXPECTED_CYCLES = 0,
     parameter int E0 = 1, E1 = 2, E2 = 1, E3 = 1, E4 = 4, E5 = 1, E6 = 1, E7 = 2, E8 = 4, E9 = 1
 );
@@ -68,11 +72,17 @@ module tb_sequencer #(
     always #0.625 clk = ~clk;
     integer cycle = 0, trace;
     always @(posedge clk) cycle <= cycle + 1;
-    integer issued_at [0:255];                            // by tag (the step index modulo 256)
+    integer issued_at [0:255];                            // by tag (the issue count modulo 256)
 
-    reg                start = 0;
-    wire               running, done;
-    wire [NU-1:0]      cmd_valid, cmd_ready;
+    reg                push = 0;
+    reg  [1:0]         push_lane = 0;
+    reg  [15:0]        push_pc = 0, push_steps = 0;
+    wire [3:0]         room, lane_busy, lane_done;
+    wire               running;
+    wire [NU-1:0]      cmd_valid;
+    wire [NU*NE-1:0]   port_ready;
+    wire [1:0]         cmd_lane, cmd_layer;
+    wire [20:0]        cmd_page;
     wire [3:0]         cmd_engine;
     wire [15:0]        cmd_len;
     wire [29:0]        cmd_src, cmd_dst, cmd_a2, cmd_a3;
@@ -81,9 +91,11 @@ module tb_sequencer #(
     wire [NU*NE-1:0]   done_valid;
     wire [NU*NE*8-1:0] done_tag;
     fabric_sequencer #(.NU(NU), .NE(NE), .PROG_FILE("program.hex")) dut (
-        .clk(clk), .rst_n(rst_n), .start(start), .pc_start(PC0[15:0]), .n_steps(N[15:0]), .running(running), .done(done),
+        .clk(clk), .rst_n(rst_n), .push(push), .push_lane(push_lane), .push_pc(push_pc), .push_steps(push_steps),
+        .push_layer(2'd0), .push_page(21'd0), .push_room(room), .lane_busy(lane_busy), .lane_done(lane_done), .running(running),
         .cmd_valid(cmd_valid), .cmd_engine(cmd_engine), .cmd_len(cmd_len), .cmd_src(cmd_src), .cmd_dst(cmd_dst),
-        .cmd_a2(cmd_a2), .cmd_a3(cmd_a3), .cmd_arg(cmd_arg), .cmd_tag(cmd_tag), .cmd_ready(cmd_ready), .done_valid(done_valid), .done_tag(done_tag));
+        .cmd_a2(cmd_a2), .cmd_a3(cmd_a3), .cmd_arg(cmd_arg), .cmd_tag(cmd_tag), .cmd_lane(cmd_lane), .cmd_layer(cmd_layer),
+        .cmd_page(cmd_page), .port_ready(port_ready), .done_valid(done_valid), .done_tag(done_tag));
 
     function automatic integer engines(input integer unit);
         case (unit)
@@ -96,13 +108,15 @@ module tb_sequencer #(
         for (u = 0; u < NU; u = u + 1) begin : g_unit
             fabric_unit_stub #(.UID(u), .E(engines(u)), .NE(NE)) stub (
                 .clk(clk), .rst_n(rst_n), .cmd_valid(cmd_valid[u]), .cmd_engine(cmd_engine), .cmd_len(cmd_len), .cmd_arg(cmd_arg),
-                .cmd_tag(cmd_tag), .cmd_ready(cmd_ready[u]), .done_valid(done_valid[u*NE +: NE]), .done_tag(done_tag[u*NE*8 +: NE*8]));
+                .cmd_tag(cmd_tag), .port_ready(port_ready[u*NE +: NE]), .done_valid(done_valid[u*NE +: NE]), .done_tag(done_tag[u*NE*8 +: NE*8]));
         end
     endgenerate
 
     // Record issues by tag, and the cycle of the last completion.
-    integer issues = 0, t0, guard, last_done = 0;
-    always @(posedge clk) if (|(cmd_valid & cmd_ready)) begin
+    integer issues = 0, t0, guard, last_done = 0, r, finished = 0, fl;
+    reg [63:0] runs [0:RUNS-1];
+    always @(posedge clk) for (fl = 0; fl < 4; fl = fl + 1) if (lane_done[fl]) finished = finished + 1;
+    always @(posedge clk) if (|cmd_valid) begin
         if (issues == 0) t0 = cycle;                       // cycle 0 of the schedule is the first issue
         issued_at[cmd_tag] = cycle; issues = issues + 1;
     end
@@ -112,11 +126,17 @@ module tb_sequencer #(
         repeat (2) @(posedge clk);
         rst_n = 1;
         @(posedge clk); #0.1;
-        start = 1; @(posedge clk); #0.1; start = 0;
+        $readmemh("runs.hex", runs);
+        for (r = 0; r < RUNS; r = r + 1) begin
+            push = 1; push_lane = runs[r][33:32]; push_pc = runs[r][31:16]; push_steps = runs[r][15:0];
+            @(posedge clk); #0.1;
+        end
+        push = 0;
         guard = 0;
-        while (!done && guard < 4000000) begin @(posedge clk); guard = guard + 1; end
+        while ((running || finished != LANES_USED) && guard < 4000000) begin @(posedge clk); guard = guard + 1; end
         $fclose(trace);
-        if (!done) $display("FAIL: never finished, %0d of %0d issued", issues, N);
+        if (running) $display("FAIL: never finished, %0d of %0d issued", issues, N);
+        else if (finished != LANES_USED) $display("FAIL: %0d lanes reported done of %0d", finished, LANES_USED);
         else if (issues != N) $display("FAIL: %0d issued of %0d", issues, N);
         else if (last_done - t0 != EXPECTED_CYCLES) $display("FAIL: last completion at %0d cycles, expected %0d", last_done - t0, EXPECTED_CYCLES);
         else $display("PASS: %0d steps, last completion at %0d cycles, done %0d cycles later", N, last_done - t0, cycle - last_done);

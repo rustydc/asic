@@ -147,6 +147,73 @@ class ScheduleTest(unittest.TestCase):
                     del held[name]
 
 
+def lane_problems(sched: S.LaneSchedule, releases: int = S.RELEASES) -> list[str]:
+    """The lane controller's rules, read off a schedule: one issue a cycle,
+    each lane in its own order after its dependencies' releases, an engine
+    port given a command only once its last one drained, and at most
+    ``releases`` drains a cycle."""
+    problems, seen, busy_until, drains = [], set(), {}, {}
+    for l, k in sched.order:
+        s = sched.lanes[l]
+        c = s.issue[k]
+        if c in seen:
+            problems.append(f"two issues at {c}")
+        seen.add(c)
+        if k and s.issue[k - 1] >= c:
+            problems.append(f"lane {l} step {k} before its predecessor")
+        for d in s.steps[k].deps:
+            if s.release[d] + 2 > c:
+                problems.append(f"lane {l} step {k} at {c}, its dependency {d} released at {s.release[d]}")
+        port = S.UNITS[s.steps[k].unit][0] * S.NE + s.steps[k].engine
+        if busy_until.get(port, -1) >= c:
+            problems.append(f"lane {l} step {k} on a port busy until {busy_until[port]}")
+        busy_until[port] = s.release[k]
+        drains[s.release[k]] = drains.get(s.release[k], 0) + 1
+        if s.release[k] <= s.end[k]:
+            problems.append(f"lane {l} step {k} released before it ended")
+    problems += [f"{n} drains at {c}" for c, n in drains.items() if n > releases]
+    return problems
+
+
+class LaneScheduleTest(unittest.TestCase):
+    """The lanes: each an in-order program, the oldest ready one issuing."""
+
+    def test_one_lane_is_the_in_order_controller(self) -> None:
+        from fixed_llm_poc import ASICLMConfig, tiny_config
+        for cfg in (tiny_config(), ASICLMConfig.qwen3_5_9b()):
+            mm = MemoryMap.from_config(cfg)
+            for t in (S.Timing(), S.Timing(devices=16, memory_mode="pipelined", pushout=0)):
+                for prog in (S.recurrent_program(cfg, None, TileSpec(), mm, t), S.global_program(cfg, None, TileSpec(), mm, 100, t),
+                             S.stream(S.recurrent_program(cfg, None, TileSpec(), mm, t), 2)):
+                    a, b = S.schedule(prog), S.schedule_lanes([prog]).lanes[0]
+                    self.assertEqual((a.issue, a.end, a.release), (b.issue, b.end, b.release))
+
+    def test_lanes_keep_the_rules_and_beat_batches(self) -> None:
+        # Four lanes at the 9B geometry on sixteen PSRAMs, each taking a new
+        # context's token a link's turnaround after its last: every rule
+        # holds, the lanes take turns being oldest so each gets its share, and
+        # the die does more than in batches of four.
+        from fixed_llm_poc import ASICLMConfig
+        cfg = ASICLMConfig.qwen3_5_9b()
+        mm = MemoryMap.from_config(cfg)
+        t = S.Timing(devices=16, memory_mode="pipelined", pushout=0)
+        rec = S.recurrent_program(cfg, None, TileSpec(), mm, t, slots=S.LANE_SLOTS)
+        glo = S.global_program(cfg, None, TileSpec(), mm, mm.context_tokens - 1, t)
+        per, T = 3 * len(rec) + len(glo), 5
+        one = S.schedule(S.lane_program([rec, rec, rec, glo], 0)).cycles
+        sched = S.schedule_lanes([S.lane_program([rec, rec, rec, glo] * T, l) for l in range(S.LANES)],
+                                 [l * one // S.LANES for l in range(S.LANES)], jobs=[[k * per for k in range(1, T)]] * S.LANES, gap=4096)
+        self.assertEqual(lane_problems(sched), [])
+        done = [[max(sched.lanes[l].release[k * per:(k + 1) * per]) for k in range(T)] for l in range(S.LANES)]
+        lo, hi = max(d[0] for d in done), min(d[-1] for d in done)
+        rate = sum(1 for d in done for x in d if lo < x <= hi) / (hi - lo)
+        r4, g4 = S.stream(S.recurrent_program(cfg, None, TileSpec(), mm, t), 4), S.stream(glo, 4)
+        batch = 4 / (3 * S.schedule(r4).cycles + S.schedule(g4).cycles)
+        self.assertGreater(rate, 1.1 * batch)
+        lat = [d[k] - d[k - 1] for d in done for k in range(1, T)]
+        self.assertLess(max(lat), 1.25 * min(lat))
+
+
 class ProgramTest(unittest.TestCase):
     """The programs reproduce the integer layers bit for bit on the tiny geometry."""
 
@@ -239,6 +306,17 @@ class ProgramTest(unittest.TestCase):
         ri = L.recurrent_layer_int(c, cfg, spec, xi, s16, np.zeros_like(hist_i))
         env = S.run_program(prog16, {"x": xi, "s_mem": s16.copy(), "hist_mem": np.zeros_like(hist_i)})
         np.testing.assert_array_equal(env["x2"], ri["x2"])
+        # A lane's program has two state slots of its own and reads one head
+        # ahead: the same layer, and every head's slot is written back before
+        # the head two on reads into it.
+        lane = S.recurrent_program(cfg, c, spec, self.mm, slots=S.LANE_SLOTS)
+        self.assertEqual({n for s in lane for n in s.src + s.dst if n.startswith(S.SHARED_PREFIX)},
+                         {f"{S.SHARED_PREFIX}[{k}]" for k in range(S.LANE_SLOTS)})
+        s0, sc0, h0 = np.zeros((nv, hk, hv), dtype=np.int64), np.tile([L.ONE_U, 0, 0, 0], (nv, 1)).astype(np.int64), np.zeros_like(hist_i)
+        ri = L.recurrent_layer_int(c, cfg, spec, xi, s0, h0, scale=sc0)
+        env = S.run_program(S.lane_program([lane], 2), {"x@2": xi, "s_mem@2": s0.copy(), "scale_mem@2": sc0.copy(), "hist_mem@2": h0.copy()})
+        np.testing.assert_array_equal(env["x2@2"], ri["x2"])
+        np.testing.assert_array_equal(env["s_mem@2"], ri["s_next"])
 
     def test_global_program(self) -> None:
         cfg, spec = self.cfg, self.spec
@@ -287,18 +365,40 @@ class SequencerRtlTest(unittest.TestCase):
     """The controller runs each program over stub units in exactly the cycles
     the model predicts, and the trace respects every dependency and engine."""
 
-    def run_program(self, steps: list[S.Step], before: list[S.Step] = ()) -> None:
+    def run_lanes(self, lanes: list[list[list[S.Step]]], before: list[S.Step] = ()) -> str:
         with tempfile.TemporaryDirectory() as directory:
             work = Path(directory)
-            params = S.emit_program(work, steps, before)
+            params = S.emit_lanes(work, lanes, before)
             args = [f"-Ptb_sequencer.{name}={value}" for name, value in params.items()]
             subprocess.run(["iverilog", "-g2012", "-I", str(RTL), "-s", "tb_sequencer", "-o", "sim.vvp", *args,
                             str(RTL / "fabric_sram.sv"), str(RTL / "fabric_sequencer.sv"), str(RTL / "tb_sequencer.sv")],
                            cwd=work, check=True, capture_output=True, text=True)
             out = subprocess.run(["vvp", "sim.vvp"], cwd=work, check=True, capture_output=True, text=True).stdout
             trace = (work / "trace.txt").read_text()
-        self.assertIn("PASS", out, out)
+            self.assertNotIn("FAIL", out, out)
+            self.assertIn("PASS", out, out)
+            self.assertEqual(S.lane_trace_problems(work, trace), [])
+        return trace
+
+    def run_program(self, steps: list[S.Step], before: list[S.Step] = ()) -> None:
+        trace = self.run_lanes([[steps]], before)
         self.assertEqual(S.check_trace(steps, trace), [])
+
+    def test_lanes(self) -> None:
+        # Two lanes of the tiny layers, a token's four layers each, and four
+        # lanes of the 9B layers on their own slots: every command issues and
+        # completes in the model's cycle, the oldest ready lane first.
+        from fixed_llm_poc import ASICLMConfig, tiny_config
+        cfg = tiny_config()
+        mm = MemoryMap.from_config(cfg)
+        rec = S.recurrent_program(cfg, None, TileSpec(), mm, slots=S.LANE_SLOTS)
+        glo = S.global_program(cfg, None, TileSpec(), mm, 5)
+        self.run_lanes([[S.retarget(p, l) for p in (rec, rec, rec, glo)] for l in range(2)])
+        cfg = ASICLMConfig.qwen3_5_9b()
+        mm = MemoryMap.from_config(cfg)
+        rec = S.recurrent_program(cfg, None, TileSpec(), mm, slots=S.LANE_SLOTS)
+        glo = S.global_program(cfg, None, TileSpec(), mm, mm.context_tokens - 1)
+        self.run_lanes([[S.retarget(p, l) for p in ((rec, glo) if l % 2 else (glo, rec))] for l in range(S.LANES)])
 
     def test_tiny_layers(self) -> None:
         from fixed_llm_poc import tiny_config
