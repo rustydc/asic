@@ -174,6 +174,15 @@ UNITS = [
           "RMAP0": 5305655462704809316, "RMAP1": 2259224409,
           "WMAP0": 5143726797662605616, "WMAP1": 5},
          "the vector buffer's crossbar, 26 reads and 19 writes folded onto 11 and 8 over eight banks (the banks are macros)", noshare=True),
+    # The crossbar as the lanes elaborate it at 9B (``engine.Layout`` over four
+    # lanes of the die's four layers): every logical port its own, since any
+    # step of one lane may run beside any of another's, over forty banks,
+    # the memory unit's ports 32 bytes wide.
+    Unit("vector_buffer_lanes", "fabric_vb", VEC + ("fabric_engine.sv",),
+         {"BYTES": 10485760, "NR": 25, "NW": 20, "AW": 25, "NB": 40, "BSH": 18,
+          "RCAP2": 31168951325, "RCAP3": 1074791425, "WCAP2": 533096546800,
+          "FOLD": 0, "NPR": 25, "NPW": 20, "WIDE_R": 17, "WIDE_W": 12},
+         "the lanes' crossbar at 9B, 25 reads and 20 writes unfolded over forty banks (the banks are macros)", noshare=True),
     # Four lanes, each with its own store and 128 buffer ids (a lane's
     # programs use 85 at the 9B geometry).  The store is a macro, so its
     # depth costs the logic nothing.  The lane is mapped once: flat, the

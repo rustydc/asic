@@ -1593,6 +1593,39 @@ def schedule_lanes(lanes: list[list[Step]], start: list[int] | None = None, rele
     return LaneSchedule(scheds, order)
 
 
+LINK_GAP = 4096              # cycles from a lane's token done to the link's next packet into it
+
+
+@dataclasses.dataclass
+class LaneRate:
+    tokens_per_s: float      # the die's, every lane busy
+    lane_cycles: float       # a lane's token, done to done: what one context waits a die
+    mhz: float
+
+
+def lane_rate(rec: list[Step], glob: list[Step], lanes: int = LANES, timing: Timing | None = None,
+              tokens: int = 6, per_job: int = 1, gap: int = LINK_GAP) -> LaneRate:
+    """The die's rate with ``lanes`` lanes each taking a context's token (or,
+    ``per_job`` tokens at a time, a chunk of its prompt) a link gap after
+    its last: three recurrent layers and the global one a token.  The lanes
+    start staggered across one token and run ``tokens`` each; the rate is
+    counted over the window where every lane is past its first token and
+    none has finished its last, so neither the ramp nor the drain is in it.
+    ``timing`` only sets the clock the cycles are divided by: the programs
+    carry their own, so build them with the same one."""
+    mhz = (timing or Timing()).core_mhz
+    per = 3 * len(rec) + len(glob)
+    one = schedule(lane_program([rec, rec, rec, glob], 0)).cycles
+    start = [l * one // lanes for l in range(lanes)]
+    sch = schedule_lanes([lane_program([rec, rec, rec, glob] * tokens, l) for l in range(lanes)], start,
+                         jobs=[[k * per for k in range(1, tokens)]] * lanes, gap=gap)
+    done = [[max(sch.lanes[l].release[k * per:(k + 1) * per]) for k in range(tokens)] for l in range(lanes)]
+    lo, hi = max(d[0] for d in done), min(d[-1] for d in done)
+    n = sum(1 for d in done for x in d if lo < x <= hi)
+    lat = sum(d[k] - d[k - 1] for d in done for k in range(1, tokens)) / (lanes * (tokens - 1))
+    return LaneRate(mhz * 1e6 * n * per_job / (hi - lo), lat, mhz)
+
+
 # --------------------------------------------------------------------------
 # The program image for the controller
 # --------------------------------------------------------------------------
