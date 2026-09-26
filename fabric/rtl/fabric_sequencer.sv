@@ -76,8 +76,8 @@ module fabric_sequencer #(
     input  wire [1:0]           push_layer,
     input  wire [20:0]          push_page,
     output wire [LN-1:0]        push_room,
-    output reg  [LN-1:0]        lane_busy,      // given runs it has not reported done
-    output reg  [LN-1:0]        lane_done,      // a cycle: everything the lane was given has drained
+    output wire [LN-1:0]        lane_busy,      // given runs it has not reported done
+    output wire [LN-1:0]        lane_done,      // a cycle: everything the lane was given has drained
     output wire                 running,
     // the command bus: one unit addressed per cycle, valid only on issue
     output wire [NU-1:0]        cmd_valid,
@@ -104,19 +104,27 @@ module fabric_sequencer #(
     // ---------------------------------------------------------------------
     // The lanes' heads.
     // ---------------------------------------------------------------------
-    wire [LN-1:0]  head_v, lane_idle, win;
+    // A lane is a block of its own, the same four times, and synthesis maps it
+    // once: its store, its runs, its fetch, its counters and its check of the
+    // head step against them, and its count of commands outstanding.  What
+    // the lanes share is here: the ports' records and the drain, the tags,
+    // and the pick of the oldest lane that can go.
+    wire [LN-1:0]  head_v, deps_ok, win;
     wire [255:0]   head       [0:LN-1];
     wire [1:0]     head_layer [0:LN-1];
     wire [20:0]    head_page  [0:LN-1];
+    wire [LN*NREL-1:0] mine;                        // this cycle's drain picks, by lane
+    reg  [NREL*NC*8-1:0] d_c, d_p;
     genvar gl;
     generate
         for (gl = 0; gl < LN; gl = gl + 1) begin : g_lane
-            fabric_seq_lane #(.LANE(gl), .DEPTH(DEPTH), .RQ(RQ), .PROG_FILE(PROG_FILE)) u (
+            fabric_seq_lane #(.LANE(gl), .DEPTH(DEPTH), .RQ(RQ), .NID(NID), .CW(CW), .NREL(NREL), .PROG_FILE(PROG_FILE)) u (
                 .clk(clk), .rst_n(rst_n),
                 .push(push && push_lane == gl), .push_pc(push_pc), .push_steps(push_steps), .push_layer(push_layer),
                 .push_page(push_page), .room(push_room[gl]),
                 .issue(win[gl]), .head_v(head_v[gl]), .head(head[gl]), .head_layer(head_layer[gl]), .head_page(head_page[gl]),
-                .idle(lane_idle[gl]));
+                .mine(mine[gl*NREL +: NREL]), .d_c(d_c), .d_p(d_p), .deps_ok(deps_ok[gl]),
+                .busy(lane_busy[gl]), .done(lane_done[gl]));
         end
     endgenerate
     assign running = |lane_busy;
@@ -209,25 +217,16 @@ module fabric_sequencer #(
     // issue check read the counters plainly instead of forwarding this
     // cycle's drains into them.
     reg [NREL-1:0]      d_en;
-    reg [NREL*NC*8-1:0] d_c, d_p;
     reg [NREL*8-1:0]    d_tag;
-    reg [NREL*2-1:0]    d_lane;
     reg [NPORT-1:0]     d_now;
-    // `d_en` gates every one of the counter updates, and registering it is
-    // exactly what the mapper cannot buffer: one flop at 495 loads and 739
-    // fF, 1,857 of this module's 2,833 ps spent before any logic runs.  It is
-    // the shape `fetched_v` had and the fix is the same -- a copy per slice
-    // of the counters, each taking the same combinational pick, so every copy
-    // and `d_en` are one register.
-    localparam int NDC = 16;                       // copies, one per slice of a lane's counters
-    localparam int IPC = NID / NDC;                // ids to a slice
-    wire [NDC*NREL-1:0] d_en_c;
-    genvar gdc, gdx;
+    // Which lane each pick returns to: the lane takes its own, registers them
+    // for its counters (a copy per slice of them, see fabric_seq_lane) and
+    // moves its counters by d_c and d_p the cycle after.
+    genvar gml, gmx;
     generate
-        for (gdc = 0; gdc < NDC; gdc = gdc + 1) begin : g_dec
-            for (gdx = 0; gdx < NREL; gdx = gdx + 1) begin : g_dex
-                fabric_seq_copy u_d (.clk(clk), .rst_n(rst_n), .d(rel_en[gdx]),
-                                     .q(d_en_c[gdc*NREL + gdx]));
+        for (gml = 0; gml < LN; gml = gml + 1) begin : g_mine
+            for (gmx = 0; gmx < NREL; gmx = gmx + 1) begin : g_mx
+                assign mine[gml*NREL + gmx] = rel_en[gmx] && rel_lane[gmx*2 +: 2] == 2'(gml);
             end
         end
     endgenerate
@@ -248,30 +247,14 @@ module fabric_sequencer #(
     // ---------------------------------------------------------------------
     // The issue: each lane's check against its own counters, then the oldest.
     // ---------------------------------------------------------------------
-    // Outstanding writers and readers per buffer, a set a lane.  The drains
-    // are registered, so the counters already hold every release that has
-    // landed and the check is a read.
-    reg [CW-1:0] wr_cnt [0:LN*NID-1];
-    reg [CW-1:0] rd_cnt [0:LN*NID-1];
     // older[m][l]: lane m's token came before lane l's.
     reg [LN-1:0] older [0:LN-1];
-    reg [LN-1:0] deps_ok, cand;
+    reg [LN-1:0] cand;
     reg [PW-1:0] port_of [0:LN-1];
-    integer l, k, m, p, id, x, w;
-    reg [7:0] cid, pid;
+    integer l, m, p, x;
     always @* begin
         for (l = 0; l < LN; l = l + 1) begin
             port_of[l] = head[l][3:0] * NE + head[l][7:4];
-            deps_ok[l] = 1'b1;
-            for (k = 0; k < NC; k = k + 1) begin
-                cid = head[l][IDB + 8*k +: 8];
-                if (cid != 8'hFF && wr_cnt[l*NID + cid] != 0) deps_ok[l] = 1'b0;
-            end
-            for (k = 0; k < NP; k = k + 1) begin
-                pid = head[l][IDB + 8*NC + 8*k +: 8];
-                if (pid != 8'hFF && (rd_cnt[l*NID + pid] != 0
-                                     || (!head[l][IDB + 8*(NC+NP) + k] && wr_cnt[l*NID + pid] != 0))) deps_ok[l] = 1'b0;
-            end
             cand[l] = head_v[l] && deps_ok[l] && !blocked[port_of[l]] && port_ready[port_of[l]] && !tab_live[icount[7:0]];
         end
     end
@@ -309,77 +292,21 @@ module fabric_sequencer #(
     assign cmd_layer  = head_layer[sel];
     assign cmd_page   = head_page[sel];
 
-    // Commands issued and not yet returned, a count a lane.  Counted against
-    // the drains, which are at most NREL a cycle, and not against the
-    // completions, which are up to NPORT: a population count of the forty
-    // done ports is forty chained increments.  A command that has completed
-    // and not drained is still outstanding, so reaching zero is every step
-    // the lane issued having returned its buffers.
-    reg  [9:0]  outstanding [0:LN-1];
-    reg  [9:0]  out_next    [0:LN-1];
-    always @* begin
-        for (l = 0; l < LN; l = l + 1) begin
-            out_next[l] = outstanding[l] + {9'd0, win[l]};
-            for (x = 0; x < NREL; x = x + 1)
-                if (d_en[x] && d_lane[x*2 +: 2] == 2'(l)) out_next[l] = out_next[l] - 1'b1;
-        end
-    end
-
-    reg signed [CW:0] dr, dw;                            // a counter's move this cycle
-    reg touch;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            lane_busy <= 0; lane_done <= 0; icount <= 0; tab_live <= 0; pend <= 0; busy <= 0;
-            d_en <= 0; d_now <= 0; d_lane <= 0;
-            for (l = 0; l < LN; l = l + 1) begin
-                outstanding[l] <= 0;
+            icount <= 0; tab_live <= 0; pend <= 0; busy <= 0;
+            d_en <= 0; d_now <= 0;
+            for (l = 0; l < LN; l = l + 1)
                 for (m = 0; m < LN; m = m + 1) older[l][m] <= (l < m);
-            end
-            for (id = 0; id < LN*NID; id = id + 1) begin wr_cnt[id] = 0; rd_cnt[id] = 0; end
         end else begin
-            lane_done <= 0;
             // The drains: NREL completions return their buffers; the rest wait.
             pend <= held;
             // This cycle's pick, for the next one to apply.
-            d_en <= rel_en; d_c <= rel_c; d_p <= rel_p; d_tag <= rel_tag; d_lane <= rel_lane; d_now <= rel_now;
+            d_en <= rel_en; d_c <= rel_c; d_p <= rel_p; d_tag <= rel_tag; d_now <= rel_now;
             for (p = 0; p < NPORT; p = p + 1)
                 if (d_now[p]) busy[p] <= 1'b0;
             for (x = 0; x < NREL; x = x + 1)
                 if (d_en[x]) tab_live[d_tag[x*8 +: 8]] <= 1'b0;
-            // Every counter moves by what this cycle did to it, once: the ids
-            // in play are at most NREL*(NC+NP) returning and NC+NP taken, so
-            // a counter's delta is a couple of dozen compares against them,
-            // all of them in parallel.  A lane neither issuing nor draining
-            // this cycle has nothing to move.
-            for (l = 0; l < LN; l = l + 1) begin
-                touch = win[l];
-                for (x = 0; x < NREL; x = x + 1) if (d_en[x] && d_lane[x*2 +: 2] == 2'(l)) touch = 1'b1;
-                if (touch)
-                    for (id = 0; id < NID; id = id + 1) begin
-                        dr = 0;
-                        dw = 0;
-                        for (x = 0; x < NREL; x = x + 1)
-                            if (d_en_c[(id / IPC) * NREL + x] && d_lane[x*2 +: 2] == 2'(l)) begin
-                                for (k = 0; k < NC; k = k + 1)
-                                    if (d_c[x*NC*8 + k*8 +: 8] == id[7:0]) dr = dr - 1;
-                                for (k = 0; k < NP; k = k + 1)
-                                    if (d_p[x*NC*8 + k*8 +: 8] == id[7:0]) dw = dw - 1;
-                            end
-                        if (win[l]) begin
-                            for (k = 0; k < NC; k = k + 1)
-                                if (head[l][IDB + 8*k +: 8] == id[7:0]) dr = dr + 1;
-                            for (k = 0; k < NP; k = k + 1)
-                                if (head[l][IDB + 8*NC + 8*k +: 8] == id[7:0]) dw = dw + 1;
-                        end
-                        if (dr != 0) rd_cnt[l*NID + id] = rd_cnt[l*NID + id] + dr[CW-1:0];
-                        if (dw != 0) wr_cnt[l*NID + id] = wr_cnt[l*NID + id] + dw[CW-1:0];
-                    end
-                outstanding[l] <= out_next[l];
-                // Done: everything given fetched and issued, and returned.
-                if (lane_busy[l] && lane_idle[l] && out_next[l] == 10'd0) begin
-                    lane_busy[l] <= 1'b0; lane_done[l] <= 1'b1;
-                end
-            end
             if (issue) begin
                 busy[cur_port] <= 1'b1;                  // after the drains: a port reissued in its drain cycle stays busy
                 slot_c[cur_port] <= cur[IDB +: NC*8];
@@ -391,7 +318,6 @@ module fabric_sequencer #(
             end
             // A run for an idle lane starts its token: the lane is the youngest.
             if (push) begin
-                lane_busy[push_lane] <= 1'b1;
                 if (!lane_busy[push_lane])
                     for (m = 0; m < LN; m = m + 1)
                         if (m != push_lane) begin older[m][push_lane] <= 1'b1; older[push_lane][m] <= 1'b0; end
@@ -431,6 +357,9 @@ module fabric_seq_lane #(
     parameter int LANE  = 0,
     parameter int DEPTH = 4096,
     parameter int RQ    = 4,
+    parameter int NID   = 128,
+    parameter int CW    = 6,
+    parameter int NREL  = 1,
     parameter     PROG_FILE = "program.hex"
 ) (
     input  wire          clk,
@@ -446,8 +375,16 @@ module fabric_seq_lane #(
     output wire [255:0]  head,
     output wire [1:0]    head_layer,
     output wire [20:0]   head_page,
-    output wire          idle            // nothing left to fetch or issue
+    // the drains that return to this lane, picked this cycle; their ids,
+    // registered, the cycle after
+    input  wire [NREL-1:0]       mine,
+    input  wire [NREL*6*8-1:0]   d_c,
+    input  wire [NREL*6*8-1:0]   d_p,
+    output reg           deps_ok,        // the head step's buffers are clear
+    output reg           busy,           // given runs it has not reported done
+    output reg           done            // a cycle: everything it was given has drained
 );
+    localparam int NC = 6, NP = 2, IDB = 64 + 4 * 30;
     localparam int PAW = (DEPTH > 1) ? $clog2(DEPTH) : 1;
     localparam int RW  = (RQ > 1) ? $clog2(RQ) : 1;
 
@@ -477,7 +414,7 @@ module fabric_seq_lane #(
     assign head       = q0;
     assign head_layer = s0[22:21];
     assign head_page  = s0[20:0];
-    assign idle       = !can && qn == 2'd0 && !fetched_v;
+    wire         idle       = !can && qn == 2'd0 && !fetched_v;     // nothing left to fetch or issue
 
     // `fetched_v` selects what each of the queue's 512 bits takes, so one flop
     // held 490 loads and 798 fF: two nanoseconds of clock-to-output.  The
@@ -541,6 +478,96 @@ module fabric_seq_lane #(
             else if (issue)          s0 <= s1;
             if (fetched_v && issue && qn == 2'd2) s1 <= fs;
             qn <= qn + {1'b0, fetched_v} - {1'b0, issue};
+        end
+    end
+    // ---------------------------------------------------------------------
+    // The lane's counters: outstanding writers and readers per buffer id.
+    // The drains are registered, so the counters already hold every release
+    // that has landed and the check is a read.
+    // ---------------------------------------------------------------------
+    reg [CW-1:0] wr_cnt [0:NID-1];
+    reg [CW-1:0] rd_cnt [0:NID-1];
+    integer kc;
+    reg [7:0] cid, pid;
+    always @* begin
+        deps_ok = 1'b1;
+        for (kc = 0; kc < NC; kc = kc + 1) begin
+            cid = q0[IDB + 8*kc +: 8];
+            if (cid != 8'hFF && wr_cnt[cid] != 0) deps_ok = 1'b0;
+        end
+        for (kc = 0; kc < NP; kc = kc + 1) begin
+            pid = q0[IDB + 8*NC + 8*kc +: 8];
+            if (pid != 8'hFF && (rd_cnt[pid] != 0 || (!q0[IDB + 8*(NC+NP) + kc] && wr_cnt[pid] != 0))) deps_ok = 1'b0;
+        end
+    end
+    // The drains that return here, registered: `d_mine` counts them against
+    // the outstanding commands, and each slice of the counters reads its own
+    // copy.  One flop gating every counter update is exactly what the mapper
+    // cannot buffer -- at 495 loads and 739 fF it was 1,857 of 2,833 ps before
+    // any logic ran -- so the copies are that one register, a slice each.
+    localparam int NDC = 16;                       // copies, one per slice of the counters
+    localparam int IPC = NID / NDC;                // ids to a slice
+    reg  [NREL-1:0]     d_mine;
+    wire [NDC*NREL-1:0] d_mine_c;
+    genvar gdc, gdx;
+    generate
+        for (gdc = 0; gdc < NDC; gdc = gdc + 1) begin : g_dec
+            for (gdx = 0; gdx < NREL; gdx = gdx + 1) begin : g_dex
+                fabric_seq_copy u_d (.clk(clk), .rst_n(rst_n), .d(mine[gdx]), .q(d_mine_c[gdc*NREL + gdx]));
+            end
+        end
+    endgenerate
+    // Commands issued and not yet returned.  Counted against the drains,
+    // which are at most NREL a cycle, and not against the completions, which
+    // are up to forty: a population count of every done port is forty
+    // chained increments.  A command that has completed and not drained is
+    // still outstanding, so reaching zero is every step the lane issued
+    // having returned its buffers.
+    reg  [9:0] outstanding, out_next;
+    integer xo;
+    always @* begin
+        out_next = outstanding + {9'd0, issue};
+        for (xo = 0; xo < NREL; xo = xo + 1) if (d_mine[xo]) out_next = out_next - 1'b1;
+    end
+    integer id, k, x;
+    reg signed [CW:0] dr, dw;                      // a counter's move this cycle
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            d_mine <= 0; outstanding <= 0; busy <= 1'b0; done <= 1'b0;
+            for (id = 0; id < NID; id = id + 1) begin wr_cnt[id] = 0; rd_cnt[id] = 0; end
+        end else begin
+            d_mine <= mine;
+            done <= 1'b0;
+            // Every counter moves by what this cycle did to it, once: the ids
+            // in play are at most NREL*(NC+NP) returning and NC+NP taken, so
+            // a counter's delta is a couple of dozen compares against them,
+            // all in parallel.  With nothing issued or returned there is
+            // nothing to move.
+            if (issue || |d_mine)
+                for (id = 0; id < NID; id = id + 1) begin
+                    dr = 0;
+                    dw = 0;
+                    for (x = 0; x < NREL; x = x + 1)
+                        if (d_mine_c[(id / IPC) * NREL + x]) begin
+                            for (k = 0; k < NC; k = k + 1)
+                                if (d_c[x*NC*8 + k*8 +: 8] == id[7:0]) dr = dr - 1;
+                            for (k = 0; k < NP; k = k + 1)
+                                if (d_p[x*NC*8 + k*8 +: 8] == id[7:0]) dw = dw - 1;
+                        end
+                    if (issue) begin
+                        for (k = 0; k < NC; k = k + 1)
+                            if (q0[IDB + 8*k +: 8] == id[7:0]) dr = dr + 1;
+                        for (k = 0; k < NP; k = k + 1)
+                            if (q0[IDB + 8*NC + 8*k +: 8] == id[7:0]) dw = dw + 1;
+                    end
+                    if (dr != 0) rd_cnt[id] = rd_cnt[id] + dr[CW-1:0];
+                    if (dw != 0) wr_cnt[id] = wr_cnt[id] + dw[CW-1:0];
+                end
+            outstanding <= out_next;
+            // Done: everything given fetched and issued, and returned.  A run
+            // pushed to an idle lane makes it busy again.
+            if (busy && idle && out_next == 10'd0) begin busy <= 1'b0; done <= 1'b1; end
+            if (push) busy <= 1'b1;
         end
     end
 `ifndef FABRIC_SYNTH
