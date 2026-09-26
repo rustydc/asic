@@ -219,8 +219,16 @@ class MemoryMap:
 
     @property
     def index_burst_records(self) -> int:
-        """Index records the scan reads per request: a page's worth."""
-        return ALIGN // self.index_record_bytes
+        """Index records the scan reads per request: a page's worth, and a
+        whole number of the memory's stripes.  A request that ended inside a
+        stripe shared it with the next, whose chunk for that stripe's device
+        waited for this one's -- and the stripe unit issues chunks in order,
+        so every chunk behind it waited too: at the 9B geometry, records of
+        80 bytes in pages of 25, the scan ran at a fifth of the devices'
+        rate.  Pages of 64 are five stripes."""
+        from fabric.hpi import STRIPE_BYTES
+        unit = STRIPE_BYTES // math.gcd(self.index_record_bytes, STRIPE_BYTES)     # records in the least whole number of stripes
+        return unit * max(1, ALIGN // (unit * self.index_record_bytes))
 
     def window_record_addr(self, ctx: int, pos: int, kv_head: int, layer: int = 0) -> int:
         """Head-major: a KV head's positions are consecutive, so the reader bursts pages of them."""

@@ -1531,12 +1531,15 @@ endmodule
 //      the chunk's own len (after them)
 //   7  a chunk's blocks: each of its len tokens' selections at src, the
 //      token's chosen block records into the shared rows at dst
-// The three requesters (a beat mover, the append, the scan) share the port
-// through fabric_mem_arbiter.  The rows are the mover's: a record is copied
-// as it is in memory, a KV_BITS key then value, each half from a word of its
-// own, and the attention adapter unpacks it.  They went through a record
-// reader that unpacked them to int8 on the way, sixteen bytes a cycle, which
-// at the 9B geometry was 34 cycles a record against the memory's eight.
+// The four requesters (a beat mover, the append, the scan, the rows fetcher)
+// share the port through fabric_mem_arbiter.  The rows are the fetcher's: a
+// record is copied as it is in memory, a KV_BITS key then value, each half
+// from a word of its own, and the attention adapter unpacks it.  They went
+// through a record reader that unpacked them to int8 on the way, sixteen
+// bytes a cycle, which at the 9B geometry was 34 cycles a record against
+// the memory's eight.  The fetcher and the scan keep several requests in
+// flight, so a memory that overlaps requests (the HPI controller) has
+// several devices reading for them at once.
 // ---------------------------------------------------------------------------
 module fabric_mem_unit #(
     parameter int HD      = 24,
@@ -1605,8 +1608,9 @@ module fabric_mem_unit #(
     localparam int SUMS_BITS = (2 * NKV * HD + IDIM) * 16, SUMS_BEATS = (SUMS_BITS + 127) / 128;
     localparam int SEL_BYTES = 2 * (1 + TOP), SEL_BEATS = (SEL_BYTES + 15) / 16;
     localparam int LOG_BS = $clog2(BS);
-    localparam int NR = 3;
+    localparam int NR = 4;
     localparam int RB = REC_BYTES, REC_BEATS = REC_BYTES / 16;   // a record in the buffer, as in memory
+    localparam int FD = 8, FW = 3;              // the rows fetcher's moves in flight
     // A chunk's rows, shared (fabric.sequencer.global_layout): the window's
     // W - 1 records before the chunk's first token and the chunk's own, by
     // position -- a position q at row q - p0 + W - 1 -- then each token's
@@ -1639,6 +1643,7 @@ module fabric_mem_unit #(
         .m_req_addr(m_req_addr), .m_req_beats(m_req_beats), .m_wdata_valid(m_wdata_valid), .m_wdata_ready(m_wdata_ready),
         .m_wdata(m_wdata), .m_rdata_valid(m_rdata_valid), .m_rdata(m_rdata));
     assign r_req_wide[1] = 1'b0;
+    assign r_req_wide[3] = 1'b1;
 
     // Requester 0, the mover: a burst between memory and the buffer or the sums register.
     localparam [1:0] MV_RD_VB = 0, MV_WR_VB = 1, MV_RD_REG = 2, MV_WR_REG = 3;
@@ -1758,14 +1763,38 @@ module fabric_mem_unit #(
         end
     endfunction
 
-    // The rows: runs of window records, then one block record at a time, each a move of the mover's.
+    // Requester 3, the rows fetcher: moves from memory into the buffer, a run
+    // of window records or a block record each, queued by the rows command and
+    // asked for as the port takes them; each one's data goes to its place in
+    // the buffer, two beats a cycle, as it comes back.
+    reg [31:0]    f_maddr [0:FD-1];
+    reg [AW-1:0]  f_vaddr [0:FD-1];
+    reg [11:0]    f_beats [0:FD-1];
+    reg [FW:0]    f_wr, f_iss, f_rd;
+    reg [11:0]    f_got;
+    wire          f_room  = ((f_wr - f_rd) != FD);
+    wire          f_idle  = (f_wr == f_rd);
+    wire [11:0]   f_hb    = f_beats[f_rd[FW-1:0]];
+    wire          f_two   = (f_hb - f_got > 1);
+    assign r_req_valid[3] = (f_iss != f_wr);
+    assign r_req_write[3] = 1'b0;
+    assign r_req_addr[3*32 +: 32]  = f_maddr[f_iss[FW-1:0]];
+    assign r_req_beats[3*12 +: 12] = f_beats[f_iss[FW-1:0]];
+    assign r_wdata_valid[3] = 1'b0;
+    assign r_wdata[3*2*DW +: 2*DW] = 0;
+    // The rows: runs of window records, then one block record at a time, each a move of the fetcher's.
     reg [15:0] rw_p, rw_last, rw_j, rw_rec;
     reg        rw_blocks;
     reg [AW-1:0] rw_base;                      // where the command's rows go
     wire [15:0] rw_wrap  = W - (rw_p % W);                                  // records before the window wraps
     wire [15:0] rw_left  = rw_last - rw_p + 1;
     wire [15:0] rw_run   = (rw_left < rw_wrap) ? rw_left : rw_wrap;
-    wire [7:0]  rw_cnt   = (rw_run > MAXR) ? MAXR[7:0] : rw_run[7:0];
+    // A run ends at a page of the ring as well: a request that started inside
+    // one would share a stripe with the next, whose chunk for that stripe's
+    // device then waits for this one's, and every chunk behind it.
+    wire [15:0] rw_page  = MAXR - ((rw_p % W) % MAXR);
+    wire [15:0] rw_fit   = (rw_run < rw_page) ? rw_run : rw_page;
+    wire [7:0]  rw_cnt   = rw_fit[7:0];
 
     // The loader: beats of the buffer into one of the operand registers.
     localparam [2:0] T_K = 0, T_V = 1, T_I = 2, T_U = 3, T_SEL = 4;
@@ -1799,7 +1828,7 @@ module fabric_mem_unit #(
     localparam [4:0] S_IDLE = 0, S_MV = 1, S_DONE = 2,
                      S_AP_LOAD = 3, S_AP_SUMS_RD = 4, S_AP_START = 5, S_AP_WAIT = 6, S_AP_SUMS_WR = 7,
                      S_SC_LOAD = 8, S_SC_SCALE = 9, S_SC_RECIP = 10, S_SC_CODES = 11, S_SC_RUN = 12, S_SC_COLLECT = 13, S_SC_WRITE = 14,
-                     S_RW_LOAD = 15, S_RW_REQ = 16, S_RW_WAIT = 17, S_WN = 18, S_RW_MV = 19;
+                     S_RW_LOAD = 15, S_RW_REQ = 16, S_RW_WAIT = 17, S_WN = 18;
     reg [4:0] state;
     assign cmd_ready = (state == S_IDLE);
     integer j;
@@ -1812,7 +1841,7 @@ module fabric_mem_unit #(
             mv_go <= 1'b0; mv_busy <= 1'b0; mv_req <= 1'b0; mv_done <= 1'b0; mv_present <= 1'b0; mv_i <= 0; mv_fill <= 1'b0; mv_hdr <= 1'b0;
             mv_a <= 0; mv_q <= 1'b0; mv_hv <= 1'b0;
             ap_start <= 1'b0; sc_start <= 1'b0; tk_clear <= 1'b0; tk_finish <= 1'b0; sc_done_d <= 1'b0; rc_start <= 1'b0;
-            rw_p <= 0; rw_j <= 0; rw_rec <= 0; rw_blocks <= 1'b0; sel_cnt <= 0;
+            rw_p <= 0; rw_j <= 0; rw_rec <= 0; rw_blocks <= 1'b0; sel_cnt <= 0; f_wr <= 0; f_iss <= 0; f_rd <= 0; f_got <= 0;
             sq <= 0; ntok <= 1; tk_seen <= 0;
         end else begin
             done_valid <= 1'b0; wr_en <= 1'b0; wr_hi_be <= 16'd0; ap_start <= 1'b0; sc_start <= 1'b0; tk_clear <= 1'b0; tk_finish <= 1'b0; rc_start <= 1'b0;
@@ -1879,6 +1908,14 @@ module fabric_mem_unit #(
                     sel_cnt[j*8 +: 8] <= sel_cnt[j*8 +: 8] + 1'b1;
                 end
             tk_seen <= tk_seen | tk_done;
+            // The fetcher: a move asked for when the port takes it, its data into the buffer as it comes.
+            if (r_req_valid[3] && r_req_ready[3]) f_iss <= f_iss + 1'b1;
+            if (r_rdata_valid[3]) begin
+                wr_en <= 1'b1; wr_addr <= f_vaddr[f_rd[FW-1:0]] + f_got * 16; wr_be <= 16'hFFFF;
+                wr_data <= r_rdata[DW-1:0]; wr_hi <= r_rdata[2*DW-1:DW]; wr_hi_be <= f_two ? 16'hFFFF : 16'd0;
+                if (f_got + (f_two ? 12'd2 : 12'd1) == f_hb) begin f_got <= 0; f_rd <= f_rd + 1'b1; end
+                else f_got <= f_got + (f_two ? 12'd2 : 12'd1);
+            end
             case (state)
                 S_IDLE: if (cmd_valid) begin
                     op <= cmd_arg[3:0]; pos <= position[32*cmd_tok +: 32] + {4'd0, cmd_arg[31:4]}; ctx_base <= {cmd_a3[20:0] + cmd_page, 11'd0};
@@ -1975,27 +2012,29 @@ module fabric_mem_unit #(
                     rw_j <= 0; rw_rec <= 0; rw_blocks <= 1'b0;
                     state <= (op == 4'd5 && pos == 0) ? S_DONE : S_RW_REQ;
                 end
-                // A run of the window up to its wrap and a page, or a block record: one move each.
-                S_RW_REQ: begin
+                // A run of the window up to its wrap and a page, or a block
+                // record: one move each, queued for the fetcher a cycle apart.
+                S_RW_REQ: if (f_room) begin
                     if (!rw_blocks && rw_p <= rw_last) begin
-                        mv_go <= 1'b1; mv_mode <= MV_RD_VB; mv_fill <= 1'b0; mv_hdr <= 1'b0;
-                        mv_maddr <= ctx_base + WINDOW_OFF + (head * W + rw_p % W) * REC_BYTES;
-                        mv_vaddr <= rw_base + rw_rec * RB; mv_n <= rw_cnt * REC_BEATS;
-                        rw_p <= rw_p + rw_cnt; rw_rec <= rw_rec + rw_cnt; state <= S_RW_MV;
+                        f_maddr[f_wr[FW-1:0]] <= ctx_base + WINDOW_OFF + (head * W + rw_p % W) * REC_BYTES;
+                        f_vaddr[f_wr[FW-1:0]] <= rw_base + rw_rec * RB; f_beats[f_wr[FW-1:0]] <= rw_cnt * REC_BEATS;
+                        f_wr <= f_wr + 1'b1;
+                        rw_p <= rw_p + rw_cnt; rw_rec <= rw_rec + rw_cnt;
                     end else if (rw_j < sel_r[7:0]) begin
                         rw_blocks <= 1'b1;
-                        mv_go <= 1'b1; mv_mode <= MV_RD_VB; mv_fill <= 1'b0; mv_hdr <= 1'b0;
-                        mv_maddr <= ctx_base + BLOCK_OFF + (sel_r[16 + rw_j*16 +: 16] * NKV + head) * REC_BYTES;
-                        mv_vaddr <= rw_base + rw_rec * RB; mv_n <= REC_BEATS;
-                        rw_j <= rw_j + 1'b1; rw_rec <= rw_rec + 1'b1; state <= S_RW_MV;
+                        f_maddr[f_wr[FW-1:0]] <= ctx_base + BLOCK_OFF + (sel_r[16 + rw_j*16 +: 16] * NKV + head) * REC_BYTES;
+                        f_vaddr[f_wr[FW-1:0]] <= rw_base + rw_rec * RB; f_beats[f_wr[FW-1:0]] <= REC_BEATS;
+                        f_wr <= f_wr + 1'b1;
+                        rw_j <= rw_j + 1'b1; rw_rec <= rw_rec + 1'b1;
                     end else state <= S_RW_WAIT;
                 end
-                S_RW_MV: if (mv_done) state <= S_RW_REQ;
+                // The chunk's next token's blocks, queued behind this one's; or,
+                // every move's data in the buffer, done.
                 S_RW_WAIT: begin
-                    if (op == 4'd7 && sq != ntok - 1) begin      // the chunk's next token's blocks
+                    if (op == 4'd7 && sq != ntok - 1) begin
                         sq <= sq + 1'b1; ld_on <= 1'b1; ld_tgt <= T_SEL; ld_base <= src + (sq + 1'b1) * SEL_BYTES; ld_i <= 0; ld_n <= SEL_BEATS;
                         state <= S_RW_LOAD;
-                    end else state <= S_DONE;
+                    end else if (f_idle) state <= S_DONE;
                 end
                 default: begin done_valid <= 1'b1; done_tag <= tag; state <= S_IDLE; end
             endcase

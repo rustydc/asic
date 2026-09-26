@@ -169,7 +169,9 @@ class CdcRtlTest(unittest.TestCase):
 class PathTimingTest(unittest.TestCase):
     """``PathModel`` against the RTL: each request through the bridge, the
     stripe unit, the channels and the device models, taken on the core clock
-    to complete, one at a time."""
+    to complete, one at a time; and runs of requests back to back, which the
+    controller overlaps across its devices.  The RTL is the pipelined
+    controller; the model's ``asbuilt`` mode is the one before it."""
 
     CORE_NS = 1.25                             # the engine testbench's core clock, 800 MHz
 
@@ -188,7 +190,7 @@ class PathTimingTest(unittest.TestCase):
         return [(spec[n], done - take) for n, _, _, take, done in rows]
 
     def check(self, ndev: int) -> None:
-        model = H.PathModel(ndev, core_mhz=1000 / self.CORE_NS)
+        model = H.PathModel(ndev, mode="pipelined", core_mhz=1000 / self.CORE_NS)
         for (write, beats, addr), took in self.measure(ndev):
             want = model.request(write, beats, addr)
             # The device model draws a read's refresh push-out at random, 0
@@ -203,6 +205,43 @@ class PathTimingTest(unittest.TestCase):
 
     def test_four_devices(self) -> None:
         self.check(4)
+
+    RUNS = {
+        "window pages": [(False, 128, i * 2048) for i in range(8)],
+        "half pages": [(False, 64, i * 1024) for i in range(8)],
+        "index pages": [(False, 125, 5000 * 16 + i * 2000) for i in range(6)],
+        "a state slot out and in": [(True, 1024, 0), (False, 1024, 1 << 20)],
+        "two": [(True, 1024, 0), (False, 1024, 1 << 20), (True, 1024, 16384), (False, 1024, (1 << 20) + 16384)],
+        "block records": [(False, 16, (i * 37 % 64) * 1024) for i in range(8)],
+    }
+
+    def run_whole(self, ndev: int, spec) -> int:
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            params = H.emit_request_vectors(work, ndev, spec, pipe=True)
+            args = [f"-Ptb_mem_bridge.{name}={value}" for name, value in params.items()]
+            args.append(f"-Ptb_mem_bridge.CORE_NS={self.CORE_NS}")
+            subprocess.run(["iverilog", "-g2012", "-I", str(RTL), "-s", "tb_mem_bridge", "-o", "sim.vvp", *args,
+                            *(str(RTL / n) for n in ("fabric_cdc.sv", "fabric_phy.sv", "fabric_hpi.sv", "tb_mem_bridge.sv"))],
+                           cwd=work, check=True, capture_output=True, text=True)
+            out = subprocess.run(["vvp", "sim.vvp"], cwd=work, check=True, capture_output=True, text=True).stdout
+            self.assertIn("PASS", out, out)
+            first, last = map(int, (work / "req_times.txt").read_text().split())
+        return last - first
+
+    def test_runs_of_requests_overlap(self) -> None:
+        # Requests back to back: the stripe takes each once the last one's
+        # chunks are issued, and a device takes its next chunk while the
+        # last waits its turn on the port.  One at a time they cost several
+        # times as much.
+        for ndev in (16, 4):
+            model = H.PathModel(ndev, mode="pipelined", core_mhz=1000 / self.CORE_NS)
+            for name, spec in self.RUNS.items():
+                took = self.run_whole(ndev, spec)
+                want = model.sequence(spec)
+                self.assertLessEqual(abs(want - took), 0.05 * took, f"{name} over {ndev}: the RTL took {took}, the model says {want}")
+                if ndev == 16 and name != "a state slot out and in":
+                    self.assertLess(took, 0.8 * sum(model.request(w, b, a) for w, b, a in spec), name)
 
 
 class PhyRtlTest(unittest.TestCase):
@@ -230,7 +269,10 @@ class PhyRtlTest(unittest.TestCase):
         for tap_ps in (25.0, 90.0):
             out = HpiRtlTest.run_rtl(self, 4, 32, transactions=12, USE_DLL=1, TAP_PS=tap_ps)
             self.assertIn("PASS", out, out)
-            self.assertIn(f"quarter {round(4000 / tap_ps / 4)} taps", out, out)
+            # The code as the run ends, which the DLL may have moved a tap
+            # while the channels were quiet.
+            quarter = int(out.split("quarter ")[1].split()[0])
+            self.assertLessEqual(abs(quarter - 4000 / tap_ps / 4), 1, out)
             self.assertNotIn("ERROR", out, out)
 
 

@@ -184,7 +184,7 @@ module tb_layer_engine #(
             assign mem_ready = &init_done && &device_ok;
             // Writes are posted: the engine is done when the port has taken the
             // last beat, and the devices have it a microsecond later.
-            assign mem_quiet = !stripe.busy && !m_req_valid && !m_wdata_valid;
+            assign mem_quiet = stripe.idle && !m_req_valid && !m_wdata_valid;
             genvar g;
             for (g = 0; g < NDEV; g = g + 1) begin : g_dev
                 wire [1:0] dqs_bus = dqs_oe[g] ? dqs_dev[g*2 +: 2] : 2'b00;

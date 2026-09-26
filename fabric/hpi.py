@@ -193,11 +193,14 @@ class PathModel:
     measured request by request (``test_hpi``): within three per cent from
     one beat to 4095, over one device and over sixteen.
 
-    ``pipelined`` is the controller with its two known faults fixed: read
-    data goes to the port as it arrives rather than after the chunk, and
-    the stripe takes the next request while the last one's chunks run, so
-    requests to different devices overlap.  That controller is not built;
-    this is what the part allows it.
+    ``pipelined`` is the controller as it is now built, with the as-built
+    one's two faults fixed: read data goes to the port as it arrives rather
+    than after the chunk (and a channel has two page buffers, so its device
+    takes the next chunk while the last one waits its turn on the port),
+    and the stripe takes the next request while the last one's chunks run,
+    so requests to different devices overlap.  It was written as what the
+    part allows before the controller was built to it, and the RTL now
+    meets it (``PathTimingTest``).
 
     ``pushout`` is the refresh push-out in clocks, per read burst: the
     testbench's device model draws it uniformly from 0 to the latency, so
@@ -243,29 +246,42 @@ class PathModel:
         return self._core(self._request(False, beats, addr)[0])
 
     def _request(self, write: bool, beats: int, addr: int) -> tuple[float, float]:
-        ch = chunks(addr, beats, self.ndev)
+        return self._run([(write, beats, addr)])
+
+    def _run(self, requests, depth: int | None = None) -> tuple[float, float]:
+        """Requests taken one after another, as the stripe takes them: its
+        first read beat and its end, in controller clocks.  Pipelined, with at
+        most ``depth`` in flight: a request waits for the one ``depth`` before
+        it to be done."""
         free: dict[int, float] = {}
-        t, first, end = 0.0, None, 0.0
-        for dev, _, s in ch:
-            if write:
-                t = max(t, free.get(dev, 0.0)) + 1
-                t += math.ceil(s / self.xb)                      # the chunk into its channel
-                done = t + self._burst(True, s) + 1 + self.cph + 1
-                free[dev] = done
-                end = max(end, done)
-            else:
-                t = max(t, free.get(dev, 0.0)) + 2
-                data0 = t + self._burst(False, 0)                # its first words on the wires
-                filled = t + self._burst(False, s)
-                if self.mode == "asbuilt":
-                    start = max(end, filled + self.cph)          # drained only once filled, in order
+        t, first, end, dones = 0.0, None, 0.0, []
+        for k, (write, beats, addr) in enumerate(requests):
+            gate = dones[k - depth] if depth and k >= depth else 0.0
+            last = 0.0
+            for dev, _, s in chunks(addr, beats, self.ndev):
+                if write:
+                    t = max(t, free.get(dev, 0.0), gate) + 1
+                    t += math.ceil(s / self.xb)                  # the chunk into its channel
+                    # As built the stripe saw a channel's done a clock after it;
+                    # its idle now sees it at once.
+                    done = t + self._burst(True, s) + 1 + self.cph + (1 if self.mode == "asbuilt" else 0)
+                    free[dev] = done
+                    end, last = max(end, done), max(last, done)
                 else:
-                    start = max(end, data0 + 1)                  # streamed as it arrives
-                if first is None:
-                    first = start + 1
-                end = max(start + math.ceil(s / self.xb) + 1, (filled + 1) if self.mode == "pipelined" else 0)
-                free[dev] = (filled + self.cph) if self.mode == "pipelined" else end + 1
-        cross = self.cross_write if write else self.cross_read
+                    t = max(t, free.get(dev, 0.0), gate) + 2
+                    data0 = t + self._burst(False, 0)            # its first words on the wires
+                    filled = t + self._burst(False, s)
+                    if self.mode == "asbuilt":
+                        start = max(end, filled + self.cph)      # drained only once filled, in order
+                    else:
+                        start = max(end, data0 + 1)              # streamed as it arrives
+                    if first is None:
+                        first = start + 1
+                    end = max(start + math.ceil(s / self.xb) + 1, (filled + 1) if self.mode == "pipelined" else 0)
+                    free[dev] = (filled + self.cph) if self.mode == "pipelined" else end + 1
+                    last = end
+            dones.append(last)
+        cross = self.cross_write if requests and requests[-1][0] else self.cross_read
         return (first or 0.0) + cross, end + cross
 
     def cost(self, write: bool, beats: int, addr: int = 0) -> int:
@@ -284,24 +300,17 @@ class PathModel:
         lead = 0.0 if write else 3 + self.lc + self.pushout + self.cross_read
         return self._core(busy + lead)
 
-    def sequence(self, requests) -> int:
+    def sequence(self, requests, depth: int | None = None) -> int:
         """Requests from one unit, each issued as soon as the path takes it:
-        in turn as built, overlapping across devices when pipelined."""
+        in turn as built, overlapping across devices when pipelined, with at
+        most ``depth`` of them in flight (the unit's own limit).  Pipelined
+        this is the one-request model run on over them, the stripe taking
+        each once the last one's chunks are issued: within five per cent of
+        the RTL on runs of window pages, index pages, state slots and block
+        records (``PathTimingTest``)."""
         if self.mode == "asbuilt":
             return sum(self.request(w, b, a) for w, b, a in requests)
-        free = [0.0] * self.ndev
-        port, end = 0.0, 0.0
-        for write, beats, addr in requests:
-            for dev, _, s in chunks(addr, beats, self.ndev):
-                start = max(port, free[dev])
-                port = start + math.ceil(s / self.xb)            # the port moves a chunk's beats, in order
-                if write:
-                    done = port + self._burst(True, s) + 1 + self.cph
-                else:
-                    done = max(port, start + self._burst(False, s) + 1)
-                free[dev] = done + (0 if write else self.cph)
-                end = max(end, done)
-        return self._core(end + self.cross_read)
+        return self._core(self._run(requests, depth)[1])
 
 
 class StripedImage:
@@ -367,15 +376,25 @@ def emit_timing_vectors(directory: Path, ndev: int, sizes=(1, 7, 16, 64, 65, 256
     time each against ``PathModel``: every size written and read back, at a
     stripe boundary and 768 bytes into a stripe.  Returns the testbench
     parameters and the requests as ``(write, beats, byte address)``."""
-    directory.mkdir(parents=True, exist_ok=True)
-    rng = np.random.default_rng(seed)
-    device_kb = max(256, 4096 // ndev)
-    image = StripedImage(ndev, device_kb << 10)
-    spec, reqs, wb, rb = [], [], [], []
+    spec = []
     for i, beats in enumerate(sizes):
         for k, off in enumerate((0, 768)):
             addr = (2 * i + k) * 65536 + off
             spec += [(True, beats, addr), (False, beats, addr)]
+    return emit_request_vectors(directory, ndev, spec, seed), spec
+
+
+def emit_request_vectors(directory: Path, ndev: int, spec, seed: int = 1, pipe: bool = False) -> dict:
+    """``tb_mem_bridge``'s files for the requests ``spec`` (``(write, beats,
+    byte address)``), every one wide and its write data on time; with
+    ``pipe`` each goes as soon as the port takes it and the run is timed
+    whole."""
+    directory.mkdir(parents=True, exist_ok=True)
+    rng = np.random.default_rng(seed)
+    top = max(a + b * BEAT_BYTES for _, b, a in spec)
+    device_kb = max(256, -(-top // (ndev * 1024)))
+    image = StripedImage(ndev, device_kb << 10)
+    reqs, wb, rb = [], [], []
     for write, beats, addr in spec:
         if write:
             payload = bytes(rng.integers(0, 256, beats * BEAT_BYTES, dtype=np.uint8))
@@ -390,6 +409,5 @@ def emit_timing_vectors(directory: Path, ndev: int, sizes=(1, 7, 16, 64, 65, 256
     write_hex(directory / "expected_rdata.hex", rb or [0], 128)
     image.to_hex(directory / "expected_devs.hex")
     mrs = mode_registers()
-    params = dict(NDEV=ndev, DEV_WORDS=(device_kb << 10) // 2, N=len(reqs), NW=max(1, len(wb)), NR=max(1, len(rb)),
-                  MR0=mrs[0], MR4=mrs[4], MR8=mrs[8], CXB=2, MXB=4, STEADY=1)
-    return params, spec
+    return dict(NDEV=ndev, DEV_WORDS=(device_kb << 10) // 2, N=len(reqs), NW=max(1, len(wb)), NR=max(1, len(rb)),
+                MR0=mrs[0], MR4=mrs[4], MR8=mrs[8], CXB=2, MXB=4, STEADY=1, PIPE=int(pipe))

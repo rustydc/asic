@@ -184,15 +184,16 @@ class Timing:
     fill_latency: int = 4            # FIRST: a fresh read's fill, two beats a cycle with no request on the port
     append_first_saving: int = 4     # FIRST: the append's block sums filled rather than read
     mem_write_latency: int = 6
-    rows_latency: int = 7            # a rows command: its selection loaded, and its done
-    rows_request: int = 7            # a move of the rows: the mover started, the request and its latency
+    rows_latency: int = 8            # a rows command: its selection loaded, and its done
+    rows_request: int = 3            # a move of the rows: its request and the port's latency (the fetcher queues the next)
     scan_latency: int = 19           # the query in and its codes, before any record is read
     scan_request: int = 1
-    scan_page: int = 4               # a request of the scan's: the port's latency and the next asked for
+    scan_page: int = 4               # the scan's first request: the port's latency
+    scan_next: int = 3               # and each after it, asked for while the last was read
     scan_query: int = 11             # a chunk's further query: its codes, and its selection written
     window_empty: int = 3            # a chunk's window before it at position 0: nothing to read
     window_saving: int = 2           # a chunk's window part against a rows command: no selection to load
-    blocks_token: int = -2           # a chunk's blocks: a token's, against a rows command of those blocks alone
+    blocks_token: int = -6           # a chunk's blocks: a token's, against a rows command of those blocks alone
     blocks_none: int = 5             # a token with none: its selection loaded and found empty
     blocks_latency: int = 2
     append_record: int = 11          # a record the append writes: its request, accepted, and the turn to the next
@@ -207,17 +208,21 @@ class Timing:
     # a request to the next device, so a request of a stripe or less gets one
     # device however many there are, and each device's chunk is a burst of
     # its own -- the command, the latency, two words a clock and tCPH.
-    # ``memory_mode`` is the controller as built or with its faults fixed;
-    # ``pushout`` the refresh push-out a read burst takes (None: the
-    # testbench device model's mean).
+    # ``memory_mode`` is the controller: ``pipelined`` as it is built, or
+    # ``asbuilt`` as it was first built, which held each request to its end
+    # and drained a read chunk only once it had filled; ``pushout`` the
+    # refresh push-out a read burst takes (None: the testbench device
+    # model's mean).
     devices: int = 0
-    memory_mode: str = "asbuilt"
+    memory_mode: str = "pipelined"
     pushout: float | None = None
-    # The scan and the rows keep one request in flight and wait for it, so a
-    # page of records reaches one or two devices of the sixteen.
-    # ``deep_requests`` is those two units asking ahead, which only the
-    # pipelined path can take: their requests then overlap across devices.
-    deep_requests: bool = False
+    # The scan and the rows fetcher ask ahead, ``depth`` requests in flight,
+    # so a page of records is one of several the devices read at once.
+    # Without it (``deep_requests`` false) they keep one request in flight
+    # and wait for it, as they did, and a page reaches one or two devices of
+    # the sixteen.
+    deep_requests: bool = True
+    depth: int = 8                   # the requests the scan and the rows fetcher keep in flight (rtl/fabric_engine.sv)
     stripe_beats: int = hpi.STRIPE_BYTES // BEAT
     burst_clocks: int = 20           # a burst's command, latency and tCPH, at 250 MHz
     beat_clocks: int = 4             # x16 DDR: four clocks to a sixteen-byte beat
@@ -300,43 +305,55 @@ class Timing:
     def move(self, beats: int, write: bool) -> int:
         """The beat mover: memory to the vector buffer, or back, two beats a
         transfer -- the port's wide requests and the buffer's wide port.
-        Over the devices it is one request on the path, and a write is
-        charged its completion: the mover's writes are posted, but the next
-        memory step waits for the path, and the steps take the memory unit
-        in turn."""
+        Over the devices a read is one request on the path, which the mover
+        waits out, and a write is posted: the bridge's queues take 64 beats
+        at once and the rest as the path feeds them to the devices, and the
+        next memory step waits for the path (``Step.port``)."""
         if self.path is not None:
-            if write and self.path.mode == "asbuilt":
-                # Posted: the bridge's queues take 64 beats at once, the
-                # rest as the path feeds them to the devices.
+            if write:
                 taken = self.path.taken(beats - 64) if beats > 64 else 0
                 return max(taken, -(-beats // 2)) + self.mem_write_latency
-            return self.path.cost(write, beats) + (self.mem_write_latency if write else self.mem_read_latency)
+            return self.path.request(False, beats) + self.mem_read_latency
         transfers = -(-beats // 2)
         return (self.port_write_beat * transfers + self.mem_write_latency) if write else (transfers + self.mem_read_latency)
 
     def port(self, beats: int, write: bool) -> tuple[int, bool]:
-        """A mover request's hold on the path as built, and whether it is a
-        posted write: see ``Step.port``."""
-        if self.path is None or self.path.mode != "asbuilt":
+        """A mover request's hold on the path, and whether it is a posted
+        write: see ``Step.port``.  As built the path took one request at a
+        time, whole.  Pipelined, a read after a posted write waits for the
+        devices the write occupies, not for the write's whole request: the
+        read's chunks start as the write's own finish, device by device."""
+        if self.path is None:
             return 0, False
+        if write and self.path.mode == "pipelined":
+            return self.path.cost(True, beats), True
         return self.path.request(write, beats), write
 
-    def rows(self, requests: list[int], record_beats: int) -> int:
+    def rows(self, requests: list[int], record_beats: int, blocks: int = 0, first: int = 0) -> int:
         """A head's rows: each request -- a run of the window up to its wrap
-        and a page, or one block record -- a move of the mover's from memory
-        to the buffer, the records as they are there, one after another
-        (rtl/fabric_engine.sv).  The attention adapter unpacks them.
+        and a page, or one block record -- a move of the rows fetcher's from
+        memory to the buffer, the records as they are there, queued a cycle
+        apart and kept ``depth`` in flight (rtl/fabric_engine.sv).  The
+        attention adapter unpacks them.
 
         They went through a record reader that unpacked them to int8 on the
         way at the attention's sixteen lanes: at the 9B geometry 34 cycles a
         record, where the memory gives one in eight."""
         path = self.path
+        requests = list(requests) + [1] * blocks
         beats = [n * record_beats for n in requests]
         if path is not None and self.deep_requests and path.mode == "pipelined":
             # Every request asked for ahead: the records arrive at the rate
-            # the devices give them, and into the buffer two beats a cycle.
-            got = path.sequence([(False, b, sum(beats[:i]) * BEAT) for i, b in enumerate(beats)])
-            return self.rows_latency + path.first_beat(record_beats) + max(got, sum(-(-b // 2) for b in beats))
+            # the devices give them (the run's end is its last record's), and
+            # into the buffer two beats a cycle.  The window's runs are one
+            # after another in memory; a head's block records are a block's
+            # records apart, a stripe or more at the 9B geometry, so the
+            # blocks chosen are taken on stripes of their own.
+            runs = len(requests) - blocks
+            at = [(first * record_beats + sum(beats[:i])) * BEAT for i in range(runs)]     # from the ring slot of the first
+            at += [(1 << 24) + i * hpi.STRIPE_BYTES for i in range(blocks)]
+            got = path.sequence(list(zip([False] * len(beats), beats, at)), self.depth)
+            return self.rows_latency + len(beats) * self.rows_request + max(got, sum(-(-b // 2) for b in beats))
         return self.rows_latency + sum(self._rows_move(b) for b in beats)
 
     def _rows_move(self, beats: int) -> int:
@@ -354,30 +371,34 @@ class Timing:
             return self.scan_latency
         per = per_request or records
         pages = [min(per, records - i) for i in range(0, records, per)]
-        # A page's transfers, and the cycle its last record's scale waits
-        # when that record ends in a transfer's second beat.
-        half = lambda n: -(-n * record_beats // 2) + (n * record_beats + 1) % 2
+        # A page's transfers, and the cycle the last page's last record's
+        # scale waits when that record ends in a transfer's second beat (an
+        # earlier page's waits under the next page's first transfer).
+        half = lambda n: -(-n * record_beats // 2)
+        tail = (pages[-1] * record_beats + 1) % 2
         if self.path is not None and per_request and self.deep_requests and self.path.mode == "pipelined":
-            got = self.path.sequence([(False, records * record_beats, 0)])
-            return self.scan_latency + self.path.first_beat(record_beats) + max(got, half(records)) + selected - 1
+            pages_at = [(False, n * record_beats, i * per_request * record_beats * BEAT) for i, n in enumerate(pages)]
+            got = self.path.sequence(pages_at, self.depth)
+            return self.scan_latency + self.scan_request + max(got, sum(half(n) for n in pages)) + tail + selected - 1
         if self.path is not None and per_request:
             each = sum(max(self.path.request(False, n * record_beats), self.path.first_beat(n * record_beats) + half(n))
                        for n in pages)
-            return self.scan_latency + each + selected - 1
-        return self.scan_latency + self.scan_request + sum(half(n) + self.scan_page for n in pages) + selected - 1
+            return self.scan_latency + each + tail + selected - 1
+        return (self.scan_latency + self.scan_request + self.scan_page + (len(pages) - 1) * self.scan_next
+                + sum(half(n) for n in pages) + tail + selected - 1)
 
-    def window_part(self, requests: list[int], record_beats: int) -> int:
+    def window_part(self, requests: list[int], record_beats: int, first: int = 0) -> int:
         """A chunk's window records before its appends or after them: the
         rows over their runs, started without the selection a rows command
         loads first."""
         if not requests:
             return self.window_empty
-        return self.rows(requests, record_beats) - self.window_saving
+        return self.rows(requests, record_beats, 0, first) - self.window_saving
 
     def blocks(self, counts: list[int], record_beats: int) -> int:
         """A chunk's blocks: each token's selection loaded, then its blocks a
         request each."""
-        return sum(self.rows([1] * n, record_beats) + self.blocks_token if n else self.blocks_none
+        return sum(self.rows([], record_beats, n) + self.blocks_token if n else self.blocks_none
                    for n in counts) + self.blocks_latency
 
     def scan_chunk(self, records: int, record_beats: int, selected: list[int], per_request: int = 0) -> int:
@@ -472,12 +493,13 @@ def _plain(name: str) -> str:
 def window_requests(pos: int, window: int, page: int, first: int | None = None) -> list[int]:
     """The requests one head's window records take, as the engine
     issues them: the window is a ring of ``window`` slots written at
-    ``pos % window``, read as runs that stop at its wrap, each a page of
-    ``page`` records at a time.  The records are positions ``first`` to
+    ``pos % window``, read as runs that stop at its wrap and at its pages of
+    ``page`` records, so that no request shares a memory stripe with the
+    next.  The records are positions ``first`` to
     ``pos``, by default the window's."""
     p, out = max(0, pos - window + 1) if first is None else first, []
     while p <= pos:
-        count = min(pos - p + 1, window - p % window, page)
+        count = min(pos - p + 1, window - p % window, page - (p % window) % page)
         out.append(count)
         p += count
     return out
@@ -897,7 +919,8 @@ def global_program(cfg, c: L.GlobalConsts | None, spec: TileSpec, mm: MemoryMap,
         # the first pass.
         for n in range(nkv):
             old = window_requests(pos - 1, mm.local_window, mm.window_burst_records, max(0, pos - mm.local_window + 1)) if pos else []
-            add(f"mem.window_old[{n}]", "mem", (), (f"+rows[{n}]",), t.window_part(old, rec_beats),
+            add(f"mem.window_old[{n}]", "mem", (), (f"+rows[{n}]",),
+                t.window_part(old, rec_beats, max(0, pos - mm.local_window + 1) % mm.local_window),
                 nbytes=sum(old) * mm.kv_record_bytes,
                 ops=operands(dst=(f"rows[{n}]", 0), a2=n, a3=ctx, arg=MEM_WINDOW_OLD, position=pos))
     for i in range(T):
@@ -966,7 +989,8 @@ def global_program(cfg, c: L.GlobalConsts | None, spec: TileSpec, mm: MemoryMap,
                 k_rows, v_rows = (e["k_rows"][i], e["v_rows"][i]) if chunk > 1 else (e["k_rows"], e["v_rows"])
                 put(e, f"rows[{n}]", i, (k_rows[n], v_rows[n]))
             add(tok(f"mem.rows[{n}]", i), "mem", ("sel",), (_contrib(f"rows[{n}]", chunk),),
-                t.rows(window_requests(p, mm.local_window, mm.window_burst_records) + [1] * n_blocks, rec_beats),
+                t.rows(window_requests(p, mm.local_window, mm.window_burst_records), rec_beats, n_blocks,
+                       max(0, p - mm.local_window + 1) % mm.local_window),
                 mem_rows, nbytes=window_bytes + block_bytes,
                 ops=operands(src=("sel", i * sel_bytes), dst=(f"rows[{n}]", i * rows_bytes), a2=n, a3=ctx, arg=[(0, MEM_ROWS), (4, i)],
                              position=pos))
@@ -1016,7 +1040,7 @@ def _chunk_memory(add, cfg, c, mm: MemoryMap, pos: int, t: Timing, T: int, lay: 
                          arg=[(0, MEM_APPEND), (4, i)], position=pos))
     new = window_requests(pos + T - 1, W, mm.window_burst_records, pos)
     for n in range(nkv):
-        add(f"mem.window_new[{n}]", "mem", (), (f"+rows[{n}]",), t.window_part(new, rec_beats),
+        add(f"mem.window_new[{n}]", "mem", (), (f"+rows[{n}]",), t.window_part(new, rec_beats, pos % W),
             nbytes=T * mm.kv_record_bytes,
             ops=operands(dst=(f"rows[{n}]", 0), a2=n, a3=ctx, arg=MEM_WINDOW_NEW, len=T, position=pos))
     # One pass over the index for every query: the records the last token may choose from.

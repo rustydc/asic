@@ -4,7 +4,8 @@
 //   req_valid / req_ready, req_write, req_addr[31:0] (byte address aligned
 //   to a beat), req_beats[11:0] (up to 4095); write beats follow the request on
 //   wdata_valid / wdata_ready / wdata; read beats return in order on
-//   rdata_valid / rdata.  One request in flight per requester.
+//   rdata_valid / rdata.  Reads come back in the order they were taken, and
+//   a requester may have several in flight.
 //
 // A port of XW beats a transfer carries, for a request with req_wide, XW
 // beats on each wdata / rdata handshake, the first in the low DW bits, and
@@ -90,13 +91,20 @@ module fabric_mem_model #(
 endmodule
 
 // ---------------------------------------------------------------------------
-// N requesters onto one port, round robin, the port held for a whole
-// transaction.  Read data is steered to the requester that owns it.
+// N requesters onto one port, round robin.  A write holds the port until its
+// data has gone, so write data follows its request; a read lets it go once
+// the memory has taken it, and its data is steered back to its requester
+// from an in-order queue of the reads in flight -- the memory returns reads
+// in the order it took them.  So a requester may keep several reads in
+// flight, which a memory that overlaps them (the HPI controller) spreads
+// over its devices.  Every read used to hold the port until its last beat,
+// which kept one request in flight however many the memory could run.
 // ---------------------------------------------------------------------------
 module fabric_mem_arbiter #(
     parameter int N  = 2,
     parameter int DW = 128,
-    parameter int XW = 1                        // beats a wide transfer carries (1 or 2)
+    parameter int XW = 1,                       // beats a wide transfer carries (1 or 2)
+    parameter int RQ = 16                       // reads in flight
 ) (
     input  wire               clk,
     input  wire               rst_n,
@@ -126,19 +134,34 @@ module fabric_mem_arbiter #(
     input  wire [XW*DW-1:0]   m_rdata
 );
     localparam int IW = $clog2(N) + 1;
-    reg          locked;
+    localparam int QW = $clog2(RQ);
+    reg          locked;                        // a write's data is going
     reg [IW-1:0] owner, last;
-    reg          own_write, own_wide;
+    reg          own_wide;
     reg [11:0]   left;
     wire [11:0]  step = (own_wide && left > 1) ? 12'd2 : 12'd1;   // beats this handshake carries
-    // Pick the next requester after `last` with a request.
+    // The reads in flight: requester, beats and width, oldest first; the
+    // head's beats still to come.
+    reg [IW-1:0] q_own [0:RQ-1];
+    reg [11:0]   q_beats [0:RQ-1];
+    reg          q_wide [0:RQ-1];
+    reg [QW:0]   q_wr, q_rd;
+    reg [11:0]   r_left;
+    wire         q_empty = (q_wr == q_rd);
+    wire         q_full  = ((q_wr - q_rd) == RQ);
+    wire [IW-1:0] r_own  = q_own[q_rd[QW-1:0]];
+    wire [11:0]  r_beats = (r_left != 0) ? r_left : q_beats[q_rd[QW-1:0]];
+    wire [11:0]  r_step  = (q_wide[q_rd[QW-1:0]] && r_beats > 1) ? 12'd2 : 12'd1;
+    // Pick the next requester after `last` with a request; a read waits for room in the queue.
     integer i;
     reg [IW-1:0] pick;
     reg          found;
     always @* begin
         pick = 0; found = 1'b0;
         for (i = 1; i <= N; i = i + 1)
-            if (!found && r_req_valid[(last + i) % N]) begin pick = (last + i) % N; found = 1'b1; end
+            if (!found && r_req_valid[(last + i) % N] && (r_req_write[(last + i) % N] || !q_full)) begin
+                pick = (last + i) % N; found = 1'b1;
+            end
     end
     wire grant = !locked && found && m_req_ready;
     assign m_req_valid = grant;
@@ -150,25 +173,33 @@ module fabric_mem_arbiter #(
     generate
         for (g = 0; g < N; g = g + 1) begin : g_r
             assign r_req_ready[g]   = grant && (pick == g);
-            assign r_wdata_ready[g] = locked && own_write && (owner == g) && m_wdata_ready;
-            assign r_rdata_valid[g] = locked && !own_write && (owner == g) && m_rdata_valid;
+            assign r_wdata_ready[g] = locked && (owner == g) && m_wdata_ready;
+            assign r_rdata_valid[g] = !q_empty && (r_own == g) && m_rdata_valid;
         end
     endgenerate
-    assign m_wdata_valid = locked && own_write && r_wdata_valid[owner];
+    assign m_wdata_valid = locked && r_wdata_valid[owner];
     assign m_wdata       = r_wdata[owner*XW*DW +: XW*DW];
     assign r_rdata       = m_rdata;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            locked <= 1'b0; owner <= 0; last <= N - 1; own_write <= 1'b0; own_wide <= 1'b0; left <= 0;
+            locked <= 1'b0; owner <= 0; last <= N - 1; own_wide <= 1'b0; left <= 0; q_wr <= 0; q_rd <= 0; r_left <= 0;
         end else begin
             if (grant) begin
-                locked <= 1'b1; owner <= pick; last <= pick; own_write <= r_req_write[pick]; left <= r_req_beats[pick*12 +: 12];
-                own_wide <= m_req_wide;
-            end else if (locked) begin
-                if ((own_write && m_wdata_valid && m_wdata_ready) || (!own_write && m_rdata_valid)) begin
-                    left <= left - step;
-                    if (left == step) locked <= 1'b0;
+                last <= pick;
+                if (r_req_write[pick]) begin
+                    locked <= 1'b1; owner <= pick; left <= r_req_beats[pick*12 +: 12]; own_wide <= m_req_wide;
+                end else begin
+                    q_own[q_wr[QW-1:0]] <= pick; q_beats[q_wr[QW-1:0]] <= r_req_beats[pick*12 +: 12];
+                    q_wide[q_wr[QW-1:0]] <= m_req_wide; q_wr <= q_wr + 1'b1;
                 end
+            end
+            if (locked && m_wdata_valid && m_wdata_ready) begin
+                left <= left - step;
+                if (left == step) locked <= 1'b0;
+            end
+            if (!q_empty && m_rdata_valid) begin
+                if (r_beats == r_step) begin r_left <= 0; q_rd <= q_rd + 1'b1; end
+                else r_left <= r_beats - r_step;
             end
         end
     end
@@ -384,6 +415,11 @@ endmodule
 // scaled the cycle after, when its sum is held -- the scale never waits on
 // the tree.  A beat a cycle, the scan was half the memory's rate and, at the
 // end of a long context, most of the global layer's time.
+//
+// DEPTH pages in flight: the scan asks for the next page as soon as the
+// memory has taken the last, so a memory that overlaps requests has several
+// devices reading index pages at once.  A page is followed by its beats;
+// records are whole in a page, so the lanes need only know where it ends.
 // ---------------------------------------------------------------------------
 module fabric_index_scan #(
     parameter int DW   = 128,
@@ -391,7 +427,8 @@ module fabric_index_scan #(
     parameter int IDW  = 16,
     parameter int RPB  = 25,                               // records per request (a page)
     parameter int NQ   = 1,                                // queries scored at once
-    parameter int XW   = 2                                 // beats a transfer carries (1 or 2)
+    parameter int XW   = 2,                                // beats a transfer carries (1 or 2)
+    parameter int DEPTH = 8                                // pages in flight
 ) (
     input  wire              clk,
     input  wire              rst_n,
@@ -404,7 +441,7 @@ module fabric_index_scan #(
     output reg  [NQ-1:0]     cand_valid,
     output reg  [IDW-1:0]    cand_id,
     output reg  [NQ*32-1:0]  cand_score,
-    output reg               req_valid,
+    output wire              req_valid,
     input  wire              req_ready,
     output wire              req_wide,
     output wire [31:0]       req_addr,
@@ -417,21 +454,30 @@ module fabric_index_scan #(
     localparam int REC  = (CB + 1) * (DW / 8);             // record bytes
     localparam int BW   = $clog2(CB + 1) + 1;
     localparam int RW   = $clog2(RPB + 1);
-    reg              busy, inflight;
+    localparam int DW2  = $clog2(DEPTH) + 1;
+    reg              busy;
     reg [IDW-1:0]    blk;                                  // the block being scored
-    reg [RW-1:0]     count, got;                           // records in the request, records finished
+    reg [IDW-1:0]    rblk;                                 // the next block to ask for
     reg [BW-1:0]     beat;                                 // the first lane's beat of its record
-    reg [11:0]       rleft;                                // beats of the request still to come
     reg [NQ*32-1:0]  accs, accc;
     reg              pend;                                 // a record ended in the second lane: scale it now
     reg [7:0]        pscale;
-    wire [IDW-1:0]   left = n_blocks - blk;
+    // The pages asked for: their beats in order, the head's still to come in rleft.
+    reg [11:0]       pq [0:DEPTH-1];
+    reg [DW2-1:0]    pq_wr, pq_rd;
+    reg              live;                                 // rleft is a page's
+    reg [11:0]       rleft;
+    wire             pq_empty = (pq_wr == pq_rd);
+    wire [DW2:0]     npages   = (pq_wr - pq_rd) + live;
+    wire [IDW-1:0]   left = n_blocks - rblk;
     wire [RW-1:0]    want = (left > RPB) ? RPB[RW-1:0] : left[RW-1:0];
-    assign req_addr  = base + blk * REC;
+    assign req_valid = busy && (rblk < n_blocks) && (npages < DEPTH);
+    assign req_addr  = base + rblk * REC;
     assign req_beats = want * (CB + 1);
     assign req_wide  = (XW > 1);
+    wire             ask = req_valid && req_ready;
     // This transfer's beats: the first lane's, and the second's if it carries two.
-    wire             xfer = inflight && rdata_valid;
+    wire             xfer = live && rdata_valid;
     wire             two  = (XW > 1) && (rleft > 1);
     wire [BW-1:0]    b0   = beat;
     wire [BW-1:0]    b1   = (beat == CB) ? {BW{1'b0}} : beat + 1'b1;
@@ -514,39 +560,38 @@ module fabric_index_scan #(
     endgenerate
     wire [BW:0] adv = {1'b0, beat} + (two ? 2 : 1);
     integer qi;
+    wire [11:0] nb = two ? 12'd2 : 12'd1;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            busy <= 1'b0; inflight <= 1'b0; blk <= 0; count <= 0; got <= 0; beat <= 0; rleft <= 0; accs <= 0; accc <= 0;
-            req_valid <= 1'b0; done <= 1'b0; cand_valid <= {NQ{1'b0}}; pend <= 1'b0; pscale <= 0;
+            busy <= 1'b0; blk <= 0; rblk <= 0; beat <= 0; rleft <= 0; live <= 1'b0; pq_wr <= 0; pq_rd <= 0; accs <= 0; accc <= 0;
+            done <= 1'b0; cand_valid <= {NQ{1'b0}}; pend <= 1'b0; pscale <= 0;
         end else begin
             done <= 1'b0;
             cand_valid <= {NQ{1'b0}};
             if (start) begin
-                blk <= 0; beat <= 0; accs <= 0; accc <= 0; inflight <= 1'b0; pend <= 1'b0;
+                blk <= 0; rblk <= 0; beat <= 0; accs <= 0; accc <= 0; pend <= 1'b0; live <= 1'b0; pq_wr <= 0; pq_rd <= 0;
                 if (n_blocks == 0) done <= 1'b1;
-                else begin busy <= 1'b1; req_valid <= 1'b1; end
+                else busy <= 1'b1;
             end else if (busy) begin
-                if (req_valid && req_ready) begin
-                    req_valid <= 1'b0; inflight <= 1'b1; beat <= 0; count <= want; got <= 0;
-                    rleft <= req_beats;
-                end
+                if (ask) begin pq[pq_wr[DW2-2:0]] <= req_beats; pq_wr <= pq_wr + 1'b1; rblk <= rblk + want; end
+                // The page whose beats come next.
+                if (!live && !pq_empty) begin rleft <= pq[pq_rd[DW2-2:0]]; pq_rd <= pq_rd + 1'b1; live <= 1'b1; end
                 // The sum moves when a transfer comes, and empties when its record is scaled.
                 if (xfer || ends) begin accs <= nxt_s; accc <= nxt_c; end
                 pend <= s1; if (s1) pscale <= hi[7:0];
                 if (xfer) begin
                     beat <= (adv > CB) ? BW'(adv - (CB + 1)) : BW'(adv);
-                    rleft <= rleft - (two ? 12'd2 : 12'd1);
-                    if (rleft == (two ? 12'd2 : 12'd1)) inflight <= 1'b0;
+                    rleft <= rleft - nb;
+                    if (rleft == nb) begin
+                        if (!pq_empty) begin rleft <= pq[pq_rd[DW2-2:0]]; pq_rd <= pq_rd + 1'b1; end
+                        else live <= 1'b0;
+                    end
                 end
                 if (ends) begin
                     for (qi = 0; qi < NQ; qi = qi + 1) cand_valid[qi] <= (blk < n_q[qi*IDW +: IDW]);
                     cand_id <= blk; cand_score <= final_score;
                     blk <= blk + 1'b1;
-                    got <= got + 1'b1;
-                    if (got == count - 1) begin
-                        if (blk == n_blocks - 1) begin busy <= 1'b0; done <= 1'b1; end
-                        else req_valid <= 1'b1;
-                    end
+                    if (blk == n_blocks - 1) begin busy <= 1'b0; done <= 1'b1; end
                 end
             end
         end

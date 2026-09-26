@@ -12,7 +12,7 @@ One board: a controller FPGA on PCIe and a ring of ten ASICs of one design. Eigh
 | --- | --- | --- |
 | Host link | PCIe Gen4 x4 to x8 over a SlimSAS cable | The FPGA terminates PCIe and owns the host protocol, scheduling, sampling, context allocation and telemetry. |
 | Ring link (die to die) | Work items: hidden vector (4096 x 16 bit), context id, position; head dies append their partial lists | Source-synchronous ready/valid packets with framing and CRC; candidate 32 data bits at 250 MHz DDR, 2 GB/s raw. A die forwards the item unchanged and replaces the hidden vector (layer mode) or appends its list (head mode). |
-| Die memory | Per-context state of the die's four layers (see the memory map) | 16 AP Memory APS512XXN PSRAMs in HPI x16 mode per layer die, 1 GB, 16 GB/s at 250 MHz, in 2 KB stripes across the devices; head dies have none. |
+| Die memory | Per-context state of the die's four layers (see the memory map) | 16 AP Memory APS512XXN PSRAMs in HPI x16 mode per layer die, 1 GB, 16 GB/s at 250 MHz, in 1 KB stripes across the devices; head dies have none. |
 | Management SPI | Boot: the ~80 KB of per-column requantizer constants and unit constants; the mode strap | Loaded into the constants SRAM before the first work item. |
 
 ## A layer die
@@ -106,7 +106,7 @@ Adapters read their streams NL=8 lanes (one beat) per cycle and write one beat p
 
 ## Memory port and the memory path
 
-One protocol from the memory unit's requesters to the PSRAM channels, one request in flight per requester.
+One protocol from the memory unit's requesters to the PSRAM channels. A requester may keep several reads in flight; they come back in the order they were taken.
 
 | Signal | Direction | Width | Meaning |
 | --- | --- | --- | --- |
@@ -119,10 +119,10 @@ One protocol from the memory unit's requesters to the PSRAM channels, one reques
 
 | Block | Upstream | Downstream | Contract |
 | --- | --- | --- | --- |
-| fabric_mem_arbiter | N=4 requester ports (mover, append, scan, reader) | One memory port | Round-robin: the next requester after the last granted with a request pending; the grant holds for the burst; rdata returns to the granted requester. |
-| fabric_mem_bridge | The core-clock memory port | The 250 MHz controller-clock memory port | Three asynchronous FIFOs (requests 4, write beats 16, read beats 8); rd_overflow flags a read burst the core did not drain in time. |
-| fabric_hpi_stripe | One memory port | NDEV=16 channels: x_valid[dev]/x_ready, x_write, x_addr[24:0], x_beats[7:0], per-device wdata/rdata, x_done[dev] | Consecutive 2 KB stripes on consecutive devices: a burst is split into its stripe chunks, which run on their devices, and read beats are reassembled in order; a chunk never crosses a device page. |
-| fabric_hpi_channel | One transaction port: xact_valid/ready, xact_write, xact_addr[24:0], xact_beats[7:0], 128-bit wdata/rdata, xact_done | HPI x16 pins: ce_n, dq[15:0] with dq_oe, dm[1:0], dqs[1:0] | Power-up and reset timing (tPU, tRST), MR0/MR4/MR8 writes, linear bursts within tCEM, tCPH between transactions, write latency WLC; 128-bit beats become eight 16-bit words. |
+| fabric_mem_arbiter | N=4 requester ports (mover, append, scan, rows fetcher) | One memory port | Round-robin: the next requester after the last granted with a request pending. A write holds the port until its data has gone; a read lets it go once taken, and its data is steered back from an in-order queue of the reads in flight (16). |
+| fabric_mem_bridge | The core-clock memory port | The 250 MHz controller-clock memory port | Three asynchronous FIFOs (requests 4, write beats 16, read beats 16) and a queue of the reads in flight (16); rd_overflow flags a read burst the core did not drain in time. |
+| fabric_hpi_stripe | One memory port | NDEV=16 channels: x_valid[dev]/x_ready, x_write, x_addr[24:0], x_beats[7:0], per-device wdata/rdata, x_done[dev] | Consecutive 1 KB stripes on consecutive devices: a burst is split into its stripe chunks, which run on their devices, and read beats are reassembled in order; a chunk never crosses a device page. The next request is taken once the last one's chunks are issued, so requests overlap; idle when nothing is in flight. |
+| fabric_hpi_channel | One transaction port: xact_valid/ready, xact_write, xact_addr[24:0], xact_beats[7:0], 128-bit wdata/rdata, xact_done | HPI x16 pins: ce_n, dq[15:0] with dq_oe, dm[1:0], dqs[1:0] | Power-up and reset timing (tPU, tRST), MR0/MR4/MR8 writes, linear bursts within tCEM, tCPH between transactions, write latency WLC; 128-bit beats become eight 16-bit words. Two page buffers: a read drains as it arrives, and the device takes the next transaction while the last one's data waits its turn. |
 | fabric_phy | The channel's DQS | Delay lines, DLL | The DLL locks a delay line to the clock period and gives the quarter-period code that centres DQS on DQ. |
 
 | Region per context | Contents | Placement |
@@ -156,10 +156,10 @@ Each vector unit is a streaming datapath of L lanes per beat: in_valid presents 
 | --- | --- | --- | --- |
 | fabric_row_dma (mover) | rd_start/rd_base, wr_start/wr_base, row streams | one request port | Reads or writes ROWS rows of ROW_BITS as one burst; the state slots and histories. |
 | fabric_kv_append | start, pos, window/block/index bases, k_rows, v_rows, idx_k, running sums in | one request port (writes) | Writes the token's keys and values into the window at pos; adds them to the block sums; at a block end pools the block into a block record and codes its index record (4-bit codes and a scale); sums out for the memory. |
-| fabric_index_scan | start, base, n_blocks, NQ queries' q_codes and counts | one request port (reads RPB records a page, two beats a transfer) | Streams every eligible block's index record, scores it against each coded query (a dot product of 4-bit codes times the record's scale), both beats of a transfer at once, and emits (cand_id, cand_score) for every query whose count takes the block. |
+| fabric_index_scan | start, base, n_blocks, NQ queries' q_codes and counts | one request port (reads RPB records a page, a whole number of stripes, eight pages in flight, two beats a transfer) | Streams every eligible block's index record, scores it against each coded query (a dot product of 4-bit codes times the record's scale), both beats of a transfer at once, and emits (cand_id, cand_score) for every query whose count takes the block. |
 | fabric_topk | clear, cand_valid/cand_id/cand_score, finish |  | Keeps the K best candidates; after finish streams them out (out_valid, out_id, out_score, out_last) and pulses done. |
 
-The memory unit's adapter turns the program's memory commands into these: op 0 and 1 are the mover's reads and writes between beat addresses and the buffer, op 2 the append of the token in the buffer, op 3 the scan of the context's index into the top-K ids, op 4 the rows command that turns a selection into the mover's reads (the window in page runs, then one record per chosen block), the records into the head's buffer as they are stored, for the attention adapter to unpack; ops 5 to 7 are a prefill chunk's: its window before and after its appends and its tokens' blocks, into one rows buffer the chunk's tokens share.
+The memory unit's adapter turns the program's memory commands into these: op 0 and 1 are the mover's reads and writes between beat addresses and the buffer, op 2 the append of the token in the buffer, op 3 the scan of the context's index into the top-K ids, op 4 the rows command that turns a selection into the rows fetcher's moves (the window in page runs, then one record per chosen block), the records into the head's buffer as they are stored, for the attention adapter to unpack; ops 5 to 7 are a prefill chunk's: its window before and after its appends and its tokens' blocks, into one rows buffer the chunk's tokens share.
 
 ## Sources
 

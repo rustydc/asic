@@ -24,7 +24,8 @@ module tb_mem_bridge #(
     parameter int  CXB      = 1,                      // beats a wide core transfer carries; at 2 every other request is wide
     parameter int  MXB      = 1,                      // beats a controller transfer carries
     parameter int  B2B      = 0,                      // a write followed by a write goes without waiting, as the engine's do
-    parameter int  STEADY   = 0                       // every request wide and every write beat on time, as the engine's mover
+    parameter int  STEADY   = 0,                      // every request wide and every write beat on time, as the engine's mover
+    parameter int  PIPE     = 0                       // every request as soon as the port takes it: the run timed whole
 );
     localparam int DW = 128;
     localparam real T = 4.0;                          // 250 MHz
@@ -129,24 +130,27 @@ module tb_mem_bridge #(
     // cycle the port took it and the cycle it was complete.
     // Complete is the stripe going idle after it took the request and, for a
     // read, the last beat back on the core clock, whichever is later.
-    integer ccyc = 0, t_take = 0, t_idle = 0, t_beat = 0, times;
+    integer ccyc = 0, t_take = 0, t_idle = 0, t_beat = 0, times, t_first = 0;
     reg     was_busy = 0;
     always @(posedge cclk) begin
         ccyc <= ccyc + 1;
         if (req_valid && req_ready) t_take = ccyc;
         if (rdata_valid) t_beat = ccyc + 1;
-        if (was_busy && !stripe.busy) t_idle = ccyc;
-        was_busy <= stripe.busy;
+        if (was_busy && stripe.idle) t_idle = ccyc;
+        was_busy <= !stripe.idle;
     end
     always @(posedge clk) if (m_req_valid && m_req_ready) accepted = accepted + 1;
     reg [15:0] edev [0:NDEV*DEV_WORDS-1];
     reg check = 0;
-    // The read in flight: whether it is wide and how many of its beats are
-    // still to come, which says how many beats each transfer carries.
+    // The reads in flight, in order: whether each is wide and how many of
+    // its beats are still to come, which says how many beats each transfer
+    // carries.
     reg        rd_wide = 0;
-    integer    rd_left = 0, k, nb;
+    integer    rd_left = 0, k, nb, rq_wr = 0, rq_rd = 0;
+    reg [12:0] rq [0:N-1];
     always @(posedge cclk) begin
         if (rdata_valid) begin
+            if (rd_left == 0) begin rd_wide = rq[rq_rd][12]; rd_left = rq[rq_rd][11:0]; rq_rd = rq_rd + 1; end
             nb = (rd_wide && rd_left > 1) ? CXB : 1;
             for (k = 0; k < nb; k = k + 1) begin
                 if (got < NR && rdata[k*DW +: DW] !== erd[got]) begin
@@ -176,7 +180,8 @@ module tb_mem_bridge #(
             while (!req_ready) @(negedge cclk);
             req_valid = 1; req_write = reqs[n][44]; req_beats = reqs[n][43:32]; req_addr = reqs[n][31:0];
             req_wide = (CXB > 1) && (STEADY || n % 2 == 1);
-            if (!reqs[n][44]) begin rd_wide = req_wide; rd_left = reqs[n][43:32]; end
+            if (!reqs[n][44]) begin rq[rq_wr] = {req_wide, reqs[n][43:32]}; rq_wr = rq_wr + 1; end
+            if (PIPE && n == 0) t_first = ccyc;
             @(posedge cclk); #0.05;
             req_valid = 0;
             if (reqs[n][44]) begin
@@ -195,16 +200,22 @@ module tb_mem_bridge #(
             // A request is complete when the controller has taken it and finished it
             // and, for a read, every beat has come back across the bridge.
             if (!reqs[n][44]) rb_expected = rb_expected + reqs[n][43:32];
-            if (!(B2B && reqs[n][44] && n + 1 < N && reqs[n+1][44])) begin
+            if (!PIPE && !(B2B && reqs[n][44] && n + 1 < N && reqs[n+1][44])) begin
                 guard = 0;
                 while (accepted != n + 1 && guard < 400000) begin @(posedge clk); guard = guard + 1; end
                 @(posedge clk);                                   // the stripe is busy from the cycle after it takes it
-                while (!(accepted == n + 1 && !stripe.busy && got == rb_expected) && guard < 400000) begin @(posedge clk); guard = guard + 1; end
+                while (!(accepted == n + 1 && stripe.idle && got == rb_expected) && guard < 400000) begin @(posedge clk); guard = guard + 1; end
                 if (guard >= 400000) begin $display("FAIL: request %0d never completed (%0d accepted, %0d of %0d read beats)", n, accepted, got, rb_expected); $finish; end
                 repeat (4) @(posedge cclk);
                 $fdisplay(times, "%0d %0d %0d %0d %0d", n, reqs[n][44], reqs[n][43:32], t_take,
                           reqs[n][44] ? t_idle : ((t_beat > t_idle) ? t_beat : t_idle));
             end
+        end
+        if (PIPE) begin                                   // the whole run: the first request taken to the last done
+            guard = 0;
+            while (!(accepted == N && stripe.idle && got == rb_expected) && guard < 400000) begin @(posedge clk); guard = guard + 1; end
+            repeat (4) @(posedge cclk);
+            $fdisplay(times, "%0d %0d", t_first, (t_beat > t_idle) ? t_beat : t_idle);
         end
         $fclose(times);
         repeat (50) @(posedge clk);

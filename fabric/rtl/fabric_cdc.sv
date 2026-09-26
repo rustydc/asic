@@ -104,7 +104,8 @@ module fabric_mem_bridge #(
     parameter int MXB    = 1,                  // beats a controller transfer carries
     parameter int REQ_AW = 2,                  // 4 requests
     parameter int WD_AW  = 4,                  // 16 write transfers
-    parameter int RD_AW  = 4                   // 16 read transfers
+    parameter int RD_AW  = 4,                  // 16 read transfers
+    parameter int RQ_AW  = 4                   // 16 reads in flight: the controller overlaps them
 ) (
     // core side
     input  wire              c_clk,
@@ -140,9 +141,12 @@ module fabric_mem_bridge #(
     wire c_req_go = c_req_valid && c_req_ready;
     wire c_wide   = (CXB > 1) && (c_req_wide === 1'b1);
     // The core side's queue of read requests, for unpacking their data.
-    reg  [IW-1:0] rq [0:3];
-    reg  [2:0]    rq_wr, rq_rd;
-    wire          rq_full  = ((rq_wr - rq_rd) == 3'd4);
+    // Deep enough for every read the controller can have in flight: it takes
+    // the next request once the last one's chunks are issued, so a unit that
+    // asks ahead keeps several devices busy only if this lets it.
+    reg  [IW-1:0] rq [0:(1<<RQ_AW)-1];
+    reg  [RQ_AW:0] rq_wr, rq_rd;
+    wire          rq_full  = ((rq_wr - rq_rd) == (1 << RQ_AW));
     wire          rq_empty = (rq_wr == rq_rd);
 
     // Requests.
@@ -227,9 +231,9 @@ module fabric_mem_bridge #(
             rq_wr <= 0; rq_rd <= 0; r_left <= 0; r_wide <= 1'b0; g_n <= 0; g_pos <= 0; c_rdata_valid <= 1'b0; c_rdata <= 0;
         end else begin
             c_rdata_valid <= 1'b0;
-            if (c_req_go && !c_req_write) begin rq[rq_wr[1:0]] <= {c_wide, c_req_beats}; rq_wr <= rq_wr + 1'b1; end
+            if (c_req_go && !c_req_write) begin rq[rq_wr[RQ_AW-1:0]] <= {c_wide, c_req_beats}; rq_wr <= rq_wr + 1'b1; end
             if (!r_active && !rq_empty) begin
-                {r_wide, r_left} <= rq[rq_rd[1:0]]; rq_rd <= rq_rd + 1'b1; g_n <= 0; g_pos <= 0;
+                {r_wide, r_left} <= rq[rq_rd[RQ_AW-1:0]]; rq_rd <= rq_rd + 1'b1; g_n <= 0; g_pos <= 0;
             end else if (r_emit) begin
                 c_rdata_valid <= 1'b1;
                 for (ri = 0; ri < CXB; ri = ri + 1)

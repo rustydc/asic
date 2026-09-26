@@ -146,6 +146,9 @@ module tb_hpi #(
             while (!req_ready && guard < 200000) begin @(posedge clk); guard = guard + 1; end
             if (!req_ready) begin $display("FAIL: request %0d never completed", n); $finish; end
         end
+        // Requests overlap: the last may still be running when it is taken.
+        guard = 0;
+        while (!stripe.idle && guard < 200000) begin @(posedge clk); guard = guard + 1; end
         repeat (50) @(posedge clk);
         if (got != NR) $display("FAIL: %0d read beats of %0d", got, NR);
         $readmemh("expected_devs.hex", edev);

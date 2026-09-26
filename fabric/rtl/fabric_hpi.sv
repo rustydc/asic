@@ -201,11 +201,21 @@ endmodule
 
 // ---------------------------------------------------------------------------
 // One device's controller.  Transactions of up to 128 beats (a page) within
-// one page: the write data is collected first into a page buffer, a read
-// fills one and is then drained, XB beats a transfer (fewer on a
-// transaction's last).  The device fills the buffer a beat every four
-// clocks; drained a beat a clock, sixteen devices could hand the port no
-// more than one of them could, and XB = 4 lets them hand it four.  Initialisation: the power-up
+// one page: the write data is collected first into a page buffer; a read
+// fills one and is drained as it fills, XB beats a transfer once that many
+// have arrived (fewer on a transaction's last).  The device fills the
+// buffer a beat every four clocks; drained a beat a clock, sixteen devices
+// could hand the port no more than one of them could, and XB = 4 lets them
+// hand it four.
+//
+// Two page buffers.  The port takes the chunks of a request in order, so a
+// read's data can wait in its buffer while another device's chunk ahead of
+// it drains; with one buffer the device waited too, and the next request's
+// chunk for it, and every chunk behind that.  With two, a read's buffer is
+// held until it has drained and the device takes the next transaction into
+// the other.  A read used to be drained only once the whole chunk was in,
+// and into one buffer, which put the chunk's burst, its drain and the
+// device's next burst in series.  Initialisation: the power-up
 // wait with the clock stopped, a global reset, the three mode registers,
 // then a check of vendor and density.
 // ---------------------------------------------------------------------------
@@ -250,10 +260,19 @@ module fabric_hpi_channel #(
     output reg          dm_oe,
     input  wire [1:0]   dqs_d                  // DQS delayed a quarter period, the capture strobe
 );
-    // Page buffer: 128 beats of 128 bits, addressed by word for the DDR side.
-    reg [127:0] buffer [0:127];
+    // Page buffers: two of 128 beats of 128 bits, addressed by word for the
+    // DDR side.  fb is the one the transaction in hand uses.
+    reg [127:0] buffer [0:255];
     reg [7:0]   nbeats;
-    reg [7:0]   bcount;                        // beats collected or drained
+    reg [7:0]   bcount;                        // a write's beats collected
+    reg         fb;
+    // The drain: a read's buffer is held from its command until its last
+    // beat has gone to the port, the older of two first.
+    reg [1:0]   held;
+    reg [7:0]   hbeats [0:1];                  // a held buffer's beats
+    reg [7:0]   hgot [0:1];                    // and those that have arrived
+    reg         db;                            // the buffer draining
+    reg [7:0]   dcount;                        // its beats gone
     reg [10:0]  wcount;                        // words moved on the device side
     reg         write_r;
     reg [24:0]  addr_r;
@@ -297,15 +316,32 @@ module fabric_hpi_channel #(
     reg [7:0]  mr1_r, mr2_r;
     reg        wdata_phase;                    // odd words launched at falling edges
 
-    assign xact_ready  = (state == S_IDLE) && init_done;
+    assign xact_ready  = (state == S_IDLE) && init_done && (held != 2'b11);
     assign wdata_ready = (state == S_COLLECT);
     // A transfer's beats: XB, or what is left of the transaction.
     wire [7:0] rest = nbeats - bcount;
     wire [7:0] kk   = (rest < XB) ? rest : XB[7:0];
+    // The drain, beside the state machine: a transfer is offered once its
+    // beats are all in the buffer.  A pair captured this clock is written
+    // at this edge, so the count it makes is good for the next.
+    wire       cap_go = (state == S_RDATA) && pair_ready && (wait_r >= 4);
+    wire [7:0] got_c  = 8'((wcount + 2) >> 3);
+    wire [7:0] d_got  = (cap_go && fb == db) ? got_c : hgot[db];
+    wire [7:0] d_rest = hbeats[db] - dcount;
+    wire [7:0] d_k    = (d_rest < XB) ? d_rest : XB[7:0];
+    wire       d_go   = rdata_valid && rdata_ready;
+    wire [7:0] dc_n   = d_go ? dcount + d_k : dcount;
+    wire       d_end  = held[db] && (dc_n == hbeats[db]);
+    wire [7:0] rest_n = hbeats[db] - dc_n;
+    wire [7:0] k_n    = (rest_n < XB) ? rest_n : XB[7:0];
+    // A transaction is taken into a buffer not held: the other one's while
+    // the draining one is.
+    wire       take   = (state == S_IDLE) && xact_valid && xact_ready;
+    wire       fb_new = held[db] ? !db : db;
     genvar gxb;
     generate
         for (gxb = 0; gxb < XB; gxb = gxb + 1) begin : g_xb
-            assign rdata[gxb*128 +: 128] = buffer[(bcount + gxb) & 8'h7F];
+            assign rdata[gxb*128 +: 128] = buffer[{db, 7'((dcount + gxb) & 8'h7F)}];
         end
     endgenerate
     assign phy_quiet   = ce_n;                 // no frame or data on the wires while CE# is high
@@ -331,8 +367,25 @@ module fabric_hpi_channel #(
             state <= S_PU; wait_r <= 0; clk_en <= 1'b0; init_done <= 1'b0; device_ok <= 1'b0; ce_n <= 1'b1; dq_oe <= 1'b0;
             d_rise <= 0; dm_rise <= 2'b11; dm_oe <= 1'b0; rdata_valid <= 1'b0; xact_done <= 1'b0; step <= 0; fedge <= 0; rp <= 0;
             cap_clear <= 1'b0; bcount <= 0; wcount <= 0; nbeats <= 0; write_r <= 1'b0; addr_r <= 0; wdata_phase <= 1'b0;
+            fb <= 1'b0; held <= 0; db <= 1'b0; dcount <= 0;
+            hbeats[0] <= 0; hbeats[1] <= 0; hgot[0] <= 0; hgot[1] <= 0;
         end else begin
             xact_done <= 1'b0;
+            if (cap_go) hgot[fb] <= got_c;
+            // The drain: the held buffer's next transfer once it has arrived;
+            // at its last, the buffer is let go and the other drains if held.
+            if (held[db]) begin
+                dcount <= dc_n;
+                rdata_valid <= !d_end && (d_got - dc_n >= k_n);
+                if (d_end) begin
+                    held[db] <= 1'b0;
+                    if (held[!db] || (take && !xact_write && fb_new == !db)) begin db <= !db; dcount <= 0; end
+                end
+            end else rdata_valid <= 1'b0;
+            if (take && !xact_write) begin
+                held[fb_new] <= 1'b1; hbeats[fb_new] <= xact_beats; hgot[fb_new] <= 0;
+                if (!held[db]) dcount <= 0;
+            end
             if (state != S_WDATA && state != S_WEND) dm_rise <= 2'b11;
             case (state)
                 S_PU: begin                                   // power-up: clock stopped, CE# high; the PHY locks meanwhile
@@ -389,17 +442,17 @@ module fabric_hpi_channel #(
                                 device_ok <= (mr1_r[4:0] == 5'b01101) && (mr2_r[2:0] == 3'b110) && (mr2_r[7:5] == 3'b110);
                                 state <= S_IDLE;
                             end
-                        end else if (write_r) state <= S_DONE;
-                        else begin state <= S_DRAIN; bcount <= 0; end
+                        end else state <= S_DONE;
                     end
                 end
                 S_IDLE: if (xact_valid) begin
                     write_r <= xact_write; addr_r <= xact_addr; nbeats <= xact_beats; bcount <= 0; wcount <= 0; fedge <= 0;
+                    fb <= fb_new;
                     state <= xact_write ? S_COLLECT : S_CMD;
                 end
                 S_COLLECT: if (wdata_valid) begin
                     for (xi = 0; xi < XB; xi = xi + 1)
-                        if (xi < kk) buffer[(bcount + xi) & 8'h7F] <= wdata[xi*128 +: 128];
+                        if (xi < kk) buffer[{fb, 7'((bcount + xi) & 8'h7F)}] <= wdata[xi*128 +: 128];
                     bcount <= bcount + kk;
                     if (bcount + kk == nbeats) begin state <= S_CMD; fedge <= 0; end
                 end
@@ -420,13 +473,13 @@ module fabric_hpi_channel #(
                 S_WLAT: begin                                 // word 0 goes out at rising edge 2 + WLC
                     wait_r <= wait_r + 1'b1;
                     if (wait_r == WLC - 1) begin
-                        d_rise <= buffer[0][15:0]; dm_rise <= 2'b00; wdata_phase <= 1'b1;
+                        d_rise <= buffer[{fb, 7'd0}][15:0]; dm_rise <= 2'b00; wdata_phase <= 1'b1;
                         wcount <= 1;
                         state <= (nbeats * 8 > 2) ? S_WDATA : S_WEND;
                     end
                 end
                 S_WDATA: begin                                // even words at rising edges; the odd ones below
-                    d_rise <= buffer[(wcount + 1) >> 3][((wcount + 1) & 7)*16 +: 16];
+                    d_rise <= buffer[{fb, 7'((wcount + 1) >> 3)}][((wcount + 1) & 7)*16 +: 16];
                     wcount <= wcount + 2;
                     if (wcount + 3 >= nbeats * 8) state <= S_WEND;
                 end
@@ -440,20 +493,13 @@ module fabric_hpi_channel #(
                     // The first pair is taken only once the pointer synchronisers have
                     // settled after the clear; data cannot arrive within the read latency.
                     if (pair_ready && wait_r >= 4) begin
-                        buffer[wcount >> 3][(wcount & 7)*16 +: 16]       <= cap[rp[3:0]];
-                        buffer[wcount >> 3][((wcount & 7) + 1)*16 +: 16] <= capf[rp[3:0]];
+                        buffer[{fb, 7'(wcount >> 3)}][(wcount & 7)*16 +: 16]       <= cap[rp[3:0]];
+                        buffer[{fb, 7'(wcount >> 3)}][((wcount & 7) + 1)*16 +: 16] <= capf[rp[3:0]];
                         rp <= rp + 5'd1;
                         wcount <= wcount + 2;
                         if (wcount + 2 >= nbeats * 8) begin ce_n <= 1'b1; state <= S_CPH; wait_r <= 0; end
                     end
                     if (wait_r == TCEM_CYCLES) begin ce_n <= 1'b1; state <= S_CPH; wait_r <= 0; end   // no data: give up
-                end
-                S_DRAIN: begin
-                    rdata_valid <= 1'b1;
-                    if (rdata_valid && rdata_ready) begin
-                        bcount <= bcount + kk;
-                        if (bcount + kk == nbeats) begin rdata_valid <= 1'b0; state <= S_DONE; end
-                    end
                 end
                 S_DONE: begin xact_done <= 1'b1; state <= S_IDLE; end
                 default: state <= S_IDLE;
@@ -466,7 +512,7 @@ module fabric_hpi_channel #(
     always @(negedge clk) begin
         if ((state == S_CMD || state == S_MRW || state == S_MRR) && fedge == 2) d_fall <= {8'h00, frame[2]};
         else if ((state == S_CMD || state == S_MRW || state == S_MRR || state == S_WLAT || state == S_RDATA) && fedge == 3) d_fall <= {8'h00, frame[4]};
-        else if (wdata_phase) d_fall <= buffer[wcount >> 3][(wcount & 7)*16 +: 16];
+        else if (wdata_phase) d_fall <= buffer[{fb, 7'(wcount >> 3)}][(wcount & 7)*16 +: 16];
         else d_fall <= d_rise;
         dm_fall <= wdata_phase ? 2'b00 : 2'b11;
     end
@@ -479,8 +525,18 @@ endmodule
 // ---------------------------------------------------------------------------
 // The die's memory port over NDEV devices: consecutive stripes on
 // consecutive devices, a burst split into stripe chunks that run on their
-// devices concurrently, read data returned in order from the channels'
-// page buffers.
+// devices concurrently, read data returned in order from the channels.
+//
+// Requests overlap.  The next is taken once the last one's chunks are all
+// issued (and, for a write, fed): its chunks start on their devices while
+// the last one's still run, and read data drains in order behind them,
+// chunk by chunk from an order queue and request by request from a queue
+// of their sizes, so no transfer on the port carries two requests' beats.
+// A channel runs its transactions in the order they were issued to it, so a
+// read after a write to the same place reads what was written.  The stripe
+// used to hold each request until every chunk was done, which put a
+// request's slowest device, and its latency, between it and the next.
+// `idle` says nothing is in flight.
 // ---------------------------------------------------------------------------
 module fabric_hpi_stripe #(
     parameter int NDEV = 16,
@@ -501,6 +557,7 @@ module fabric_hpi_stripe #(
     output wire                  rdata_valid,
     input  wire                  rdata_ready,             // the port can take a read transfer this clock
     output wire [XB*DW-1:0]      rdata,
+    output wire                  idle,                    // no request is issuing, draining or writing
     // the channels
     output reg  [NDEV-1:0]       x_valid,
     input  wire [NDEV-1:0]       x_ready,
@@ -522,11 +579,11 @@ module fabric_hpi_stripe #(
     localparam int DSHIFT = $clog2(NDEV);
     localparam int AB     = 2 * XB;                       // beats the repacking buffers hold
     localparam int KW     = $clog2(AB + 1);
-    // Issue side.
+    // Issue side: the request being split into chunks.
     reg          busy, write_r;
     reg [31:0]   addr;
     reg [11:0]   left;                                    // beats not yet issued to a channel
-    reg [11:0]   port_left;                               // beats not yet moved on the port
+    reg [11:0]   wleft;                                   // a write's beats not yet taken from the port
     reg [DEVW-1:0] cur;                                    // device of the chunk being fed
     reg [7:0]    cur_beats, fed;
     reg          feeding;                                  // write data of the current chunk in flight
@@ -535,6 +592,13 @@ module fabric_hpi_stripe #(
     reg [7:0]    q_beats [0:31];
     reg [5:0]    q_wr, q_rd;
     reg [7:0]    drained;
+    // The reads taken and not yet all on the port: their sizes in order, the
+    // head's beats still to go out in rd_left.
+    reg [11:0]   rs [0:7];
+    reg [3:0]    rs_wr, rs_rd;
+    reg [11:0]   rd_left;
+    wire         rs_empty = (rs_wr == rs_rd);
+    wire         rs_full  = ((rs_wr - rs_rd) == 4'd8);
     reg [5:0]    pending_w;                                // write chunks issued and not yet done
     wire         q_empty = (q_wr == q_rd);
     wire         q_full  = ((q_wr - q_rd) == 6'd32);
@@ -551,7 +615,7 @@ module fabric_hpi_stripe #(
         for (dc = 0; dc < NDEV; dc = dc + 1) done_count = done_count + (x_done[dc] & w_out[dc]);
     end
     wire [7:0]   chunk    = (left < room) ? left[7:0] : room[7:0];
-    assign req_ready = !busy;
+    assign req_ready = !busy && !rs_full;
 
     // The repacking buffers.  A request is a run of chunks, one device each,
     // and a chunk need not be a whole number of transfers -- one that starts
@@ -566,13 +630,15 @@ module fabric_hpi_stripe #(
 
     // Reads.  The head chunk's channel hands over up to XB beats a clock, all
     // of them or none; a transfer goes to the port when XB beats are in hand,
-    // or the request's last.
+    // or the request's last.  A chunk of the next request waits until this
+    // one's last transfer has gone.
     wire [DEVW-1:0] head = q_dev[q_rd[4:0]];
     wire [7:0]   h_left = q_beats[q_rd[4:0]] - drained;
     wire [KW-1:0] h_k   = (h_left < XB) ? h_left[KW-1:0] : XB[KW-1:0];
-    wire         r_take = busy && !write_r && !q_empty && x_rdata_valid[head] && rdata_ready;
+    wire         fits   = ({4'd0, racc_n} + {4'd0, h_k} <= rd_left);
+    wire         r_take = !q_empty && x_rdata_valid[head] && rdata_ready && fits;
     wire [KW:0]  r_tot  = racc_n + (r_take ? h_k : 0);
-    wire         r_emit = busy && !write_r && rdata_ready && (r_tot >= XB || (r_tot != 0 && r_tot == port_left));
+    wire         r_emit = rdata_ready && (rd_left != 0) && (r_tot >= XB || (r_tot != 0 && r_tot == rd_left));
     wire [KW-1:0] r_n   = !r_emit ? 0 : ((r_tot >= XB) ? XB[KW-1:0] : r_tot[KW-1:0]);
     reg  [DW-1:0] r_comb [0:AB-1];
     always @* for (ai = 0; ai < AB; ai = ai + 1)
@@ -588,9 +654,8 @@ module fabric_hpi_stripe #(
     // Writes.  A port transfer is taken while the buffer has room for it;
     // the current chunk's channel is fed XB beats a clock, or what is left of
     // the chunk, once that many are in hand.
-    wire [11:0]  in_left = port_left;
-    wire [KW-1:0] in_k  = (in_left < XB) ? in_left[KW-1:0] : XB[KW-1:0];
-    assign wdata_ready = busy && write_r && (in_left != 0) && (wacc_n + in_k <= AB);
+    wire [KW-1:0] in_k  = (wleft < XB) ? wleft[KW-1:0] : XB[KW-1:0];
+    assign wdata_ready = busy && write_r && (wleft != 0) && (wacc_n + in_k <= AB);
     wire         w_in   = wdata_valid && wdata_ready;
     wire [7:0]   f_left = cur_beats - fed;
     wire [KW-1:0] f_k   = (f_left < XB) ? f_left[KW-1:0] : XB[KW-1:0];
@@ -608,19 +673,23 @@ module fabric_hpi_stripe #(
     generate
         for (g = 0; g < NDEV; g = g + 1) begin : g_x
             assign x_wdata_valid[g] = f_have && (cur == g);
-            assign x_rdata_ready[g] = busy && !write_r && !q_empty && (q_dev[q_rd[4:0]] == g) && rdata_ready;
+            assign x_rdata_ready[g] = !q_empty && (head == g) && rdata_ready && fits;
         end
     endgenerate
+    assign idle = !busy && q_empty && racc_n == 0 && rd_left == 0 && rs_empty && pending_w == 0 && done_count == 0;
 
+    wire         take_read = !busy && req_valid && req_ready && !req_write;
+    wire [11:0]  rd_after  = rd_left - r_n;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             busy <= 1'b0; x_valid <= 0; feeding <= 1'b0; q_wr <= 0; q_rd <= 0; drained <= 0; left <= 0; addr <= 0;
-            write_r <= 1'b0; cur <= 0; cur_beats <= 0; fed <= 0; pending_w <= 0; w_out <= 0; port_left <= 0;
-            racc_n <= 0; wacc_n <= 0;
+            write_r <= 1'b0; cur <= 0; cur_beats <= 0; fed <= 0; pending_w <= 0; w_out <= 0; wleft <= 0;
+            racc_n <= 0; wacc_n <= 0; rs_wr <= 0; rs_rd <= 0; rd_left <= 0;
         end else begin
             // Accept a port request.
-            if (!busy && req_valid) begin
-                busy <= 1'b1; write_r <= req_write; addr <= req_addr; left <= req_beats; port_left <= req_beats;
+            if (!busy && req_valid && req_ready) begin
+                busy <= 1'b1; write_r <= req_write; addr <= req_addr; left <= req_beats;
+                wleft <= req_write ? req_beats : 12'd0;
             end
             // Issue the next chunk when its device is free and, for writes, the previous chunk's data is in.
             if (busy && left != 0 && !feeding && x_valid == 0 && x_ready[dev] && !q_full) begin
@@ -639,7 +708,7 @@ module fabric_hpi_stripe #(
                 else begin q_dev[q_wr[4:0]] <= cur; q_beats[q_wr[4:0]] <= cur_beats; q_wr <= q_wr + 6'd1; end
             end
             // Write beats: in from the port, out to the chunk's channel.
-            if (w_in) port_left <= port_left - in_k;
+            if (w_in) wleft <= wleft - in_k;
             for (ai = 0; ai < AB; ai = ai + 1)
                 if (ai + (f_go ? f_k : 0) < AB) wacc[ai] <= w_comb[ai + (f_go ? f_k : 0)];
             wacc_n <= wacc_n + (w_in ? in_k : 0) - (f_go ? f_k : 0);
@@ -655,11 +724,15 @@ module fabric_hpi_stripe #(
             for (ai = 0; ai < AB; ai = ai + 1)
                 if (ai + r_n < AB) racc[ai] <= r_comb[ai + r_n];
             racc_n <= r_tot - r_n;
-            if (r_emit) port_left <= port_left - r_n;
-            // The request is done when every chunk is issued and drained (reads) or written (writes).
-            if (busy && left == 0 && !feeding && x_valid == 0
-                && (write_r ? (pending_w == 0 && done_count == 0) : (q_empty && racc_n == 0 && !r_emit)))
-                busy <= 1'b0;
+            // The reads' sizes: a request taken joins the queue, and the head
+            // moves on when its last beat has gone.
+            if (take_read) begin rs[rs_wr[2:0]] <= req_beats; rs_wr <= rs_wr + 4'd1; end
+            if (rd_left == 0 || rd_after == 0) begin
+                if (!rs_empty) begin rd_left <= rs[rs_rd[2:0]]; rs_rd <= rs_rd + 4'd1; end
+                else if (rd_left != 0) rd_left <= 0;
+            end else rd_left <= rd_after;
+            // The request is taken off the issue side when every chunk is issued and fed.
+            if (busy && left == 0 && !feeding && x_valid == 0) busy <= 1'b0;
         end
     end
 endmodule

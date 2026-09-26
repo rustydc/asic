@@ -1052,8 +1052,9 @@ worth of bandwidth. That is not what the devices are. `hpi.PathModel`
 times each request on the real path: the port, the clock crossing, the
 stripe unit, the channels and sixteen APS512XXN at their datasheet timing
 -- three command clocks, read latency 10 plus any refresh push-out, write
-latency 9, two words a clock, tCPH of 7 -- and the controller as it is
-built. It follows `fabric_hpi.sv`'s state machines, and its two crossing
+latency 9, two words a clock, tCPH of 7 -- and the controller, as it was
+first built (`asbuilt`) and as it is now (`pipelined`, below). It
+follows `fabric_hpi.sv`'s state machines, and its two crossing
 constants were fitted to `tb_mem_bridge` measured request by request:
 it is within three per cent of the RTL from sixteen beats to 4,095, over
 four devices and over sixteen, plus the random push-out the device model
@@ -1061,58 +1062,108 @@ draws for a read (`PathTimingTest`). With it, `Timing(devices=...)`
 charges every memory step its requests on the path: the mover's reads
 whole, its writes posted (the step ends when the bridge has the data, and
 the next request waits for the path), the rows' and the scan's pages as
-they arrive. The engine run over the device models lands within
-three per cent of that schedule, 3,598 cycles against 3,643 for the
-recurrent layer and 4,424 against 4,515 for the global one (with the
-record reader, below), where the ideal port said 1,382 and 1,766.
+they arrive. The engine run over the device models, on the controller as
+first built, landed within three per cent of that schedule, 3,598 cycles
+against 3,643 for the recurrent layer and 4,424 against 4,515 for the
+global one (with the record reader, below), where the ideal port said
+1,382 and 1,766.
 
-The path as built is far from the devices' own rate, for two reasons the
-measurement makes plain. The stripe unit takes one request at a time and
-holds it to the end, and a read chunk is filled into its channel's page
-buffer before any of it is drained; so a 16 KB state slot moves at 7 GB/s,
-not 15. And a stripe is 1 KB, so anything of a kilobyte or less goes to
-one device at 1 GB/s: the rows' two-kilobyte window pages and the scan's
-pages of 25 index records each reach two devices of sixteen, one
-request at a time, and at the end of a 128K context the scan's 655 KB of
-index is most of the global layer's time.
+The path as first built was far from the devices' own rate, for two
+reasons the measurement made plain. The stripe unit took one request at a
+time and held it to the end, and a read chunk was filled into its
+channel's page buffer before any of it was drained; so a 16 KB state
+slot moved at 7 GB/s, not 15. And a stripe is 1 KB, so anything of a
+kilobyte or less goes to one device at 1 GB/s: the rows' two-kilobyte
+window pages and the scan's index pages each reached two devices of
+sixteen, one request at a time.
+
+The controller is now built to the model's pipelined mode, which had
+been written as what the part allows before there was RTL for it:
+
+* **A read streams.** A channel hands its read beats to the port as they
+  arrive, four to a transfer, rather than once the chunk is in. And it has
+  two page buffers: the port takes a request's chunks in order, so a
+  chunk's data can wait while another device's chunk ahead of it drains,
+  and with one buffer its device waited too.
+* **Requests overlap.** The stripe unit takes the next request once the
+  last one's chunks are issued. Read data drains in order behind them,
+  from the order queue of chunks and a queue of the requests' sizes, so no
+  transfer carries two requests' beats; a channel runs its chunks in the
+  order they were issued to it, so a read after a write reads what was
+  written. The bridge keeps sixteen reads in flight instead of four.
+* **The units ask ahead.** The memory port is split-transaction for
+  reads: `fabric_mem_arbiter` lets the port go once a read is taken and
+  steers read data back from an in-order queue of the reads in flight
+  (a write still holds it for its data). The scan keeps eight index pages
+  in flight, and the rows are a fetcher's -- a queue of moves, each a
+  window run or a block record, eight in flight, each one's data into its
+  place in the rows buffer as it comes back.
+
+And the requests are stripe-aligned. The stripe unit issues chunks in
+order, so a request that ends inside a stripe shares that stripe's
+device with the next one, whose chunk there waits -- and every chunk
+behind it. An index page of 25 records was 2,000 bytes, so every page
+waited on the last: at 128K the scan ran at a fifth of the devices'
+rate. An index page is now the least whole number of stripes, 64
+records and five stripes at the 9B geometry, and a window run ends at a
+page of the ring as well as at its wrap.
+
+`PathTimingTest` holds the model to the RTL: every request on its own
+within three per cent (plus the device model's push-out), and runs of
+requests back to back -- window pages, half pages, index pages, state
+slots out and in, scattered block records, over four devices and
+sixteen -- within five, each at a fraction of its requests one at a
+time. The run model is the one-request model carried on over the
+requests, and it has a depth for a unit's limit on requests in flight.
+In the schedule a posted write holds the path for the devices it
+occupies, and a read after it waits for them; the rows' and the scan's
+requests are a run of the unit's own. Over one device the engine lands
+within two per cent of that schedule, 3,254 cycles against 3,218 for the
+recurrent token and 3,918 against 3,881 for the global one. Over four
+the schedule is only a bound (2,947 against 3,218, 3,022 against 3,669):
+at the tiny geometry every request is a stripe or less and the schedule
+does not know which device it reaches, so it cannot see two of them
+overlap. At the 9B geometry a state slot is every device's.
 
 At 600 MHz, per die, streamed:
 
 | Memory | Recurrent | Global, 4K | Global, 128K | Tokens/s, 4K | Tokens/s, 128K |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| the ideal port | 40,365 | 27,094 | 42,371 | 4,049 | 3,670 |
-| 16 PSRAMs, the path as built | 95,416 | 239,431 | 482,842 | 1,141 | 780 |
-| pipelined: reads streamed, requests overlapped | 54,766 | 226,042 | 451,970 | 1,537 | 974 |
-| and the scan and the rows asking ahead | 54,766 | 46,508 | 72,231 | 2,846 | 2,537 |
-| the same, every read burst pushed out | 56,998 | 49,892 | 76,527 | 2,716 | 2,424 |
+| the ideal port | 40,365 | 25,131 | 39,880 | 4,103 | 3,727 |
+| 16 PSRAMs, the controller as first built | 95,416 | 234,462 | 344,574 | 1,152 | 951 |
+| as now built, a unit's requests one at a time | 73,845 | 216,099 | 319,391 | 1,371 | 1,109 |
+| as now built, the units asking ahead | 73,845 | 33,080 | 58,923 | 2,356 | 2,139 |
+| the same, every read burst pushed out | 74,541 | 34,328 | 61,083 | 2,326 | 2,107 |
 
-(With a pass walking only its own tiles, and the rows and the scan at
-the memory's rate, below. The first figures here were 41,605 cycles and
-2,497 tokens/s for the ideal port; before the rows and the scan were
-widened the global layer was 75,823 and 115,503 cycles on the ideal port
-and 78,587 and 118,057 with the units asking ahead, and the die 2,536
-and 2,125 tokens/s at 128K.)
+(With a pass walking only its own tiles, the rows and the scan at the
+memory's rate and the requests stripe-aligned, below. The first figures
+here were 41,605 cycles and 2,497 tokens/s for the ideal port. Before the
+controller was built to it the model's pipelined path said 54,766 cycles
+for the recurrent layer and 2,537 tokens/s at 128K: its mover's reads
+and writes overlapped more than a mover that waits for its reads can,
+and its scan was one request over every device, which pages of 2,000
+bytes were not.)
 
-So the 3.7K of the ideal port is 780 tokens/s on the parts as the
-controller is built, and 2.5K with three changes to it: drain a read
-chunk as it arrives, take the next request while the last one's chunks
-run, and let the scan and the rows keep requests in flight so their pages
-spread over the devices. The last is what the global layer
-needs; the first two are what the recurrent layer's state needs, and even
-then its 1 MB a token of state at the devices' 14.9 GB/s is 70 µs of the
-91 µs it takes. The push-out costs two per cent at worst.
+So the 3.7K of the ideal port is 2.1K on the parts, where it was 950 on
+the controller as first built. What is left is the recurrent layers:
+each moves about 1 MB of state a token, read and written, and three of
+them are 220K of the die's 280K cycles a token. The global layer at 128K
+is 59K, most of it the index scan at the devices' rate. The push-out
+costs two per cent at worst. Decoding in batches of four lanes, the die
+does 1,984 tokens/s at 128K (920 as first built), a single user 206
+(105), and a prefill chunk of eight 4,477 (3,133).
 
 The device count is a cost question -- a part is about $5 in hundreds,
-and sixteen a die is 128 of them on the board. At the pipelined
-controller, per die:
+and sixteen a die is 128 of them on the board. With the controller as
+built, per die:
 
 | PSRAMs a die | Capacity | Contexts at 128K | Tokens/s, 4K | Tokens/s, 128K |
 | ---: | ---: | ---: | ---: | ---: |
-| 4 | 256 MB | 23 | 881 | 765 |
-| 8 | 512 MB | 46 | 1,618 | 1,421 |
-| 12 | 768 MB | 70 | 1,760 | 1,599 |
-| 16 | 1 GB | 93 | 2,846 | 2,537 |
-| 24 | 1.5 GB | 140 | 3,023 | 2,699 |
+| 4 | 256 MB | 23 | 894 | 775 |
+| 8 | 512 MB | 46 | 1,603 | 1,409 |
+| 12 | 768 MB | 70 | 1,790 | 1,623 |
+| 16 | 1 GB | 93 | 2,356 | 2,139 |
+| 24 | 1.5 GB | 140 | 2,404 | 2,183 |
 
 Twelve buys little over eight and twenty-four little over sixteen, because
 a state slot is sixteen stripes: at twelve devices four of them take two,
@@ -1382,7 +1433,8 @@ streamed (2,536 before) and 3,217 in batches of four lanes (2,311); a
 single user gets 294 (228), and a chunk of eight prefills at 4,749
 (4,403). On sixteen PSRAMs with the pipelined controller asking ahead it
 is 2,537 streamed (2,125), 2,311 in batches (1,964) and 3,965 prefill
-(3,815). Without asking ahead the global layer is the path's, and a
+(3,815) -- figures of the model's pipelined path before the controller
+was built to it; as built (above), 2,139, 1,984 and 4,477. Without asking ahead the global layer is the path's, and a
 little worse than the reader's (974 streamed against 996): the reader
 emitted one request's records while the next arrived, and the mover's
 requests wait for each other. The scan is now 22K of the 42K memory

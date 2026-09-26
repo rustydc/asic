@@ -32,7 +32,9 @@ class MapTest(unittest.TestCase):
         self.assertEqual(mm.kv_record_bytes, 256)
         self.assertEqual(M.MemoryMap(kv_bits=8).kv_record_bytes, 512)
         self.assertEqual(mm.window_bytes, 512 * 4 * 256)
-        self.assertEqual((mm.window_burst_records, mm.index_burst_records), (8, 25))
+        # A request is a whole number of the memory's stripes: 8 records of
+        # 256 bytes, two; 64 index records of 80 bytes, five.
+        self.assertEqual((mm.window_burst_records, mm.index_burst_records), (8, 64))
         self.assertEqual(mm.blocks, 8192)
         self.assertEqual(mm.index_record_bytes, 80)
         regions = mm.regions()

@@ -140,10 +140,10 @@ def layer_die() -> Drawing:
     d.text(680, 373, "NR read ports (norm 4, tiles TMAX, conv 2, gates 2, state 4, swiglu 2, residual 2, rotary 2, attn 4, mem 1), NW=19 write ports with byte enables, read data one cycle later", "s", "middle")
     # memory unit
     d.group(20, 400, 1320, 300, "memory path: one port per die")
-    d.box(40, 430, 220, 120, "Memory unit", ["mover: state/hist DMA", "append: window, block,", "index, block sums", "index_scan + topk", "rows: mover, as stored"], "mem")
+    d.box(40, 430, 220, 120, "Memory unit", ["mover: state/hist DMA", "append: window, block,", "index, block sums", "index_scan + topk", "rows fetcher, as stored"], "mem")
     d.edge([(145, 380), (145, 430)], "e2")
     d.edge([(30, 206), (30, 490), (40, 490)], "ec")
-    d.box(290, 450, 120, 80, "Arbiter", ["3 requesters", "one req in flight", "per requester"], "mem")
+    d.box(290, 450, 120, 80, "Arbiter", ["4 requesters", "reads in flight,", "back in order"], "mem")
     d.edge([(260, 490), (290, 490)], "ed")
     d.box(440, 450, 140, 80, "Bridge (CDC)", ["async FIFOs: req 4,", "wdata 16, rdata 8", "core clk <-> 250 MHz"], "mem")
     d.edge([(410, 490), (440, 490)], "ed", "memory port: req / wdata / rdata", 425, 440)

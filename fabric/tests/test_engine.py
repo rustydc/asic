@@ -19,6 +19,7 @@ RTL = Path(__file__).parents[1] / "rtl"
 # The engine testbench's clocks are 1.25 ns for the core and 4 ns for the
 # memory controller: the timing for a run over its four PSRAM models.
 PSRAM_TB = S.Timing(core_mhz=800, devices=4)
+PSRAM_ONE = S.Timing(core_mhz=800, devices=1)
 SOURCES = [RTL / name for name in ("fabric_sram.sv", "fabric_vector.sv", "fabric_norm.sv", "fabric_recurrent.sv", "fabric_ffn.sv", "fabric_attention.sv",
                                    "fabric_memory.sv", "fabric_tile.sv", "fabric_sequencer.sv", "fabric_engine.sv",
                                    "fabric_phy.sv", "fabric_cdc.sv", "fabric_hpi.sv", "fabric_controller.sv", "fabric_ring.sv",
@@ -26,7 +27,8 @@ SOURCES = [RTL / name for name in ("fabric_sram.sv", "fabric_vector.sv", "fabric
 
 
 def run_engine(case: unittest.TestCase, cfg, c, spec, mm, steps: list[S.Step], inputs: dict, memory=None, ndev: int = 0,
-               model_tiles: bool = False, log=None, first: bool = False, base_page: int = 0, ring: bool = False) -> int:
+               model_tiles: bool = False, log=None, first: bool = False, base_page: int = 0, ring: bool = False,
+               bound: bool = False) -> int:
     """Emit, simulate and check one program; returns the engine's cycle count.  With ``ndev`` the memory is the HPI path,
     with ``model_tiles`` the tiles' behavioural columns (full-size runs), with ``first`` the token is FIRST, with ``ring``
     the tokens come and go as packets through the die's ring link."""
@@ -58,9 +60,18 @@ def run_engine(case: unittest.TestCase, cfg, c, spec, mm, steps: list[S.Step], i
     # PSRAMs' (``Timing(devices=...)``, ``hpi.PathModel``): the path is
     # calibrated request by request, but the devices' refresh push-out is
     # random and the clock crossing adds a cycle here and there, so the two
-    # agree to three per cent rather than exactly.
+    # agree to three per cent rather than exactly.  That is over one device,
+    # where the path takes the requests in turn.  Over several the controller
+    # overlaps requests on different devices, which the schedule sees within
+    # a unit's run of them (``PathModel.sequence``, checked against the RTL in
+    # ``test_hpi``) but not between the steps, since it does not know which
+    # devices a step's requests reach: at the tiny geometry every request is
+    # a stripe or less, one device, and the schedule is only a bound (``bound``).
+    # At the 9B geometry a state slot is every device's, and the bound is close.
     if not ndev:
         case.assertEqual(took, S.schedule(steps).cycles, passed)
+    elif bound:
+        case.assertLessEqual(took, S.schedule(steps).cycles, passed)
     else:
         case.assertLessEqual(abs(took - S.schedule(steps).cycles), 0.03 * took, passed)
     return took
@@ -188,10 +199,14 @@ class EngineRtlTest(unittest.TestCase):
         self.assertGreater(cycles, S.schedule(self.prog).cycles // 2)
 
     def test_one_token_over_the_hpi_devices(self) -> None:
-        # The same token with the bridge, the stripe unit and four PSRAM models
-        # behind the memory port, against the schedule on the path's timing.
+        # The same token with the bridge, the stripe unit and PSRAM models
+        # behind the memory port, against the schedule on the path's timing:
+        # over one device to three per cent, over four bit for bit and within
+        # the schedule's bound.
+        prog = S.recurrent_program(self.cfg, self.c, self.spec, self.mm, PSRAM_ONE)
+        run_engine(self, self.cfg, self.c, self.spec, self.mm, prog, self.context_after(2), ndev=1)
         prog = S.recurrent_program(self.cfg, self.c, self.spec, self.mm, PSRAM_TB)
-        self.run_engine(prog, self.context_after(2), ndev=4)
+        run_engine(self, self.cfg, self.c, self.spec, self.mm, prog, self.context_after(2), ndev=4, bound=True)
 
     def test_the_same_program_serves_any_slot(self) -> None:
         # The program carries its memory operands as offsets in the token's
@@ -416,10 +431,14 @@ class GlobalEngineRtlTest(unittest.TestCase):
         run_engine(self, self.cfg, self.c, self.spec, self.mm, prog, inputs, {"m_ctx": images})
 
     def test_one_token_over_the_hpi_devices(self) -> None:
+        # At a block's end, the append's heaviest: over one device to three
+        # per cent, over four bit for bit and within the schedule's bound.
         pos = 31
         inputs, images = self.context_at(pos)
+        prog = S.global_program(self.cfg, self.c, self.spec, self.mm, pos, PSRAM_ONE)
+        run_engine(self, self.cfg, self.c, self.spec, self.mm, prog, inputs, {"m_ctx": images}, ndev=1)
         prog = S.global_program(self.cfg, self.c, self.spec, self.mm, pos, PSRAM_TB)
-        run_engine(self, self.cfg, self.c, self.spec, self.mm, prog, inputs, {"m_ctx": images}, ndev=4)
+        run_engine(self, self.cfg, self.c, self.spec, self.mm, prog, inputs, {"m_ctx": images}, ndev=4, bound=True)
 
     def test_a_stream_of_two_contexts(self) -> None:
         programs, inputs, memory = [], {}, {}
